@@ -9,10 +9,6 @@
 # Deliberately absent: `cargo fmt`. There is no `rustfmt.toml`, over a thousand source lines
 # already run past 100 columns, and `src/dml.rs` has never been formatted, so a format gate would
 # rewrite the tree rather than check it. See CONTRIBUTING.md.
-#
-# The frontend job also carries the repository's four prose gates. Three block and one does not,
-# and the split is on whether the question has a yes/no answer: dangling links, developer-machine
-# paths and internal names do; "is this number a measurement" does not.
 
 name: CI
 
