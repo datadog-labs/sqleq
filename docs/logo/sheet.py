@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Render the contact sheet. Imports build.py for the palette so the two cannot drift."""
+import io, os
+import build as B
+
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+SIZES = (16, 24, 32, 48, 96)
+
+def row(name, bg, sizes=SIZES):
+    cells = "".join('<figure class="sz"><img src="%s.svg" alt="" style="height:%dpx">'
+                    '<figcaption>%dpx</figcaption></figure>' % (name, s, s) for s in sizes)
+    return '<div class="row %s">%s</div>' % (bg, cells)
+
+def both(name, sizes=SIZES):
+    return row(name + "-light", "l", sizes) + row(name + "-dark", "d", sizes)
+
+AXES = [("qed", B.QED, "proves"), ("sqlsolver", B.SQS, "proves"),
+        ("fuzz", B.FUZ, "refutes")]
+swatches = "".join(
+    '<div class="sw"><div class="chips"><span style="background:%s"></span>'
+    '<span style="background:%s"></span></div><div><b>%s</b><div class="cap">%s</div>'
+    '<div class="hex">%s &middot; %s</div></div></div>' % (c[0], c[1], n, d, c[0], c[1])
+    for n, c, d in AXES)
+
+HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sqleq Marks</title>
+<link rel="icon" href="favicon-light.svg">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:#f4f5f8; --panel:#fff; --ink:#171a21; --muted:#5b6474; --line:#dfe3ea;
+    --warn-bg:#fdf6e7; --warn-line:#e4c77e; --warn-ink:#7a5410;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --ground:#0d0f14; --panel:#161922; --ink:#e6e9f0; --muted:#98a2b6; --line:#262b37;
+    --warn-bg:#241d0e; --warn-line:#5c491f; --warn-ink:#e9c375;
+  } }
+  :root[data-theme="dark"] {
+    --ground:#0d0f14; --panel:#161922; --ink:#e6e9f0; --muted:#98a2b6; --line:#262b37;
+    --warn-bg:#241d0e; --warn-line:#5c491f; --warn-ink:#e9c375;
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--ground); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; padding-block:3rem; padding-left:16px; padding-right:16px }
+  .wrap { max-width:62rem; margin:0 auto; display:flex; flex-direction:column; gap:2.75rem }
+  header img { height:44px; display:block } header img.d { display:none }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) header img.l{display:none}
+    :root:not([data-theme="light"]) header img.d{display:block} }
+  :root[data-theme="dark"] header img.l{display:none} :root[data-theme="dark"] header img.d{display:block}
+  h2 { font-family:var(--mono); font-size:1.05rem; font-weight:600; margin:0 0 .15rem }
+  .sub { font-size:.78rem; color:var(--muted); margin:0 0 .9rem }
+  p { margin:0 0 .9rem; max-width:64ch; color:var(--muted) }
+  p strong, li strong { color:var(--ink); font-weight:600 }
+  code { font-family:var(--mono); font-size:.88em; background:var(--panel);
+         border:1px solid var(--line); border-radius:3px; padding:.05em .3em }
+  section { border-top:1px solid var(--line); padding-top:1.4rem }
+  .row { display:flex; align-items:flex-end; gap:2rem; flex-wrap:wrap; padding:1.4rem;
+         border:1px solid var(--line) }
+  .row.l { background:#f2f4f7; border-radius:6px 6px 0 0; border-bottom:0 }
+  .row.d { background:#11131a; border-radius:0 0 6px 6px }
+  .row.d figcaption { color:#98a2b6 }
+  .sz { margin:0; display:flex; flex-direction:column; align-items:center; gap:.5rem }
+  figcaption { font-family:var(--mono); font-size:.7rem; color:var(--muted) }
+  .pair { display:grid; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); gap:.75rem }
+  .sw { display:flex; gap:.8rem; align-items:center; padding:.8rem; background:var(--panel);
+        border:1px solid var(--line); border-radius:6px }
+  .chips { display:flex; flex-direction:column; flex:none }
+  .chips span { width:24px; height:18px; display:block }
+  .chips span:first-child{border-radius:4px 4px 0 0} .chips span:last-child{border-radius:0 0 4px 4px}
+  .sw b { font-family:var(--mono); font-size:.88rem }
+  .cap { font-size:.8rem; color:var(--muted) }
+  .hex { font-family:var(--mono); font-size:.7rem; color:var(--muted) }
+  ul { margin:0 0 .9rem; padding-left:1.1rem; color:var(--muted) } li { margin-bottom:.4rem }
+  table { border-collapse:collapse; font-size:.85rem; width:100%% }
+  td,th { text-align:left; padding:.4rem .7rem .4rem 0; border-bottom:1px solid var(--line);
+          vertical-align:top }
+  th { font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted) }
+  td:first-child { font-family:var(--mono); white-space:nowrap; color:var(--ink) }
+  .warn { background:var(--warn-bg); border:1px solid var(--warn-line); border-radius:6px;
+          padding:.9rem 1.1rem; color:var(--warn-ink); font-size:.88rem; max-width:64ch }
+  .warn strong { color:var(--warn-ink) }
+  .ab { display:grid; grid-template-columns:repeat(auto-fit,minmax(16rem,1fr)); gap:1rem }
+  .ab > div { border:1px solid var(--line); border-radius:6px; overflow:hidden }
+  .ab .hd { font-family:var(--mono); font-size:.78rem; padding:.55rem .85rem;
+            background:var(--panel); border-bottom:1px solid var(--line) }
+  .ab .bd { padding:1.6rem; background:#f2f4f7; display:flex; justify-content:center }
+  .ab .bd img { height:64px }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header><img class="l" src="lockup-light.svg" alt="sqleq"><img class="d" src="lockup-dark.svg" alt="sqleq"></header>
+
+<section style="border:0;padding-top:0">
+  <h2>&#8866;&#8801;</h2>
+  <p class="sub">turnstile &middot; identity sign</p>
+  <p><strong>Proves equivalent.</strong> <code>&#8866;</code> is the entailment turnstile
+    &mdash; it reads &ldquo;proves&rdquo;. <code>&#8801;</code> is the identity sign. Together
+    they state the judgement the project makes, in the notation it would be written in.</p>
+  <p>The turnstile is load-bearing, not decorative: a bare <code>&#8801;</code> is the
+    hamburger-menu icon and would be read as one everywhere it appeared.</p>
+</section>
+
+<section>
+  <h2>Where the SQL is</h2>
+  <p class="sub">the identity sign is built from table cells</p>
+  <p>The identity sign is drawn as <strong>cells rather than solid rules</strong>, so it carries
+    two readings at once: three horizontal bands at a glance, a grid of table cells up close.
+    Nothing was added to the mark to achieve this &mdash; the same three bars do both jobs.</p>
+  <div class="ab"><div><div class="hd">the mark</div>
+      <div class="bd"><img src="mark-light.svg" alt=""></div></div></div>
+  <p style="margin-top:1rem">Two ratios keep the identity reading dominant. Row gaps are
+    <strong>double</strong> the column gaps and run the full width uninterrupted, so the rows
+    group before the columns do. And the cells are <strong>wider than they are tall</strong>
+    &mdash; square cells would make a 3&times;3 grid, which is the app-launcher icon.</p>
+  <p>Worth knowing what you are <em>not</em> getting: no database cylinder. It is the most
+    templated shape available, it says &ldquo;database&rdquo; rather than &ldquo;SQL&rdquo;, and
+    it would break the typographic register that makes the rest of the mark work. The name also
+    already carries the signal &mdash; <code>sqleq</code> is <em>sql</em> + <em>eq</em> &mdash;
+    so the wordmark says it in letters and the mark says it in form, once each.</p>
+</section>
+
+<section>
+  <h2>Primary mark</h2>
+  <p class="sub">single colour &middot; horizontal &middot; READMEs, headers, docs, slides</p>
+  %(mark)s
+</section>
+
+<section>
+  <h2>Square mark</h2>
+  <p class="sub">the end-of-proof square &middot; avatars, square frames</p>
+  <p>The Halmos tombstone &mdash; the box that ends a proof &mdash; enclosing the same cells.</p>
+  %(square)s
+</section>
+
+<section>
+  <h2>Favicon</h2>
+  <p class="sub">pixel-snapped &middot; use below 32px</p>
+  <p>Designed <em>on</em> a 16-unit grid rather than scaled down to one, so every edge lands on a
+    device pixel. This exists because the square mark does not survive 16px honestly: its bars
+    fall to 1.5px with a 0.9px gap, which antialiasing merges into a grey block. Here the bars
+    are 2px with 2px gaps &mdash; and <strong>solid</strong>, because cells at this size would
+    need to be 2px wide with 1px gaps, which reads as noise rather than as a table.</p>
+  %(fav)s
+</section>
+
+<section>
+  <h2>Axis-coloured variant</h2>
+  <p class="sub">available &middot; not the default</p>
+  <div class="warn"><strong>This variant has an expiry date.</strong> Colouring the three bars
+    for qed, sqlsolver and fuzz makes the mark a legend for the portfolio &mdash; which means a
+    fourth tool makes it wrong, not merely dated. The mono mark carries no count and never
+    expires. Use this one only where the three axes are themselves the subject.</div>
+  <div style="margin-top:1rem">%(axes)s</div>
+  <div class="pair" style="margin-top:1rem">%(swatches)s</div>
+  <p style="margin-top:.8rem">Hues are lifted from the project's generated reports; nothing here
+    was invented for the logo.</p>
+</section>
+
+<section>
+  <h2>Files</h2>
+  <table>
+    <tr><th>File</th><th>viewBox</th><th>Use</th></tr>
+    <tr><td>mark-{light,dark}</td><td>49&times;34</td><td><strong>primary</strong></td></tr>
+    <tr><td>square-{light,dark}</td><td>54&times;54</td><td>avatar, square frames</td></tr>
+    <tr><td>favicon-{light,dark}</td><td>16&times;16</td><td>below 32px</td></tr>
+    <tr><td>lockup-{light,dark}</td><td>124&times;32</td><td>mark + wordmark</td></tr>
+    <tr><td>mark-solid-{light,dark}</td><td>49&times;34</td><td>solid rules, no table reading</td></tr>
+    <tr><td>*-axes-{light,dark}</td><td>&mdash;</td><td>axis-coloured; see the warning above</td></tr>
+    <tr><td>build.py / sheet.py</td><td>&mdash;</td><td>regenerate every file on this page</td></tr>
+  </table>
+  <p style="margin-top:1rem">Every mark is plain <code>&lt;rect&gt;</code> on a half-unit grid
+    &mdash; no paths, strokes or transforms. They scale without hinting and recolour by editing
+    one hex value.</p>
+</section>
+
+<section>
+  <h2>Notes and limits</h2>
+  <ul>
+    <li><strong>The wordmark is live text.</strong> The lockup needs IBM Plex Mono; anywhere it
+      is missing the browser substitutes and the spacing changes. Outline it before production.</li>
+    <li><strong>Its viewBox width is computed, not measured.</strong> This machine has no SVG
+      renderer and no Plex installed, so the extent comes from Plex Mono's 0.6em advance rather
+      than from a render. Outlining settles it.</li>
+    <li><strong>The marks themselves are verified</strong> &mdash; rasterized exactly from their
+      own rect geometry, bounding box centred on the viewBox, nothing clipped.</li>
+    <li><strong>Below 32px use the favicon file</strong>, not a scaled square mark.</li>
+    <li><strong>Keep the turnstile.</strong> Without it the mark is a hamburger icon.</li>
+  </ul>
+</section>
+
+</div>
+</body>
+</html>
+"""
+
+io.open(OUT, "w", encoding="utf-8").write(HTML % dict(
+    swatches=swatches, mark=both("mark"), square=both("square"),
+    fav=both("favicon", (16, 24, 32, 48)), axes=both("mark-axes")))
+print("wrote", OUT, os.path.getsize(OUT), "bytes")

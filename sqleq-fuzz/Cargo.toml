@@ -1,0 +1,30 @@
+[package]
+name = "sqleq-fuzz"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "License-clean concrete differential tester: a SQL non-equivalence disprover (DuckDB)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sqleq_fuzz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqleq-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+# DuckDB, statically bundled so the binary is self-contained (no system libduckdb needed).
+duckdb = { version = "1", features = ["bundled"] }
+# Query/schema parsing (same parser the frontend uses) — `visitor` for relation discovery.
+sqlparser = { workspace = true, features = ["visitor"] }
+# Pattern matching for time-freezing, LIMIT/param detection, and the UNIQUE-INDEX regex fallback.
+regex = "1"
+# Deterministic, seedable RNG for instance/parameter generation.
+rand = "0.8"
+# Robust CSV reader for the corpus (DDL cells contain quoted, multi-line SQL).
+csv = { workspace = true }
+# Batch verdict output.
+serde_json = { workspace = true }
