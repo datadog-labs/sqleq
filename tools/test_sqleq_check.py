@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Tests for sqleq_check's triviality classifier.
+
+    python3 -m unittest discover -s tools -p 'test_*.py'
+
+The classifier decides whether a pair is `x` against `x`, which is what the
+`capability` number is computed from — so a mis-split here silently moves cases
+between the two buckets and quietly inflates or deflates the headline. The
+statement splitter is the part with real edge cases: a `;` inside a string
+literal or a comment does not end a statement.
+
+Standard library only, like the harness itself.
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from sqleq_check import _statements, triviality_from_ir, triviality_from_text
+
+
+class StatementSplitting(unittest.TestCase):
+    def test_declarations_are_dropped(self):
+        sql = (
+            'create table "t" ("a" INTEGER);\n'
+            "declare scalar function f(INTEGER) returns INTEGER;\n"
+            'select "a" from "t";\nselect "a" from "t";'
+        )
+        self.assertEqual(_statements(sql),
+                         ['select "a" from "t"', 'select "a" from "t"'])
+
+    def test_whitespace_is_normalized(self):
+        self.assertEqual(_statements("select   1\n  +\t2; select 1 + 2;"),
+                         ["select 1 + 2", "select 1 + 2"])
+
+    def test_semicolon_inside_a_string_literal_does_not_split(self):
+        self.assertEqual(_statements("select ';' ; select ';';"),
+                         ["select ';'", "select ';'"])
+
+    def test_semicolon_inside_a_quoted_identifier_does_not_split(self):
+        self.assertEqual(_statements('select "a;b" from "t"; select 1;'),
+                         ['select "a;b" from "t"', "select 1"])
+
+    def test_doubled_quote_is_an_escape_not_a_terminator(self):
+        # If the doubled quote ended the literal, the `;` after it would split.
+        self.assertEqual(_statements("select 'it''s; fine'; select 2;"),
+                         ["select 'it''s; fine'", "select 2"])
+
+    def test_line_comment_hides_a_semicolon(self):
+        self.assertEqual(_statements("select 1 -- ; not a split\n; select 1;"),
+                         ["select 1", "select 1"])
+
+    def test_block_comment_hides_a_semicolon(self):
+        self.assertEqual(_statements("select /* ; */ 1; select 1;"),
+                         ["select 1", "select 1"])
+
+    def test_unterminated_comment_swallows_the_rest(self):
+        # Degenerate input; the point is that it terminates and yields a count
+        # other than two, so the case is reported undetermined rather than
+        # guessed at.
+        self.assertIsNone(triviality_from_text("select 1; /* unterminated"))
+
+
+class TrivialityFromText(unittest.TestCase):
+    def test_identical_modulo_whitespace(self):
+        self.assertIs(triviality_from_text(
+            'create table "t" ("a" INTEGER);\nselect  "a"  from "t";\n'
+            'select "a" from "t";'), True)
+
+    def test_different(self):
+        self.assertIs(triviality_from_text(
+            'select "a" from "t"; select "b" from "t";'), False)
+
+    def test_wrong_statement_count_is_undetermined(self):
+        self.assertIsNone(triviality_from_text("select 1;"))
+        self.assertIsNone(triviality_from_text("select 1; select 2; select 3;"))
+
+    def test_the_text_test_is_blind_to_aliasing(self):
+        # Both sides mean the same thing and lower to the same plan, but the
+        # text differs. This is exactly why the IR test is preferred when there
+        # is an IR to look at.
+        self.assertIs(triviality_from_text(
+            'select "a" as "x" from "t"; select "a" as "y" from "t";'), False)
+
+
+class TrivialityFromIR(unittest.TestCase):
+    def test_structurally_equal_plans(self):
+        plan = {"queries": [{"scan": 0}, {"scan": 0}], "schemas": []}
+        self.assertIs(triviality_from_ir(plan), True)
+
+    def test_structurally_different_plans(self):
+        plan = {"queries": [{"scan": 0}, {"scan": 1}], "schemas": []}
+        self.assertIs(triviality_from_ir(plan), False)
+
+    def test_key_order_does_not_matter(self):
+        # Two dicts with the same entries are equal in Python regardless of
+        # insertion order, which is the behaviour we want: the plan is a tree,
+        # not a serialization.
+        a = {"project": {"cols": [0, 1], "input": {"scan": 0}}}
+        b = {"project": {"input": {"scan": 0}, "cols": [0, 1]}}
+        self.assertIs(triviality_from_ir({"queries": [a, b]}), True)
+
+    def test_list_order_does_matter(self):
+        a = {"project": {"cols": [0, 1], "input": {"scan": 0}}}
+        b = {"project": {"cols": [1, 0], "input": {"scan": 0}}}
+        self.assertIs(triviality_from_ir({"queries": [a, b]}), False)
+
+    def test_malformed_plans_are_undetermined(self):
+        self.assertIsNone(triviality_from_ir({}))
+        self.assertIsNone(triviality_from_ir({"queries": [{"scan": 0}]}))
+        self.assertIsNone(triviality_from_ir({"queries": "not a list"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

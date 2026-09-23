@@ -1,0 +1,43 @@
+[workspace]
+members = ["sqleq-fuzz"]
+# Bare `cargo build` / `cargo test` stay on the lean frontend. sqleq-fuzz statically bundles DuckDB
+# (~4.5 min cold build), so it is opt-in: `cargo build -p sqleq-fuzz`.
+default-members = ["."]
+resolver = "2"
+
+# Shared versions, so the two crates cannot drift apart on the parser.
+[workspace.dependencies]
+serde_json = "1"
+
+# `visitor` gives us the derived AST walker. It is used for the "is this expression closed?"
+# guards, where a hand-written match risks *missing* a variant — and a missed variant there is a
+# soundness hole, not a coverage gap.
+sqlparser = { version = "0.62", features = ["visitor"] }
+# Robust CSV reader for the corpus: the DDL field holds quoted, multi-line SQL.
+csv = "1"
+
+[package]
+name = "sqleq-frontend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Analyze SQL equivalence pairs and lower them to prover IR (QED, SQLSolver)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sqleq_frontend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqleq-frontend"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+sqlparser = { workspace = true }
+csv = { workspace = true }
+
+# Profiles are workspace-wide and may only be set at the root (moved here from sqleq-fuzz).
+[profile.release]
+opt-level = 3

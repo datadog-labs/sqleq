@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 49 34" width="49" height="34" role="img" aria-labelledby="t d">
+  <title id="t">sqleq</title>
+  <desc id="d">The entailment turnstile followed by the identity sign. The identity sign is built from table cells, so it reads as both 'equivalent' and 'a table'. Axis-coloured variant.</desc>
+  <rect x="4" y="4" width="5" height="26" rx="1" fill="#171a21"/>
+  <rect x="9" y="15" width="12" height="4" rx="1" fill="#171a21"/>
+  <rect x="26" y="7" width="5" height="4" rx="1" fill="#3b5bdb"/>
+  <rect x="33" y="7" width="5" height="4" rx="1" fill="#3b5bdb"/>
+  <rect x="40" y="7" width="5" height="4" rx="1" fill="#3b5bdb"/>
+  <rect x="26" y="15" width="5" height="4" rx="1" fill="#0f766e"/>
+  <rect x="33" y="15" width="5" height="4" rx="1" fill="#0f766e"/>
+  <rect x="40" y="15" width="5" height="4" rx="1" fill="#0f766e"/>
+  <rect x="26" y="23" width="5" height="4" rx="1" fill="#b45309"/>
+  <rect x="33" y="23" width="5" height="4" rx="1" fill="#b45309"/>
+  <rect x="40" y="23" width="5" height="4" rx="1" fill="#b45309"/>
+</svg>

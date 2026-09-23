@@ -1,0 +1,15 @@
+-- Schema for the pair.
+create table "users" (
+  "id"      INTEGER,
+  "tier"    INTEGER,
+  "org_id"  INTEGER,
+  unique ("id")
+);
+
+-- Two query rewrites we claim are equivalent:
+--   A: the membership test written as an OR of equalities
+SELECT "id", "tier" FROM "users"
+ WHERE "org_id" = 1 AND ("tier" = 1 OR "tier" = 2);
+--   B: the same test written with IN
+SELECT "id", "tier" FROM "users"
+ WHERE "org_id" = 1 AND "tier" IN (1, 2);

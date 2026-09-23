@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+
+# Local cargo home used for offline/sandboxed builds
+/.cargo-home
+
+# Default output of `sqleq-frontend <input.sql>` when no out path is given
+*.fe.json
+
+# qed-prover writes its verdict beside its input, as `<input>.result`
+*.fe.result
+
+# The scratch directory the README's quick start creates
+/out
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Python bytecode from tools/
+tools/__pycache__/
+
+# javac output for the SQLSolver IR bridge (tools/sqlsolver/*.java)
+tools/sqlsolver/out/
+tools/sqlsolver/out-fork/

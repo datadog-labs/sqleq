@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-labelledby="t d">
+  <title id="t">sqleq</title>
+  <desc id="d">Pixel-snapped favicon; every edge lands on a device pixel at 16, 32 and 64px.</desc>
+  <rect x="0" y="0" width="16" height="1" rx="0" fill="#171a21"/>
+  <rect x="0" y="15" width="16" height="1" rx="0" fill="#171a21"/>
+  <rect x="0" y="1" width="1" height="14" rx="0" fill="#171a21"/>
+  <rect x="15" y="1" width="1" height="14" rx="0" fill="#171a21"/>
+  <rect x="4" y="3" width="8" height="2" rx="0" fill="#171a21"/>
+  <rect x="4" y="7" width="8" height="2" rx="0" fill="#171a21"/>
+  <rect x="4" y="11" width="8" height="2" rx="0" fill="#171a21"/>
+</svg>
