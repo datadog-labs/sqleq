@@ -27,7 +27,7 @@ at all: it runs the two queries against DuckDB looking for a counterexample. See
 
 ## The disproving axis (`sqleq-fuzz/`)
 
-A separate crate, opt-in because it statically bundles DuckDB: `cargo build -p sqleq-fuzz`. It
+A separate crate, opt-in because its first build downloads DuckDB: `cargo build -p sqleq-fuzz`. It
 generates instances, runs both queries, and reports the first divergence. Its own soundness rules —
 what it must never call a counterexample — are in [`sqleq-fuzz/README.md`](../sqleq-fuzz/README.md).
 

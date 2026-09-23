@@ -1,7 +1,7 @@
 [workspace]
 members = ["sqleq-fuzz"]
-# Bare `cargo build` / `cargo test` stay on the lean frontend. sqleq-fuzz statically bundles DuckDB
-# (~4.5 min cold build), so it is opt-in: `cargo build -p sqleq-fuzz`.
+# Bare `cargo build` / `cargo test` stay on the lean frontend. sqleq-fuzz links DuckDB, whose
+# release library its first build downloads, so it is opt-in: `cargo build -p sqleq-fuzz`.
 default-members = ["."]
 resolver = "2"
 

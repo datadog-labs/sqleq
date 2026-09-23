@@ -1,0 +1,9 @@
+# DuckDB comes from the project's own release library rather than from a source build: the
+# `libduckdb-sys` build script downloads it once into `target/duckdb-download/` and links it.
+# That library already has the icu, json and parquet extensions compiled in, which the crates.io
+# `bundled` amalgamation does not -- see sqleq-fuzz/src/duck.rs for why the oracle needs them.
+#
+# To build against a libduckdb you already have, set DUCKDB_LIB_DIR; the build script checks it
+# before it considers downloading anything.
+[env]
+DUCKDB_DOWNLOAD_LIB = "1"

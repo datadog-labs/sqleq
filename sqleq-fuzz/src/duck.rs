@@ -161,8 +161,17 @@ pub fn ddl_for(parts: &[String], t: &Table) -> String {
 ///
 /// `threads=1` because intra-query parallelism buys nothing on 5-row tables and the workers already
 /// saturate the cores; the default pool (one thread per core, per instance) only added contention.
+///
+/// Extension autoloading is off. DuckDB's default is to fetch a missing extension from
+/// `extensions.duckdb.org` on first use, which would make a verdict depend on the network and on
+/// whatever happens to be in `~/.duckdb` — the same pair could come back decided on one machine
+/// and `Error` on another. The library we link against already has icu, json and parquet compiled
+/// in, so nothing here needs fetching and turning it off costs no coverage. A missing extension
+/// was never a soundness risk (`pair.rs` abandons a trial whose side errors, so a refutation
+/// always has two successful sides), but it was a reproducibility one.
 pub fn open_db() -> duckdb::Result<Connection> {
-    Connection::open_in_memory_with_flags(Config::default().threads(1)?)
+    let config = Config::default().threads(1)?.enable_autoload_extension(false)?;
+    Connection::open_in_memory_with_flags(config)
 }
 
 /// Drop everything a side created, so the next side starts from a clean catalog. `thorough` also
@@ -482,7 +491,7 @@ pub fn run_side(
 
 #[cfg(test)]
 mod tests {
-    use super::{ddl_for, fetch_rows, Connection};
+    use super::{ddl_for, fetch_rows, open_db};
     use crate::gen::{lit, Val, JSONS};
     use crate::schema::{Column, Table, VType};
 
@@ -509,7 +518,9 @@ mod tests {
         assert!(ddl.contains("\"j\" JSON"), "{ddl}");
         assert!(ddl.contains("\"js\" JSON[]"), "{ddl}");
 
-        let con = Connection::open_in_memory().unwrap();
+        // Through `open_db`, not a bare connection: with autoloading off this passes only if the
+        // json extension is really compiled into the library we linked.
+        let con = open_db().unwrap();
         con.execute_batch(&ddl).unwrap();
         for doc in JSONS {
             let row = Val::List(vec![Val::Str(doc.to_string())]);
@@ -544,6 +555,26 @@ mod tests {
             acc.iter().filter(|c| c.contains("Null")).count(),
             2,
             "each key is absent from exactly two pool documents: {acc:?}"
+        );
+    }
+
+    /// The other extension the linked library has to carry, and the one the crates.io `bundled`
+    /// build could not supply at all. `gen.rs` generates named time zones for any argument that
+    /// needs one, so without icu every pair that uses one comes back `Error` — and with DuckDB's
+    /// default settings it would instead be silently fetched over the network on first use.
+    #[test]
+    fn a_named_time_zone_resolves_without_fetching_an_extension() {
+        let con = open_db().unwrap();
+        let rows = fetch_rows(
+            &con,
+            "SELECT (TIMESTAMP '2024-01-15 12:00:00' AT TIME ZONE 'America/New_York')::VARCHAR",
+        )
+        .unwrap();
+        // New York is five hours behind UTC in January, so this reads icu's actual tz database
+        // rather than merely parsing the clause.
+        assert!(
+            rows.len() == 1 && rows[0].contains("2024-01-15 17:00:00"),
+            "{rows:?}"
         );
     }
 }

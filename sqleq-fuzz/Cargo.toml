@@ -16,8 +16,10 @@ name = "sqleq-fuzz"
 path = "src/main.rs"
 
 [dependencies]
-# DuckDB, statically bundled so the binary is self-contained (no system libduckdb needed).
-duckdb = { version = "1", features = ["bundled"] }
+# DuckDB, linked against the project's own release library -- which, unlike the crates.io
+# `bundled` amalgamation, has the icu, json and parquet extensions compiled into it. The
+# workspace's .cargo/config.toml is what tells the build script to fetch it.
+duckdb = { version = "1" }
 # Query/schema parsing (same parser the frontend uses) — `visitor` for relation discovery.
 sqlparser = { workspace = true, features = ["visitor"] }
 # Pattern matching for time-freezing, LIMIT/param detection, and the UNIQUE-INDEX regex fallback.
