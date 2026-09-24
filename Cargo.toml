@@ -33,6 +33,11 @@ path = "src/lib.rs"
 name = "sqleq-frontend"
 path = "src/main.rs"
 
+# Off by default. Exposes lowering internals to sqleq's own benchmark harness, which audits a
+# corpus that cannot be published and so cannot live in this repository. Exempt from semver.
+[features]
+internals = []
+
 [dependencies]
 serde_json = { workspace = true }
 sqlparser = { workspace = true }

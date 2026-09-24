@@ -446,7 +446,10 @@ pub fn name_type(col: &str) -> Option<Ty> {
 ///
 /// `crate::casts` keeps using these keys *after* inference, across a pass that mutates the same
 /// tree. That is sound only because of how it mutates; see [`crate::casts`] for the argument.
-pub(crate) fn nid(e: &Expr) -> usize {
+/// Re-exported under the `internals` feature, which makes this doc "public"; the links
+/// below point at private callers on purpose and resolve in the crate's own docs.
+#[allow(rustdoc::private_intra_doc_links)]
+pub fn nid(e: &Expr) -> usize {
     e as *const Expr as usize
 }
 
@@ -545,7 +548,7 @@ struct Attributor<'a> {
 }
 
 /// Whether a declared catalog says `table` has `col`.
-pub(crate) fn declares(cat: &Catalog, table: &str, col: &str) -> bool {
+pub fn declares(cat: &Catalog, table: &str, col: &str) -> bool {
     cat.find(table)
         .is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c.eq_ignore_ascii_case(col)))
 }

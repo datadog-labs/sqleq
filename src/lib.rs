@@ -50,6 +50,23 @@ pub mod sqlsolver;
 mod types;
 mod verify;
 
+/// Frontend internals, for sqleq's own benchmark harness.
+///
+/// Not an entry point and not public API: these are implementation details of the lowering
+/// pipeline, exposed behind an off-by-default feature so the harness can audit a corpus
+/// without carrying a second copy of the frontend. Exempt from semver -- anything here may
+/// change or disappear in a patch release. If you are not that harness, do not enable it.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::catalog::{obj_name, Catalog, SYSTEM_COLUMNS};
+    pub use crate::infer::{declares, nid};
+
+    /// Aliased rather than re-exported: `DIALECT` sits at the crate root, where making it
+    /// `pub` would widen the default API even with this feature off.
+    pub const DIALECT: sqlparser::dialect::PostgreSqlDialect = crate::DIALECT;
+}
+
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{json, Value};
