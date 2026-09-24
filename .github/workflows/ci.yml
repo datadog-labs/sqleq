@@ -51,6 +51,11 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
 
+      # The `internals` feature is off by default, so the two lines above never compile it.
+      # Without this step it would rot silently until the benchmark harness that depends on it
+      # failed to build against a new frontend.
+      - run: cargo clippy --features internals --all-targets -- -D warnings
+
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
 
       # Every relative link in every tracked Markdown file resolves. See tools/linkcheck.py for

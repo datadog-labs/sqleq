@@ -22,7 +22,10 @@ use crate::types::map_type;
 /// Only the columns present on *every* relation are listed: `oid` is not, since PG12 it exists on
 /// system catalogs alone, and treating it as universal would suppress a real finding on a user
 /// table.
-pub(crate) const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"];
+/// Re-exported under the `internals` feature, which makes this doc "public"; the links
+/// below point at private callers on purpose and resolve in the crate's own docs.
+#[allow(rustdoc::private_intra_doc_links)]
+pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"];
 
 /// A table's columns (lowercased name, prover type), per-column nullability, and key column-sets
 /// (from UNIQUE / PRIMARY KEY).
