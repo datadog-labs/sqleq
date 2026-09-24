@@ -7,14 +7,14 @@ conventions are not the ones you would guess from the code — this file is the 
 
 ```sh
 cargo test                 # the frontend: 199 + 173 + 17
-cargo test -p sqleq-fuzz   # the disprover: 51 + 37 + 5
+cargo test -p sqleq-fuzz   # the disprover: 51 + 38 + 5
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
 ```
 
-`cargo test` deliberately does not build `sqleq-fuzz`. It statically bundles DuckDB (~4.5 minutes
-from cold), so the root manifest sets `default-members = ["."]` and the disprover is opt-in. CI
-splits them into two jobs for the same reason.
+`cargo test` deliberately does not build `sqleq-fuzz`. Its first build downloads DuckDB's release
+library (~40 MB, cached in `target/`), so the root manifest sets `default-members = ["."]` and the
+disprover is opt-in. CI splits them into two jobs for the same reason.
 
 ## Lints
 

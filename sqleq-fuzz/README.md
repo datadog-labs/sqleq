@@ -17,7 +17,7 @@ For a query pair `(A, B)` under a schema, it repeatedly:
    match rows) — but only where that consistency is something the row supports, see
    [Parameter binding](#parameter-binding-is-an-assumption-not-a-given) below;
 3. freezes `now()` / `current_*` to constants and skips truly nondeterministic functions;
-4. runs both statements on **DuckDB** (bundled — no system library needed);
+4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install);
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
    counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state.
 
@@ -113,11 +113,11 @@ Two things this test does **not** cover, both stated rather than papered over:
 
 ## Usage
 
-This crate is a workspace member but *not* a default one — it statically bundles DuckDB, so a bare
-`cargo build` at the workspace root skips it. Build it explicitly:
+This crate is a workspace member but *not* a default one — its first build downloads DuckDB's
+release library, so a bare `cargo build` at the workspace root skips it. Build it explicitly:
 
 ```
-cargo build -p sqleq-fuzz --release     # first build compiles the DuckDB amalgamation (~4.5 min)
+cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 MB) into target/
 cargo test  -p sqleq-fuzz               # the self-contained suite below
 ```
 
@@ -166,5 +166,6 @@ time-freezing, and non-equivalence-detection rules.
 ## Notes
 
 - Clean-room port; shares no code with the NonCommercial VeriEQL.
-- DuckDB is statically bundled (`duckdb` crate, MIT); parsing uses `sqlparser` (the same parser as
+- DuckDB is linked from its own release library (`duckdb` crate, MIT), which the build downloads
+  into `target/` and copies next to the executable; parsing uses `sqlparser` (the same parser as
   `sqleq-frontend`); `regex`, `rand`, `csv` complete the dependency set — all permissive licenses.

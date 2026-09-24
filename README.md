@@ -31,11 +31,11 @@ The two things you might want have very different prerequisites, so pick first:
 Both take the [same input file](#input-format), and both examples below ship in
 [`examples/`](examples/) — one pair is an equivalent rewrite, the other is not.
 
-**Look for a counterexample.** No external dependency: `sqleq-fuzz` statically bundles DuckDB, which
-is also why the first build is slow.
+**Look for a counterexample.** Nothing to install first: the build fetches DuckDB's own release
+library and links against it.
 
 ```sh
-cargo build --release -p sqleq-fuzz      # ~4.5 min cold — it bundles DuckDB
+cargo build --release -p sqleq-fuzz      # first build downloads libduckdb (~40 MB)
 FUZZ=./target/release/sqleq-fuzz
 
 $FUZZ file examples/dropped_filter.sql   # B drops an org-scoping predicate
@@ -161,8 +161,9 @@ Recent stable Rust (edition 2021; MSRV 1.85, set by the dependency tree). The fr
 on `sqlparser`, `serde_json` and `csv`.
 
 `sqleq-fuzz` is in the same Cargo workspace but outside `default-members`, so a bare `cargo build
---release` deliberately skips it — it statically bundles DuckDB and costs ~4.5 min cold. Build it
-with `cargo build --release -p sqleq-fuzz`.
+--release` deliberately skips it — its first build downloads DuckDB's release library (~40 MB).
+Build it with `cargo build --release -p sqleq-fuzz`. To link a libduckdb you already have instead,
+set `DUCKDB_LIB_DIR`; the build script checks it before it considers downloading anything.
 
 The prover binary is external (from the upstream `qed-solver` project) and is not vendored here. It
 needs the native `z3` and `cvc5` solvers, and its Nix flake bundles them, so Nix is the most
