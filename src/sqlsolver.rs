@@ -16,8 +16,8 @@
 //!
 //! 1. **Renders the schema as MySQL-dialect DDL.** `CalciteSupport` hardcodes `DB_TYPE = MySQL`, so
 //!    the schema SQLSolver is handed is parsed by their MySQL ANTLR grammar. We do not write a second
-//!    Postgres DDL reader for it: [`crate::pgddl`] already builds a [`Catalog`], and
-//!    [`emit_mysql`] prints that catalog back out in the dialect their grammar accepts.
+//!    Postgres DDL reader for it: [`crate::pgddl`] already builds a [`Catalog`](crate::catalog::Catalog), and
+//!    [`emit_mysql`](crate::sqlsolver::emit_mysql) prints that catalog back out in the dialect their grammar accepts.
 //! 2. **Encodes `$N` parameters as 0-ary function calls,** `$1` -> `_DOLLAR_1()`. See below.
 //! 3. **Strips schema qualifiers from table references,** `app.foo` -> `foo`. Their Calcite root
 //!    schema is flat (`calciteSchema.add(table.name(), calciteTable)`, no sub-schemas), so a qualified
@@ -75,8 +75,13 @@
 //!
 //! A row whose DDL yields no tables still gets a job with an empty schema, and a row whose queries do
 //! not tokenize still gets a job with its text unmodified. What SQLSolver does with them is the
-//! measurement. The notes on a [`Job`] say which rewrites did not fire, so the harness can report
+//! measurement. The notes on a [`Job`](crate::sqlsolver::Job) say which rewrites did not fire, so the harness can report
 //! that separately from the verdict.
+
+// The prose above and below documents this adapter against the pipeline it adapts, and most
+// of that pipeline is private to the crate. The links are for whoever is reading these docs
+// with `--document-private-items`; in the public build rustdoc renders them as plain code.
+#![allow(rustdoc::private_intra_doc_links)]
 
 use std::collections::{BTreeMap, BTreeSet};
 

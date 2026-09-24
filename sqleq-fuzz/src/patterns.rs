@@ -302,6 +302,8 @@ pub fn param_cols(a: &str, b: &str, cols: &HashSet<String>) -> HashMap<u32, Stri
 /// A param is only reported when *every* one of its occurrences is an array position: some corpus
 /// pairs use one placeholder as both an array and a scalar, and binding a list there would merely
 /// trade one bind error for another.
+// Documented in terms of the private pattern table it consults.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn array_params(a: &str, b: &str, arraycols: &HashSet<String>) -> BTreeSet<u32> {
     // Occurrences are identified by (side, byte offset) rather than counted, because two rules can
     // land on the same one — `$1 && $2` is a single application and one array position for each param

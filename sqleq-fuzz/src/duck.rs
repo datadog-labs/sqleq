@@ -379,6 +379,8 @@ fn fetch_rows(con: &Connection, sql: &str) -> duckdb::Result<Vec<String>> {
 /// the common case of a duplicate key, prints an instance the schema itself forbids. DuckDB decides
 /// here exactly as it does during a trial, so the two cannot drift. Called only once a
 /// counterexample is in hand, so the extra load costs nothing on the common path.
+// Documented in terms of the private helper that does the inserting.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn accepted_rows(
     con: &Connection,
     forms: &Forms,

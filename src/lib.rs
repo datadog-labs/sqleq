@@ -476,6 +476,9 @@ impl Rewrites {
 /// raises on `UPDATE ... RETURNING`, so skipping it is what makes a DML pair reachable at all. For
 /// those the comparison is on the unreduced statements, which is the simpler claim anyway: two
 /// identical `UPDATE`s are the same statement, no reduction required.
+// The prose above cites the normalizations it depends on by name; those live in private
+// modules, so the links only resolve under `--document-private-items`.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn reflexive(src: &str) -> bool {
     reflexive_with(src, Rewrites::ALL)
 }

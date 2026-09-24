@@ -80,13 +80,13 @@
 //!
 //! Most of the rows it refuses are rows nothing else would have refused, which is what raising the
 //! verdict after lowering buys. The remainder are the precedence rule: a renumbering produced a
-//! `type conflict` ([`root_cause`]) or mistyped a `LIMIT` count ([`root_cause_lowered`]), and the
+//! `type conflict` ([`root_cause`](crate::params::root_cause)) or mistyped a `LIMIT` count ([`root_cause_lowered`](crate::params::root_cause_lowered)), and the
 //! misalignment is now reported instead of the symptom it caused. No row changes *status* in either
 //! direction — the same refused set, differently labelled — and every emitted case file is
 //! byte-identical across the change.
 //!
 //! One pair was being refused for a misalignment `strip_identical_pagination` had itself created,
-//! which is why [`mentioned`] takes its snapshot above the normalizations rather than below. Both its
+//! which is why [`mentioned`](crate::params::mentioned) takes its snapshot above the normalizations rather than below. Both its
 //! sides lower and neither is a proof — the prover returns `provable: false` outside its complete
 //! fragment and sqleq-fuzz returns `NO-COUNTEREXAMPLE` — so it lands in the cell where the two axes
 //! have nothing to say about each other, and capability does not move.
@@ -112,17 +112,17 @@
 //! The two sub-reasons need different things, so they are two functions and they run at different
 //! points.
 //!
-//! [`check_arity`] needs only the `$N` each query mentions, which is in the text. It runs **before
+//! [`check_arity`](crate::params::check_arity) needs only the `$N` each query mentions, which is in the text. It runs **before
 //! inference**, because inference is one of the things a misalignment can make fail: a pair whose
 //! placeholders were renumbered gets two unrelated values in one type class, and what surfaces is a
-//! `type conflict` at a parameter that is not itself wrong. [`root_cause`] is where that ordering is
+//! `type conflict` at a parameter that is not itself wrong. [`root_cause`](crate::params::root_cause) is where that ordering is
 //! decided, and it decides it by asking whether the failure survives the two queries' parameters being
 //! pulled apart.
 //!
-//! [`check_roles`] reads inference's own attribution, so it runs between
+//! [`check_roles`](crate::params::check_roles) reads inference's own attribution, so it runs between
 //! [`crate::casts::rewrite_casts`] and [`crate::casts::substitute_params`]: the first has already
 //! hoisted `$N::T` to a bare `$N` (rule 1), so a cast cannot hide a parameter from the operand test,
-//! and the second deletes the [`Inferred::col`] attribution the role walk reads.
+//! and the second deletes the [`Inferred::col`](crate::infer::Inferred::col) attribution the role walk reads.
 //!
 //! Either verdict is then *held* and raised only after both queries have lowered, so a construct the
 //! frontend cannot lower — which no misalignment produced — is still what the row reports.
@@ -131,7 +131,7 @@
 //!
 //! Holding the verdict makes lowering a second gate, and a refusal there gets the same treatment
 //! inference's did: **a misalignment outranks any refusal it could have manufactured, and yields to any
-//! refusal it could not.** [`root_cause`] applies it to inference failing, [`root_cause_lowered`] to
+//! refusal it could not.** [`root_cause`](crate::params::root_cause) applies it to inference failing, [`root_cause_lowered`](crate::params::root_cause_lowered) to
 //! lowering failing, and both decide by the same counterfactual — pull the two queries' parameters
 //! apart ([`crate::infer::split_params`]) and see whether the refusal survives. A refusal that *goes
 //! away* was the frontend's own index binding talking, and reporting it sends the caller after a type,
@@ -210,7 +210,7 @@ fn operand_params(e: &Expr) -> Vec<u32> {
 /// no role, so a swap between two cast columns is missed. The error runs in the unsound direction, so
 /// the bound is measured rather than argued — a corpus scan found every slot blinded this way, looked
 /// through the cast at each one, and found none of them misaligned.
-/// Note the loss is *not* an artifact of running after [`casts::rewrite_casts`]: the pre-rewrite tree
+/// Note the loss is *not* an artifact of running after [`crate::casts::rewrite_casts`]: the pre-rewrite tree
 /// is an `Expr::Cast`, equally unmatched here, and the rewrite's rule 4 no-op *restores* the evidence
 /// by deleting the cast. `tests/lower.rs` pins both halves.
 fn role_of(e: &Expr, inf: &Inferred) -> Option<Col> {
@@ -419,7 +419,7 @@ pub fn check_roles(queries: &[Query], inf: &Inferred) -> Result<()> {
 ///   against reporting a manufactured `type conflict`, arriving from the other direction.
 /// * **The refusals it pre-empts are raised before [`check_arity`] can run at all.** Two of the three
 ///   are `dml::reduce` refusals, and `reduce` runs inside [`crate::parse_input`] *above*
-///   [`params::mentioned`]. So for most of these rows there is no held verdict to order against: the
+///   [`mentioned`]. So for most of these rows there is no held verdict to order against: the
 ///   pipeline never reaches the point where a misalignment could be noticed. Ordering was never the
 ///   mechanism keeping them in their bucket; reachability was.
 /// * **It is syntactic.** Like [`check_arity`] and unlike [`check_roles`], it reads the text and needs
