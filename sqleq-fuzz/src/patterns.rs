@@ -73,7 +73,7 @@ re!(
 );
 re!(
     NONDET_AGG,
-    r"(?i)\b(?:string_agg|group_concat|listagg|array_to_string|json_agg|jsonb_agg)\s*\("
+    r"(?i)\b(?:string_agg|group_concat|listagg|array_to_string|json_object_agg|jsonb_object_agg|json_agg|jsonb_agg)\s*\("
 );
 // Any statement that writes to the catalog or the data, however it starts.
 re!(

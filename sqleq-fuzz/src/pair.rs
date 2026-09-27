@@ -18,6 +18,7 @@ use crate::gen::{
 use crate::patterns as pat;
 use crate::rewrite;
 use crate::schema::{parse_schema, VType};
+use crate::shim;
 use crate::typing;
 
 /// Test configuration.
@@ -335,6 +336,12 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         Ok(c) => c,
         Err(e) => return Verdict::Error(err_msg(&e)),
     };
+    // Postgres functions DuckDB has no name for, defined as macros before anything runs — only the
+    // ones this pair actually mentions, and identically for both sides. Without them both sides
+    // fail to bind and the pair is never tried at all.
+    if let Err(e) = shim::install(&con, &[&a, &b]) {
+        return Verdict::Error(err_msg(&e));
+    }
 
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut last_err: Option<String> = None;
