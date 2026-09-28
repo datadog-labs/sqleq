@@ -98,4 +98,6 @@ Two consequences:
 
 A pair where a prover claims equivalence and the queries are not equivalent is the most serious bug
 this project can have. Open an issue with the two queries, the DDL, and the counterexample if you
-have one — it does not need to be minimized.
+have one — it does not need to be minimized. The
+[soundness bug template](https://github.com/datadog-labs/sqleq/issues/new?template=soundness_bug.md)
+asks for exactly that.
