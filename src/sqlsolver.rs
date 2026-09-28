@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Emit verification jobs for the SQLSolver backend -- the `sqlsolver` axis.
 //!
 //! SQLSolver (SIGMOD 2024, Apache 2.0) is a second, independent prover. Unlike the QED path it takes

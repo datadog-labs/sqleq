@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Lowering: SQL AST -> the prover's `Relation`/`Expr` IR (as `serde_json::Value`).
 //!
 //! Columns are lowered to absolute de-Bruijn indices (see [`crate::scope`]). Every clause that would

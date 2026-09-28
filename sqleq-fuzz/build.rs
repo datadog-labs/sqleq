@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Tells the executables where to find `libduckdb` at run time.
 //!
 //! `libduckdb-sys` copies the library it fetched into `target/<profile>/deps` and emits an rpath

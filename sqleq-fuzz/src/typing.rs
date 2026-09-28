@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! What each `$N` has to *be*, read off the syntax that surrounds it.
 //!
 //! [`crate::patterns::param_cols`] learns a parameter's type from one shape — a bare column directly

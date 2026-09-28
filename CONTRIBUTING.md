@@ -31,6 +31,17 @@ are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdpart
 Dependencies must be under a permissive licence: `cargo deny --workspace check licenses` enforces
 the allow-list in [`deny.toml`](deny.toml), and a licence outside it needs a discussion first.
 
+Every `.rs`, `.py`, `.java`, `.toml`, `.yml`, `.sql` and `.sh` file opens with this header (after
+the shebang, if there is one), written in the file's own comment syntax; CI checks the first six
+lines of each:
+
+```
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+```
+
 ## Lints
 
 `cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per

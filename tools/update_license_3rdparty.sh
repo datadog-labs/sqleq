@@ -1,4 +1,9 @@
 #!/bin/sh
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
 # Regenerate LICENSE-3rdparty.csv, or with --check, fail if the committed file is stale.
 #
 # Crate rows come from dd-rust-license-tool, run once per workspace member: the root manifest is

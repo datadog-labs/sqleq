@@ -1,3 +1,8 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
 # Three jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
@@ -138,6 +143,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # Every source file opens with the licence header in CONTRIBUTING.md. Only the first six
+      # lines are read, so a file cannot pass by quoting the header further down -- which is also
+      # why this file, which quotes it here, has to carry the header itself.
+      - name: licence headers
+        run: |
+          missing=$(git ls-files '*.rs' '*.py' '*.java' '*.toml' '*.yml' '*.sql' '*.sh' \
+            | while read -r f; do head -n 6 "$f" | grep -qF 'Copyright 2026-Present Datadog, Inc.' || echo "$f"; done)
+          if [ -n "$missing" ]; then
+            echo "::error::these files do not start with the licence header (see CONTRIBUTING.md):"
+            echo "$missing"
+            exit 1
+          fi
 
       # Only the two binaries, not all of ~/.cargo/bin: restoring that directory would also put back
       # stale copies of the runner's own rustup proxies. Bump a version here and in the key together.
