@@ -10,10 +10,16 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # Only patch releases are batched; anything bigger arrives as its own PR, so one breaking upgrade
+    # cannot hold the routine ones back. Dependabot classes a release by its literal version
+    # numbers, so a 0.x bump such as 0.62 -> 0.63, which Cargo treats as breaking, counts as
+    # "minor" -- which is why the group is patch-only rather than minor-and-patch.
     groups:
-      all-dependencies:
+      patch-updates:
         patterns:
           - "*"
+        update-types:
+          - "patch"
     # A new release waits this long before it is proposed, so a compromised or broken publish has
     # time to be yanked first.
     cooldown:
