@@ -195,8 +195,7 @@ default. Every `qed-prover` command above assumes it is on `PATH` this way.
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to build and test, the lint policy, and the two rules a
 change must not break: *refuse rather than emit best-effort IR*, and *anything that grows the
 provable set is cross-checked against the refuting axis, where the run is its own control*.
-[`SECURITY.md`](SECURITY.md) is how to report a vulnerability, and
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) applies to everyone taking part.
+[`SECURITY.md`](SECURITY.md) is how to report a vulnerability.
 
 ## License
 
