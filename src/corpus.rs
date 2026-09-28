@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Read a corpus CSV and lower each row straight to prover `Input` JSON.
 //!
 //! This is the batch driver. Lowering the whole file in one pass collapses what would otherwise be

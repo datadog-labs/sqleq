@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! A last-line check on the IR the frontend is about to hand the prover.
 //!
 //! Everything else in this crate refuses what it cannot lower. This module catches the other kind of

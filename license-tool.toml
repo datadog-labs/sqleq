@@ -1,0 +1,12 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+# Overrides for dd-rust-license-tool, which writes LICENSE-3rdparty.csv (see
+# tools/update_license_3rdparty.sh).
+
+[overrides]
+# Also offered under LGPL-2.1-or-later; this repository takes it under MIT or Apache-2.0. It only
+# builds for UEFI targets.
+"r-efi" = { license = "MIT OR Apache-2.0" }

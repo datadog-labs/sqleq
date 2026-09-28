@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Equivalence-preserving rewrites applied to the parsed tree before anything reads it.
 //!
 //! Two kinds live here, and the distinction matters for how each is justified:

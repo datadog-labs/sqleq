@@ -1,0 +1,32 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
+    # A new release waits this long before it is proposed, so a compromised or broken publish has
+    # time to be yanked first.
+    cooldown:
+      default-days: 7
+    # A DuckDB bump changes the library the fuzz job downloads, and that download is checked
+    # against a hardcoded sha256 in ci.yml. Upgrade these by hand, together with the digest.
+    ignore:
+      - dependency-name: "duckdb"
+      - dependency-name: "libduckdb-sys"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7

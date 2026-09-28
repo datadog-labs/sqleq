@@ -1,10 +1,19 @@
-# Two jobs, split on build cost rather than on subject.
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+# Three jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
 # cache than anything else here. Keeping it in its own job means the frontend's answer
 # -- the one that gates most changes -- arrives in under a minute, and the two caches do not evict
 # each other. Each job lints the crate it builds, so the union is `cargo clippy --workspace`
 # without either job paying for the other's dependencies.
+#
+# `licenses` builds nothing. It checks that every dependency is under a permissive licence and
+# that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
+# attribution changing with it.
 #
 # Deliberately absent: `cargo fmt`. There is no `rustfmt.toml`, over a thousand source lines
 # already run past 100 columns, and `src/dml.rs` has never been formatted, so a format gate would
@@ -16,6 +25,10 @@ on:
   push:
     branches: [main]
   pull_request:
+
+# No job writes anything back to the repository, so the token gets read access and nothing else.
+permissions:
+  contents: read
 
 # `-D warnings` lives on the clippy invocations, not in `RUSTFLAGS`: a global `RUSTFLAGS`
 # reaches dependency crates too, so an upstream release that adds one warning would break
@@ -31,7 +44,12 @@ jobs:
       # Actions are pinned to a full-length commit SHA with the release tag alongside. A tag
       # is mutable, so a compromised one re-points silently, and some organisations reject
       # unpinned actions outright. Bump the SHA and its comment together.
+      #
+      # `persist-credentials: false` keeps the token out of `.git/config`, where every later step
+      # could read it; nothing here pushes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The runner's preinstalled stable toolchain, on purpose: a third-party toolchain action is
       # one more thing an organisation has to allowlist, and this workspace pins no nightly
@@ -79,6 +97,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustc --version && cargo --version
 
       # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library.
@@ -114,3 +134,46 @@ jobs:
 
       - run: cargo test -p sqleq-fuzz
       - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
+
+  licenses:
+    name: licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Every source file opens with the licence header in CONTRIBUTING.md. Only the first six
+      # lines are read, so a file cannot pass by quoting the header further down -- which is also
+      # why this file, which quotes it here, has to carry the header itself.
+      - name: licence headers
+        run: |
+          missing=$(git ls-files '*.rs' '*.py' '*.java' '*.toml' '*.yml' '*.sql' '*.sh' \
+            | while read -r f; do head -n 6 "$f" | grep -qF 'Copyright 2026-Present Datadog, Inc.' || echo "$f"; done)
+          if [ -n "$missing" ]; then
+            echo "::error::these files do not start with the licence header (see CONTRIBUTING.md):"
+            echo "$missing"
+            exit 1
+          fi
+
+      # Only the two binaries, not all of ~/.cargo/bin: restoring that directory would also put back
+      # stale copies of the runner's own rustup proxies. Bump a version here and in the key together.
+      - id: license-tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/dd-rust-license-tool
+          key: license-tools-${{ runner.os }}-cargo-deny-0.20.2-dd-rust-license-tool-1.0.6
+      - if: steps.license-tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo install --locked dd-rust-license-tool --version 1.0.6
+
+      # `--workspace`: the root manifest is also the frontend package, so without it the fuzz
+      # crate's dependencies are never looked at. See deny.toml.
+      - run: cargo deny --workspace check licenses
+
+      # Invoked through `sh` so it does not depend on the file's executable bit.
+      - run: sh tools/update_license_3rdparty.sh --check

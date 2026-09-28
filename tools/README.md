@@ -4,6 +4,7 @@
 |---|---|
 | `sqleq_check.py` | the batch harness: a directory of `.sql` pairs in, verdicts and a CI exit code out |
 | `linkcheck.py` | every relative link in every tracked Markdown file resolves |
+| `update_license_3rdparty.sh` | regenerates `LICENSE-3rdparty.csv`; `--check` is the CI gate — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | `sqlsolver/` | our side of the IR bridge to the second prover — see [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) |
 
 Standard library only, Python 3.8+. `test_sqleq_check.py` covers `sqleq_check.py`; run it with

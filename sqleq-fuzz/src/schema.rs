@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Parsing table schemas out of the corpus DDL.
 //!
 //! We need three things per table for sound instance generation: column names, column types (to

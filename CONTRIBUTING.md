@@ -16,6 +16,32 @@ python3 tools/linkcheck.py # every relative link in every tracked Markdown file 
 library (~40 MB, cached in `target/`), so the root manifest sets `default-members = ["."]` and the
 disprover is opt-in. CI splits them into two jobs for the same reason.
 
+### Licensing
+
+[`LICENSE-3rdparty.csv`](LICENSE-3rdparty.csv) lists every third-party component, and CI fails when
+it no longer matches `Cargo.lock`. After any dependency change, regenerate it:
+
+```sh
+cargo install dd-rust-license-tool --version 1.0.6 --locked   # once
+sh tools/update_license_3rdparty.sh
+```
+
+Components that are not crates (the DuckDB library, and what the SQLSolver bridge compiles against)
+are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
+Dependencies must be under a permissive licence: `cargo deny --workspace check licenses` enforces
+the allow-list in [`deny.toml`](deny.toml), and a licence outside it needs a discussion first.
+
+Every `.rs`, `.py`, `.java`, `.toml`, `.yml`, `.sql` and `.sh` file opens with this header (after
+the shebang, if there is one), written in the file's own comment syntax; CI checks the first six
+lines of each:
+
+```
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+```
+
 ## Lints
 
 `cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per
@@ -83,4 +109,6 @@ Two consequences:
 
 A pair where a prover claims equivalence and the queries are not equivalent is the most serious bug
 this project can have. Open an issue with the two queries, the DDL, and the counterexample if you
-have one — it does not need to be minimized.
+have one — it does not need to be minimized. The
+[soundness bug template](https://github.com/datadog-labs/sqleq/issues/new?template=soundness_bug.md)
+asks for exactly that.

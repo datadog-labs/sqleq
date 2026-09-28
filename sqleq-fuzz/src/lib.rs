@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! `sqleq-fuzz` — a license-clean concrete differential tester: a SQL *non-equivalence* disprover.
 //!
 //! For a query pair `(A, B)` under a schema, it generates small **valid** random database instances

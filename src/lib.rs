@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! `sqleq-frontend` — read a SQL equivalence pair, and lower it to a prover's input IR.
 //!
 //! This crate parses a SQL equivalence pair, resolves names and types, and lowers it to the

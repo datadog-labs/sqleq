@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the
+// Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-Present Datadog, Inc.
+
 //! Instance construction, execution, and result comparison on DuckDB.
 //!
 //! For each side we build every table under the exact (possibly schema-/catalog-qualified) name the

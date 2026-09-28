@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
 """sqleq-check — a batch harness that runs SQL equivalence pairs past the QED prover.
 
 Takes `.sql` files (or directories of them), runs each through the Rust
