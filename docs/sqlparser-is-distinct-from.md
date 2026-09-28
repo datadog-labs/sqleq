@@ -1,9 +1,12 @@
-# DRAFT — not filed
+# DRAFT — not filed, and fixed upstream in 0.63.0
 
 A bug report for `apache/datafusion-sqlparser-rs`, written up but **never filed with that project**.
 Publishing it here is disclosure, not a submission: it has had no upstream review, and it may be
-wrong about that project's intent. Our own workaround lives in `src/normalize.rs`; this report is
-independent of it.
+wrong about that project's intent.
+
+sqlparser 0.63.0 parses the examples below as expected, so there is nothing left to file. It is
+kept as the record of why `src/normalize.rs` guards these shapes: that guard now refuses the 0.62
+tree rather than repairing it, so a release that brought the bug back would be refused, not trusted.
 
 ---
 

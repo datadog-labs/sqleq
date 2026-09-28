@@ -106,7 +106,8 @@ fn map_vtype(dt: &sqlparser::ast::DataType) -> (VType, bool) {
     match dt {
         DataType::Array(A::SquareBracket(inner, _))
         | DataType::Array(A::AngleBracket(inner))
-        | DataType::Array(A::Parenthesis(inner)) => (map_vtype(inner).0, true),
+        | DataType::Array(A::Parenthesis(inner))
+        | DataType::Array(A::Qualified(inner, _)) => (map_vtype(inner).0, true),
         // `ARRAY` with no element type: the domain is unknowable, and VARCHAR is the same default
         // an unrecognised scalar type gets.
         DataType::Array(A::None) => (VType::Varchar, true),

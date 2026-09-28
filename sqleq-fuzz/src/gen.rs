@@ -10,8 +10,8 @@
 //! small instances — that collision is what surfaces DISTINCT / LIMIT / filter differences.
 
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::seq::IndexedRandom;
+use rand::RngExt;
 
 use crate::schema::{Column, VType};
 use crate::typing::Need;
@@ -69,7 +69,7 @@ pub const JSONS: [&str; 4] = [
 
 /// Generate a value for a column of type `vt`. Nullable columns are NULL with probability 0.3.
 pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
-    if nullable && rng.gen_bool(0.3) {
+    if nullable && rng.random_bool(0.3) {
         return Val::Null;
     }
     match vt {
@@ -117,10 +117,10 @@ pub fn randval_col(c: &Column, rng: &mut StdRng) -> Val {
     if !c.array {
         return randval(c.vt, !c.notnull, rng);
     }
-    if !c.notnull && rng.gen_bool(0.3) {
+    if !c.notnull && rng.random_bool(0.3) {
         return Val::Null;
     }
-    let k = rng.gen_range(1..=3);
+    let k = rng.random_range(1..=3);
     Val::List((0..k).map(|_| randval(c.vt, false, rng)).collect())
 }
 
@@ -139,7 +139,10 @@ pub enum CastTarget {
 pub fn cast_target(ty: &str) -> Option<CastTarget> {
     let lowered = ty.to_lowercase();
     let t = lowered.trim().trim_matches('"');
-    if t.ends_with("[]") || t.contains("record") || t.contains("struct") {
+    // `int ARRAY` / `int ARRAY[4]` are the SQL-standard spellings of `int[]`; the leading word alone
+    // would read them as `int`.
+    let array_word = t.split_whitespace().any(|w| w == "array" || w.starts_with("array["));
+    if t.ends_with("[]") || array_word || t.contains("record") || t.contains("struct") {
         return None;
     }
     let base = t

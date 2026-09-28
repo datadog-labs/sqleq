@@ -374,7 +374,14 @@ pub fn canon_type_name(txt: &str) -> String {
 /// punctuation.
 pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
     let t = canon_type_name(txt);
-    if t.contains("[]") || t.starts_with("array") || t.starts_with("struct") || t.starts_with("map")
+    // `int ARRAY` and `int ARRAY[4]` are the SQL-standard spellings of `int[]`. The leading word is
+    // what the scalar mapping below reads, so without the word test they would come back as `Int`.
+    let array_word = t.split_whitespace().any(|w| w == "array" || w.starts_with("array["));
+    if t.contains("[]")
+        || array_word
+        || t.starts_with("array")
+        || t.starts_with("struct")
+        || t.starts_with("map")
     {
         return (None, false);
     }
@@ -1517,6 +1524,10 @@ mod tests {
         assert_eq!(map_type_name("jsonb").0, None);
         assert_eq!(map_type_name("integer[]").0, None);
         assert_eq!(map_type_name("ARRAY<UUID>").0, None);
+        // The SQL-standard array spellings, which would otherwise map by their leading word.
+        assert_eq!(map_type_name("INT ARRAY").0, None);
+        assert_eq!(map_type_name("integer ARRAY[4]").0, None);
+        assert_eq!(map_type_name("double precision").0, Some(Ty::Real));
         assert_eq!(map_type_name("geometry").0, None);
         // Mapped, with the length qualifier flagged so an identity cast is not dropped.
         assert_eq!(map_type_name("varchar(8)"), (Some(Ty::Str), true));

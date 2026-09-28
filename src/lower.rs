@@ -402,7 +402,7 @@ fn sort_sandwich(
         let v = order_key_value(cat, scope, fns, &key.expr, &targets, out_cols)?;
         let ty = ty_of(&v);
         let idx = push_unique(&mut targets, v);
-        collation.push(json!([idx, ty, ord_string(&key.options)]));
+        collation.push(json!([idx, ty, ord_string(&key.options)?]));
     }
 
     let extended = json!({ "project": { "target": targets, "source": source } });
@@ -518,7 +518,7 @@ fn collation(q: &Query, out_cols: &OutCols) -> Result<CollationPlan> {
         let Some(idx) = order_key_index(&key.expr, out_cols)? else {
             return Ok(CollationPlan::NeedsExtension);
         };
-        out.push(json!([idx, out_cols[idx].1, ord_string(&key.options)]));
+        out.push(json!([idx, out_cols[idx].1, ord_string(&key.options)?]));
     }
     Ok(CollationPlan::Direct(out))
 }
@@ -584,11 +584,19 @@ fn order_key_index(e: &Expr, out_cols: &OutCols) -> Result<Option<usize>> {
 /// fields are index, type, and this string. Leaving it out would make `NULLS FIRST` and `NULLS LAST`
 /// mint the same symbol and prove equal, which is a false-proof channel. Postgres defaults are
 /// `NULLS LAST` for ascending and `NULLS FIRST` for descending.
-fn ord_string(o: &sqlparser::ast::OrderByOptions) -> String {
-    let desc = o.asc == Some(false);
+///
+/// `USING <operator>` is refused: its direction is whatever the operator's btree class says, and
+/// reading it as the ascending default would let `USING >` prove equal to `ASC`.
+fn ord_string(o: &sqlparser::ast::OrderByOptions) -> Result<String> {
+    use sqlparser::ast::OrderBySort;
+    let desc = match &o.sort {
+        None | Some(OrderBySort::Asc) => false,
+        Some(OrderBySort::Desc) => true,
+        Some(OrderBySort::Using(_)) => return Err(unsupported("ORDER BY ... USING <operator>")),
+    };
     let dir = if desc { "DESCENDING" } else { "ASCENDING" };
     let nulls_first = o.nulls_first.unwrap_or(desc);
-    format!("{dir} NULLS {}", if nulls_first { "FIRST" } else { "LAST" })
+    Ok(format!("{dir} NULLS {}", if nulls_first { "FIRST" } else { "LAST" }))
 }
 
 /// The enclosing query's `ORDER BY`, threaded down for the one construct whose meaning depends on
@@ -1067,7 +1075,7 @@ fn order_digest(
         }
         let v = order_key_value(cat, scope, fns, &key.expr, targets, out_cols)?;
         let pos = push_unique(targets, v);
-        out.push_str(&format!("{pos}:{};", ord_string(&key.options)));
+        out.push_str(&format!("{pos}:{};", ord_string(&key.options)?));
     }
     Ok(out)
 }

@@ -346,6 +346,18 @@ fn refuses_an_ambiguous_order_key() {
     }
 }
 
+/// `USING >` is a descending sort; read as the ascending default it would prove equal to `ASC`.
+#[test]
+fn refuses_order_by_using() {
+    refused(
+        &pair(
+            r#"SELECT "a" FROM "t" ORDER BY "a" USING > LIMIT 5"#,
+            r#"SELECT "a" FROM "t" ORDER BY "a" ASC LIMIT 5"#,
+        ),
+        "USING",
+    );
+}
+
 /// Nothing above a `Group` can address the FROM scope, so those keep the refusal rather than
 /// appending a key at an index that means something else.
 #[test]
