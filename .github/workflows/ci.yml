@@ -56,7 +56,7 @@ jobs:
       # features. `rust-version = "1.85"` is the floor; an MSRV job can be added later.
       - run: rustc --version && cargo --version
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -102,7 +102,7 @@ jobs:
       - run: rustc --version && cargo --version
 
       # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -160,7 +160,7 @@ jobs:
       # Only the two binaries, not all of ~/.cargo/bin: restoring that directory would also put back
       # stale copies of the runner's own rustup proxies. Bump a version here and in the key together.
       - id: license-tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-deny
