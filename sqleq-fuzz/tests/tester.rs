@@ -105,6 +105,33 @@ fn a_width_changing_cast_is_not_a_counterexample() {
 }
 
 #[test]
+fn a_bare_float_is_double_precision() {
+    // Postgres's bare `float` is `double precision`; DuckDB's is single precision, so the two
+    // spellings used to compute different values for any quotient single precision cannot hold.
+    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)";
+    assert_eq!(
+        label(
+            "SELECT id, a / 3::float AS r FROM t",
+            "SELECT id, a / 3::double precision AS r FROM t",
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    // A genuinely different value still is a counterexample.
+    let v = test_pair(
+        "SELECT id, a / 3::float AS r FROM t",
+        "SELECT id, a / 7::float AS r FROM t",
+        ddl,
+        cfg(),
+    );
+    assert!(
+        matches!(v, Verdict::NotEquivalent(_)),
+        "expected NOT-EQUIVALENT, got {}",
+        v.label()
+    );
+}
+
+#[test]
 fn scalar_vs_grouped_aggregate_over_empty() {
     // The canonical bug pattern: `... WHERE a = $1 GROUP BY a` (no rows on empty match) vs the scalar
     // aggregate `... WHERE a = $1` (always one row). Value-from-data param biasing surfaces the split.

@@ -45,6 +45,10 @@ deterministic. The hard-won rules, all preserved from the Python original:
   so `c` and `c::bigint` come back as different DuckDB types carrying the same number, and a
   `numeric` of another scale does the same. Cells are compared by numeric value, which can only merge
   them, never split them.
+- **A bare `float` is `double precision`.** Postgres reads `float` as `double precision`; DuckDB
+  reads it as single-precision `REAL`, so a `::float` cast would compute a different value from the
+  same cast spelled `::double precision`. Bare `float` cast targets are rewritten to `DOUBLE` before
+  anything runs; `float(p)`, `float4`, `float8` and `real` already agree between the two.
 - **Don't invent a parameter correspondence.** See the next section.
 - **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
   functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as
