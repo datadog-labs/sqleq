@@ -17,6 +17,10 @@ on:
     branches: [main]
   pull_request:
 
+# No job writes anything back to the repository, so the token gets read access and nothing else.
+permissions:
+  contents: read
+
 # `-D warnings` lives on the clippy invocations, not in `RUSTFLAGS`: a global `RUSTFLAGS`
 # reaches dependency crates too, so an upstream release that adds one warning would break
 # this repo's CI. Clippy runs rustc's own lints, so nothing is lost by scoping it.
@@ -31,7 +35,12 @@ jobs:
       # Actions are pinned to a full-length commit SHA with the release tag alongside. A tag
       # is mutable, so a compromised one re-points silently, and some organisations reject
       # unpinned actions outright. Bump the SHA and its comment together.
+      #
+      # `persist-credentials: false` keeps the token out of `.git/config`, where every later step
+      # could read it; nothing here pushes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The runner's preinstalled stable toolchain, on purpose: a third-party toolchain action is
       # one more thing an organisation has to allowlist, and this workspace pins no nightly
@@ -79,6 +88,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustc --version && cargo --version
 
       # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library.
