@@ -14,12 +14,14 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, Select, SelectItem, SelectItemQualifiedWildcardKind, Spanned,
-    Statement, Visit, VisitMut, Visitor, VisitorMut,
+    ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, ObjectName, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, Spanned, Statement, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Span};
+use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 
 /// Byte offset of a 1-based (line, char-column) [`Location`].
 ///
@@ -301,9 +303,156 @@ impl VisitorMut for Denest {
     }
 }
 
+/// Rewrite every bare `float` cast target to `DOUBLE`: `x::float` → `x::DOUBLE`,
+/// `CAST(x AS float)` → `CAST(x AS DOUBLE)`, `x::float[]` → `x::DOUBLE[]`.
+///
+/// **Postgres's bare `float` is `double precision`; DuckDB's is the 4-byte `REAL`.** So DuckDB
+/// evaluates a `::float` cast in single precision, and a pair whose two sides spell one Postgres type
+/// two ways — `::float` on one side, `::double precision` on the other — computes different values
+/// whenever the result is not exactly representable in single precision (`1/3` is `0.33333334`
+/// against `0.3333333333333333`). That is a false refutation. Every other spelling already means the
+/// same in both engines — `float(p)` (single up to 24 bits, double from 25), `float4`, `float8`,
+/// `real`, `double precision` — so only the bare word is touched.
+///
+/// The edit is found by token and checked against the parse: the output must parse to exactly the
+/// input's tree with each bare-`float` cast target made `DOUBLE`, and is discarded otherwise. That
+/// rejects a `float` token that was not a cast target (an alias spelled `AS float`) as surely as a
+/// cast target the token scan missed, so the scan can stay simple — and a statement the check rejects
+/// keeps the single-precision reading it had before, which costs a verdict at worst.
+pub fn double_precision_floats(sql: &str) -> String {
+    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return sql.to_string();
+    };
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location() else {
+        return sql.to_string();
+    };
+    let words: Vec<_> = tokens
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+    // An unquoted `FLOAT` right after `::` or `AS`, with no `(precision)` after it.
+    let mut starts = Vec::new();
+    for (i, t) in words.iter().enumerate() {
+        let Token::Word(w) = &t.token else { continue };
+        if w.keyword != Keyword::FLOAT || w.quote_style.is_some() {
+            continue;
+        }
+        let cast_target = i > 0
+            && match &words[i - 1].token {
+                Token::DoubleColon => true,
+                Token::Word(prev) => prev.keyword == Keyword::AS,
+                _ => false,
+            };
+        let precision = matches!(words.get(i + 1).map(|n| &n.token), Some(Token::LParen));
+        if cast_target && !precision {
+            let Some(b) = byte_of(sql, t.span.start) else {
+                return sql.to_string();
+            };
+            starts.push(b);
+        }
+    }
+    if starts.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut out = String::with_capacity(sql.len() + starts.len());
+    let mut cur = 0;
+    for &b in &starts {
+        let e = b + "float".len();
+        if b < cur
+            || !sql
+                .get(b..e)
+                .is_some_and(|w| w.eq_ignore_ascii_case("float"))
+        {
+            return sql.to_string();
+        }
+        out.push_str(&sql[cur..b]);
+        out.push_str("DOUBLE");
+        cur = e;
+    }
+    out.push_str(&sql[cur..]);
+
+    match Parser::parse_sql(&PostgreSqlDialect {}, &out) {
+        Ok(after) if after == retyped(&stmts) => out,
+        _ => sql.to_string(),
+    }
+}
+
+/// The parse with every bare-`float` cast target made `DOUBLE` — what [`double_precision_floats`]
+/// claims its output parses to. `float(p)` is left alone, as the rewrite leaves it.
+fn retyped(stmts: &[Statement]) -> Vec<Statement> {
+    let mut out = stmts.to_vec();
+    for st in &mut out {
+        let _ = VisitMut::visit(st, &mut Retype);
+    }
+    out
+}
+
+struct Retype;
+
+impl VisitorMut for Retype {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Cast { data_type, .. } = expr {
+            double_the_float(data_type);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn double_the_float(t: &mut DataType) {
+    match t {
+        DataType::Float(ExactNumberInfo::None) => *t = DataType::Double(ExactNumberInfo::None),
+        DataType::Array(
+            ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::Parenthesis(inner),
+        ) => double_the_float(inner),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parenthesize_json_ops, unqualify_stars, Parser, PostgreSqlDialect};
+    use super::{
+        double_precision_floats, parenthesize_json_ops, unqualify_stars, Parser, PostgreSqlDialect,
+    };
+
+    #[test]
+    fn a_bare_float_cast_becomes_double() {
+        for (sql, want) in [
+            ("SELECT x::float FROM t", "SELECT x::DOUBLE FROM t"),
+            (
+                "SELECT CAST(x AS float) FROM t",
+                "SELECT CAST(x AS DOUBLE) FROM t",
+            ),
+            ("SELECT x::float[] FROM t", "SELECT x::DOUBLE[] FROM t"),
+            (
+                "SELECT ROUND ( AVG ( c.p ),$1 ) :: FLOAT AS p FROM t c",
+                "SELECT ROUND ( AVG ( c.p ),$1 ) :: DOUBLE AS p FROM t c",
+            ),
+            ("SELECT x::float", "SELECT x::DOUBLE"),
+        ] {
+            assert_eq!(double_precision_floats(sql), want, "{sql:?}");
+        }
+    }
+
+    /// Every spelling that already means the same in both engines is returned byte-identical, and so
+    /// is a `float` that is not a cast target: the parse check refuses the alias outright.
+    #[test]
+    fn only_the_bare_float_cast_moves() {
+        for sql in [
+            "SELECT x::float(24), x::float(53) FROM t",
+            "SELECT x::float4, x::float8, x::real, x::double precision FROM t",
+            "SELECT 1 AS float",
+            "SELECT \"float\" FROM t",
+            "SELECT 'x::float' FROM t -- y::float\n",
+            "this is not sql at all",
+        ] {
+            assert_eq!(double_precision_floats(sql), sql, "rewrote {sql:?}");
+        }
+    }
 
     #[test]
     fn a_three_part_star_loses_only_its_schema() {

@@ -215,19 +215,20 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         return Verdict::NoSchema;
     }
     // `unqualify_stars` runs on the pristine text, ahead of every text-level rewrite, so it never
-    // depends on one of them leaving the statement parseable. `parenthesize_json_ops` runs on its
-    // output rather than on the pristine text: both read their edits off a Postgres parse, and
-    // `unqualify_stars` only ever shortens a qualifier, so the statement the second one parses is
-    // still the one the caller wrote — and if it somehow is not, that pass returns its input
-    // unchanged and we merely lose the parenthesization on this row. Neither can add or remove a
-    // `$N`, so the misalignment check below still sees the parameter numbering the caller actually
-    // wrote.
+    // depends on one of them leaving the statement parseable. `double_precision_floats` and then
+    // `parenthesize_json_ops` run on its output rather than on the pristine text: all three read
+    // their edits off a Postgres parse, `unqualify_stars` only ever shortens a qualifier and
+    // `double_precision_floats` only respells a type, so each later pass still parses the statement
+    // the caller wrote — and if it somehow does not, that pass returns its input unchanged and we
+    // merely lose its edit on this row. None of them can add or remove a `$N`, so the misalignment
+    // check below still sees the parameter numbering the caller actually wrote.
     //
     // One closure, applied to both sides, so the two sides cannot drift apart in how they are
     // prepared — which is the shape the `is_query` defect took.
     let prep = |sql: &str| {
         let unqualified = rewrite::unqualify_stars(sql);
-        pat::freeze_time(&rewrite::parenthesize_json_ops(&unqualified))
+        let doubled = rewrite::double_precision_floats(&unqualified);
+        pat::freeze_time(&rewrite::parenthesize_json_ops(&doubled))
     };
     let a = prep(a);
     let b = prep(b);
