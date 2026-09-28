@@ -1,12 +1,12 @@
 //! Type inference for queries whose tables are **not** declared.
 //!
 //! Everything else in this crate reads types off a declared catalog: `catalog::scan_ddl` turns the
-//! input's `CREATE TABLE`s into [`Catalog`], `Scope::try_resolve` hands a column's type to
+//! input's `CREATE TABLE`s into [`Catalog`](crate::catalog::Catalog), `Scope::try_resolve` hands a column's type to
 //! `lower.rs`, and `types.rs` maps and coerces types that are already known. None of it *decides*
 //! what type an undeclared column has. This module makes that decision, and whether it can make it
 //! is the single largest factor in whether a pair with no DDL can be lowered at all.
 //!
-//! It is a second producer of the same [`Catalog`] type, so nothing downstream changes:
+//! It is a second producer of the same [`Catalog`](crate::catalog::Catalog) type, so nothing downstream changes:
 //!
 //! ```text
 //!                   ┌─ declared:  scan_ddl(statements)           (today)
@@ -22,7 +22,7 @@
 //! answers a question about a different schema than the one the row came from — it does not make the
 //! prover agree to a false equivalence over the schema it was given. What it can do is make the
 //! question uninteresting, so the ranking below prefers hard evidence to soft, and anything with no
-//! evidence at all becomes [`Ty::Opaque`] rather than a plausible-looking `INTEGER`.
+//! evidence at all becomes [`Ty::Opaque`](crate::infer::Ty::Opaque) rather than a plausible-looking `INTEGER`.
 //!
 //! ## Evidence ranking
 //!
@@ -32,15 +32,15 @@
 //! alternative is picking one and reporting nothing.
 //!
 //! A refusal names the atoms that disagreed and, for each type, which of the pair's queries argued
-//! for it ([`Origin`]) — `type conflict INTEGER/BOOLEAN unifying dogs.id with $2` says far more than
+//! for it ([`Origin`](crate::infer::Origin)) — `type conflict INTEGER/BOOLEAN unifying dogs.id with $2` says far more than
 //! `type conflict INTEGER/BOOLEAN` about where to look.
 //!
-//! **What [`Origin`] is not:** it does not say whether a disagreement is an artifact of one union-find
+//! **What [`Origin`](crate::infer::Origin) is not:** it does not say whether a disagreement is an artifact of one union-find
 //! spanning both queries. Equal-and-agreeing evidence unions its provenance, so a class picks up both
 //! queries as soon as a name guess in each query agrees with the DDL, and the origins then overlap
 //! regardless of how the conflict actually arose. The fact that *would* answer that question lives on
 //! the union edges — which query's predicate joined two classes — not on the type evidence. To ask it,
-//! change the pair and infer again: [`infers_with_split_params`] renumbers the second query's
+//! change the pair and infer again: [`infers_with_split_params`](crate::infer::infers_with_split_params) renumbers the second query's
 //! parameters clear of the first's and reports whether the failure survives. That is the definition,
 //! it costs one extra pass on a row that has already failed, and it is what
 //! [`crate::params::root_cause`] uses to tell a conflict inference *found* from one a misalignment

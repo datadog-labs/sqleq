@@ -198,7 +198,7 @@ pub fn randval_cast(ct: CastTarget, rng: &mut StdRng) -> Val {
     }
 }
 
-/// A value satisfying a syntactic [`Need`](crate::typing::Need).
+/// A value satisfying a syntactic [`Need`].
 ///
 /// The five string domains are closed sets rather than free text, because DuckDB checks the *content*
 /// of these strings and not merely their type: an unknown time zone or an unrecognised date field is a

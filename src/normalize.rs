@@ -123,8 +123,8 @@ impl VisitorMut for Fix {
     }
 }
 
-/// Rebuild `<lhs> IS DISTINCT FROM <spine>` as `<spine with its leftmost leaf replaced by
-/// `<lhs> IS DISTINCT FROM <leaf>`>`.
+/// Rebuild `<lhs> IS DISTINCT FROM <spine>` as the spine with its leftmost leaf replaced by
+/// `<lhs> IS DISTINCT FROM <leaf>`.
 ///
 /// `AND`/`OR` come out of the parser left-associative, so the leftmost leaf of the spine is exactly
 /// the operand the comparison should have taken. Everything above it was swallowed and belongs back
@@ -867,7 +867,7 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
 ///
 /// - a **row slice**, which is the opposite of dead — it is what *chooses* the rows the slice keeps;
 /// - **`DISTINCT ON`**, which chooses the surviving row of each key group. It is the subtler of the
-///   two because it leaves no `Sort` behind: [`crate::lower::distinct_on`] encodes the ordering into
+///   two because it leaves no `Sort` behind: `lower::distinct_on` encodes the ordering into
 ///   the name of an opaque operator instead, so stripping the clause here would make
 ///   `DISTINCT ON (k) … ORDER BY k, t` and `… ORDER BY k, t DESC` mint the *same* symbol and prove
 ///   equal. Any lowering that reads a clause this pass can delete has to be listed here.
