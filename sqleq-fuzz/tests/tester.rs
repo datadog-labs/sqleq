@@ -70,6 +70,41 @@ fn equivalent_pair_not_flagged() {
 }
 
 #[test]
+fn a_width_changing_cast_is_not_a_counterexample() {
+    // A declared `bigint` is materialized as INTEGER, so the cast side reads back as another
+    // DuckDB type carrying the same value -- which used to be reported as a difference.
+    let ddl = "CREATE TABLE t (id BIGINT PRIMARY KEY, parent BIGINT NOT NULL)";
+    assert_eq!(
+        label(
+            "SELECT id, parent FROM t WHERE parent = $1",
+            "SELECT id, $1::bigint AS parent FROM t WHERE parent = $1",
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    assert_eq!(
+        label(
+            "SELECT id, parent FROM t",
+            "SELECT id, parent::numeric(12, 2) AS parent FROM t",
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    // A changed value still is one.
+    let v = test_pair(
+        "SELECT id, parent FROM t",
+        "SELECT id, parent + 1 AS parent FROM t",
+        ddl,
+        cfg(),
+    );
+    assert!(
+        matches!(v, Verdict::NotEquivalent(_)),
+        "expected NOT-EQUIVALENT, got {}",
+        v.label()
+    );
+}
+
+#[test]
 fn scalar_vs_grouped_aggregate_over_empty() {
     // The canonical bug pattern: `... WHERE a = $1 GROUP BY a` (no rows on empty match) vs the scalar
     // aggregate `... WHERE a = $1` (always one row). Value-from-data param biasing surfaces the split.
