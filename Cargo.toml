@@ -17,7 +17,7 @@ serde_json = "1"
 # `visitor` gives us the derived AST walker. It is used for the "is this expression closed?"
 # guards, where a hand-written match risks *missing* a variant — and a missed variant there is a
 # soundness hole, not a coverage gap.
-sqlparser = { version = "0.62", features = ["visitor"] }
+sqlparser = { version = "0.63", features = ["visitor"] }
 # Robust CSV reader for the corpus: the DDL field holds quoted, multi-line SQL.
 csv = "1"
 
