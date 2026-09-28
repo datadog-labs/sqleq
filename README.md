@@ -40,7 +40,7 @@ FUZZ=./target/release/sqleq-fuzz
 
 $FUZZ file examples/dropped_filter.sql   # B drops an org-scoping predicate
 # NOT-EQUIVALENT
-# counterexample: users=[(1,0,2); (NULL,NULL,2); (0,1,0)]
+# counterexample: users=[(0,2,2); (NULL,1,0); (1,2,0)]
 
 $FUZZ file examples/in_vs_or.sql         # `tier IN (1,2)` against an OR of equalities
 # NO-COUNTEREXAMPLE

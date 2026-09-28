@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::seq::IndexedRandom;
+use rand::{RngExt, SeedableRng};
 
 use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -440,7 +440,7 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
                 if pneed.get(&n) == Some(&typing::Need::NumericString) {
                     return randval_need(typing::Need::NumericString, rng);
                 }
-                if col_survives_cast && !present.is_empty() && rng.gen_bool(0.75) {
+                if col_survives_cast && !present.is_empty() && rng.random_bool(0.75) {
                     present.choose(rng).unwrap().clone() // bias to a value that exists in the column
                 } else if let Some(ct) = cast {
                     randval_cast(ct, rng)
@@ -459,7 +459,7 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             } else if is_array {
                 // 1-3 elements: enough to match real rows often, few enough that the predicate stays
                 // selective and can still discriminate the two sides.
-                let k = rng.gen_range(1..=3);
+                let k = rng.random_range(1..=3);
                 let mut elems = Vec::with_capacity(k);
                 for _ in 0..k {
                     elems.push(pick(&mut rng));
