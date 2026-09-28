@@ -184,7 +184,7 @@ jobs:
     env:
       # One Z3 release supplies both the library the crate links and the header its bindings are
       # generated from; a header from another release can disagree with the library on enum values.
-      Z3_VERSION: 4.13.4
+      Z3_VERSION: 5.1.0
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -202,17 +202,19 @@ jobs:
           restore-keys: solver-${{ runner.os }}-
 
       # The crate's build script reads Z3's location from these two variables and bakes the
-      # library's directory into every binary's rpath, so nothing is needed at run time. Z3
-      # publishes no checksum for its release archives, and this library is linked into every test
-      # executable, so it is pinned by digest like DuckDB's above. $RUNNER_TEMP is the same path on
-      # every run, which keeps the cached build's rpath valid.
+      # library's directory into every binary's rpath, so nothing is needed at run time. This
+      # library is linked into every test executable, so it is pinned by digest like DuckDB's above:
+      # the value is the SHA-256 GitHub lists for the release asset, checked here so that a replaced
+      # upload fails the build. Bump the version, the glibc suffix of the asset name and the digest
+      # together. $RUNNER_TEMP is the same path on every run, which keeps the cached build's rpath
+      # valid.
       - name: fetch Z3 (digest-pinned)
         run: |
           set -euo pipefail
-          name="z3-$Z3_VERSION-x64-glibc-2.35"
+          name="z3-$Z3_VERSION-x64-glibc-2.39"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.zip" \
             "https://github.com/Z3Prover/z3/releases/download/z3-$Z3_VERSION/$name.zip"
-          echo "93f91f9c6f4a00a041c19fc7a74adc1f441c8244ce70d486e19abcd89c6a014b  $RUNNER_TEMP/$name.zip" \
+          echo "f47be8d27d3230e823bf1eeede2fe0abaca55bb78d0b59974370e6689a92284a  $RUNNER_TEMP/$name.zip" \
             | sha256sum -c -
           unzip -q -o "$RUNNER_TEMP/$name.zip" -d "$RUNNER_TEMP"
           echo "SQLEQ_Z3_LIB_DIR=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
