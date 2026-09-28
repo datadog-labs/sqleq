@@ -7,8 +7,8 @@
 //!
 //! Two kinds live here, and the distinction matters for how each is justified:
 //!
-//! * [`fix_precedence`] repairs a **parser bug**. Its justification is that the tree sqlparser built
-//!   is not what the SQL says, so leaving it alone is the unsound option.
+//! * [`fix_precedence`] guards against a **parser bug**: it refuses the trees where what sqlparser
+//!   built is not what Postgres would, because lowering those is the unsound option.
 //! * [`strip_in_exists_distinct`] and [`unnest_in_to_any`] are **normalizations**. The tree is
 //!   correct and the rewrite changes it anyway, to a form the prover has an easier time with. Their
 //!   justification has to be an equivalence argument, and every precondition of that argument has to
@@ -27,29 +27,35 @@
 //! because unlike the one below it is not present in every dialect. [`demote_operators`] is what would
 //! have carried the mis-parse into the IR, so the pinning test lives beside it.
 //!
-//! ### The one that has to be rewritten
+//! ### The one this module guards
 //!
-//! sqlparser 0.62 parses the right operand of `IS [NOT] DISTINCT FROM` with
-//! [`parse_expr`][pe] — precedence 0 — where every other infix branch beside it uses
-//! `parse_subexpr(precedence)`. The right operand therefore swallows everything to its right:
+//! sqlparser 0.62 parsed the right operand of `IS [NOT] DISTINCT FROM` at precedence 0, so it
+//! swallowed everything to its right:
 //!
 //! ```text
 //! a IS DISTINCT FROM 1 AND b = 2
-//!   parsed as   IsDistinctFrom(a, And(1, Eq(b, 2)))     -- a IS DISTINCT FROM (1 AND b = 2)
-//!   should be   And(IsDistinctFrom(a, 1), Eq(b, 2))
+//!   0.62 parsed   IsDistinctFrom(a, And(1, Eq(b, 2)))     -- a IS DISTINCT FROM (1 AND b = 2)
+//!   meaning       And(IsDistinctFrom(a, 1), Eq(b, 2))
 //! ```
 //!
-//! In PostgreSQL the `IS` family binds tighter than `NOT`/`AND`/`OR`, so the second tree is the
-//! meaning. This matters beyond a wrong answer: [`lower`][crate::lower] lowers `IsDistinctFrom`
-//! faithfully, so a mis-parse hands the prover a *different predicate* than the query states, and
-//! two genuinely-inequivalent queries can lower to two equivalent IRs. That is the one way to get a
-//! false proof out of a sound prover, so this runs before the catalog is built rather than being
-//! left for each consumer to work around.
+//! 0.63 parses it at the `IS` family's own precedence, and this pass used to splice the first tree
+//! back into the second. It now only refuses: a rewrite that no parser output exercises any more is
+//! an untested rewrite of a soundness-relevant tree, and an honest refusal is worth more. This
+//! matters beyond a wrong answer: [`lower`][crate::lower] lowers `IsDistinctFrom` faithfully, so a
+//! mis-parse hands the prover a *different predicate* than the query states, and two
+//! genuinely-inequivalent queries can lower to two equivalent IRs. That is the one way to get a false
+//! proof out of a sound prover, so this runs before the catalog is built.
 //!
-//! Explicit parentheses are safe either way: sqlparser keeps them as [`Expr::Nested`], which is not
-//! a bare `BinaryOp`, so `a IS DISTINCT FROM (1 AND b)` is left alone.
+//! Three shapes are refused:
 //!
-//! [pe]: https://docs.rs/sqlparser/0.62.0/sqlparser/parser/struct.Parser.html#method.parse_expr
+//! * `IS [NOT] DISTINCT FROM` over a bare `AND`/`OR` — the 0.62 mis-parse, should it ever come back.
+//! * One `IS` operator directly over another, in either order. PostgreSQL declares the family
+//!   non-associative (`%nonassoc IS` in its grammar), so `a IS DISTINCT FROM b IS NULL` is a syntax
+//!   error there, whichever way sqlparser happens to nest it.
+//! * `IS [NOT] DISTINCT FROM NOT x`, which was never rewritten and is still not.
+//!
+//! Explicit parentheses are safe: sqlparser keeps them as [`Expr::Nested`], so
+//! `a IS DISTINCT FROM (1 AND b)` and `(a IS DISTINCT FROM b) IS NULL` are left alone.
 
 use core::ops::ControlFlow;
 
@@ -65,41 +71,60 @@ use sqlparser::ast::{
 
 use crate::error::{unsupported, FrontendError, Result};
 
-/// Undo the mis-parse everywhere in `statements`.
+/// Refuse, anywhere in `statements`, the precedence shapes listed in the module documentation.
 pub fn fix_precedence(statements: &mut [Statement]) -> Result<()> {
-    let mut fix = Fix;
-    for st in statements {
-        if let ControlFlow::Break(e) = st.visit(&mut fix) {
+    for st in statements.iter() {
+        if let ControlFlow::Break(e) = st.visit(&mut PrecedenceGuard) {
             return Err(e);
         }
     }
     Ok(())
 }
 
-struct Fix;
+struct PrecedenceGuard;
 
-impl VisitorMut for Fix {
+const CHAINED_IS: &str = "one IS operator directly over another (PostgreSQL's IS family is \
+                          non-associative, so this does not parse there)";
+
+impl Visitor for PrecedenceGuard {
     type Break = FrontendError;
 
-    /// `post_visit` and not `pre_visit`: the right operand of an outer `IS DISTINCT FROM` can hold
-    /// an inner one that is itself mis-parsed, and the spine we splice into has to be the repaired
-    /// one. Children first gets that for free. Nothing re-descends afterwards, which is fine —
-    /// every node of the rebuilt tree has already been visited.
-    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
-        let (neg, rhs) = match e {
-            Expr::IsDistinctFrom(_, r) => (false, &**r),
-            Expr::IsNotDistinctFrom(_, r) => (true, &**r),
-            _ => return ControlFlow::Continue(()),
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<Self::Break> {
+        let reason = match e {
+            Expr::IsDistinctFrom(l, r) | Expr::IsNotDistinctFrom(l, r) => {
+                if matches!(**r, Expr::BinaryOp { op: BinaryOperator::And | BinaryOperator::Or, .. })
+                {
+                    Some("IS [NOT] DISTINCT FROM over a bare AND/OR (the sqlparser 0.62 mis-parse)")
+                } else if is_is_operator(l) || is_is_operator(r) {
+                    Some(CHAINED_IS)
+                } else if matches!(**r, Expr::UnaryOp { op: UnaryOperator::Not, .. }) {
+                    Some("IS [NOT] DISTINCT FROM NOT ... (this shape is not rewritten)")
+                } else {
+                    None
+                }
+            }
+            Expr::IsNull(x)
+            | Expr::IsNotNull(x)
+            | Expr::IsTrue(x)
+            | Expr::IsNotTrue(x)
+            | Expr::IsFalse(x)
+            | Expr::IsNotFalse(x)
+            | Expr::IsUnknown(x)
+            | Expr::IsNotUnknown(x) => is_is_operator(x).then_some(CHAINED_IS),
+            _ => None,
         };
-        match rhs {
-            // The case that occurs: the operand swallowed a conjunction.
-            Expr::BinaryOp { op: BinaryOperator::And | BinaryOperator::Or, .. } => {}
-            // The same bug reaches these — `a IS DISTINCT FROM b IS NULL` is
-            // `(a IS DISTINCT FROM b) IS NULL`, since the `IS` family is left-associative, but
-            // parses as `a IS DISTINCT FROM (b IS NULL)`. No case in the corpus does this, so it is
-            // refused rather than rewritten: an untested rewrite of a soundness-relevant tree is
-            // worth less than an honest refusal.
-            Expr::IsNull(_)
+        match reason {
+            Some(r) => ControlFlow::Break(unsupported(r)),
+            None => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// Whether `e` is, unparenthesised, one of the operators PostgreSQL parses at `IS` precedence.
+fn is_is_operator(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::IsNull(_)
             | Expr::IsNotNull(_)
             | Expr::IsTrue(_)
             | Expr::IsNotTrue(_)
@@ -109,38 +134,7 @@ impl VisitorMut for Fix {
             | Expr::IsNotUnknown(_)
             | Expr::IsDistinctFrom(..)
             | Expr::IsNotDistinctFrom(..)
-            | Expr::UnaryOp { op: UnaryOperator::Not, .. } => {
-                return ControlFlow::Break(unsupported(
-                    "IS [NOT] DISTINCT FROM followed by another IS/NOT operator (parser \
-                     precedence bug, and this shape is not rewritten)",
-                ))
-            }
-            _ => return ControlFlow::Continue(()),
-        }
-
-        let (left, mut right) = match std::mem::replace(e, placeholder()) {
-            Expr::IsDistinctFrom(l, r) | Expr::IsNotDistinctFrom(l, r) => (l, r),
-            _ => unreachable!("matched just above"),
-        };
-        splice(&mut right, neg, left);
-        *e = *right;
-        ControlFlow::Continue(())
-    }
-}
-
-/// Rebuild `<lhs> IS DISTINCT FROM <spine>` as the spine with its leftmost leaf replaced by
-/// `<lhs> IS DISTINCT FROM <leaf>`.
-///
-/// `AND`/`OR` come out of the parser left-associative, so the leftmost leaf of the spine is exactly
-/// the operand the comparison should have taken. Everything above it was swallowed and belongs back
-/// outside. Recursion depth is the length of one conjunction chain.
-fn splice(e: &mut Expr, neg: bool, lhs: Box<Expr>) {
-    if let Expr::BinaryOp { left, op: BinaryOperator::And | BinaryOperator::Or, .. } = e {
-        splice(left, neg, lhs);
-        return;
-    }
-    let leaf = Box::new(std::mem::replace(e, placeholder()));
-    *e = if neg { Expr::IsNotDistinctFrom(lhs, leaf) } else { Expr::IsDistinctFrom(lhs, leaf) };
+    )
 }
 
 /// A throwaway value to leave behind while a node is being moved out. Every one written is
@@ -809,13 +803,12 @@ impl VisitorMut for DistributeArrayCast {
 
     /// Post-order, so an array cast nested inside another one is distributed from the inside out.
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
-        let Expr::Cast { expr, data_type, kind, format, array } = e else {
+        let Expr::Cast { expr, data_type, kind, format } = e else {
             return ControlFlow::Continue(());
         };
-        // Two non-Postgres spellings whose meaning over an array we would be guessing at: `format`
-        // is `CAST(x AS t FORMAT f)`, and `array` is MySQL's `CAST(x AS t ARRAY)` flag — which is
-        // *not* `DataType::Array` and would leave a second, unaccounted array level behind.
-        if format.is_some() || *array {
+        // `CAST(x AS t FORMAT f)` is not Postgres, and its meaning over an array would be a guess.
+        // The `T ARRAY` spelling is declined by `array_elem_type` itself.
+        if format.is_some() {
             return ControlFlow::Continue(());
         }
         let Some(elem) = array_elem_type(data_type) else {
@@ -837,7 +830,6 @@ impl VisitorMut for DistributeArrayCast {
                     expr: Box::new(it),
                     data_type: elem.clone(),
                     format: None,
-                    array: false,
                 })
                 .collect(),
             named: arr.named,
@@ -859,6 +851,10 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
             | ArrayElemTypeDef::Parenthesis(t) => Some((**t).clone()),
             // A bare `ARRAY` with no element type: nothing to distribute.
             ArrayElemTypeDef::None => None,
+            // The SQL-standard `T ARRAY` / `T ARRAY[n]`. Postgres reads it as `T[]`, but it is left
+            // undistributed, as `CAST(x AS T ARRAY)` always was, rather than grow what can be proved
+            // on a parser upgrade.
+            ArrayElemTypeDef::Qualified(..) => None,
         },
         _ => None,
     }
@@ -1336,25 +1332,26 @@ mod tests {
         }
     }
 
+    // The next three pin the parser: these are the inputs sqlparser 0.62 mis-parsed. Should a
+    // release bring the bug back, the guard refuses them and `fixed` panics here.
+
     #[test]
-    fn conjunction_is_pulled_back_out() {
+    fn conjunction_stays_outside_the_comparison() {
         assert_eq!(fixed("a IS DISTINCT FROM 1 AND b = 2"), "((a IDF 1) AND (b = 2))");
         assert_eq!(fixed("a IS NOT DISTINCT FROM 1 OR b = 2"), "((a INDF 1) OR (b = 2))");
     }
 
-    /// `AND` binds tighter than `OR`, so only the leaf at the bottom of the left spine belongs to
-    /// the comparison — not the whole swallowed subtree.
     #[test]
-    fn respects_and_or_precedence_in_what_was_swallowed() {
+    fn and_or_precedence_is_kept_around_the_comparison() {
         assert_eq!(fixed("a IS DISTINCT FROM 1 OR b AND c"), "((a IDF 1) OR (b AND c))");
         assert_eq!(fixed("a IS DISTINCT FROM 1 AND b OR c"), "(((a IDF 1) AND b) OR c)");
     }
 
     #[test]
-    fn nested_comparisons_are_each_repaired() {
+    fn nested_comparisons_parse_as_a_left_associative_conjunction() {
         assert_eq!(
             fixed("a IS DISTINCT FROM 1 AND b IS DISTINCT FROM 2 AND c"),
-            "((a IDF 1) AND ((b IDF 2) AND c))"
+            "(((a IDF 1) AND (b IDF 2)) AND c)"
         );
     }
 
@@ -1371,9 +1368,34 @@ mod tests {
     }
 
     #[test]
-    fn unrewritten_mis_parse_shapes_are_refused() {
-        assert!(err("a IS DISTINCT FROM b IS NULL").contains("precedence bug"));
-        assert!(err("a IS DISTINCT FROM NOT b").contains("precedence bug"));
+    fn chained_is_operators_are_refused_in_either_nesting() {
+        assert!(err("a IS DISTINCT FROM b IS NULL").contains("non-associative"));
+        assert!(err("a IS NULL IS DISTINCT FROM b").contains("non-associative"));
+        assert!(err("a IS DISTINCT FROM b IS NOT DISTINCT FROM c").contains("non-associative"));
+        assert_eq!(fixed("(a IS DISTINCT FROM b) IS NULL"), "(a IS DISTINCT FROM b) IS NULL");
+    }
+
+    #[test]
+    fn a_not_operand_is_refused() {
+        assert!(err("a IS DISTINCT FROM NOT b").contains("NOT"));
+    }
+
+    /// The 0.62 tree, built by hand because no parser in use produces it any more: without this the
+    /// guard's first branch would have no test that can fail.
+    #[test]
+    fn the_old_mis_parse_tree_is_refused() {
+        let mut st =
+            Parser::parse_sql(&crate::DIALECT, "SELECT 1 WHERE a IS DISTINCT FROM (1 AND b)")
+                .expect("parses");
+        let Statement::Query(q) = &mut st[0] else { panic!("query") };
+        let sqlparser::ast::SetExpr::Select(s) = &mut *q.body else { panic!("select") };
+        let Some(Expr::IsDistinctFrom(_, r)) = s.selection.as_mut() else { panic!("idf") };
+        let Expr::Nested(inner) = std::mem::replace(&mut **r, placeholder()) else {
+            panic!("nested")
+        };
+        **r = *inner;
+        let e = fix_precedence(&mut st).expect_err("the bare AND/OR shape must be refused");
+        assert!(e.to_string().contains("0.62 mis-parse"), "{e}");
     }
 
     /// Round-trip one statement through the strip. The cases below are this rewrite's

@@ -243,6 +243,8 @@ fn param_casts_pin_the_generated_type() {
     assert_eq!(cast_target("text"), Some(CastTarget::V(VType::Varchar)));
     // Shapes we refuse to guess at.
     assert_eq!(cast_target("text[]"), None);
+    assert_eq!(cast_target("INT ARRAY"), None);
+    assert_eq!(cast_target("int ARRAY[4]"), None);
     assert_eq!(cast_target("my_custom_enum"), None);
 }
 

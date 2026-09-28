@@ -139,7 +139,10 @@ pub enum CastTarget {
 pub fn cast_target(ty: &str) -> Option<CastTarget> {
     let lowered = ty.to_lowercase();
     let t = lowered.trim().trim_matches('"');
-    if t.ends_with("[]") || t.contains("record") || t.contains("struct") {
+    // `int ARRAY` / `int ARRAY[4]` are the SQL-standard spellings of `int[]`; the leading word alone
+    // would read them as `int`.
+    let array_word = t.split_whitespace().any(|w| w == "array" || w.starts_with("array["));
+    if t.ends_with("[]") || array_word || t.contains("record") || t.contains("struct") {
         return None;
     }
     let base = t

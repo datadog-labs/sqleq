@@ -412,7 +412,8 @@ fn double_the_float(t: &mut DataType) {
         DataType::Array(
             ArrayElemTypeDef::SquareBracket(inner, _)
             | ArrayElemTypeDef::AngleBracket(inner)
-            | ArrayElemTypeDef::Parenthesis(inner),
+            | ArrayElemTypeDef::Parenthesis(inner)
+            | ArrayElemTypeDef::Qualified(inner, _),
         ) => double_the_float(inner),
         _ => {}
     }
@@ -433,6 +434,10 @@ mod tests {
                 "SELECT CAST(x AS DOUBLE) FROM t",
             ),
             ("SELECT x::float[] FROM t", "SELECT x::DOUBLE[] FROM t"),
+            (
+                "SELECT CAST(x AS float ARRAY) FROM t",
+                "SELECT CAST(x AS DOUBLE ARRAY) FROM t",
+            ),
             (
                 "SELECT ROUND ( AVG ( c.p ),$1 ) :: FLOAT AS p FROM t c",
                 "SELECT ROUND ( AVG ( c.p ),$1 ) :: DOUBLE AS p FROM t c",

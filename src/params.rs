@@ -146,8 +146,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Array, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query,
-    SetExpr, Statement, TableFactor, Visit, Visitor,
+    Array, ArrayElemTypeDef, BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 
 use crate::casts::unwrap_nested;
@@ -638,12 +638,12 @@ fn param_under_casts(e: &Expr) -> Option<u32> {
 fn scalar_cast_target(e: &Expr) -> CastTarget<'_> {
     let mut cur = unwrap_nested(e);
     loop {
-        let Expr::Cast { expr, data_type, format, array, .. } = cur else {
+        let Expr::Cast { expr, data_type, format, .. } = cur else {
             return CastTarget::Scalar(cur);
         };
         // The two spellings `normalize::distribute_array_casts` also declines to read: `CAST(x AS t
-        // FORMAT f)` and MySQL's `CAST(x AS t ARRAY)`, whose array-ness is not in `data_type`.
-        if format.is_some() || *array {
+        // FORMAT f)` and the SQL-standard `t ARRAY`.
+        if format.is_some() || matches!(data_type, DataType::Array(ArrayElemTypeDef::Qualified(..))) {
             return CastTarget::Scalar(cur);
         }
         if array_elem_type(data_type).is_some() {

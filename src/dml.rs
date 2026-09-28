@@ -129,8 +129,8 @@
 //! ## Where this runs
 //!
 //! Between [`fix_precedence`][crate::normalize::fix_precedence] and every normalization. After the
-//! repair, because the reduction copies the `WHERE` predicate into one `CASE` per column and the tree
-//! it copies has to be the one the SQL means; before the normalizations, because then no other pass
+//! precedence guard, because the reduction copies the `WHERE` predicate into one `CASE` per column and
+//! the tree it copies has to be the one the SQL means; before the normalizations, because then no other pass
 //! needs to know that DML exists — everything downstream of here sees two queries.
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -799,7 +799,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query)> 
 /// Note what this is *not*: rendering the reduced query as text and re-parsing it. Two of the
 /// subtrees spliced in here — the predicate and the assigned expressions — are the reason the
 /// reduction can be unsound at all, and a round trip through `Display` would put them back through a
-/// parser that has [a precedence bug][crate::normalize] in the first place.
+/// parser whose precedence handling [has had to be guarded][crate::normalize] in the first place.
 fn select(projection: Vec<SelectItem>, from: TableWithJoins, selection: Option<Expr>) -> Query {
     let mut parsed =
         Parser::parse_sql(&crate::DIALECT, "SELECT 1 FROM t").expect("the skeleton is a constant");
