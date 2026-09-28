@@ -2304,3 +2304,66 @@ fn a_parameter_used_both_ways_in_one_query_is_not_evidence() {
         r#"INSERT INTO "v" ("a") VALUES ($1), (( SELECT "a" FROM unnest($1::varchar[]) AS "u"("a") LIMIT 1 ))"#,
     ));
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Row-locking clauses
+//
+// Inert in the prover's single-transaction model, observable under concurrency, so a clause the two
+// sides do not share is refused and one they do share is dropped from both. See
+// `normalize::strip_identical_locks`.
+
+#[test]
+fn refuses_a_lock_clause_on_one_side_only() {
+    refused(
+        &pair(r#"SELECT "a" FROM "t" FOR UPDATE SKIP LOCKED"#, r#"SELECT "a" FROM "t""#),
+        "row-locking clause",
+    );
+}
+
+#[test]
+fn refuses_two_different_lock_clauses() {
+    refused(
+        &pair(
+            r#"SELECT "a" FROM "t" FOR UPDATE SKIP LOCKED"#,
+            r#"SELECT "a" FROM "t" FOR UPDATE"#,
+        ),
+        "row-locking clause",
+    );
+}
+
+/// The same clause, but on a derived table on one side and on the outer query on the other: the
+/// clause text matches and its position does not.
+#[test]
+fn refuses_the_same_lock_clause_in_a_different_place() {
+    refused(
+        &pair(
+            r#"SELECT "a" FROM (SELECT "a" FROM "t" FOR UPDATE) AS "s""#,
+            r#"SELECT "a" FROM "t" FOR UPDATE"#,
+        ),
+        "row-locking clause",
+    );
+}
+
+/// Shared clauses are dropped, so the pair lowers to exactly what its lock-free twin does.
+#[test]
+fn a_shared_lock_clause_lowers_as_if_absent() {
+    let locked = ok(&pair(
+        r#"SELECT "a" FROM "t" WHERE "a" > 1 FOR UPDATE SKIP LOCKED"#,
+        r#"SELECT "a" FROM "t" WHERE 1 < "a" FOR UPDATE SKIP LOCKED"#,
+    ));
+    let plain = ok(&pair(
+        r#"SELECT "a" FROM "t" WHERE "a" > 1"#,
+        r#"SELECT "a" FROM "t" WHERE 1 < "a""#,
+    ));
+    assert_eq!(locked, plain);
+}
+
+/// The queue shape: the clause sits inside a `WITH` binding, which is a derived table by the time
+/// the clauses are compared.
+#[test]
+fn a_shared_lock_clause_inside_a_cte_is_dropped() {
+    ok(&pair(
+        r#"WITH "c" AS (SELECT "a" FROM "t" WHERE "a" > 1 FOR UPDATE SKIP LOCKED) SELECT "a" FROM "c""#,
+        r#"WITH "c" AS (SELECT "a" FROM "t" WHERE 1 < "a" FOR UPDATE SKIP LOCKED) SELECT "a" FROM "c""#,
+    ));
+}

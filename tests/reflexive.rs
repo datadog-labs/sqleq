@@ -164,7 +164,7 @@ fn clearing_a_rewrite_disables_exactly_that_rewrite() {
 /// rewrite missing from `EACH` would be reported as "no rewrite was necessary" for every row it closes.
 #[test]
 fn every_rewrite_is_reachable_from_all() {
-    assert_eq!(Rewrites::EACH.len(), 9);
+    assert_eq!(Rewrites::EACH.len(), 10);
     let rebuilt = Rewrites::EACH.iter().fold(Rewrites::NONE, |acc, (_, b)| acc.with(*b));
     assert_eq!(rebuilt, Rewrites::ALL);
     for (_, bit) in Rewrites::EACH {

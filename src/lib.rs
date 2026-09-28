@@ -407,10 +407,11 @@ impl Rewrites {
     pub const STRIP_DEAD_ORDER_BY: Rewrites = Rewrites(1 << 6);
     pub const STRIP_SCHEMA: Rewrites = Rewrites(1 << 7);
     pub const DISTRIBUTE_ARRAY_CAST: Rewrites = Rewrites(1 << 8);
-    /// The nine bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
+    pub const STRIP_IDENTICAL_LOCKS: Rewrites = Rewrites(1 << 9);
+    /// The ten bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
     /// is a rewrite an attribution pass reports as "no rewrite was necessary" for every row it
     /// closes, so the two are pinned equal by a test and this mask is what makes that pin possible.
-    pub const ALL: Rewrites = Rewrites((1 << 9) - 1);
+    pub const ALL: Rewrites = Rewrites((1 << 10) - 1);
     /// Every rewrite except one — the single-subtraction counterfactual.
     pub const NONE: Rewrites = Rewrites(0);
 
@@ -428,13 +429,14 @@ impl Rewrites {
 
     /// The individual rewrites, in the order [`reflexive_with`] runs them, each with the stable name
     /// an attribution pass reports it under.
-    pub const EACH: [(&'static str, Rewrites); 9] = [
+    pub const EACH: [(&'static str, Rewrites); 10] = [
         ("fix_precedence", Rewrites::FIX_PRECEDENCE),
         ("demote_operators", Rewrites::DEMOTE_OPERATORS),
         ("strip_in_exists_distinct", Rewrites::STRIP_IN_EXISTS_DISTINCT),
         ("unnest_in_to_any", Rewrites::UNNEST_IN_TO_ANY),
         ("distribute_array_casts", Rewrites::DISTRIBUTE_ARRAY_CAST),
         ("inline_ctes", Rewrites::INLINE_CTES),
+        ("strip_identical_locks", Rewrites::STRIP_IDENTICAL_LOCKS),
         ("strip_identical_pagination", Rewrites::STRIP_IDENTICAL_PAGINATION),
         ("strip_dead_order_by", Rewrites::STRIP_DEAD_ORDER_BY),
         ("strip_schema", Rewrites::STRIP_SCHEMA),
@@ -557,6 +559,9 @@ fn normalized_pair(
     if rewrites.has(Rewrites::INLINE_CTES) {
         normalize::inline_ctes(&mut queries);
     }
+    if rewrites.has(Rewrites::STRIP_IDENTICAL_LOCKS) {
+        normalize::strip_identical_locks(&mut queries);
+    }
     if rewrites.has(Rewrites::STRIP_IDENTICAL_PAGINATION) {
         normalize::strip_identical_pagination(&mut queries);
     }
@@ -611,6 +616,9 @@ fn parse_input(
     // Before `strip_schema`, which would otherwise turn `part_16.c` into something a CTE named `c`
     // captures.
     normalize::inline_ctes(&mut queries);
+    // After `inline_ctes`, so a lock clause inside a `WITH` binding sits on the derived table that
+    // replaced it and is compared in the position lowering will see it.
+    normalize::strip_identical_locks(&mut queries);
     // Pair-level, so it needs both queries and runs after they are separated out. Before the
     // `ORDER BY` strip, which it can unblock: removing the pair's only `LIMIT` leaves an ordering
     // with nothing downstream to consume it.

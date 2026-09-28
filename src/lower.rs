@@ -273,6 +273,14 @@ pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<Value> {
 /// returning the relation and its output columns. The output columns are needed when the query is a
 /// derived table or subquery so the enclosing query can resolve its columns.
 fn lower_query_ctx(cat: &Catalog, fns: &Fns, q: &Query, outer: &[Binding]) -> Result<(Value, OutCols)> {
+    // Every query node passes through here, so this is the one place a lock clause can be caught.
+    // Identical ones were already dropped by `normalize::strip_identical_locks`; any left differ
+    // between the sides, and the prover has no concurrency to tell them apart.
+    if !q.locks.is_empty() {
+        return Err(unsupported(
+            "row-locking clause (FOR UPDATE / FOR SHARE) not identical on both sides",
+        ));
+    }
     let ord = OrderCtx::Known(q.order_by.as_ref());
     let (rel, out_cols, sortable) = lower_setexpr_ctx(cat, fns, q.body.as_ref(), outer, ord)?;
     let rel = apply_pagination(cat, fns, q, rel, &out_cols, sortable.as_ref())?;
