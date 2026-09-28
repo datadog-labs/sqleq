@@ -1,0 +1,7 @@
+# Overrides for dd-rust-license-tool, which writes LICENSE-3rdparty.csv (see
+# tools/update_license_3rdparty.sh).
+
+[overrides]
+# Also offered under LGPL-2.1-or-later; this repository takes it under MIT or Apache-2.0. It only
+# builds for UEFI targets.
+"r-efi" = { license = "MIT OR Apache-2.0" }

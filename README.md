@@ -200,4 +200,5 @@ provable set is cross-checked against the refuting axis, where the run is its ow
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The `qed-prover` binary and SQLSolver
-are separate upstream projects, not vendored here, each under its own licence.
+are separate upstream projects, not vendored here, each under its own licence. Third-party components
+and their licences are listed in [`LICENSE-3rdparty.csv`](LICENSE-3rdparty.csv).

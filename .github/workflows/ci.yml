@@ -1,10 +1,14 @@
-# Two jobs, split on build cost rather than on subject.
+# Three jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
 # cache than anything else here. Keeping it in its own job means the frontend's answer
 # -- the one that gates most changes -- arrives in under a minute, and the two caches do not evict
 # each other. Each job lints the crate it builds, so the union is `cargo clippy --workspace`
 # without either job paying for the other's dependencies.
+#
+# `licenses` builds nothing. It checks that every dependency is under a permissive licence and
+# that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
+# attribution changing with it.
 #
 # Deliberately absent: `cargo fmt`. There is no `rustfmt.toml`, over a thousand source lines
 # already run past 100 columns, and `src/dml.rs` has never been formatted, so a format gate would
@@ -125,3 +129,33 @@ jobs:
 
       - run: cargo test -p sqleq-fuzz
       - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
+
+  licenses:
+    name: licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Only the two binaries, not all of ~/.cargo/bin: restoring that directory would also put back
+      # stale copies of the runner's own rustup proxies. Bump a version here and in the key together.
+      - id: license-tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/dd-rust-license-tool
+          key: license-tools-${{ runner.os }}-cargo-deny-0.20.2-dd-rust-license-tool-1.0.6
+      - if: steps.license-tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo install --locked dd-rust-license-tool --version 1.0.6
+
+      # `--workspace`: the root manifest is also the frontend package, so without it the fuzz
+      # crate's dependencies are never looked at. See deny.toml.
+      - run: cargo deny --workspace check licenses
+
+      # Invoked through `sh` so it does not depend on the file's executable bit.
+      - run: sh tools/update_license_3rdparty.sh --check

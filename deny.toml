@@ -1,0 +1,23 @@
+# cargo-deny, run in CI as `cargo deny --workspace check licenses`. `--workspace` is load-bearing:
+# the root manifest is also the sqleq-frontend package, so without it only the frontend's
+# dependencies are checked and everything sqleq-fuzz pulls in goes unexamined.
+
+[graph]
+all-features = true
+
+# Permissive licenses only. A dependency under anything else, copyleft in particular, needs a
+# conversation before it needs an entry here.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]

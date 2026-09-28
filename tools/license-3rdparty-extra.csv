@@ -1,0 +1,5 @@
+Component,Origin,License,Copyright
+libduckdb,https://github.com/duckdb/duckdb,MIT,Copyright 2018-2025 Stichting DuckDB Foundation
+guava,https://github.com/google/guava,Apache-2.0,The Guava Authors
+jackson-databind,https://github.com/FasterXML/jackson-databind,Apache-2.0,"Copyright 2007-, Tatu Saloranta"
+SQLSolver,https://github.com/SJTU-IPADS/SQLSolver,Apache-2.0,Copyright 2022 OpenSource
