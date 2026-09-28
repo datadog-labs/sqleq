@@ -41,6 +41,10 @@ deterministic. The hard-won rules, all preserved from the Python original:
   are trusted.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
+- **Compare numbers by value, not by type.** A declared `bigint` is materialized as DuckDB `INTEGER`,
+  so `c` and `c::bigint` come back as different DuckDB types carrying the same number, and a
+  `numeric` of another scale does the same. Cells are compared by numeric value, which can only merge
+  them, never split them.
 - **Don't invent a parameter correspondence.** See the next section.
 - **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
   functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as

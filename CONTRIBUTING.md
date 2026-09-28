@@ -7,7 +7,7 @@ conventions are not the ones you would guess from the code — this file is the 
 
 ```sh
 cargo test                 # the frontend: 199 + 173 + 17
-cargo test -p sqleq-fuzz   # the disprover: 51 + 49 + 5
+cargo test -p sqleq-fuzz   # the disprover: 52 + 50 + 5
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
 ```

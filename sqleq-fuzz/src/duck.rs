@@ -336,6 +336,12 @@ fn ensure_types(con: &Connection, stmt: &str) {
 /// A stable, order-insensitive rendering of a cell. List elements are *sorted* because array_agg /
 /// unnest order is nondeterministic without ORDER BY — an element-order difference is not a sound
 /// counterexample.
+///
+/// Numbers are rendered by value, not by DuckDB type. The generated schema materializes a declared
+/// `bigint` as `INTEGER`, so `c` reads back as `Int(0)` while `c::bigint` reads back as `BigInt(0)`,
+/// and a rendering that kept the type would call two equal values different — a false refutation,
+/// the one failure this tester must not have. Rendering by value can only merge cells, never split
+/// them, so it cannot manufacture a counterexample either.
 fn canon(v: &DVal) -> String {
     match v {
         DVal::List(items) => {
@@ -343,8 +349,43 @@ fn canon(v: &DVal) -> String {
             cs.sort();
             format!("[{}]", cs.join(","))
         }
-        other => format!("{other:?}"),
+        other => match number(other) {
+            Some(n) => format!("Number({n})"),
+            None => format!("{other:?}"),
+        },
     }
+}
+
+/// A numeric cell's value as its shortest decimal spelling, whatever its width or representation:
+/// `Int(5)`, `BigInt(5)`, `Decimal(5.00)` and `Double(5.0)` all give `5`. `None` for anything else.
+fn number(v: &DVal) -> Option<String> {
+    let s = match v {
+        DVal::TinyInt(i) => i.to_string(),
+        DVal::SmallInt(i) => i.to_string(),
+        DVal::Int(i) => i.to_string(),
+        DVal::BigInt(i) => i.to_string(),
+        DVal::HugeInt(i) => i.to_string(),
+        DVal::UTinyInt(i) => i.to_string(),
+        DVal::USmallInt(i) => i.to_string(),
+        DVal::UInt(i) => i.to_string(),
+        DVal::UBigInt(i) => i.to_string(),
+        DVal::UHugeInt(i) => i.to_string(),
+        // `Display` is exact; its scale is only presentation, so `1.50` and `1.5` are one value.
+        DVal::Decimal(d) => {
+            let s = d.to_string();
+            if s.contains('.') {
+                s.trim_end_matches('0').trim_end_matches('.').to_string()
+            } else {
+                s
+            }
+        }
+        // `Display` for floats is the shortest spelling that round-trips, with no exponent.
+        DVal::Float(f) => f.to_string(),
+        DVal::Double(f) => f.to_string(),
+        _ => return None,
+    };
+    // Negative zero is zero, in every one of these representations.
+    Some(if s == "-0" { "0".to_string() } else { s })
 }
 
 /// Read every row of `sql` as canonical `CELL_SEP`-joined strings.
@@ -493,9 +534,10 @@ pub fn run_side(
 
 #[cfg(test)]
 mod tests {
-    use super::{ddl_for, fetch_rows, open_db};
+    use super::{canon, ddl_for, fetch_rows, open_db};
     use crate::gen::{lit, Val, JSONS};
     use crate::schema::{Column, Table, VType};
+    use duckdb::types::Value as DVal;
 
     fn json_col(name: &str, array: bool) -> Column {
         Column {
@@ -504,6 +546,34 @@ mod tests {
             notnull: false,
             array,
         }
+    }
+
+    /// A number is one cell whatever DuckDB type carries it, so an equal value in another width,
+    /// scale or representation is not a counterexample. Different values, and a number against
+    /// its text spelling, stay apart.
+    #[test]
+    fn numbers_compare_by_value_not_by_type() {
+        let dec = |w, s, v| DVal::Decimal(duckdb::types::Decimal::new(w, s, v).unwrap());
+        for v in [
+            DVal::BigInt(0),
+            DVal::HugeInt(0),
+            DVal::UTinyInt(0),
+            dec(10, 2, 0),
+            DVal::Float(0.0),
+            DVal::Double(-0.0),
+        ] {
+            assert_eq!(canon(&v), canon(&DVal::Int(0)), "{v:?}");
+        }
+        assert_eq!(canon(&dec(10, 2, 150)), canon(&DVal::Double(1.5)));
+        assert_eq!(canon(&dec(12, 3, 1500)), canon(&dec(10, 1, 15)));
+        assert_eq!(canon(&dec(10, 2, -500)), canon(&DVal::BigInt(-5)));
+        assert_ne!(canon(&DVal::Int(1)), canon(&DVal::Int(2)));
+        assert_ne!(canon(&DVal::Double(0.5)), canon(&DVal::Int(0)));
+        assert_ne!(canon(&DVal::Text("1".into())), canon(&DVal::Int(1)));
+        assert_eq!(
+            canon(&DVal::List(vec![DVal::Int(1), DVal::BigInt(2)])),
+            canon(&DVal::List(vec![DVal::BigInt(2), DVal::Int(1)]))
+        );
     }
 
     /// A declared `json`/`jsonb` column has to reach DuckDB *as* JSON, and every document the
