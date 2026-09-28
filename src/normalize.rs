@@ -994,6 +994,66 @@ pub fn strip_identical_pagination(queries: &mut [Query]) {
     }
 }
 
+/// Drop the row-locking clauses (`FOR UPDATE`, `FOR SHARE`, with `SKIP LOCKED` or `NOWAIT`) when both
+/// sides carry exactly the same ones in the same places; otherwise leave every one in place, for
+/// lowering to refuse.
+///
+/// The prover evaluates one query against one database state, with no other transaction running. In
+/// that model no row is ever locked by anyone else, so `FOR UPDATE SKIP LOCKED` returns what the bare
+/// query returns and `NOWAIT` never fails: every lock clause is inert, which is why lowering used to
+/// ignore them. Under concurrency they are not inert: `SKIP LOCKED` changes which rows come back and
+/// `NOWAIT` turns a wait into an error. So a lock clause on one side only, or two different ones, is a
+/// difference the prover cannot see, and ignoring it would prove the pair.
+///
+/// "The same places" is the pre-order position of the query node that carries each clause, which is
+/// what survives [`inline_ctes`]: the usual queue shape, `WITH c AS (SELECT .. FOR UPDATE SKIP LOCKED)
+/// UPDATE ..`, has its clause on a derived table by the time this runs. Taking identical clauses in
+/// identical positions to lock the same way is the same kind of assumption
+/// [`strip_identical_pagination`] makes about a shared page.
+pub fn strip_identical_locks(queries: &mut [Query]) {
+    let [a, b] = queries else { return };
+    let sites = lock_sites(a);
+    if sites.is_empty() || sites != lock_sites(b) {
+        return;
+    }
+    for q in [a, b] {
+        let _ = q.visit(&mut ClearLocks);
+    }
+}
+
+/// Every lock clause in `q`, with the pre-order position of the query node that carries it.
+fn lock_sites(q: &Query) -> Vec<(usize, String)> {
+    let mut sites = LockSites { seen: 0, out: Vec::new() };
+    let _ = q.visit(&mut sites);
+    sites.out
+}
+
+struct LockSites {
+    seen: usize,
+    out: Vec<(usize, String)>,
+}
+
+impl Visitor for LockSites {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+        self.out.extend(q.locks.iter().map(|l| (self.seen, l.to_string())));
+        self.seen += 1;
+        ControlFlow::Continue(())
+    }
+}
+
+struct ClearLocks;
+
+impl VisitorMut for ClearLocks {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<Self::Break> {
+        q.locks.clear();
+        ControlFlow::Continue(())
+    }
+}
+
 /// Replace every `WITH` binding with a derived table at each of its uses, innermost first.
 ///
 /// ```text
