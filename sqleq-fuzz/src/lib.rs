@@ -25,6 +25,7 @@ pub mod pair;
 pub mod patterns;
 pub mod rewrite;
 pub mod schema;
+pub mod shim;
 pub mod typing;
 
 pub use pair::{test_pair, Config, Verdict};

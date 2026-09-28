@@ -42,6 +42,19 @@ deterministic. The hard-won rules, all preserved from the Python original:
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
 - **Don't invent a parameter correspondence.** See the next section.
+- **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
+  functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as
+  macros. Applying the same macro to both sides is not enough to make a loose mapping safe: if the
+  two sides call the function on different arguments that Postgres maps to one value, a mapping
+  that keeps them apart refutes an equivalent pair. Anything needing a real translation rather than
+  a rename — format strings, regex semantics, full-text and jsonpath — is left undefined, and the
+  pair keeps reporting an error.
+- **A shim has to refuse what Postgres refuses.** Refusing an input is part of a function's
+  semantics, and being more permissive is the unsafe direction: Postgres raises for
+  `json_array_elements` of a non-array, where DuckDB answers with an empty list. An error makes the
+  tester skip the trial, so the two sides are never compared; an empty answer instead drops a row,
+  and a pair whose sides differ only in how they treat a dropped row is then refuted on an input
+  Postgres would have rejected. So the set-returning shims check the type and raise.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
 rather than a false counterexample; `../docs/SOUNDNESS.md` is that argument.
