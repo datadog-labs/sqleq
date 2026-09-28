@@ -26,8 +26,8 @@ cargo install dd-rust-license-tool --version 1.0.6 --locked   # once
 sh tools/update_license_3rdparty.sh
 ```
 
-Components that are not crates (the DuckDB library, and what the SQLSolver bridge compiles against)
-are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
+Components that are not crates (the DuckDB and Z3 libraries, and what the SQLSolver bridge compiles
+against) are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
 Dependencies must be under a permissive licence: `cargo deny --workspace check licenses` enforces
 the allow-list in [`deny.toml`](deny.toml), and a licence outside it needs a discussion first.
 

@@ -4,9 +4,11 @@
 # Copyright 2026-Present Datadog, Inc.
 
 [workspace]
-members = ["sqleq-fuzz"]
+members = ["sqleq-fuzz", "sqleq-solver"]
 # Bare `cargo build` / `cargo test` stay on the lean frontend. sqleq-fuzz links DuckDB, whose
 # release library its first build downloads, so it is opt-in: `cargo build -p sqleq-fuzz`.
+# sqleq-solver needs SQLEQ_Z3_LIB_DIR/Z3_SYS_Z3_HEADER set (see its build.rs) and is opt-in the
+# same way: `cargo build -p sqleq-solver`.
 default-members = ["."]
 resolver = "2"
 

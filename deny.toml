@@ -5,7 +5,7 @@
 
 # cargo-deny, run in CI as `cargo deny --workspace check licenses`. `--workspace` is load-bearing:
 # the root manifest is also the sqleq-frontend package, so without it only the frontend's
-# dependencies are checked and everything sqleq-fuzz pulls in goes unexamined.
+# dependencies are checked and everything sqleq-fuzz and sqleq-solver pull in goes unexamined.
 
 [graph]
 all-features = true
