@@ -238,11 +238,13 @@ What is ported, in the order the ladder runs it:
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
   or negation.
 
-Not ported: the **LIA\* rung**. The pairs it would add need integer reasoning over columns the IR
-types as `INTEGER`, and the IR's `INTEGER` also stands for `DATE` and `TIMESTAMP`, where that
-reasoning is unsound (`ts >= k AND ts < k + 1` is not `ts = k` for a timestamp). It needs the IR to
-keep time types apart first. **`LIMIT`/`OFFSET`** (`OrderbySupport`) is not ported either; a bare
-`ORDER BY` is erased, which is sound under the bag semantics `sqleq` decides.
+Not ported: the **LIA\* rung**. The pairs it would add need integer reasoning across the
+conversions between dates and timestamps (`ts >= k AND ts < k + 1` is not `ts = k` for a
+timestamp). The IR keeps those types apart and names every conversion (`q_conv_date_timestamp` and
+the like), which is what such a rung would have to interpret; the commonest of these pairs, a
+truncated timestamp against the range of its day, the frontend already lowers to one term.
+**`LIMIT`/`OFFSET`** (`OrderbySupport`) is not ported either; a bare `ORDER BY` is erased, which is
+sound under the bag semantics `sqleq` decides.
 
 Where the port deliberately differs from the fork, each for soundness:
 
@@ -251,8 +253,7 @@ Where the port deliberately differs from the fork, each for soundness:
   per predicate would make `NOT (a = 1)` hold on a `NULL` `a`.
 * **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
   fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
-  types is not an identity either, since `CAST(ts AS DATE)` over a timestamp arrives as
-  `INTEGER`-to-`INTEGER`.
+  types is not treated as an identity either, since the frontend drops the ones that are.
 * **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
   is derive their nullness; any other function — parameter carriers included, since a parameter
   may be bound to `NULL` — gets an uninterpreted nullness of its own.

@@ -40,10 +40,10 @@
 
 use serde_json::Value;
 
-/// The closed 5-type vocabulary every column and literal is drawn from (`IrToRel.type()`/
-/// `literal()`, cross-checked against the emitting side's `types.rs::map_type`). `VARBINARY` is
-/// `IrToRel`'s own opaque catch-all -- DATE/TIME/TIMESTAMP aside (carried as INTEGER), it's also
-/// where BINARY/BLOB/BYTEA land.
+/// The closed type vocabulary every column and literal is drawn from (`IrToRel.type()`/
+/// `literal()`, cross-checked against the emitting side's `types.rs::map_type`): the five builtin
+/// types and the four temporal ones. `VARBINARY` is `IrToRel`'s own opaque catch-all, where
+/// BINARY/BLOB/BYTEA and every unmodelled type land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     Integer,
@@ -51,6 +51,14 @@ pub enum Type {
     Boolean,
     Varchar,
     Varbinary,
+    /// The temporal types, each an integer in its own unit (days, microseconds since midnight,
+    /// microseconds). The frontend never lets two of them meet except through a named conversion
+    /// (`q_conv_<from>_<to>`), and emits TIMESTAMPTZ as TIMESTAMP. INTERVAL is opaque: it may
+    /// count months, and it only ever reaches arithmetic through uninterpreted `q_arith_*` calls.
+    Date,
+    Time,
+    Timestamp,
+    Interval,
 }
 
 impl Type {
@@ -61,6 +69,10 @@ impl Type {
             "BOOLEAN" => Type::Boolean,
             "VARCHAR" => Type::Varchar,
             "VARBINARY" => Type::Varbinary,
+            "DATE" => Type::Date,
+            "TIME" => Type::Time,
+            "TIMESTAMP" => Type::Timestamp,
+            "INTERVAL" => Type::Interval,
             other => return Err(TranslateError::UnknownType(other.to_string())),
         })
     }
@@ -72,6 +84,10 @@ impl Type {
             Type::Boolean => "BOOLEAN",
             Type::Varchar => "VARCHAR",
             Type::Varbinary => "VARBINARY",
+            Type::Date => "DATE",
+            Type::Time => "TIME",
+            Type::Timestamp => "TIMESTAMP",
+            Type::Interval => "INTERVAL",
         }
     }
 }
@@ -109,10 +125,9 @@ pub enum TranslateError {
     /// `literal:<tyName>` -- an INTEGER/REAL literal whose value string isn't numeric.
     Literal(String),
     /// Not part of `IrToRel`'s taxonomy: it silently falls back to `SqlTypeName.ANY` for an
-    /// unrecognized type string instead of refusing. Our own frontend never emits anything outside
-    /// the closed 5-type set (confirmed independently on both the JVM-reader and Rust-writer sides),
-    /// so this is unreachable on real input; refusing loudly here rather than inventing an ANY
-    /// variant matches this codebase's general refuse-rather-than-silently-misinterpret posture.
+    /// unrecognized type string instead of refusing. Our own frontend emits only the types [`Type`]
+    /// names, so this is unreachable on its output; refusing loudly here rather than inventing an
+    /// ANY variant matches this codebase's general refuse-rather-than-silently-misinterpret posture.
     UnknownType(String),
     /// Not part of `IrToRel`'s taxonomy: Java NPEs on a field that's absent where it expects one
     /// (missing `source`, a non-array `collation`, etc.) since it never checks before dereferencing.
@@ -453,6 +468,12 @@ impl Expr {
         if value != "NULL" && matches!(ty, Type::Integer | Type::Real) && value.parse::<f64>().is_err() {
             return Err(TranslateError::Literal(ty_str.to_string()));
         }
+        // The frontend never emits a temporal literal (a literal cast arrives as a `q_conv_varchar_*`
+        // call over a VARCHAR literal). Read as a string, one would make `'2020-01-01'` and
+        // `'2020-1-1'` distinct constants although they are the same day, so a stray one is refused.
+        if value != "NULL" && matches!(ty, Type::Date | Type::Time | Type::Timestamp | Type::Interval) {
+            return Err(TranslateError::Literal(ty_str.to_string()));
+        }
         Ok(Expr::Literal { value, ty })
     }
 
@@ -662,6 +683,20 @@ mod tests {
     fn refuses_a_non_numeric_integer_literal() {
         let err = Expr::parse(&json!({ "operator": "abc", "type": "INTEGER" }), 0).unwrap_err();
         assert_eq!(err.to_string(), "literal:INTEGER");
+    }
+
+    #[test]
+    fn reads_the_temporal_types_and_refuses_what_the_frontend_never_emits() {
+        for t in ["DATE", "TIME", "TIMESTAMP", "INTERVAL"] {
+            assert_eq!(Type::parse(t).unwrap().name(), t);
+        }
+        // TIMESTAMPTZ leaves the frontend as TIMESTAMP, so the name itself is unknown here.
+        assert_eq!(Type::parse("TIMESTAMPTZ").unwrap_err().to_string(), "unknown-type:TIMESTAMPTZ");
+        // A temporal literal is never emitted; read as a string it would be spelling-sensitive.
+        let err = Expr::parse(&json!({ "operator": "2020-01-01", "type": "DATE" }), 0).unwrap_err();
+        assert_eq!(err.to_string(), "literal:DATE");
+        let null = Expr::parse(&json!({ "operator": "NULL", "type": "TIMESTAMP" }), 0).unwrap();
+        assert!(matches!(null, Expr::Literal { ty: Type::Timestamp, .. }));
     }
 
     #[test]

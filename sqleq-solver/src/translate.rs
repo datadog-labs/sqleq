@@ -145,6 +145,10 @@ fn column_value(v: UVar) -> Value {
 fn is_null_exactly_on_null_input(op: &str) -> bool {
     matches!(op, "UPPER" | "LOWER" | "ABS" | "SUBSTRING" | "DATE" | "DATE_TRUNC" | "TO_CHAR" | "TO_TIMESTAMP" | "CARDINALITY" | "NLEVEL")
         || op.strip_prefix("QCAST").is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+        // The frontend's temporal conversions and temporal operators: Postgres casts and the
+        // date/time operators are all strict.
+        || op.starts_with("q_conv_")
+        || op.starts_with("q_arith_")
 }
 
 /// The operators with a three-valued meaning of their own (see [`Translator::truth_call`]), at the
@@ -758,6 +762,11 @@ impl<'s> Translator<'s> {
                 Err(_) => UTerm::Const(UConst::Decimal(value.to_string())),
             },
             Type::Varchar | Type::Varbinary => UTerm::Const(UConst::Str(value.to_string())),
+            // Refused by `ir::Expr::literal` before translation; keyed by type anyway, so that a
+            // date and a timestamp spelled alike could never be one constant.
+            Type::Date | Type::Time | Type::Timestamp | Type::Interval => {
+                UTerm::Const(UConst::Str(format!("{}:{value}", ty.name())))
+            }
         };
         Value::not_null(term)
     }

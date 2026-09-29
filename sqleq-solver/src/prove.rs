@@ -166,12 +166,49 @@ mod tests {
 
     #[test]
     fn a_cast_between_equal_ir_types_is_not_the_identity() {
-        // The frontend's own lowering of `SELECT CAST(ts AS DATE)` vs `SELECT ts` over a TIMESTAMP
-        // column: DATE and TIMESTAMP both read INTEGER in the IR, but truncating a timestamp to a
-        // day changes it.
+        // The frontend drops a cast it knows is the identity before emitting, so one that survives
+        // is not. (It once lowered `CAST(ts AS DATE)` this way, with both types read as INTEGER.)
         let cast = project_one(json!({ "operator": "CAST", "type": "INTEGER", "operand": [col(1)] }));
         let v = verify(&json!({ "schemas": schema(), "queries": [cast, project_one(col(1))] }));
         assert_eq!(v, Verdict::NotProved(NotProvedReason::Exhausted));
+    }
+
+    /// `t(ts TIMESTAMP, d DATE)`, filtered on `cond`, projecting column 0 -- the shape the frontend
+    /// emits for the temporal pairs below, conversions included.
+    fn temporal(cond: serde_json::Value) -> serde_json::Value {
+        json!({ "project": { "source": { "filter": { "source": { "scan": 0 }, "condition": cond } },
+                             "target": [{ "column": 0, "type": "TIMESTAMP" }] } })
+    }
+
+    fn cmp(op: &str, l: serde_json::Value, r: serde_json::Value) -> serde_json::Value {
+        json!({ "operator": op, "type": "BOOLEAN", "operand": [l, r] })
+    }
+
+    fn conv(name: &str, ty: &str, x: serde_json::Value) -> serde_json::Value {
+        json!({ "operator": name, "type": ty, "operand": [x] })
+    }
+
+    #[test]
+    fn the_frontends_temporal_conversions_are_functions_not_identities() {
+        let schema = json!([{ "types": ["TIMESTAMP", "DATE"], "key": [], "nullable": [true, true] }]);
+        let ts = || json!({ "column": 0, "type": "TIMESTAMP" });
+        let d = || json!({ "column": 1, "type": "DATE" });
+        let d_plus_1 = json!({ "operator": "+", "type": "DATE", "operand": [d(), { "operator": "1", "operand": [], "type": "INTEGER" }] });
+        // `ts < d + 1` vs `ts <= d`: different for any mid-day `ts`.
+        let a = temporal(cmp("<", ts(), conv("q_conv_date_timestamp", "TIMESTAMP", d_plus_1)));
+        let b = temporal(cmp("<=", ts(), conv("q_conv_date_timestamp", "TIMESTAMP", d())));
+        let v = verify(&json!({ "schemas": schema, "queries": [a, b] }));
+        assert_eq!(v, Verdict::NotProved(NotProvedReason::Exhausted));
+        // `CAST(ts AS DATE) = d` vs `ts = d`: the truncation is not the identity.
+        let a = temporal(cmp("=", conv("q_conv_timestamp_date", "DATE", ts()), d()));
+        let b = temporal(cmp("=", ts(), conv("q_conv_date_timestamp", "TIMESTAMP", d())));
+        let v = verify(&json!({ "schemas": schema, "queries": [a, b] }));
+        assert_eq!(v, Verdict::NotProved(NotProvedReason::Exhausted));
+        // The same conversion on both sides, reordered, still matches.
+        let a = temporal(cmp("=", conv("q_conv_timestamp_date", "DATE", ts()), d()));
+        let b = temporal(cmp("=", d(), conv("q_conv_timestamp_date", "DATE", ts())));
+        let v = verify(&json!({ "schemas": schema, "queries": [a, b] }));
+        assert_eq!(v, Verdict::Eq { literal: false });
     }
 
     #[test]

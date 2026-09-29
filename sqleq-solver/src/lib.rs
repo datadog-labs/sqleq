@@ -18,9 +18,11 @@
 //! (`ic`); `alpha` compares them up to renaming of bound variables (SQLSolver's rung 2);
 //! `setsolver` hands set-shaped leftovers to Z3 (rung 3); `prove` is the ladder over all of it.
 //! `eval` evaluates a term on a small concrete database, which is how the tests check that a
-//! rewrite preserves meaning. SQLSolver's LIA* rung is not ported: the pairs it would add need
-//! integer reasoning over columns the IR types as INTEGER, which also stands for DATE and
-//! TIMESTAMP, and that reasoning is unsound for timestamps.
+//! rewrite preserves meaning. SQLSolver's LIA* rung is not ported. The pairs it would add need
+//! integer reasoning across the conversions between dates and timestamps; the IR keeps those types
+//! apart and names every conversion (`q_conv_date_timestamp` and the like), which is what such a
+//! rung would have to interpret, and the commonest of those pairs the frontend already lowers to
+//! one term.
 
 pub mod alpha;
 pub mod eval;
