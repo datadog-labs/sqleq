@@ -132,11 +132,13 @@ axes make. See [SOUNDNESS.md](SOUNDNESS.md).
 We render it from the catalog `pgddl::parse_provided_schema` already builds — nothing new parses
 Postgres — and `sqlsolver::emit_mysql` writes backticked identifiers, one `CREATE TABLE` per table.
 
-The type vocabulary is closed and load-bearing. `pgddl::map_pg_type` yields five types, mapped as:
+The type vocabulary is closed and load-bearing. `pgddl::map_pg_type` yields five types plus the
+temporal ones, mapped as:
 
 | ours | emitted |
 |---|---|
 | `INTEGER` | `int` |
+| `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ` | `int` |
 | `REAL` | `double` |
 | `VARCHAR` | `varchar(255)` |
 | `BOOLEAN` | `boolean` |
@@ -145,6 +147,12 @@ The type vocabulary is closed and load-bearing. `pgddl::map_pg_type` yields five
 Validated against the jar: `json`, `uuid`, `inet`, `money` and `xml` are all rejected by their
 grammar, and **one unmappable type name kills the whole `CREATE TABLE` and therefore the whole
 schema**. That is why the fallback is a type that parses rather than the Postgres spelling.
+
+The temporal types are `int` because each is exact as an integer in its own unit, and the IR never
+lets two of them meet except through a `q_conv_*` call, which `IrToRel` turns into an uninterpreted
+function like any other unknown operator (see [SOUNDNESS.md](SOUNDNESS.md)). SQLSolver erases every
+`CAST`, so a conversion written as one would vanish. INTERVAL, which may count months, is not linear
+in one unit and falls through to `varbinary(255)`.
 
 ### `UNIQUE` means something different here
 

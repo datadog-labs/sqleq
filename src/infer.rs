@@ -63,13 +63,23 @@ use sqlparser::ast::{
 use crate::catalog::{obj_name, Catalog, Table};
 use crate::error::{schema, unsupported, FrontendError, Result};
 
-/// The types inference can conclude. A deliberately coarse lattice: four concrete points and a top.
+/// The types inference can conclude. A deliberately coarse lattice: the concrete points and a top.
+///
+/// The temporal points are kept apart from `Int` and from each other: a date counts days and a
+/// timestamp counts microseconds, and reading both as one integer is unsound (see the module docs
+/// of `types.rs`). They are peers in [`Uf::merge`], so a parameter compared with a DATE on one side
+/// and a TIMESTAMP on the other is a type conflict, not a guess.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     Int,
     Real,
     Str,
     Bool,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
     /// No confident type. Rendered as `VARBINARY`, which the prover treats as an uninterpreted
     /// `Custom` sort supporting `=` only: equality, `IN` and projection work, while any use that
     /// needs an order or arithmetic fails loudly instead of silently assuming one.
@@ -84,6 +94,11 @@ impl Ty {
             Ty::Real => "DOUBLE",
             Ty::Str => "VARCHAR",
             Ty::Bool => "BOOLEAN",
+            Ty::Date => "DATE",
+            Ty::Time => "TIME",
+            Ty::Timestamp => "TIMESTAMP",
+            Ty::TimestampTz => "TIMESTAMPTZ",
+            Ty::Interval => "INTERVAL",
             Ty::Opaque => "VARBINARY",
         }
     }
@@ -101,6 +116,11 @@ impl Ty {
             "REAL" | "DOUBLE" => Ty::Real,
             "VARCHAR" => Ty::Str,
             "BOOLEAN" => Ty::Bool,
+            "DATE" => Ty::Date,
+            "TIME" => Ty::Time,
+            "TIMESTAMP" => Ty::Timestamp,
+            "TIMESTAMPTZ" => Ty::TimestampTz,
+            "INTERVAL" => Ty::Interval,
             _ => Ty::Opaque,
         }
     }
@@ -304,6 +324,17 @@ impl Uf {
         if ra == rb {
             return Ok(());
         }
+        // Two classes already typed as different points of the temporal promotion chain are not a
+        // conflict: `d < ts` is how Postgres compares a DATE with a TIMESTAMP, by promoting the date.
+        // They stay separate classes, each keeping its type, and the lowering puts the conversion
+        // between them (`types::coerce_cmp`). Merging would either refuse the pair or relabel one
+        // column with the other's unit.
+        let chain = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp | Ty::TimestampTz);
+        if let (Some((ta, ..)), Some((tb, ..))) = (self.ty.get(&ra), self.ty.get(&rb)) {
+            if ta != tb && chain(*ta) && chain(*tb) {
+                return Ok(());
+            }
+        }
         let merged = Self::merge(self.ty.get(&ra).copied(), self.ty.get(&rb).copied())
             .map_err(|c| c.err(&format!("unifying {} with {}", a.label(), b.label())))?;
         self.parent.insert(rb.clone(), ra.clone());
@@ -335,9 +366,6 @@ const STR_NAMES: &[&str] = &[
     "string",
 ];
 const BOOL_NAMES: &[&str] = &["bool", "boolean"];
-/// All map to INTEGER: the prover has no temporal sort and aliases these to it.
-const TIME_NAMES: &[&str] =
-    &["date", "time", "timestamp", "timestamptz", "datetime", "interval", "smalldatetime"];
 
 /// The normalized spelling of a type name: trimmed, unquoted, lower-cased.
 ///
@@ -385,6 +413,16 @@ pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
     {
         return (None, false);
     }
+    // Temporal names first: they are the ones whose meaning lives past the first word
+    // (`timestamp with time zone`), and `interval` would otherwise read as nothing. The classifier is
+    // `types::temporal_class`, shared with the declared-DDL reader so the two agree. `time with time
+    // zone` is temporal but unmodelled, hence unmappable. An interval with fields (`interval day`)
+    // truncates, so like a precision it counts as a qualifier.
+    if let Some(class) = crate::types::temporal_class(&t.to_uppercase()) {
+        let ty = class.map(Ty::from_prover);
+        let qualified = t.contains('(') || (ty == Some(Ty::Interval) && t != "interval");
+        return (ty, qualified);
+    }
     let qualified = t.contains('(');
     let base: &str = t.split(['(', '[', ' ']).next().unwrap_or(&t);
     let ty = if INT_NAMES.contains(&base) {
@@ -395,8 +433,6 @@ pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
         Some(Ty::Str)
     } else if BOOL_NAMES.contains(&base) {
         Some(Ty::Bool)
-    } else if TIME_NAMES.contains(&base) {
-        Some(Ty::Int)
     } else {
         None
     };
@@ -431,9 +467,12 @@ pub fn name_type(col: &str) -> Option<Ty> {
     if c == "id" || INT_SUF.iter().any(|s| c.ends_with(s)) {
         return Some(Ty::Int);
     }
+    // No guess for temporal-sounding names (`created_at`, `_date`). Which temporal type a column
+    // has decides which conversions its comparisons get, and a DATE guessed for a TIMESTAMP column
+    // would put a conversion where there is none, or leave one out. Other evidence, or none, decides.
     const TS_SUF: &[&str] = &["_at", "_date", "_time", "_timestamp", "_on"];
     if c == "date" || TS_SUF.iter().any(|s| c.ends_with(s)) {
-        return Some(Ty::Int); // temporal -> INTEGER, as in map_type_name
+        return None;
     }
     const STR_SUB: &[&str] = &[
         "name", "json", "text", "code", "prefix", "email", "title", "url", "slug", "uuid", "status",
@@ -1532,7 +1571,18 @@ mod tests {
         // Mapped, with the length qualifier flagged so an identity cast is not dropped.
         assert_eq!(map_type_name("varchar(8)"), (Some(Ty::Str), true));
         assert_eq!(map_type_name("varchar"), (Some(Ty::Str), false));
-        assert_eq!(map_type_name("timestamptz").0, Some(Ty::Int));
+        // The temporal names: each its own type, whatever the spelling, and an interval with fields
+        // counted as qualified (it truncates). `time with time zone` is unmodelled, so unmappable.
+        assert_eq!(map_type_name("timestamptz"), (Some(Ty::TimestampTz), false));
+        assert_eq!(map_type_name("timestamp with time zone"), (Some(Ty::TimestampTz), false));
+        assert_eq!(map_type_name("timestamp without time zone"), (Some(Ty::Timestamp), false));
+        assert_eq!(map_type_name("timestamp(3)"), (Some(Ty::Timestamp), true));
+        assert_eq!(map_type_name("date"), (Some(Ty::Date), false));
+        assert_eq!(map_type_name("time"), (Some(Ty::Time), false));
+        assert_eq!(map_type_name("interval"), (Some(Ty::Interval), false));
+        assert_eq!(map_type_name("interval day to second"), (Some(Ty::Interval), true));
+        assert_eq!(map_type_name("time with time zone").0, None);
+        assert_eq!(map_type_name("timetz").0, None);
         assert_eq!(map_type_name("numeric(10,2)"), (Some(Ty::Real), true));
         // A type a dialect does not recognise comes back as a user-defined one and prints the way it
         // was written, so the quoted spelling has to reach the same entry the bare one does. Treating
@@ -1548,7 +1598,9 @@ mod tests {
         assert_eq!(name_type("deleted"), Some(Ty::Bool));
         assert_eq!(name_type("user_id"), Some(Ty::Int));
         assert_eq!(name_type("id"), Some(Ty::Int));
-        assert_eq!(name_type("created_at"), Some(Ty::Int));
+        // No guess for a temporal-sounding name: which temporal type it is decides its conversions.
+        assert_eq!(name_type("created_at"), None);
+        assert_eq!(name_type("start_date"), None);
         assert_eq!(name_type("first_name"), Some(Ty::Str));
         assert_eq!(name_type("qty"), None);
     }

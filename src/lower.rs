@@ -637,7 +637,16 @@ fn lower_setexpr_ctx(
         SetExpr::Query(q) => lower_query_ctx(cat, fns, q, outer).map(|(v, c)| (v, c, None)),
         SetExpr::SetOperation { op, set_quantifier, left, right } => {
             let (lv, lcols, _) = lower_setexpr_ctx(cat, fns, left, outer, OrderCtx::Unknown)?;
-            let (rv, _rcols, _) = lower_setexpr_ctx(cat, fns, right, outer, OrderCtx::Unknown)?;
+            let (rv, rcols, _) = lower_setexpr_ctx(cat, fns, right, outer, OrderCtx::Unknown)?;
+            // Postgres resolves each output column to one type across both branches, promoting a
+            // DATE branch against a TIMESTAMP one. The prover takes the columns as they stand, so a
+            // branch pair that differs across a temporal boundary would put two units in one column;
+            // with no conversion to insert inside a branch from here, it is refused.
+            if let Some(((_, a), (_, b))) =
+                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b))
+            {
+                return Err(unsupported(format!("set operation over columns of type {a} and {b}")));
+            }
             let all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
             let rel = match op {
                 SetOperator::Union => {
@@ -672,6 +681,15 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         .map(|row| row.iter().map(|e| lower_expr(cat, &empty, fns, e)).collect::<Result<Vec<_>>>())
         .collect::<Result<Vec<_>>>()?;
     let schema_tys: Vec<String> = content[0].iter().map(ty_of).collect();
+    // Same reason as the set operations: the column type is the first row's, and a later row of
+    // another temporal type would hold a value in another unit.
+    for row in &content[1..] {
+        if let Some((a, b)) =
+            schema_tys.iter().zip(row.iter().map(ty_of)).find(|(a, b)| temporal_mismatch(a, b))
+        {
+            return Err(unsupported(format!("VALUES column of type {a} holding a {b}")));
+        }
+    }
     let out_cols: OutCols =
         schema_tys.iter().enumerate().map(|(i, t)| (format!("$col{i}"), t.clone())).collect();
     Ok((json!({ "values": { "schema": schema_tys, "content": content } }), out_cols))
@@ -1719,7 +1737,7 @@ impl AggCtx<'_> {
             Expr::IsNull(i) => Ok(json!({ "operator": "IS NULL", "operand": [self.lower_post(i)?], "type": "BOOLEAN" })),
             Expr::IsNotNull(i) => Ok(json!({ "operator": "IS NOT NULL", "operand": [self.lower_post(i)?], "type": "BOOLEAN" })),
             Expr::Cast { expr, data_type, .. } => {
-                Ok(json!({ "operator": "CAST", "operand": [self.lower_post(expr)?], "type": map_type(data_type) }))
+                Ok(lower_cast(self.lower_post(expr)?, data_type))
             }
             Expr::Case { operand, conditions, else_result, .. } => {
                 if operand.is_some() {
@@ -2321,7 +2339,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             })
         }
         Expr::Cast { expr, data_type, .. } => {
-            Ok(json!({ "operator": "CAST", "operand": [lower_expr(cat, scope, fns, expr)?], "type": map_type(data_type) }))
+            Ok(lower_cast(lower_expr(cat, scope, fns, expr)?, data_type))
         }
         Expr::InSubquery { expr, subquery, negated } => {
             lower_in_subquery(cat, scope, fns, expr, subquery, *negated)
@@ -2422,6 +2440,13 @@ fn lower_in_subquery(
             sub_cols.len()
         )));
     }
+    // The prover compares each left operand with the subquery's column as it stands, with no
+    // coercion of its own, so a DATE against a TIMESTAMP column would compare two units.
+    let lhs: Vec<Value> = lhs
+        .into_iter()
+        .zip(&sub_cols)
+        .map(|(x, (_, t))| coerce_in_operand(x, t).map_err(|m| unsupported(format!("IN subquery: {m}"))))
+        .collect::<Result<_>>()?;
     let v = json!({ "operator": "IN", "operand": lhs, "query": sub, "type": "BOOLEAN" });
     Ok(if negated { not_bool(v) } else { v })
 }

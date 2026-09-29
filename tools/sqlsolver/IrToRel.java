@@ -513,6 +513,12 @@ final class IrToRel {
     final SqlTypeName n;
     switch (t) {
       case "INTEGER": n = SqlTypeName.INTEGER; break;
+      // The temporal types the frontend keeps apart: each is exact as an integer in its own unit,
+      // and it never lets two of them meet except through a `q_conv_*` call, which `mint` turns into
+      // an uninterpreted function like any other unknown operator. INTERVAL is not linear in one
+      // unit (months), so it stays opaque, like VARBINARY.
+      case "DATE": case "TIME": case "TIMESTAMP": n = SqlTypeName.INTEGER; break;
+      case "INTERVAL": n = SqlTypeName.VARCHAR; break;
       case "BOOLEAN": n = SqlTypeName.BOOLEAN; break;
       case "REAL": n = SqlTypeName.REAL; break;
       case "VARCHAR": n = SqlTypeName.VARCHAR; break;

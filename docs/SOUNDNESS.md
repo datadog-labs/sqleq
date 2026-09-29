@@ -32,6 +32,38 @@ declared by `CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as im
 Between them they account for nearly all the remaining functional-dependence refusals — completeness
 work, in the safe direction.
 
+### Dates and timestamps are not one integer
+
+A DATE counts days, a TIMESTAMP counts microseconds, and an INTERVAL may count months. The frontend
+used to lower all of them as `INTEGER`, and both provers then accepted pairs that are not equivalent:
+`ts < d + 1` against `ts <= d` (over integers `x < y + 1` is `x <= y`, but `d + 1` is the next *day*),
+and `CAST(ts AS DATE) = d` against `ts = d` (the cast truncates, and it was dropped as an identity).
+One row with a mid-day `ts` separates each pair. Nothing in the pipeline disagreed about these; they
+were found by probing the lowering directly, and the disprover confirms each witness.
+
+The rule now is that integer semantics hold **within** one temporal type and never **across** two.
+Comparing two values of one type, `date ± integer` and `date - date` stay native, which is exact:
+every value of one type is an integer in that type's own unit. Every crossing — the promotion in
+`d < ts`, an explicit cast, a literal cast such as `'2024-01-01'::date` — is an uninterpreted function
+named after both types (`q_conv_date_timestamp`), never a `CAST`, because both provers erase casts
+they consider trivial. Arithmetic that is not linear in one unit, which is anything with an
+INTERVAL, is an uninterpreted function too. A function nobody interprets can only cost a proof.
+
+One shape is restated rather than left opaque, because it is common and exact. `x::date op e`, with
+`x` a TIMESTAMP and `e` a DATE, becomes a comparison of `x` against the start of day `e` or `e + 1`:
+`=` becomes `x >= e::timestamp AND x < (e + 1)::timestamp`, and each of the other five comparison
+operators has its own one-sided form. That is an identity in Postgres, and it lets the truncation
+and the hand-written range lower to the same term. It is **not** applied to TIMESTAMPTZ: there the
+identity depends on the session time zone, and some zones break it — in `America/Sitka` the local date
+1867-10-19 happens twice, and Postgres itself disagrees with the restated form there.
+
+An `UPDATE` of a temporal column converts the assigned value to the column's type, as Postgres's
+assignment cast does, so `SET d = ts` and `SET d = ts::date` store the same thing. That is done where
+the value's type is evident from its shape (a column, a literal, a parameter, a cast); elsewhere the
+value keeps its own type, which costs exactness and not soundness. Where a relation
+would put two temporal types in one column with no comparison to hang a conversion on — a set
+operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
+
 ## The one assumption: `$N` on one side is `$N` on the other
 
 Everything above is the frontend declining to lower what it cannot lower faithfully. This section is

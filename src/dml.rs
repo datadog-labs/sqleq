@@ -135,7 +135,7 @@
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    CaseWhen, Delete, Expr, FromTable, Ident, Insert, ObjectName, Query, SelectItem,
+    CaseWhen, CastKind, Delete, Expr, FromTable, Ident, Insert, ObjectName, Query, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     Update, WildcardAdditionalOptions,
 };
@@ -545,6 +545,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query)> 
     // the reduction currently runs before that append, so moving either cannot break this.
     let t = &cat.tables[idx];
     let cols: Vec<String> = t.cols[..t.n_declared].iter().map(|(c, _)| c.clone()).collect();
+    let types: Vec<String> = t.cols[..t.n_declared].iter().map(|(_, ty)| ty.clone()).collect();
     // An assignment to a column the catalog does not have would simply not appear in the
     // projection — the update would become invisible. Refuse rather than drop it.
     for (col, _) in sets_a.iter().chain(&sets_b) {
@@ -553,7 +554,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query)> 
         }
     }
 
-    let (pa, pb) = (project(&cols, &sets_a, pred_a), project(&cols, &sets_b, pred_b));
+    let (pa, pb) = (project(&cols, &types, &sets_a, pred_a), project(&cols, &types, &sets_b, pred_b));
     // Without a `RETURNING` clause the final table is the whole observable and one goal says it all.
     if !returning {
         return Ok((select(pa, ta.clone(), None), select(pb, tb.clone(), None)));
@@ -578,24 +579,46 @@ fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
 ///
 /// Returned rather than wrapped in a query, because both blocks of [`two_goals`] use the *same*
 /// projection — which is what makes their slot types agree without a cast anywhere.
-fn project(cols: &[String], sets: &[(String, &Expr)], pred: Option<&Expr>) -> Vec<SelectItem> {
+///
+/// An assignment to a temporal column is wrapped in a cast to the column's type: Postgres applies
+/// that cast on assignment, so `SET d = ts` stores `ts::date`, and `SET ts = $1::timestamptz` stores
+/// `($1::timestamptz)::timestamp`. The cast is written, not implied, because the lowering has no
+/// assignment context of its own; a value already of the column's type makes it the identity, which
+/// the lowering drops.
+///
+/// Only where the value's type is evident from its shape ([`type_is_evident`]). Elsewhere the cast
+/// rewrite of the inferring modes cannot see through the value, and it wraps a cast it cannot type
+/// in a symbol keyed on the value's *text*, so two spellings of one `CASE` would stop matching. The
+/// assignment is then left as it was, which costs exactness but not soundness: the value keeps its
+/// own type, and the conversions it would have needed stay uninterpreted either way.
+fn project(cols: &[String], types: &[String], sets: &[(String, &Expr)], pred: Option<&Expr>) -> Vec<SelectItem> {
     cols
         .iter()
-        .map(|c| {
+        .zip(types)
+        .map(|(c, ty)| {
             let old = Expr::Identifier(Ident::new(c.clone()));
+            let assigned = |value: &Expr| match crate::types::temporal_data_type(ty) {
+                Some(data_type) if type_is_evident(value) => Expr::Cast {
+                    kind: CastKind::Cast,
+                    expr: Box::new(value.clone()),
+                    data_type,
+                    format: None,
+                },
+                _ => value.clone(),
+            };
             let expr = match sets.iter().find(|(set, _)| set == c) {
                 None => old,
                 // No `WHERE` means every row is updated, so the assigned expression is the value
                 // unconditionally and the `CASE` would have an unreachable `ELSE`.
                 Some((_, value)) => match pred {
-                    None => (*value).clone(),
+                    None => assigned(value),
                     Some(p) => Expr::Case {
                         case_token: AttachedToken::empty(),
                         end_token: AttachedToken::empty(),
                         operand: None,
                         conditions: vec![CaseWhen {
                             condition: p.clone(),
-                            result: (*value).clone(),
+                            result: assigned(value),
                         }],
                         else_result: Some(Box::new(old)),
                     },
@@ -786,6 +809,16 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query)> 
         )));
     }
     Ok((sa.clone(), sb.clone()))
+}
+
+/// Whether the cast rewrite can type `e` from its shape alone: a column, a literal or parameter, or a
+/// cast (which states its own result type), under any parentheses. See [`project`].
+fn type_is_evident(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => type_is_evident(inner),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) | Expr::Cast { .. } => true,
+        _ => false,
+    }
 }
 
 /// A `Query` for `SELECT <projection> FROM <from> [WHERE <selection>]`.

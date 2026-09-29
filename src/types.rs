@@ -7,27 +7,142 @@
 //!
 //! The prover's `DataType` is one of INTEGER / REAL / BOOLEAN / VARCHAR or a `Custom(name)` (e.g.
 //! VARBINARY, geometry types). We render types as the uppercase strings the prover deserializes.
+//!
+//! # Temporal types
+//!
+//! DATE, TIME, TIMESTAMP, TIMESTAMPTZ and INTERVAL are kept apart. A DATE is a count of days, a
+//! TIMESTAMP a count of microseconds, and reading both as one integer is what let `ts < d + 1` prove
+//! equivalent to `ts <= d`: over integers `x < y + 1` is `x <= y`, but `d + 1` is the next *day*.
+//!
+//! The rule that keeps this sound is that integer semantics hold *within* one temporal type and
+//! never *across* two. Comparisons of two values of the same type, `date ± integer` and `date - date`
+//! stay native, which is exact: every value of one type is an integer in that type's own unit. Every
+//! crossing between two types -- an implicit promotion, an explicit cast, a literal cast -- becomes a
+//! [`convert`] call, an uninterpreted function named after both types. A prover that knows nothing
+//! about it can only fail to prove through it; one that knows the conversion can interpret the name.
+//! Arithmetic that is not linear in one unit (anything with an INTERVAL, which may count months) is
+//! an uninterpreted function too. See [`make_arith`].
 
 use serde_json::{json, Value};
 use sqlparser::ast::DataType;
 
+/// The temporal types this module keeps apart, as the type strings the rest of the frontend uses.
+pub const TEMPORAL: &[&str] = &["DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL"];
+
+/// Whether `t` is one of the [`TEMPORAL`] types.
+pub fn is_temporal(t: &str) -> bool {
+    TEMPORAL.contains(&t)
+}
+
+/// The spelling a type leaves the frontend with. Only one differs: TIMESTAMPTZ is emitted as
+/// TIMESTAMP.
+///
+/// QED reads DATE, TIME and TIMESTAMP as its integer sort, which keeps their order and their
+/// arithmetic, and any other name as an uninterpreted sort with equality only. A TIMESTAMPTZ is an
+/// instant in microseconds, so the integer sort is exact for it too, and emitting it under a name QED
+/// does not know would cost every range predicate over one. The two types still never meet in the
+/// IR: every crossing between them is a conversion named `q_conv_timestamp_timestamptz` or the
+/// reverse, so the time zone that separates them lives in that name, not in the type annotation.
+pub fn emitted_type_name(t: &str) -> &str {
+    if t == "TIMESTAMPTZ" {
+        "TIMESTAMP"
+    } else {
+        t
+    }
+}
+
+/// Apply [`emitted_type_name`] to every type position of an emitted input: each expression's
+/// `type`, each schema's `types`, each `VALUES` block's `schema` and the type in each `sort`
+/// collation entry (`[position, type, direction]`). Literals are left alone.
+pub fn rename_emitted_types(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                match (k.as_str(), &mut *x) {
+                    ("type", Value::String(s)) => *s = emitted_type_name(s).to_string(),
+                    ("collation", Value::Array(entries)) => {
+                        for e in entries.iter_mut() {
+                            if let Some(Value::String(s)) = e.get_mut(1) {
+                                *s = emitted_type_name(s).to_string();
+                            }
+                        }
+                    }
+                    ("types" | "schema", Value::Array(a)) if a.iter().all(Value::is_string) => {
+                        for t in a.iter_mut() {
+                            if let Value::String(s) = t {
+                                *s = emitted_type_name(s).to_string();
+                            }
+                        }
+                    }
+                    _ => rename_emitted_types(x),
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(rename_emitted_types),
+        _ => {}
+    }
+}
+
+/// Classify an upper-cased type spelling as one of the [`TEMPORAL`] types.
+///
+/// `Some(None)` is a temporal type we do not model: `TIME WITH TIME ZONE` carries an offset that
+/// makes it neither a TIME nor a TIMESTAMP, and it stays opaque (VARBINARY). `None` means the name
+/// is not temporal at all. A precision qualifier (`TIMESTAMP(3)`) does not change the class; the
+/// callers that care about it, the casts, read it off the spelling themselves.
+pub fn temporal_class(upper: &str) -> Option<Option<&'static str>> {
+    let s = upper.trim();
+    let tz = s.contains("WITH TIME ZONE");
+    if s == "DATE" {
+        Some(Some("DATE"))
+    } else if s.starts_with("TIMESTAMPTZ") || (s.starts_with("TIMESTAMP") && tz) {
+        Some(Some("TIMESTAMPTZ"))
+    } else if s.starts_with("TIMESTAMP") || s == "DATETIME" || s.starts_with("DATETIME(")
+        || s == "SMALLDATETIME"
+    {
+        Some(Some("TIMESTAMP"))
+    } else if s.starts_with("TIMETZ") || (s.starts_with("TIME") && tz) {
+        Some(None)
+    } else if s == "TIME" || s.starts_with("TIME(") || s.starts_with("TIME WITHOUT") {
+        Some(Some("TIME"))
+    } else if s.starts_with("INTERVAL") {
+        Some(Some("INTERVAL"))
+    } else {
+        None
+    }
+}
+
+/// The sqlparser `DataType` a temporal type string names, for the casts the frontend inserts itself
+/// (the assignment casts of an `UPDATE`). `None` for anything else.
+pub fn temporal_data_type(t: &str) -> Option<DataType> {
+    use sqlparser::ast::TimezoneInfo;
+    Some(match t {
+        "DATE" => DataType::Date,
+        "TIME" => DataType::Time(None, TimezoneInfo::None),
+        "TIMESTAMP" => DataType::Timestamp(None, TimezoneInfo::None),
+        "TIMESTAMPTZ" => DataType::Timestamp(None, TimezoneInfo::WithTimeZone),
+        "INTERVAL" => DataType::Interval { fields: None, precision: None },
+        _ => return None,
+    })
+}
+
 /// Map a sqlparser `DataType` to the prover's type string. Classifies on the rendered type name so
-/// it stays robust across sqlparser versions. DATE/TIME/TIMESTAMP map to INTEGER (the prover aliases
-/// them); BINARY/BLOB/BYTEA become the opaque `VARBINARY`; unknown types pass through uppercased.
+/// it stays robust across sqlparser versions. Temporal types keep their own names (see the module
+/// docs); BINARY/BLOB/BYTEA become the opaque `VARBINARY`; unknown types pass through uppercased.
 // The arms below are kept apart on purpose: each names a distinct source class, and two of
-// them happening to land on INTEGER is a fact about the prover's type set, not a redundancy.
+// them happening to land on the same type is a fact about the prover's type set, not a redundancy.
 #[allow(clippy::if_same_then_else)]
 pub fn map_type(dt: &DataType) -> String {
     let s = format!("{dt}").to_uppercase();
     let base = s.split('(').next().unwrap_or(&s).trim();
-    if base.contains("CHAR") || base.contains("TEXT") || base.contains("STRING") || base.contains("CLOB") {
+    if let Some(t) = temporal_class(&s) {
+        // Before the `INT` arm below, which INTERVAL would otherwise reach through its spelling.
+        t.unwrap_or("VARBINARY").into()
+    } else if base.contains("CHAR") || base.contains("TEXT") || base.contains("STRING") || base.contains("CLOB") {
         "VARCHAR".into()
     } else if base.contains("BINARY") || base == "BLOB" || base == "BYTEA" {
         "VARBINARY".into()
     } else if base.starts_with("BOOL") {
         "BOOLEAN".into()
-    } else if base == "DATE" || base.starts_with("TIME") || base == "DATETIME" {
-        "INTEGER".into()
     } else if base.contains("INT") {
         "INTEGER".into()
     } else if base.contains("REAL") || base.contains("FLOAT") || base.contains("DOUBLE")
@@ -41,7 +156,11 @@ pub fn map_type(dt: &DataType) -> String {
 
 /// Normalise a type name written in the `declare ... function ... returns T` DSL.
 pub fn normalize_type_name(t: &str) -> String {
-    match t.to_uppercase().as_str() {
+    let up = t.to_uppercase();
+    if let Some(class) = temporal_class(&up) {
+        return class.unwrap_or("VARBINARY").to_string();
+    }
+    match up.as_str() {
         "INT" | "INTEGER" | "SMALLINT" | "BIGINT" | "TINYINT" => "INTEGER",
         "VARCHAR" | "CHAR" | "TEXT" | "STRING" => "VARCHAR",
         "BOOL" | "BOOLEAN" => "BOOLEAN",
@@ -72,6 +191,8 @@ pub fn is_builtin(t: &str) -> bool {
 pub fn common_type(a: &str, b: &str) -> String {
     if a == b {
         a.into()
+    } else if is_temporal(a) || is_temporal(b) {
+        temporal_common(a, b)
     } else if !is_builtin(a) {
         a.into()
     } else if !is_builtin(b) {
@@ -85,16 +206,148 @@ pub fn common_type(a: &str, b: &str) -> String {
     }
 }
 
+/// Position on Postgres's implicit-promotion chain among temporal types: DATE -> TIMESTAMP ->
+/// TIMESTAMPTZ. TIME and INTERVAL are not on it; Postgres has no implicit cast between them and the
+/// other three.
+fn temporal_rank(t: &str) -> Option<u8> {
+    match t {
+        "DATE" => Some(0),
+        "TIMESTAMP" => Some(1),
+        "TIMESTAMPTZ" => Some(2),
+        _ => None,
+    }
+}
+
+/// [`common_type`] when at least one side is temporal.
+///
+/// Two types on the promotion chain meet at the higher one, as in Postgres (`d < ts` compares
+/// `d::timestamp` with `ts`). A temporal type against a builtin wins: the builtin side is a string
+/// literal, which Postgres reads as a value of the temporal type, or a NULL, which [`cast_to`]
+/// relabels, or something Postgres would reject. Anything else -- TIME against a DATE, an INTERVAL
+/// against a TIMESTAMP, a temporal type against an opaque one -- has no implicit cast in Postgres, and
+/// the two sides meet at the opaque type, each through its own conversion. The result is never wrong
+/// in the direction that matters: every crossing it asks for becomes a [`convert`] call.
+fn temporal_common(a: &str, b: &str) -> String {
+    match (temporal_rank(a), temporal_rank(b)) {
+        (Some(x), Some(y)) => if x >= y { a } else { b }.into(),
+        _ => {
+            let (t, o) = if is_temporal(a) { (a, b) } else { (b, a) };
+            if is_temporal(o) {
+                "VARBINARY".into()
+            } else if is_builtin(o) {
+                t.into()
+            } else {
+                o.into()
+            }
+        }
+    }
+}
+
+/// The name of the conversion from type `from` to type `to`: `q_conv_<from>_<to>`, lower-cased, with
+/// the target's qualifier appended when it has one. `timestamp(0)` rounds away the fractional
+/// seconds, so it is a different function from `timestamp`, and its name has to say so.
+pub fn conv_name(from: &str, to: &str, qualifier: Option<&str>) -> String {
+    let base = format!("q_conv_{}_{}", from.to_lowercase(), to.to_lowercase());
+    match qualifier {
+        Some(q) => format!("{base}_{q}"),
+        None => base,
+    }
+}
+
+/// Convert `v` to the type `to` across a temporal boundary: an application of the uninterpreted
+/// function [`conv_name`]`(ty_of(v), to)`, never a `CAST`.
+///
+/// Not a `CAST` because both provers downstream erase one. QED drops a cast between two types it
+/// reads as the same sort, and it reads DATE, TIME and TIMESTAMP all as its integer sort; the JVM
+/// SQLSolver drops every cast. An unknown function name survives both, and it is keyed on the source
+/// type as well as the target: a date's and a timestamp's conversion to text are different functions
+/// even where the two values are the same integer. A NULL is relabelled rather than converted, for
+/// the reason [`cast_to`] gives.
+pub fn convert(v: Value, to: &str) -> Value {
+    convert_qualified(v, to, None)
+}
+
+fn convert_qualified(mut v: Value, to: &str, qualifier: Option<&str>) -> Value {
+    if is_null_lit(&v) {
+        v["type"] = json!(to);
+        return v;
+    }
+    json!({ "operator": conv_name(&ty_of(&v), to, qualifier), "operand": [v], "type": to })
+}
+
+/// The qualifier of an explicit temporal cast target, as a name-safe suffix: the precision of
+/// `TIMESTAMP(3)` (`p3`), or the fields of `INTERVAL DAY TO SECOND`. `None` for an unqualified target.
+fn cast_qualifier(spelled: &str) -> Option<String> {
+    if let (Some(i), Some(j)) = (spelled.find('('), spelled.find(')')) {
+        let digits: String = spelled[i + 1..j].chars().filter(|c| c.is_ascii_digit()).collect();
+        return Some(format!("p{digits}"));
+    }
+    let rest = spelled.strip_prefix("INTERVAL")?.trim();
+    (!rest.is_empty()).then(|| {
+        rest.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect()
+    })
+}
+
+/// Lower an explicit `CAST(v AS dt)`.
+///
+/// A cast that touches no temporal type lowers to a `CAST` node as it always has. One that does is a
+/// [`convert`] call -- including a literal's, so `'2024-01-01'::date` and `'2024-01-01'::timestamp`
+/// are two different terms -- except a cast to the operand's own type with no qualifier, which is the
+/// identity and is dropped.
+pub fn lower_cast(v: Value, dt: &DataType) -> Value {
+    let target = map_type(dt);
+    let from = ty_of(&v);
+    if !is_temporal(&target) && !is_temporal(&from) {
+        return json!({ "operator": "CAST", "operand": [v], "type": target });
+    }
+    let qualifier = cast_qualifier(&format!("{dt}").to_uppercase());
+    if from == target && qualifier.is_none() {
+        return v;
+    }
+    convert_qualified(v, &target, qualifier.as_deref())
+}
+
+/// Whether two column types are two *different temporal types*. Where a relation-shaped construct
+/// (a set operation, a `VALUES` list, an `IN (subquery)`) would pair such columns without any
+/// comparison to hang a conversion on, the values of two units would share one column.
+///
+/// A temporal type against a non-temporal one is not a mismatch here. That pairing is exactly what
+/// the INTEGER a temporal type used to be met in the same place -- an untyped parameter in a `UNION`
+/// branch is opaque, and a NULL is an INTEGER -- and the prover reads it the same way now as then.
+pub fn temporal_mismatch(a: &str, b: &str) -> bool {
+    a != b && is_temporal(a) && is_temporal(b)
+}
+
+/// Coerce the left operand of `x IN (subquery)` to the type of the subquery's column, which is
+/// what Postgres does when that column is the higher type (`d IN (SELECT ts ..)` compares
+/// `d::timestamp`). `Err` names the pair when the conversion would have to go on the subquery's
+/// side instead, which the lowering cannot reach from here.
+pub fn coerce_in_operand(x: Value, col_ty: &str) -> std::result::Result<Value, String> {
+    let xt = ty_of(&x);
+    if !temporal_mismatch(&xt, col_ty) || is_null_lit(&x) {
+        return Ok(x);
+    }
+    if common_type(&xt, col_ty) == col_ty {
+        Ok(cast_to(x, col_ty))
+    } else {
+        Err(format!("{xt} compared with a subquery column of type {col_ty}"))
+    }
+}
+
 /// Whether `v` is the nullary `NULL` constant.
 fn is_null_lit(v: &Value) -> bool {
     v.get("operator").and_then(|o| o.as_str()) == Some("NULL")
         && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
 }
 
-/// Wrap `v` in a CAST to `ct` unless it already has that type.
+/// Wrap `v` in a CAST to `ct` unless it already has that type. A crossing that involves a temporal
+/// type is a [`convert`] call instead; see the module docs.
 pub fn cast_to(mut v: Value, ct: &str) -> Value {
     if ty_of(&v) == ct {
         return v;
+    }
+    if is_temporal(&ty_of(&v)) || is_temporal(ct) {
+        return convert(v, ct);
     }
     // NULL is a *typed nullary constant* to the prover (`Op("NULL", [], ty)`), and it recognises a
     // value as null by comparing against the constant of that same type. Casting instead of
@@ -124,26 +377,162 @@ pub fn coerce_cmp(l: Value, r: Value) -> (Value, Value) {
 /// Build a comparison/equality operator (BOOLEAN result) with operand type coercion.
 pub fn make_cmp(opstr: &str, l: Value, r: Value) -> Value {
     let (l, r) = coerce_cmp(l, r);
+    if let Some(v) = trunc_cmp(opstr, &l, &r) {
+        return v;
+    }
     json!({ "operator": opstr, "operand": [l, r], "type": "BOOLEAN" })
+}
+
+/// The operand of `v` if `v` truncates a TIMESTAMP to its DATE, i.e. is the unqualified
+/// [`convert`] from TIMESTAMP to DATE.
+fn truncated_timestamp(v: &Value) -> Option<&Value> {
+    (v.get("operator").and_then(|o| o.as_str()) == Some(&conv_name("TIMESTAMP", "DATE", None)))
+        .then(|| v.get("operand").and_then(|o| o.as_array()).and_then(|a| a.first()))
+        .flatten()
+}
+
+/// A comparison between a truncated TIMESTAMP and a DATE, restated on the TIMESTAMP itself:
+///
+/// | `x::date op e` | becomes |
+/// |---|---|
+/// | `=`  | `x >= e::timestamp AND x < (e + 1)::timestamp` |
+/// | `<>` | `NOT (x >= e::timestamp AND x < (e + 1)::timestamp)` |
+/// | `<`  | `x < e::timestamp` |
+/// | `<=` | `x < (e + 1)::timestamp` |
+/// | `>`  | `x >= (e + 1)::timestamp` |
+/// | `>=` | `x >= e::timestamp` |
+///
+/// Each row is an identity in Postgres: truncating a TIMESTAMP to its date is rounding down to a
+/// midnight, and `e::timestamp` is the midnight that starts `e`. It survives NULLs too, since every
+/// piece is null exactly when `x` or `e` is. Both conversions are still uninterpreted downstream,
+/// so the point is not to teach a prover the conversion. It is that `x::date = $1` and the range
+/// written out by hand now lower to the same term, where before one of them could only be proved
+/// equal to the other by reading dates as timestamps. `e` and `x` each appear twice, which is safe
+/// because nothing the frontend lowers is volatile (the nondeterministic functions are refused).
+///
+/// TIMESTAMP only. For TIMESTAMPTZ the same rows hold only for time zones whose clocks never go back
+/// across a midnight, and some do: in `America/Sitka`, 1867-10-19 happens twice.
+fn trunc_cmp(opstr: &str, l: &Value, r: &Value) -> Option<Value> {
+    let (x, e, op) = match (truncated_timestamp(l), truncated_timestamp(r)) {
+        (Some(x), _) => (x, r, opstr),
+        (None, Some(x)) => (x, l, flip_cmp(opstr)?),
+        (None, None) => return None,
+    };
+    if ty_of(e) != "DATE" {
+        return None;
+    }
+    let next = json!({
+        "operator": "+",
+        "operand": [e.clone(), { "operator": "1", "operand": [], "type": "INTEGER" }],
+        "type": "DATE"
+    });
+    let cmp = |o: &str, bound: Value| json!({ "operator": o, "operand": [x.clone(), convert(bound, "TIMESTAMP")], "type": "BOOLEAN" });
+    let day = || json!({ "operator": "AND", "operand": [cmp(">=", e.clone()), cmp("<", next.clone())], "type": "BOOLEAN" });
+    Some(match op {
+        "=" => day(),
+        "<>" => not_bool(day()),
+        "<" => cmp("<", e.clone()),
+        "<=" => cmp("<", next.clone()),
+        ">" => cmp(">=", next.clone()),
+        ">=" => cmp(">=", e.clone()),
+        _ => return None,
+    })
+}
+
+/// `a op b` restated as `b op' a`.
+fn flip_cmp(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "=" => "=",
+        "<>" => "<>",
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        _ => return None,
+    })
 }
 
 /// Build an arithmetic / concatenation operator with operand type coercion.
 ///
 /// `num_ty` is the numeric result type the operator would have on numbers (INTEGER, REAL, VARCHAR
-/// for `||`). That rule is right for numbers but wrong once an operand is opaque: the preprocessor
-/// renders TIMESTAMP and friends as VARBINARY, so `ts + n` would otherwise emit an INTEGER-typed
-/// `+` over mismatched operand sorts and the prover builds an ill-sorted z3 term from it. Coercing
-/// both sides to their common type — and taking that type as the result when it is opaque — keeps
-/// the term well-sorted. Sound for the same reason as [`coerce_cmp`]: the cast is deterministic, so
-/// both queries get it identically, and `+` over an opaque type is uninterpreted either way.
+/// for `||`). An operand of a temporal type takes Postgres's own operator table instead
+/// ([`temporal_arith`]). Past that, the numeric rule is still wrong once an operand is opaque: an
+/// INTEGER-typed `+` over an opaque operand is ill-sorted, and the prover builds a broken z3 term
+/// from it. Coercing both sides to their common type — and taking that type as the result when it
+/// is opaque — keeps the term well-sorted. Sound for the same reason as [`coerce_cmp`]: the cast is
+/// deterministic, so both queries get it identically, and `+` over an opaque type is uninterpreted
+/// either way.
 pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
     let (a, b) = (ty_of(&l), ty_of(&r));
+    if is_temporal(&a) || is_temporal(&b) {
+        return temporal_arith(opstr, l, r);
+    }
     if a == b || (is_num(&a) && is_num(&b)) {
         return json!({ "operator": opstr, "operand": [l, r], "type": num_ty });
     }
     let ct = common_type(&a, &b);
     let ty = if is_builtin(&ct) { num_ty } else { &ct };
     json!({ "operator": opstr, "operand": [cast_to(l.clone(), &ct), cast_to(r, &ct)], "type": ty })
+}
+
+/// [`make_arith`] with a temporal operand: Postgres's operator table, split by whether the result
+/// is linear in one unit.
+///
+/// Three rows stay native, because each is exact on integers in the unit of its type:
+/// `date + integer`, `integer + date` and `date - integer` are a DATE (a count of days plus a count
+/// of days), and `date - date` is an INTEGER (days). `||` converts its temporal side to text and
+/// concatenates.
+///
+/// Every other row is an uninterpreted function named after the operator and both operand types,
+/// `q_arith_<op>_<left>_<right>`, with the result type Postgres gives it. That includes all interval
+/// arithmetic: an interval may count months, and months have no fixed length, so `ts + iv - iv` is
+/// not `ts` (2024-01-31 plus a month, minus a month, is 2024-01-29). It also includes rows Postgres
+/// rejects, such as `timestamp + integer`, which come out as a function nothing else uses. A
+/// function is sound for all of these: it is deterministic and both queries get the same one.
+fn temporal_arith(op: &str, l: Value, r: Value) -> Value {
+    let (a, b) = (ty_of(&l), ty_of(&r));
+    let native = |ty: &str, l: Value, r: Value| json!({ "operator": op, "operand": [l, r], "type": ty });
+    match (op, a.as_str(), b.as_str()) {
+        ("+" | "-", "DATE", "INTEGER") | ("+", "INTEGER", "DATE") => native("DATE", l, r),
+        ("-", "DATE", "DATE") => native("INTEGER", l, r),
+        ("||", ..) => native("VARCHAR", cast_to(l, "VARCHAR"), cast_to(r, "VARCHAR")),
+        _ => {
+            let ty = temporal_arith_type(op, &a, &b);
+            let name = match op {
+                "+" => "add",
+                "-" => "sub",
+                "*" => "mul",
+                "/" => "div",
+                "%" => "mod",
+                other => other,
+            };
+            json!({
+                "operator": format!("q_arith_{name}_{}_{}", a.to_lowercase(), b.to_lowercase()),
+                "operand": [l, r],
+                "type": ty
+            })
+        }
+    }
+}
+
+/// The result type Postgres gives a temporal operator that [`temporal_arith`] leaves uninterpreted,
+/// or VARBINARY for a combination Postgres rejects.
+fn temporal_arith_type(op: &str, a: &str, b: &str) -> &'static str {
+    let ts = |t: &str| matches!(t, "TIMESTAMP" | "TIMESTAMPTZ");
+    let num = |t: &str| is_num(t);
+    match (op, a, b) {
+        ("+" | "-", "TIMESTAMP", "INTERVAL") | ("+", "INTERVAL", "TIMESTAMP") => "TIMESTAMP",
+        ("+" | "-", "TIMESTAMPTZ", "INTERVAL") | ("+", "INTERVAL", "TIMESTAMPTZ") => "TIMESTAMPTZ",
+        ("+" | "-", "DATE", "INTERVAL") | ("+", "INTERVAL", "DATE") => "TIMESTAMP",
+        ("+", "DATE", "TIME") | ("+", "TIME", "DATE") => "TIMESTAMP",
+        ("-", x, y) if ts(x) && x == y => "INTERVAL",
+        ("-", "TIME", "TIME") => "INTERVAL",
+        ("+" | "-", "TIME", "INTERVAL") | ("+", "INTERVAL", "TIME") => "TIME",
+        ("+" | "-", "INTERVAL", "INTERVAL") => "INTERVAL",
+        ("*", "INTERVAL", x) | ("*", x, "INTERVAL") if num(x) => "INTERVAL",
+        ("/", "INTERVAL", x) if num(x) => "INTERVAL",
+        _ => "VARBINARY",
+    }
 }
 
 /// Build a `CASE` from the prover's flat `cond, result, .., else` operand list, coercing every
@@ -213,5 +602,78 @@ pub fn coerce_bool(mut v: Value) -> Value {
             v
         }
         None => v,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(i: u64, ty: &str) -> Value {
+        json!({ "column": i, "type": ty })
+    }
+
+    /// `x::date op e` for a column `x` of type `xt` and a DATE column `e`, as `make_cmp` lowers it.
+    fn trunc(op: &str, xt: &str, flipped: bool) -> Value {
+        let t = convert(col(0, xt), "DATE");
+        if flipped {
+            make_cmp(op, col(1, "DATE"), t)
+        } else {
+            make_cmp(op, t, col(1, "DATE"))
+        }
+    }
+
+    fn day_start(e: Value) -> Value {
+        convert(e, "TIMESTAMP")
+    }
+
+    fn next_day(e: Value) -> Value {
+        day_start(json!({ "operator": "+", "operand": [e, { "operator": "1", "operand": [], "type": "INTEGER" }], "type": "DATE" }))
+    }
+
+    fn cmp(op: &str, b: Value) -> Value {
+        json!({ "operator": op, "operand": [col(0, "TIMESTAMP"), b], "type": "BOOLEAN" })
+    }
+
+    #[test]
+    fn a_truncated_timestamp_compares_against_the_day_bounds() {
+        let e = || col(1, "DATE");
+        let range = json!({ "operator": "AND", "operand": [cmp(">=", day_start(e())), cmp("<", next_day(e()))], "type": "BOOLEAN" });
+        assert_eq!(trunc("=", "TIMESTAMP", false), range);
+        assert_eq!(trunc("<>", "TIMESTAMP", false), not_bool(range));
+        assert_eq!(trunc("<", "TIMESTAMP", false), cmp("<", day_start(e())));
+        assert_eq!(trunc("<=", "TIMESTAMP", false), cmp("<", next_day(e())));
+        assert_eq!(trunc(">", "TIMESTAMP", false), cmp(">=", next_day(e())));
+        assert_eq!(trunc(">=", "TIMESTAMP", false), cmp(">=", day_start(e())));
+        // `e op x::date` is `x::date op' e`.
+        assert_eq!(trunc("<", "TIMESTAMP", true), trunc(">", "TIMESTAMP", false));
+        assert_eq!(trunc(">=", "TIMESTAMP", true), trunc("<=", "TIMESTAMP", false));
+    }
+
+    #[test]
+    fn a_truncated_timestamptz_or_a_non_date_bound_is_left_alone() {
+        let plain = |op: &str, l: Value, r: Value| json!({ "operator": op, "operand": [l, r], "type": "BOOLEAN" });
+        let tz = convert(col(0, "TIMESTAMPTZ"), "DATE");
+        assert_eq!(trunc("=", "TIMESTAMPTZ", false), plain("=", tz, col(1, "DATE")));
+        // Against a TIMESTAMP the truncated side is promoted back, and nothing is recognised.
+        let t = convert(col(0, "TIMESTAMP"), "DATE");
+        let v = make_cmp("=", t.clone(), col(2, "TIMESTAMP"));
+        assert_eq!(v, plain("=", convert(t, "TIMESTAMP"), col(2, "TIMESTAMP")));
+    }
+
+    #[test]
+    fn crossings_are_conversions_and_the_same_type_is_not() {
+        assert_eq!(cast_to(col(0, "DATE"), "DATE"), col(0, "DATE"));
+        let c = cast_to(col(0, "DATE"), "TIMESTAMP");
+        assert_eq!(c["operator"], "q_conv_date_timestamp");
+        assert_eq!(c["type"], "TIMESTAMP");
+        // A NULL is relabelled, not converted.
+        let null = json!({ "operator": "NULL", "operand": [], "type": "INTEGER" });
+        assert_eq!(cast_to(null, "DATE")["operator"], "NULL");
+        // The promotion chain, and the off-chain meet at the opaque type.
+        assert_eq!(common_type("DATE", "TIMESTAMP"), "TIMESTAMP");
+        assert_eq!(common_type("TIMESTAMPTZ", "DATE"), "TIMESTAMPTZ");
+        assert_eq!(common_type("TIME", "DATE"), "VARBINARY");
+        assert_eq!(common_type("VARCHAR", "DATE"), "DATE");
     }
 }
