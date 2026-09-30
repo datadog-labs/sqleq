@@ -338,8 +338,8 @@ fn decide(
                 // (`types::lower_cast`). Named after the types rather than after this operand's text,
                 // because a conversion is a function of its source type, its target and its value,
                 // and the source type is known here -- so `ts::date` on both sides of a pair is one
-                // function, and the lowering can recognise it (`types::trunc_cmp`). A `qcast` would
-                // hide both. An operand of unknown type still takes rule 5b below.
+                // function, where a `qcast` keyed on each operand's text would split it. An operand
+                // of unknown type still takes rule 5b below.
                 dec.insert(nid(e), Decision::Retarget(tq));
             } else {
                 rw.dropped.qcast += 1;

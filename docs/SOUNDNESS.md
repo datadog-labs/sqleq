@@ -41,21 +41,26 @@ and `CAST(ts AS DATE) = d` against `ts = d` (the cast truncates, and it was drop
 One row with a mid-day `ts` separates each pair. Nothing in the pipeline disagreed about these; they
 were found by probing the lowering directly, and the disprover confirms each witness.
 
-The rule now is that integer semantics hold **within** one temporal type and never **across** two.
-Comparing two values of one type, `date ± integer` and `date - date` stay native, which is exact:
-every value of one type is an integer in that type's own unit. Every crossing — the promotion in
-`d < ts`, an explicit cast, a literal cast such as `'2024-01-01'::date` — is an uninterpreted function
-named after both types (`q_conv_date_timestamp`), never a `CAST`, because both provers erase casts
-they consider trivial. Arithmetic that is not linear in one unit, which is anything with an
-INTERVAL, is an uninterpreted function too. A function nobody interprets can only cost a proof.
+The rule now is that a comparison of two values of one temporal type stays native, and every
+*operation* on a temporal value is an uninterpreted function. Comparisons are exact: the values of
+one type, `-infinity` and `infinity` included, form a bounded total order, so they embed
+order-preservingly into the integers a prover reads them as.
 
-One shape is restated rather than left opaque, because it is common and exact. `x::date op e`, with
-`x` a TIMESTAMP and `e` a DATE, becomes a comparison of `x` against the start of day `e` or `e + 1`:
-`=` becomes `x >= e::timestamp AND x < (e + 1)::timestamp`, and each of the other five comparison
-operators has its own one-sided form. That is an identity in Postgres, and it lets the truncation
-and the hand-written range lower to the same term. It is **not** applied to TIMESTAMPTZ: there the
-identity depends on the session time zone, and some zones break it — in `America/Sitka` the local date
-1867-10-19 happens twice, and Postgres itself disagrees with the restated form there.
+Arithmetic is not exact there, because of the infinities. Postgres leaves `infinity` unchanged under
+`date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error for
+`infinity - date`. Read as integer addition, `d + 1 > d` would hold for every date, and
+`d >= $1 AND d < $1 + 1` would mean `d = $1`; at `d = $1 = 'infinity'` neither does. So
+`date ± integer`, `date - date` and all interval arithmetic (an interval may count months, and
+months have no fixed length) are functions named after their operand types (`q_arith_add_date_integer`).
+So is every crossing between two types — the promotion in `d < ts`, an explicit cast, a literal cast
+such as `'2024-01-01'::date` (`q_conv_date_timestamp`) — and never a `CAST`, because both provers erase
+casts they consider trivial. A function nobody interprets can only cost a proof; a prover that knows
+its Postgres meaning, infinities included, can interpret the name.
+
+For the same reason a truncation is compared as it stands. `ts::date = $1` and the range written out
+by hand, `ts >= $1::date AND ts < $1::date + 1`, look like the same predicate and are not: at
+`ts = $1 = 'infinity'` the truncation holds and `ts < 'infinity'` does not. A restatement of one as
+the other would have made the pair lower to one term and every prover call it equivalent.
 
 An `UPDATE` of a temporal column converts the assigned value to the column's type, as Postgres's
 assignment cast does, so `SET d = ts` and `SET d = ts::date` store the same thing. That is done where

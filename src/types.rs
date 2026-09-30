@@ -14,14 +14,21 @@
 //! TIMESTAMP a count of microseconds, and reading both as one integer is what let `ts < d + 1` prove
 //! equivalent to `ts <= d`: over integers `x < y + 1` is `x <= y`, but `d + 1` is the next *day*.
 //!
-//! The rule that keeps this sound is that integer semantics hold *within* one temporal type and
-//! never *across* two. Comparisons of two values of the same type, `date ± integer` and `date - date`
-//! stay native, which is exact: every value of one type is an integer in that type's own unit. Every
-//! crossing between two types -- an implicit promotion, an explicit cast, a literal cast -- becomes a
-//! [`convert`] call, an uninterpreted function named after both types. A prover that knows nothing
-//! about it can only fail to prove through it; one that knows the conversion can interpret the name.
-//! Arithmetic that is not linear in one unit (anything with an INTERVAL, which may count months) is
-//! an uninterpreted function too. See [`make_arith`].
+//! The rule that keeps this sound: a comparison of two values of the same temporal type stays
+//! native, and every *operation* on a temporal value is an uninterpreted function.
+//!
+//! Comparisons are exact. The values of one temporal type, `-infinity` and `infinity` included, form
+//! a bounded total order, so they embed order-preservingly into the integers a prover reads them as.
+//!
+//! Arithmetic is not exact on those integers, because of the infinities: Postgres leaves `infinity`
+//! unchanged under `date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error
+//! for `infinity - date`. Read as integer addition, `d + 1 > d` would hold for every `d` and it does
+//! not; nor does `d >= $1 AND d < $1 + 1` mean `d = $1`. So `date ± integer`, `date - date` and all
+//! interval arithmetic are [`make_arith`]'s `q_arith_*` functions, and every crossing between two
+//! types -- an implicit promotion, an explicit cast, a literal cast -- is a [`convert`] call. Each is
+//! an uninterpreted function named after its operands' types: a prover that knows nothing about it
+//! can only fail to prove through it, and one that knows its Postgres meaning, infinities included,
+//! can interpret the name.
 
 use serde_json::{json, Value};
 use sqlparser::ast::DataType;
@@ -377,79 +384,7 @@ pub fn coerce_cmp(l: Value, r: Value) -> (Value, Value) {
 /// Build a comparison/equality operator (BOOLEAN result) with operand type coercion.
 pub fn make_cmp(opstr: &str, l: Value, r: Value) -> Value {
     let (l, r) = coerce_cmp(l, r);
-    if let Some(v) = trunc_cmp(opstr, &l, &r) {
-        return v;
-    }
     json!({ "operator": opstr, "operand": [l, r], "type": "BOOLEAN" })
-}
-
-/// The operand of `v` if `v` truncates a TIMESTAMP to its DATE, i.e. is the unqualified
-/// [`convert`] from TIMESTAMP to DATE.
-fn truncated_timestamp(v: &Value) -> Option<&Value> {
-    (v.get("operator").and_then(|o| o.as_str()) == Some(&conv_name("TIMESTAMP", "DATE", None)))
-        .then(|| v.get("operand").and_then(|o| o.as_array()).and_then(|a| a.first()))
-        .flatten()
-}
-
-/// A comparison between a truncated TIMESTAMP and a DATE, restated on the TIMESTAMP itself:
-///
-/// | `x::date op e` | becomes |
-/// |---|---|
-/// | `=`  | `x >= e::timestamp AND x < (e + 1)::timestamp` |
-/// | `<>` | `NOT (x >= e::timestamp AND x < (e + 1)::timestamp)` |
-/// | `<`  | `x < e::timestamp` |
-/// | `<=` | `x < (e + 1)::timestamp` |
-/// | `>`  | `x >= (e + 1)::timestamp` |
-/// | `>=` | `x >= e::timestamp` |
-///
-/// Each row is an identity in Postgres: truncating a TIMESTAMP to its date is rounding down to a
-/// midnight, and `e::timestamp` is the midnight that starts `e`. It survives NULLs too, since every
-/// piece is null exactly when `x` or `e` is. Both conversions are still uninterpreted downstream,
-/// so the point is not to teach a prover the conversion. It is that `x::date = $1` and the range
-/// written out by hand now lower to the same term, where before one of them could only be proved
-/// equal to the other by reading dates as timestamps. `e` and `x` each appear twice, which is safe
-/// because nothing the frontend lowers is volatile (the nondeterministic functions are refused).
-///
-/// TIMESTAMP only. For TIMESTAMPTZ the same rows hold only for time zones whose clocks never go back
-/// across a midnight, and some do: in `America/Sitka`, 1867-10-19 happens twice.
-fn trunc_cmp(opstr: &str, l: &Value, r: &Value) -> Option<Value> {
-    let (x, e, op) = match (truncated_timestamp(l), truncated_timestamp(r)) {
-        (Some(x), _) => (x, r, opstr),
-        (None, Some(x)) => (x, l, flip_cmp(opstr)?),
-        (None, None) => return None,
-    };
-    if ty_of(e) != "DATE" {
-        return None;
-    }
-    let next = json!({
-        "operator": "+",
-        "operand": [e.clone(), { "operator": "1", "operand": [], "type": "INTEGER" }],
-        "type": "DATE"
-    });
-    let cmp = |o: &str, bound: Value| json!({ "operator": o, "operand": [x.clone(), convert(bound, "TIMESTAMP")], "type": "BOOLEAN" });
-    let day = || json!({ "operator": "AND", "operand": [cmp(">=", e.clone()), cmp("<", next.clone())], "type": "BOOLEAN" });
-    Some(match op {
-        "=" => day(),
-        "<>" => not_bool(day()),
-        "<" => cmp("<", e.clone()),
-        "<=" => cmp("<", next.clone()),
-        ">" => cmp(">=", next.clone()),
-        ">=" => cmp(">=", e.clone()),
-        _ => return None,
-    })
-}
-
-/// `a op b` restated as `b op' a`.
-fn flip_cmp(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "=" => "=",
-        "<>" => "<>",
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        _ => return None,
-    })
 }
 
 /// Build an arithmetic / concatenation operator with operand type coercion.
@@ -478,23 +413,21 @@ pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
 /// [`make_arith`] with a temporal operand: Postgres's operator table, split by whether the result
 /// is linear in one unit.
 ///
-/// Three rows stay native, because each is exact on integers in the unit of its type:
-/// `date + integer`, `integer + date` and `date - integer` are a DATE (a count of days plus a count
-/// of days), and `date - date` is an INTEGER (days). `||` converts its temporal side to text and
-/// concatenates.
+/// Only `||` stays native: it converts its temporal side to text and concatenates.
 ///
 /// Every other row is an uninterpreted function named after the operator and both operand types,
-/// `q_arith_<op>_<left>_<right>`, with the result type Postgres gives it. That includes all interval
-/// arithmetic: an interval may count months, and months have no fixed length, so `ts + iv - iv` is
-/// not `ts` (2024-01-31 plus a month, minus a month, is 2024-01-29). It also includes rows Postgres
-/// rejects, such as `timestamp + integer`, which come out as a function nothing else uses. A
-/// function is sound for all of these: it is deterministic and both queries get the same one.
+/// `q_arith_<op>_<left>_<right>`, with the result type Postgres gives it. That includes
+/// `date ± integer` and `date - date`, which look like arithmetic on counts of days and are not:
+/// Postgres leaves `infinity` unchanged under `+`, so `'infinity'::date + 1 = 'infinity'`, and raises
+/// an error for `infinity - date`. It includes all interval arithmetic: an interval may count months,
+/// and months have no fixed length, so `ts + iv - iv` is not `ts` (2024-01-31 plus a month, minus a
+/// month, is 2024-01-29). And it includes rows Postgres rejects, such as `timestamp + integer`, which
+/// come out as a function nothing else uses. A function is sound for all of these: it is
+/// deterministic and both queries get the same one.
 fn temporal_arith(op: &str, l: Value, r: Value) -> Value {
     let (a, b) = (ty_of(&l), ty_of(&r));
     let native = |ty: &str, l: Value, r: Value| json!({ "operator": op, "operand": [l, r], "type": ty });
     match (op, a.as_str(), b.as_str()) {
-        ("+" | "-", "DATE", "INTEGER") | ("+", "INTEGER", "DATE") => native("DATE", l, r),
-        ("-", "DATE", "DATE") => native("INTEGER", l, r),
         ("||", ..) => native("VARCHAR", cast_to(l, "VARCHAR"), cast_to(r, "VARCHAR")),
         _ => {
             let ty = temporal_arith_type(op, &a, &b);
@@ -523,6 +456,8 @@ fn temporal_arith_type(op: &str, a: &str, b: &str) -> &'static str {
     match (op, a, b) {
         ("+" | "-", "TIMESTAMP", "INTERVAL") | ("+", "INTERVAL", "TIMESTAMP") => "TIMESTAMP",
         ("+" | "-", "TIMESTAMPTZ", "INTERVAL") | ("+", "INTERVAL", "TIMESTAMPTZ") => "TIMESTAMPTZ",
+        ("+" | "-", "DATE", "INTEGER") | ("+", "INTEGER", "DATE") => "DATE",
+        ("-", "DATE", "DATE") => "INTEGER",
         ("+" | "-", "DATE", "INTERVAL") | ("+", "INTERVAL", "DATE") => "TIMESTAMP",
         ("+", "DATE", "TIME") | ("+", "TIME", "DATE") => "TIMESTAMP",
         ("-", x, y) if ts(x) && x == y => "INTERVAL",
@@ -613,52 +548,31 @@ mod tests {
         json!({ "column": i, "type": ty })
     }
 
-    /// `x::date op e` for a column `x` of type `xt` and a DATE column `e`, as `make_cmp` lowers it.
-    fn trunc(op: &str, xt: &str, flipped: bool) -> Value {
-        let t = convert(col(0, xt), "DATE");
-        if flipped {
-            make_cmp(op, col(1, "DATE"), t)
-        } else {
-            make_cmp(op, t, col(1, "DATE"))
-        }
-    }
-
-    fn day_start(e: Value) -> Value {
-        convert(e, "TIMESTAMP")
-    }
-
-    fn next_day(e: Value) -> Value {
-        day_start(json!({ "operator": "+", "operand": [e, { "operator": "1", "operand": [], "type": "INTEGER" }], "type": "DATE" }))
-    }
-
-    fn cmp(op: &str, b: Value) -> Value {
-        json!({ "operator": op, "operand": [col(0, "TIMESTAMP"), b], "type": "BOOLEAN" })
+    /// `l op r` as `make_cmp` builds it once the operands already share a type.
+    fn plain(op: &str, l: Value, r: Value) -> Value {
+        json!({ "operator": op, "operand": [l, r], "type": "BOOLEAN" })
     }
 
     #[test]
-    fn a_truncated_timestamp_compares_against_the_day_bounds() {
-        let e = || col(1, "DATE");
-        let range = json!({ "operator": "AND", "operand": [cmp(">=", day_start(e())), cmp("<", next_day(e()))], "type": "BOOLEAN" });
-        assert_eq!(trunc("=", "TIMESTAMP", false), range);
-        assert_eq!(trunc("<>", "TIMESTAMP", false), not_bool(range));
-        assert_eq!(trunc("<", "TIMESTAMP", false), cmp("<", day_start(e())));
-        assert_eq!(trunc("<=", "TIMESTAMP", false), cmp("<", next_day(e())));
-        assert_eq!(trunc(">", "TIMESTAMP", false), cmp(">=", next_day(e())));
-        assert_eq!(trunc(">=", "TIMESTAMP", false), cmp(">=", day_start(e())));
-        // `e op x::date` is `x::date op' e`.
-        assert_eq!(trunc("<", "TIMESTAMP", true), trunc(">", "TIMESTAMP", false));
-        assert_eq!(trunc(">=", "TIMESTAMP", true), trunc("<=", "TIMESTAMP", false));
-    }
-
-    #[test]
-    fn a_truncated_timestamptz_or_a_non_date_bound_is_left_alone() {
-        let plain = |op: &str, l: Value, r: Value| json!({ "operator": op, "operand": [l, r], "type": "BOOLEAN" });
-        let tz = convert(col(0, "TIMESTAMPTZ"), "DATE");
-        assert_eq!(trunc("=", "TIMESTAMPTZ", false), plain("=", tz, col(1, "DATE")));
-        // Against a TIMESTAMP the truncated side is promoted back, and nothing is recognised.
+    fn a_truncated_timestamp_is_compared_as_it_stands() {
+        // `x::date = e` is not restated as a range on `x`: at `x = e = 'infinity'` the truncation
+        // holds and `x < (e + 1)::timestamp` does not, since `'infinity'::date + 1` is `infinity`.
         let t = convert(col(0, "TIMESTAMP"), "DATE");
-        let v = make_cmp("=", t.clone(), col(2, "TIMESTAMP"));
-        assert_eq!(v, plain("=", convert(t, "TIMESTAMP"), col(2, "TIMESTAMP")));
+        assert_eq!(make_cmp("=", t.clone(), col(1, "DATE")), plain("=", t, col(1, "DATE")));
+    }
+
+    #[test]
+    fn date_arithmetic_is_a_function_not_integer_addition() {
+        let one = json!({ "operator": "1", "operand": [], "type": "INTEGER" });
+        let add = make_arith("+", col(0, "DATE"), one.clone(), "INTEGER");
+        assert_eq!((add["operator"].as_str(), add["type"].as_str()), (Some("q_arith_add_date_integer"), Some("DATE")));
+        let rev = make_arith("+", one, col(0, "DATE"), "INTEGER");
+        assert_eq!((rev["operator"].as_str(), rev["type"].as_str()), (Some("q_arith_add_integer_date"), Some("DATE")));
+        let diff = make_arith("-", col(0, "DATE"), col(1, "DATE"), "INTEGER");
+        assert_eq!((diff["operator"].as_str(), diff["type"].as_str()), (Some("q_arith_sub_date_date"), Some("INTEGER")));
+        // Concatenation is still native, over the converted text.
+        let cat = make_arith("||", col(0, "DATE"), col(2, "VARCHAR"), "VARCHAR");
+        assert_eq!(cat["operator"], "||");
     }
 
     #[test]

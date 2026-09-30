@@ -4,13 +4,15 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! The temporal types: DATE, TIME, TIMESTAMP, TIMESTAMPTZ and INTERVAL are kept apart in the IR,
-//! and every crossing between two of them is a named conversion (see `src/types.rs`).
+//! every crossing between two of them is a named conversion, and every operation on one is a named
+//! function (see `src/types.rs`).
 //!
 //! Each "not identical" test below is a pair that is **not** equivalent in Postgres and used to
 //! lower to IR that a prover proved equal, most of them to byte-identical IR. Reading dates and
-//! timestamps as one integer did it: `d + 1` is the next day, not the next microsecond, and
-//! `CAST(ts AS DATE)` truncates. These tests do not run a prover; they pin the lowering that keeps
-//! the two sides apart, and the identical lowering that keeps the equivalent shapes provable.
+//! timestamps as one integer did it: `d + 1` is the next day, not the next microsecond,
+//! `CAST(ts AS DATE)` truncates, and `'infinity'::date + 1` is `infinity`. These tests do not run a
+//! prover; they pin the lowering that keeps the two sides apart, and the identical lowering that
+//! keeps the equivalent shapes provable.
 
 use serde_json::Value;
 use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
@@ -75,7 +77,7 @@ fn a_date_plus_one_is_a_day_not_a_microsecond() {
         let v = lower(r#"SELECT "id" FROM "t" WHERE "ts" < "d" + 1"#, r#"SELECT "id" FROM "t" WHERE "ts" <= "d""#, src);
         let conv = &v["queries"][0]["project"]["source"]["filter"]["condition"]["operand"][1];
         assert_eq!(conv["operator"], "q_conv_date_timestamp", "{src:?}: {conv}");
-        assert_eq!(conv["operand"][0]["operator"], "+");
+        assert_eq!(conv["operand"][0]["operator"], "q_arith_add_date_integer");
         assert_eq!(conv["operand"][0]["type"], "DATE");
     }
     assert!(!identical(r#"SELECT "id" FROM "t" WHERE "d" < "ts""#, r#"SELECT "id" FROM "t" WHERE "d" + 1 <= "ts""#));
@@ -92,11 +94,17 @@ fn casts_to_different_temporal_types_are_different_functions() {
 }
 
 #[test]
-fn a_cast_against_a_promotion_keeps_its_comparison() {
-    // `<` survives the truncation (the first instant of day $1 is the promoted $1); `<=` does not.
-    assert!(identical(
-        r#"SELECT "id" FROM "t" WHERE CAST("ts" AS date) < $1::date"#,
-        r#"SELECT "id" FROM "t" WHERE "ts" < ($1::date)::timestamp"#,
+fn a_truncated_timestamp_is_not_restated_as_a_range() {
+    // `ts::date = $1` against the range of day $1 differs at `ts = $1 = 'infinity'`: the truncation
+    // holds, and `ts < ($1 + 1)::timestamp` does not, because `'infinity'::date + 1` is `infinity`.
+    // So the two must not lower alike, for TIMESTAMP and TIMESTAMPTZ both.
+    assert!(!identical(
+        r#"SELECT "id" FROM "t" WHERE "ts"::date = $1"#,
+        r#"SELECT "id" FROM "t" WHERE "ts" >= $1::date AND "ts" < $1::date + 1"#,
+    ));
+    assert!(!identical(
+        r#"SELECT "id" FROM "t" WHERE "tz"::date = $1"#,
+        r#"SELECT "id" FROM "t" WHERE "tz" >= $1::date AND "tz" < $1::date + 1"#,
     ));
     assert!(!identical(
         r#"SELECT "id" FROM "t" WHERE CAST("ts" AS date) <= $1::date"#,
@@ -105,34 +113,26 @@ fn a_cast_against_a_promotion_keeps_its_comparison() {
 }
 
 #[test]
-fn a_truncated_timestamp_against_a_day_lowers_like_the_range() {
-    // The equivalent shape the unsound model used to prove: now it lowers identically, soundly.
-    assert!(identical(
-        r#"SELECT "id" FROM "t" WHERE "ts"::date = $1"#,
-        r#"SELECT "id" FROM "t" WHERE "ts" >= $1::date AND "ts" < $1::date + 1"#,
-    ));
-    assert!(identical(
-        r#"SELECT "id" FROM "t" WHERE CAST("ts" AS DATE) = "d""#,
-        r#"SELECT "id" FROM "t" WHERE "d" = CAST("ts" AS DATE)"#,
-    ));
+fn integer_reasoning_about_dates_is_not_available() {
+    // Each pair differs at `d = 'infinity'`, where `d + 1` is `d`: the first on `d = $1 = infinity`,
+    // the second because `infinity + 1 > infinity` is false. Neither may reach a prover as integer
+    // addition, which is what would let it treat the two sides as equal.
+    for (a, b) in [
+        (r#"SELECT "id" FROM "t" WHERE "d" = $1"#, r#"SELECT "id" FROM "t" WHERE "d" >= $1 AND "d" < $1 + 1"#),
+        (r#"SELECT "id" FROM "t" WHERE "d" + 1 > "d""#, r#"SELECT "id" FROM "t" WHERE "d" IS NOT NULL"#),
+    ] {
+        let ops = ops_of(a, b, CatalogSource::InferredSeeded);
+        assert!(ops.contains(&"q_arith_add_date_integer".to_string()), "{ops:?}");
+        assert!(!ops.contains(&"+".to_string()), "{ops:?}");
+    }
 }
 
 #[test]
-fn a_truncated_timestamptz_is_not_rewritten() {
-    // Postgres itself disagrees with the rewrite for TIMESTAMPTZ in some time zones (a local date
-    // can happen twice), so the pair must not lower identically.
-    assert!(!identical(
-        r#"SELECT "id" FROM "t" WHERE "tz"::date = $1"#,
-        r#"SELECT "id" FROM "t" WHERE "tz" >= $1::date AND "tz" < $1::date + 1"#,
-    ));
-}
-
-#[test]
-fn date_arithmetic_stays_native_and_interval_arithmetic_does_not() {
+fn date_and_interval_arithmetic_are_functions() {
     let v = lower(r#"SELECT "d" + 1, "d" - "d" FROM "t""#, r#"SELECT "d" + 1, "d" - "d" FROM "t""#, CatalogSource::Declared);
     let target = &v["queries"][0]["project"]["target"];
-    assert_eq!((target[0]["operator"].as_str(), target[0]["type"].as_str()), (Some("+"), Some("DATE")));
-    assert_eq!((target[1]["operator"].as_str(), target[1]["type"].as_str()), (Some("-"), Some("INTEGER")));
+    assert_eq!((target[0]["operator"].as_str(), target[0]["type"].as_str()), (Some("q_arith_add_date_integer"), Some("DATE")));
+    assert_eq!((target[1]["operator"].as_str(), target[1]["type"].as_str()), (Some("q_arith_sub_date_date"), Some("INTEGER")));
     // `ts + dur - dur` is not `ts` when the interval counts months, so it must not reduce to it.
     let ops = ops_of(r#"SELECT "ts" + "dur" - "dur" FROM "t""#, r#"SELECT "ts" FROM "t""#, CatalogSource::Declared);
     assert!(ops.contains(&"q_arith_add_timestamp_interval".to_string()), "{ops:?}");
