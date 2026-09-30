@@ -160,6 +160,12 @@ impl Db {
     /// with an `e` that already evaluates (it mentions no unassigned var). Any other tuple makes that
     /// factor 0, so this is exact.
     fn pinned(&self, body: &UTerm, id: u32, env: &Env) -> Option<Vec<UConst>> {
+        self.pinned_cols(body, id, env)?.into_iter().collect()
+    }
+
+    /// Per column of `id`, the value a direct `[id.i = e]` factor of `body` fixes it to, as for
+    /// [`Db::pinned`]; `None` for a column no such factor fixes.
+    fn pinned_cols(&self, body: &UTerm, id: u32, env: &Env) -> Option<Vec<Option<UConst>>> {
         let width = *self.widths.get(&id)?;
         let factors: Vec<&UTerm> = match body {
             UTerm::Mul(fs) => fs.iter().map(|f| &**f).collect(),
@@ -180,7 +186,7 @@ impl Db {
                 }
             }
         }
-        cols.into_iter().collect()
+        Some(cols)
     }
 
     /// Evaluates a term in multiplicity position.
@@ -254,14 +260,24 @@ impl Db {
                 }
                 rows
             }
-            None => match self.pinned(body, *id, env) {
-                Some(tuple) => vec![tuple],
-                None => {
-                    let n = self.universe.len();
-                    let total = n.checked_pow(width as u32).filter(|&t| t <= MAX_ASSIGNMENTS).ok_or("universe too large")?;
-                    (0..total).map(|code| (0..width).map(|i| self.universe[(code / n.pow(i as u32)) % n].clone()).collect()).collect()
-                }
-            },
+            // Columns a direct equality pins take that value alone; only the others range over the
+            // universe. A pinned value may lie outside the universe (a count, say), so enumerating it
+            // there would miss the one tuple that counts.
+            None => {
+                let pins = self.pinned_cols(body, *id, env).unwrap_or_else(|| vec![None; width]);
+                let free: Vec<usize> = (0..width).filter(|&i| pins[i].is_none()).collect();
+                let n = self.universe.len();
+                let total = n.checked_pow(free.len() as u32).filter(|&t| t <= MAX_ASSIGNMENTS).ok_or("universe too large")?;
+                (0..total)
+                    .map(|code| {
+                        let mut tuple = pins.clone();
+                        for (k, &i) in free.iter().enumerate() {
+                            tuple[i] = Some(self.universe[(code / n.pow(k as u32)) % n].clone());
+                        }
+                        tuple.into_iter().map(|c| c.expect("every column filled")).collect()
+                    })
+                    .collect()
+            }
         };
         let saved = env.get(id).cloned();
         let mut acc = 0i64;
@@ -274,5 +290,24 @@ impl Db {
             None => env.remove(id),
         };
         Ok(acc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn a_column_pinned_outside_the_universe_is_still_counted() {
+        // Σ_x [x.0 = 7] over two-column tuples: one tuple per value of x.1, though 7 is not in the
+        // universe.
+        let pin = UTerm::Pred {
+            kind: PredKind::Eq,
+            args: vec![UTerm::Var(UVar::proj(0, UVar::Base(0))), UTerm::Const(UConst::Int(7))],
+        };
+        let term = UTerm::Sum { vars: vec![UVar::Base(0)], body: Rc::new(UTerm::Mul(vec![Rc::new(pin)])) };
+        let db = Db::new(HashMap::new(), vec![UConst::Int(0), UConst::Int(1)], HashMap::from([(0, 2)]));
+        assert_eq!(db.count(&term, &mut Env::new()), Ok(2));
     }
 }

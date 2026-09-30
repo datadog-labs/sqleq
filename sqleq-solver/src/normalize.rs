@@ -194,8 +194,9 @@ impl Normalizer {
     }
 
     /// Removes bound vars whose every column is fixed by the equalities of their own sum's body
-    /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`). Inner sums first.
-    fn eliminate_bound(&self, t: &UTerm) -> UTerm {
+    /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`), and single columns so
+    /// fixed (`removeDeterminedBoundedColumnByConst`). Inner sums first.
+    fn eliminate_bound(&mut self, t: &UTerm) -> UTerm {
         match t {
             UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
             UTerm::Pred { .. } | UTerm::Func { .. } => pass_args(t, &mut |x| self.eliminate_bound(x)),
@@ -210,9 +211,14 @@ impl Normalizer {
         }
     }
 
-    fn eliminate_at(&self, mut vars: Vec<UVar>, mut body: UTerm) -> UTerm {
-        while let Some((pos, next)) = self.eliminate_one(&vars, &body) {
-            vars.remove(pos);
+    fn eliminate_at(&mut self, mut vars: Vec<UVar>, mut body: UTerm) -> UTerm {
+        while let Some((pos, narrower, next)) = self.eliminate_one(&vars, &body) {
+            match narrower {
+                Some(z) => vars[pos] = z,
+                None => {
+                    vars.remove(pos);
+                }
+            }
             body = next;
         }
         if vars.is_empty() {
@@ -222,8 +228,9 @@ impl Normalizer {
         }
     }
 
-    /// The first bound var of `vars` that can be eliminated, with the body it leaves behind.
-    fn eliminate_one(&self, vars: &[UVar], body: &UTerm) -> Option<(usize, UTerm)> {
+    /// The first bound var of `vars` that can be eliminated, or narrowed to a var of fewer columns
+    /// (returned in its place), with the body it leaves behind.
+    fn eliminate_one(&mut self, vars: &[UVar], body: &UTerm) -> Option<(usize, Option<UVar>, UTerm)> {
         let classes = Congruence::from_factors(&factors_of(body));
         for (pos, x) in vars.iter().enumerate() {
             let UVar::Base(xid) = *x else { continue };
@@ -231,12 +238,12 @@ impl Normalizer {
             // By tuple: every column of x equals the same column of one other var y of the same
             // width, so x is y (a tuple is its columns). Table atoms of x become atoms of y.
             if let Some(y) = self.same_tuple(&classes, xid, width) {
-                return Some((pos, body.rename_base(xid, y)));
+                return Some((pos, None, body.rename_base(xid, y)));
             }
             // By key (`applyPrimaryImplyTupleEq`): x and y are both rows of a table with a unique
             // NOT NULL key K and agree on K, so they are the same row.
             if let Some(y) = self.same_key(&classes, body, xid) {
-                return Some((pos, body.rename_base(xid, y)));
+                return Some((pos, None, body.rename_base(xid, y)));
             }
             // By constant: every column of x equals some x-free term, and x is in no table atom (a
             // `Table` needs a var, not a tuple of terms). Exactly one x satisfies the equalities, so
@@ -246,11 +253,38 @@ impl Normalizer {
                     .map(|i| classes.pick_free_of(&UTerm::Var(UVar::proj(i, UVar::Base(xid))), xid))
                     .collect();
                 if let Some(b) = cols.and_then(|cols| subst_cols(body, xid, &cols)) {
-                    return Some((pos, b));
+                    // Folded now, while the copies of each substituted term are still identical:
+                    // the defining `[x.i = e]` has become `[e = e]`.
+                    return Some((pos, None, simplify(&b)));
+                }
+                // By column: one column x.i equals a term e that does not mention x.i (other
+                // columns of x may occur in it). For each choice of the other columns exactly one
+                // x.i leaves the body non-zero, so the sum ranges over the other columns only, as a
+                // fresh var z one column narrower -- fresh, because a copy of this sum elsewhere
+                // keeps x. e is renumbered onto z first; its placeholder for x.i is never read.
+                if width > 1 {
+                    let col = |i: usize, v: u32| UTerm::Var(UVar::proj(i as u32, UVar::Base(v)));
+                    for i in 0..width {
+                        let Some(e) = classes.pick_free_of_col(&col(i, xid), xid, i as u32) else { continue };
+                        let z = self.fresh_id();
+                        let mut cols: Vec<UTerm> =
+                            (0..width).map(|j| if j == i { UTerm::Const(UConst::Null) } else { col(j - (j > i) as usize, z) }).collect();
+                        let Some(e) = subst_cols(&e, xid, &cols) else { continue };
+                        cols[i] = e;
+                        if let Some(b) = subst_cols(body, xid, &cols) {
+                            self.widths.insert(z, width - 1);
+                            return Some((pos, Some(UVar::Base(z)), simplify(&b)));
+                        }
+                    }
                 }
             }
         }
         None
+    }
+
+    /// An id no var of the current term has.
+    fn fresh_id(&self) -> u32 {
+        self.widths.keys().filter(|&&id| id != OUT_VAR_ID).max().map_or(0, |m| m + 1)
     }
 
     /// Another var y with a direct `T(y)` factor for the same keyed table as a direct `T(x)`, agreeing
@@ -838,6 +872,20 @@ fn mentions(t: &UTerm, id: u32) -> bool {
     mentions_any(t, &HashSet::from([id]))
 }
 
+/// Whether `t` mentions column `i` of `id`, counting any use of `id` as a whole tuple (a table
+/// atom, a binder) as one.
+fn mentions_col(t: &UTerm, id: u32, i: u32) -> bool {
+    match t {
+        UTerm::Const(_) => false,
+        UTerm::Var(UVar::Proj { index, base }) if **base == UVar::Base(id) => *index == i,
+        UTerm::Var(v) | UTerm::Table { var: v, .. } => var_base(v) == id,
+        UTerm::Pred { args, .. } | UTerm::Func { args, .. } => args.iter().any(|a| mentions_col(a, id, i)),
+        UTerm::Add(ts) | UTerm::Mul(ts) => ts.iter().any(|c| mentions_col(c, id, i)),
+        UTerm::Squash(c) | UTerm::Neg(c) => mentions_col(c, id, i),
+        UTerm::Sum { vars, body } => base_ids(vars).contains(&id) || mentions_col(body, id, i),
+    }
+}
+
 fn mentions_table_of(t: &UTerm, id: u32) -> bool {
     match t {
         UTerm::Table { var, .. } => var_base(var) == id,
@@ -1260,6 +1308,16 @@ impl Congruence {
             .min_by_key(|m| (m.tree_size(usize::MAX), key(m)))
             .cloned()
     }
+
+    /// A member of `t`'s class that does not mention column `i` of `id`, chosen as
+    /// [`Congruence::pick_free_of`] chooses. Other columns of `id` may occur in it.
+    fn pick_free_of_col(&self, t: &UTerm, id: u32, i: u32) -> Option<UTerm> {
+        self.members_of(t)
+            .into_iter()
+            .filter(|m| !mentions_col(m, id, i))
+            .min_by_key(|m| (m.tree_size(usize::MAX), key(m)))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -1399,6 +1457,33 @@ mod tests {
         let widths = HashMap::from([(0, 2), (1, 3), (2, 2), (OUT_VAR_ID, 1)]);
         let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", vec![])).unwrap();
         assert_ne!(got, int(0));
+    }
+
+    /// `SELECT a FROM (SELECT a, b [, COUNT(*)] FROM t GROUP BY a, b) g`: the group var's key
+    /// columns, plus a count column only when `counted`, and the group's existence.
+    fn grouped(counted: bool) -> UTerm {
+        let group = |v: u32| mul(vec![scan("t", v), eq(col(0, v), col(0, 0)), eq(col(1, v), col(1, 0))]);
+        let mut fs = vec![eq(col(0, OUT_VAR_ID), col(0, 0)), UTerm::Squash(Rc::new(sum(&[1], group(1))))];
+        if counted {
+            fs.push(eq(col(2, 0), sum(&[2], group(2))));
+        }
+        sum(&[0], mul(fs))
+    }
+
+    #[test]
+    fn an_unread_aggregate_column_of_a_group_drops_out() {
+        let norm = |counted: bool| {
+            let width = if counted { 3 } else { 2 };
+            let mut n = Normalizer::new(HashMap::from([(0, width), (1, 2), (2, 2), (OUT_VAR_ID, 1)]), 1_000_000);
+            let t = n.normalize(&grouped(counted)).unwrap();
+            (t, n.widths)
+        };
+        let ((a, wa), (b, wb)) = (norm(true), norm(false));
+        assert!(crate::alpha::alpha_eq(&a, &wa, &b, &wb), "{a:?}\n  vs\n{b:?}");
+        // The unfixed key column b still ranges: one column narrower, but a sum.
+        let UTerm::Sum { vars, .. } = &b else { panic!("got {b:?}") };
+        let [UVar::Base(g)] = vars.as_slice() else { panic!("got {b:?}") };
+        assert_eq!(wb.get(g), Some(&1));
     }
 
     #[test]
