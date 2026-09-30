@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use crate::ic::Ics;
 use crate::translate::OUT_VAR_ID;
-use crate::uterm::{PredKind, UConst, UTerm, UVar};
+use crate::uterm::{mk_mul, mk_sum, PredKind, UConst, UTerm, UVar};
 
 /// Rounds of (simplify, eliminate bound vars, rename apart) before giving up on a fixpoint. Stopping
 /// early is sound -- every intermediate term is equivalent to the input -- it only costs proofs.
@@ -86,7 +86,9 @@ impl Normalizer {
             next = self.drop_key_squash(&next);
         }
         let next = canonicalize_congruence(&next);
+        let next = self.contradict_neg_sum(&next);
         let next = self.eliminate_bound(&next);
+        let next = self.merge_complements(&next, false);
         let next = self.rename_apart(&next);
         // Squash spines strip set markers (`‖T(x)‖` inside a squash is `T(x)`), and removing a
         // squash can expose such an atom again; re-marking every round keeps one canonical form.
@@ -193,8 +195,9 @@ impl Normalizer {
     }
 
     /// Removes bound vars whose every column is fixed by the equalities of their own sum's body
-    /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`). Inner sums first.
-    fn eliminate_bound(&self, t: &UTerm) -> UTerm {
+    /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`), and single columns so
+    /// fixed (`removeDeterminedBoundedColumnByConst`). Inner sums first.
+    fn eliminate_bound(&mut self, t: &UTerm) -> UTerm {
         match t {
             UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
             UTerm::Pred { .. } | UTerm::Func { .. } => pass_args(t, &mut |x| self.eliminate_bound(x)),
@@ -209,9 +212,14 @@ impl Normalizer {
         }
     }
 
-    fn eliminate_at(&self, mut vars: Vec<UVar>, mut body: UTerm) -> UTerm {
-        while let Some((pos, next)) = self.eliminate_one(&vars, &body) {
-            vars.remove(pos);
+    fn eliminate_at(&mut self, mut vars: Vec<UVar>, mut body: UTerm) -> UTerm {
+        while let Some((pos, narrower, next)) = self.eliminate_one(&vars, &body) {
+            match narrower {
+                Some(z) => vars[pos] = z,
+                None => {
+                    vars.remove(pos);
+                }
+            }
             body = next;
         }
         if vars.is_empty() {
@@ -221,8 +229,9 @@ impl Normalizer {
         }
     }
 
-    /// The first bound var of `vars` that can be eliminated, with the body it leaves behind.
-    fn eliminate_one(&self, vars: &[UVar], body: &UTerm) -> Option<(usize, UTerm)> {
+    /// The first bound var of `vars` that can be eliminated, or narrowed to a var of fewer columns
+    /// (returned in its place), with the body it leaves behind.
+    fn eliminate_one(&mut self, vars: &[UVar], body: &UTerm) -> Option<(usize, Option<UVar>, UTerm)> {
         let classes = Congruence::from_factors(&factors_of(body));
         for (pos, x) in vars.iter().enumerate() {
             let UVar::Base(xid) = *x else { continue };
@@ -230,12 +239,12 @@ impl Normalizer {
             // By tuple: every column of x equals the same column of one other var y of the same
             // width, so x is y (a tuple is its columns). Table atoms of x become atoms of y.
             if let Some(y) = self.same_tuple(&classes, xid, width) {
-                return Some((pos, body.rename_base(xid, y)));
+                return Some((pos, None, body.rename_base(xid, y)));
             }
             // By key (`applyPrimaryImplyTupleEq`): x and y are both rows of a table with a unique
             // NOT NULL key K and agree on K, so they are the same row.
             if let Some(y) = self.same_key(&classes, body, xid) {
-                return Some((pos, body.rename_base(xid, y)));
+                return Some((pos, None, body.rename_base(xid, y)));
             }
             // By constant: every column of x equals some x-free term, and x is in no table atom (a
             // `Table` needs a var, not a tuple of terms). Exactly one x satisfies the equalities, so
@@ -245,11 +254,38 @@ impl Normalizer {
                     .map(|i| classes.pick_free_of(&UTerm::Var(UVar::proj(i, UVar::Base(xid))), xid))
                     .collect();
                 if let Some(b) = cols.and_then(|cols| subst_cols(body, xid, &cols)) {
-                    return Some((pos, b));
+                    // Folded now, while the copies of each substituted term are still identical:
+                    // the defining `[x.i = e]` has become `[e = e]`.
+                    return Some((pos, None, simplify(&b)));
+                }
+                // By column: one column x.i equals a term e that does not mention x.i (other
+                // columns of x may occur in it). For each choice of the other columns exactly one
+                // x.i leaves the body non-zero, so the sum ranges over the other columns only, as a
+                // fresh var z one column narrower -- fresh, because a copy of this sum elsewhere
+                // keeps x. e is renumbered onto z first; its placeholder for x.i is never read.
+                if width > 1 {
+                    let col = |i: usize, v: u32| UTerm::Var(UVar::proj(i as u32, UVar::Base(v)));
+                    for i in 0..width {
+                        let Some(e) = classes.pick_free_of_col(&col(i, xid), xid, i as u32) else { continue };
+                        let z = self.fresh_id();
+                        let mut cols: Vec<UTerm> =
+                            (0..width).map(|j| if j == i { UTerm::Const(UConst::Null) } else { col(j - (j > i) as usize, z) }).collect();
+                        let Some(e) = subst_cols(&e, xid, &cols) else { continue };
+                        cols[i] = e;
+                        if let Some(b) = subst_cols(body, xid, &cols) {
+                            self.widths.insert(z, width - 1);
+                            return Some((pos, Some(UVar::Base(z)), simplify(&b)));
+                        }
+                    }
                 }
             }
         }
         None
+    }
+
+    /// An id no var of the current term has.
+    fn fresh_id(&self) -> u32 {
+        self.widths.keys().filter(|&&id| id != OUT_VAR_ID).max().map_or(0, |m| m + 1)
     }
 
     /// Another var y with a direct `T(y)` factor for the same keyed table as a direct `T(x)`, agreeing
@@ -287,6 +323,230 @@ impl Normalizer {
         candidates
             .into_iter()
             .find(|&y| self.widths.get(&y) == Some(&width) && (0..width).all(|i| classes.same(&col(i, xid), &col(i, y))))
+    }
+
+    /// `simplifySumToZeroByContradictNegSum`: a product with a factor `¬Σ_Y b` is 0 when its other
+    /// factors already hold a witness for the sum -- an assignment σ of `Y` to rows in scope under
+    /// which every factor of `b` is one of the other factors, or an equality theirs imply. Wherever
+    /// the other factors are non-zero, `b[σ] ≥ 1`, and `b[σ]` is one summand of `Σ_Y b`, so the
+    /// negation is 0. `b` must be a count, so that no summand is negative. This is how a `LEFT JOIN`
+    /// whose row an inner join has already matched loses its null-padded branch.
+    fn contradict_neg_sum(&self, t: &UTerm) -> UTerm {
+        match t {
+            UTerm::Mul(fs) => {
+                let factors: Vec<UTerm> = fs.iter().map(|f| self.contradict_neg_sum(f)).collect();
+                if (0..factors.len()).any(|i| self.witnessed(&factors, i)) {
+                    return int(0);
+                }
+                UTerm::Mul(factors.into_iter().map(Rc::new).collect())
+            }
+            UTerm::Add(ts) => UTerm::Add(ts.iter().map(|c| Rc::new(self.contradict_neg_sum(c))).collect()),
+            UTerm::Squash(c) => UTerm::Squash(Rc::new(self.contradict_neg_sum(c))),
+            UTerm::Neg(c) => UTerm::Neg(Rc::new(self.contradict_neg_sum(c))),
+            UTerm::Sum { vars, body } => UTerm::Sum { vars: vars.clone(), body: Rc::new(self.contradict_neg_sum(body)) },
+            other => pass_args(other, &mut |x| self.contradict_neg_sum(x)),
+        }
+    }
+
+    /// Whether `factors[i]` is `¬Σ_Y b` and the other factors hold a witness for `Σ_Y b`. Each
+    /// var of `Y` may be sent to any row the other factors scan from the same table, of the same
+    /// width; σ need not be injective, since any assignment of `Y` is one point of the sum.
+    fn witnessed(&self, factors: &[UTerm], i: usize) -> bool {
+        let UTerm::Neg(n) = &factors[i] else { return false };
+        let UTerm::Sum { vars, body } = &**n else { return false };
+        if !is_count(body) {
+            return false;
+        }
+        let others: Vec<UTerm> = factors.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| f.clone()).collect();
+        let scanned = direct_tables(&UTerm::Mul(others.iter().cloned().map(Rc::new).collect()));
+        let inner = direct_tables(body);
+        let mut choices: Vec<(u32, Vec<u32>)> = Vec::new();
+        for v in vars {
+            let UVar::Base(y) = *v else { return false };
+            let Some(width) = self.widths.get(&y) else { return false };
+            let mut rows: Vec<u32> = inner
+                .iter()
+                .filter(|(_, id)| *id == y)
+                .flat_map(|(name, _)| scanned.iter().filter(move |(n, _)| n == name).map(|(_, z)| *z))
+                .filter(|z| self.widths.get(z) == Some(width))
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            if rows.is_empty() {
+                return false;
+            }
+            choices.push((y, rows));
+        }
+        let assignments = choices.iter().try_fold(1usize, |n, (_, rows)| n.checked_mul(rows.len()));
+        if assignments.is_none_or(|n| n > MAX_WITNESSES) {
+            return false;
+        }
+        let held: HashSet<&UTerm> = others.iter().collect();
+        let classes = Congruence::from_factors(&others);
+        let mut pick = vec![0usize; choices.len()];
+        loop {
+            let b = choices.iter().zip(&pick).fold((**body).clone(), |b, ((y, rows), &k)| b.rename_base(*y, rows[k]));
+            if factors_of(&b).iter().all(|g| implied_nonzero(g, &held, &classes)) {
+                return true;
+            }
+            // Next assignment, odometer-style; done once every position has wrapped.
+            let Some(pos) = (0..pick.len()).find(|&p| pick[p] + 1 < choices[p].1.len()) else { return false };
+            pick[pos] += 1;
+            pick[..pos].iter_mut().for_each(|k| *k = 0);
+        }
+    }
+}
+
+impl Normalizer {
+    /// Complementary summands: `Σ_V X·N + Σ_V X·¬N` is `Σ_V X` when `N` is 0/1, since then
+    /// `N + ¬N = 1`. This is how a `LEFT JOIN` that can match at most one row, and whose columns
+    /// nothing reads, drops out: its matched and null-padded branches add up to the row alone. The
+    /// matched branch is rebuilt from the padded one with this round's own rules and recognised by
+    /// alpha-equivalence, rung 2's own test, so a merge is only as trusted as a rung-2 proof.
+    ///
+    /// `set_ctx`: `t` sits on a squash or negation spine of non-negative terms, where only zero
+    /// versus non-zero matters. There `N` need not be 0/1: with `X, N ≥ 0`, `X·N + X·¬N` is non-zero
+    /// exactly when `X` is, since `N + ¬N ≥ 1`.
+    fn merge_complements(&self, t: &UTerm, set_ctx: bool) -> UTerm {
+        match t {
+            UTerm::Add(ts) => {
+                let mut parts: Vec<UTerm> = ts.iter().map(|c| self.merge_complements(c, set_ctx)).collect();
+                if parts.len() <= MAX_MERGE_SUMMANDS {
+                    while let Some((p, q, merged)) = self.complement_pair(&parts, set_ctx) {
+                        parts.remove(p.max(q));
+                        parts.remove(p.min(q));
+                        parts.push(merged);
+                    }
+                }
+                match parts.len() {
+                    1 => parts.pop().expect("len 1"),
+                    _ => UTerm::Add(parts.into_iter().map(Rc::new).collect()),
+                }
+            }
+            UTerm::Mul(ts) => UTerm::Mul(ts.iter().map(|c| Rc::new(self.merge_complements(c, set_ctx))).collect()),
+            UTerm::Squash(c) => UTerm::Squash(Rc::new(self.merge_complements(c, spine_nonneg(c)))),
+            UTerm::Neg(c) => UTerm::Neg(Rc::new(self.merge_complements(c, spine_nonneg(c)))),
+            UTerm::Sum { vars, body } => {
+                UTerm::Sum { vars: vars.clone(), body: Rc::new(self.merge_complements(body, set_ctx)) }
+            }
+            other => pass_args(other, &mut |x| self.merge_complements(x, false)),
+        }
+    }
+
+    /// The first `(P, Q, Σ_V X)` with `Q = Σ_V X·¬N` for a 0/1 sum `N` (any sum, in a set context)
+    /// and `P` alpha-equivalent to `Σ_V X·N`. `V` may be empty, `Q` then being a bare product.
+    fn complement_pair(&self, parts: &[UTerm], set_ctx: bool) -> Option<(usize, usize, UTerm)> {
+        // Compared without set-table markers: this round's squash spines have stripped them in some
+        // places and not others, and on a set table `‖T(x)‖` is `T(x)`.
+        let unmarked: Vec<UTerm> = parts.iter().map(|p| unmark_set_tables(p, &self.ics)).collect();
+        let mut shapes: Vec<Option<u64>> = vec![None; parts.len()];
+        // Which tables each summand scans directly. The rules that rebuild the matched summand
+        // merge and rename table atoms but never add or drop a table, so a summand scanning other
+        // tables cannot be the match -- a filter that skips the rebuild, which is the cost here.
+        let scans: Vec<Vec<String>> = parts.iter().map(|p| table_names(&factors_of(summand_body(p)))).collect();
+        for (qi, q) in parts.iter().enumerate() {
+            let (vars, body) = match q {
+                UTerm::Sum { vars, body } => (vars.clone(), (**body).clone()),
+                other => (Vec::new(), other.clone()),
+            };
+            let factors = factors_of(&body);
+            for (ni, f) in factors.iter().enumerate() {
+                // Only a negated sum -- the "no row matched" of an outer join. A negated predicate
+                // (`X·p + X·¬p`) would be as exact, but a product has many of those (every NULL
+                // test) and rebuilding a summand for each costs more than it finds.
+                let UTerm::Neg(n) = f else { continue };
+                let UTerm::Sum { vars: u, body: y } = &**n else { continue };
+                let zero_one = self.sum_is_zero_one(u, y);
+                if !(zero_one || (set_ctx && spine_nonneg(n))) {
+                    continue;
+                }
+                let rest: Vec<UTerm> = factors.iter().enumerate().filter(|(j, _)| *j != ni).map(|(_, g)| g.clone()).collect();
+                let mut would_scan = rest.clone();
+                would_scan.extend(factors_of(summand_body(n)));
+                let would_scan = table_names(&would_scan);
+                if !scans.iter().enumerate().any(|(pi, s)| pi != qi && *s == would_scan) {
+                    continue;
+                }
+                let (matched, matched_widths) = self.local_rules(&mk_sum(vars.clone(), mk_mul(rest.iter().cloned().chain([(**n).clone()]))));
+                let matched = unmark_set_tables(&matched, &self.ics);
+                let want = crate::alpha::shape(&matched);
+                let hit = unmarked.iter().enumerate().find(|(pi, p)| {
+                    *pi != qi
+                        && scans[*pi] == would_scan
+                        && *shapes[*pi].get_or_insert_with(|| crate::alpha::shape(p)) == want
+                        && crate::alpha::alpha_eq(p, &self.widths, &matched, &matched_widths)
+                });
+                if let Some((pi, _)) = hit {
+                    return Some((pi, qi, mk_sum(vars, mk_mul(rest))));
+                }
+            }
+        }
+        None
+    }
+
+    /// A round's rules up to bound-var elimination, repeated to a fixpoint (pulling a sum out of a
+    /// product leaves its body nested one level until the next pass), so that a term rebuilt from a
+    /// normalized one reaches the form its neighbours already have. Every rule preserves meaning.
+    /// Runs on a copy of the widths, since elimination may mint vars, and returns them with it.
+    fn local_rules(&self, t: &UTerm) -> (UTerm, HashMap<u32, usize>) {
+        let mut scratch = Normalizer { widths: self.widths.clone(), max_tree: self.max_tree, ics: self.ics.clone() };
+        let mut cur = t.clone();
+        for _ in 0..MAX_LOCAL_PASSES {
+            let mut next = simplify(&cur);
+            if !scratch.ics.not_null.is_empty() {
+                next = scratch.remove_not_null(&next);
+            }
+            if !scratch.ics.keys.is_empty() {
+                next = scratch.drop_key_squash(&next);
+            }
+            let next = scratch.contradict_neg_sum(&canonicalize_congruence(&next));
+            let next = scratch.eliminate_bound(&next);
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        (cur, scratch.widths)
+    }
+}
+
+/// Passes [`Normalizer::local_rules`] makes over a rebuilt term.
+const MAX_LOCAL_PASSES: usize = 8;
+
+/// A summand's product: the body of a sum, or the term itself.
+fn summand_body(t: &UTerm) -> &UTerm {
+    match t {
+        UTerm::Sum { body, .. } => body,
+        other => other,
+    }
+}
+
+/// The distinct names of the tables `factors` scan directly (`T(x)` or `‖T(x)‖`), sorted.
+fn table_names(factors: &[UTerm]) -> Vec<String> {
+    let mut names: Vec<String> = direct_tables(&UTerm::Mul(factors.iter().cloned().map(Rc::new).collect())).into_iter().map(|(n, _)| n).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Summands of one `Add` beyond which [`Normalizer::merge_complements`] does not look for pairs.
+const MAX_MERGE_SUMMANDS: usize = 64;
+
+/// Assignments [`Normalizer::witnessed`] tries for one negated sum before giving up.
+const MAX_WITNESSES: usize = 64;
+
+/// Whether a factor `g` of a count is at least 1 wherever the factors `held` are all non-zero: it is
+/// one of them (a count that is non-zero is at least 1), a squash of one or the operand of a squashed
+/// one (`‖h‖ ≠ 0` iff `h ≠ 0`), an equality `held`'s equalities imply, or a positive constant.
+fn implied_nonzero(g: &UTerm, held: &HashSet<&UTerm>, classes: &Congruence) -> bool {
+    if held.contains(g) {
+        return true;
+    }
+    match g {
+        UTerm::Const(UConst::Int(n)) => *n >= 1,
+        UTerm::Pred { kind: PredKind::Eq, args } if args.len() == 2 => classes.same(&args[0], &args[1]),
+        UTerm::Squash(h) => held.contains(&**h),
+        other => held.contains(&UTerm::Squash(Rc::new(other.clone()))),
     }
 }
 
@@ -748,6 +1008,20 @@ fn mentions(t: &UTerm, id: u32) -> bool {
     mentions_any(t, &HashSet::from([id]))
 }
 
+/// Whether `t` mentions column `i` of `id`, counting any use of `id` as a whole tuple (a table
+/// atom, a binder) as one.
+fn mentions_col(t: &UTerm, id: u32, i: u32) -> bool {
+    match t {
+        UTerm::Const(_) => false,
+        UTerm::Var(UVar::Proj { index, base }) if **base == UVar::Base(id) => *index == i,
+        UTerm::Var(v) | UTerm::Table { var: v, .. } => var_base(v) == id,
+        UTerm::Pred { args, .. } | UTerm::Func { args, .. } => args.iter().any(|a| mentions_col(a, id, i)),
+        UTerm::Add(ts) | UTerm::Mul(ts) => ts.iter().any(|c| mentions_col(c, id, i)),
+        UTerm::Squash(c) | UTerm::Neg(c) => mentions_col(c, id, i),
+        UTerm::Sum { vars, body } => base_ids(vars).contains(&id) || mentions_col(body, id, i),
+    }
+}
+
 fn mentions_table_of(t: &UTerm, id: u32) -> bool {
     match t {
         UTerm::Table { var, .. } => var_base(var) == id,
@@ -1030,6 +1304,19 @@ fn substitute(t: &UTerm, subst: &HashMap<UTerm, UTerm>) -> UTerm {
     }
 }
 
+/// The inverse of [`mark_set_tables`]: every `‖T(x)‖` of a set table back to `T(x)`, the same
+/// value on the databases the constraints describe.
+fn unmark_set_tables(t: &UTerm, ics: &Ics) -> UTerm {
+    if ics.keys.is_empty() {
+        return t.clone();
+    }
+    match t {
+        UTerm::Squash(c) if matches!(&**c, UTerm::Table { name, .. } if ics.is_set(name)) => (**c).clone(),
+        UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
+        other => rebuild_children(other, &mut |c| unmark_set_tables(c, ics)),
+    }
+}
+
 /// Wraps every atom of a table that is a set (see [`Ics::is_set`]) as `‖T(x)‖`. That is the identity
 /// on such tables, and it makes the atom structurally 0/1, so duplicate occurrences collapse like
 /// any other idempotent factor.
@@ -1170,6 +1457,16 @@ impl Congruence {
             .min_by_key(|m| (m.tree_size(usize::MAX), key(m)))
             .cloned()
     }
+
+    /// A member of `t`'s class that does not mention column `i` of `id`, chosen as
+    /// [`Congruence::pick_free_of`] chooses. Other columns of `id` may occur in it.
+    fn pick_free_of_col(&self, t: &UTerm, id: u32, i: u32) -> Option<UTerm> {
+        self.members_of(t)
+            .into_iter()
+            .filter(|m| !mentions_col(m, id, i))
+            .min_by_key(|m| (m.tree_size(usize::MAX), key(m)))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -1264,6 +1561,137 @@ mod tests {
         let (a, wa) = norm(&joined, HashMap::from([(0, 2), (1, 2), (OUT_VAR_ID, 2)]), ics.clone());
         let (b, wb) = norm(&single, HashMap::from([(0, 2), (OUT_VAR_ID, 2)]), ics);
         assert!(crate::alpha::alpha_eq(&a, &wa, &b, &wb), "{a:?}\n  vs\n{b:?}");
+    }
+
+    fn scan(name: &str, v: u32) -> UTerm {
+        UTerm::Table { name: name.into(), var: UVar::Base(v) }
+    }
+
+    fn not(t: UTerm) -> UTerm {
+        UTerm::Neg(Rc::new(t))
+    }
+
+    /// `t JOIN u ON t.1 = u.0 LEFT JOIN u AS u1 ON u1.0 = t.1`'s null-padded branch, with `extra`
+    /// as further conditions on `u1`, and `joined` the table the inner join scans.
+    fn padded_branch(joined: &str, extra: Vec<UTerm>) -> UTerm {
+        let mut matched = vec![scan("u", 2), eq(col(0, 2), col(1, 0))];
+        matched.extend(extra);
+        sum(
+            &[0, 1],
+            mul(vec![scan("t", 0), scan(joined, 1), eq(col(1, 0), col(0, 1)), not(sum(&[2], mul(matched))), eq(col(0, OUT_VAR_ID), col(0, 0))]),
+        )
+    }
+
+    #[test]
+    fn a_left_join_the_inner_join_already_matched_has_no_padding() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", vec![])).unwrap();
+        assert_eq!(got, int(0));
+    }
+
+    #[test]
+    fn a_witness_must_satisfy_every_condition_of_the_negated_sum() {
+        // The joined row need not have u.1 = 5, so the left join may still pad.
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let extra = vec![eq(col(1, 2), int(5))];
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", extra)).unwrap();
+        assert_ne!(got, int(0));
+    }
+
+    #[test]
+    fn a_witness_must_be_a_row_of_the_same_table_and_width() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("v", vec![])).unwrap();
+        assert_ne!(got, int(0));
+        let widths = HashMap::from([(0, 2), (1, 3), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", vec![])).unwrap();
+        assert_ne!(got, int(0));
+    }
+
+    /// `t LEFT JOIN u ON u.0 = t.1`, reading `out.0` from `t.0` and, when `reads_u`, `out.1` from
+    /// `u.1` (null on the padded branch): the matched branch plus the null-padded one.
+    fn left_join(reads_u: bool) -> UTerm {
+        let mut matched = vec![scan("t", 0), scan("u", 1), eq(col(0, 1), col(1, 0)), eq(col(0, OUT_VAR_ID), col(0, 0))];
+        let mut padded = vec![scan("t", 2), not(sum(&[3], mul(vec![scan("u", 3), eq(col(0, 3), col(1, 2))]))), eq(col(0, OUT_VAR_ID), col(0, 2))];
+        if reads_u {
+            matched.push(eq(col(1, OUT_VAR_ID), col(1, 1)));
+            padded.push(eq(col(1, OUT_VAR_ID), null()));
+        }
+        UTerm::Add(vec![Rc::new(sum(&[0, 1], mul(matched))), Rc::new(sum(&[2], mul(padded)))])
+    }
+
+    fn u_keyed_on_0() -> Ics {
+        Ics {
+            not_null: HashMap::from([("u".into(), HashSet::from([0]))]),
+            keys: HashMap::from([("u".into(), vec![vec![0]])]),
+        }
+    }
+
+    #[test]
+    fn an_unread_left_join_on_a_key_is_the_left_table_alone() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (3, 2), (OUT_VAR_ID, 1)]);
+        let mut n = Normalizer::new(widths, 1_000_000).with_ics(u_keyed_on_0());
+        let got = n.normalize(&left_join(false)).unwrap();
+        assert_eq!(n.round(&got), got, "not a fixpoint");
+        let alone = sum(&[0], mul(vec![scan("t", 0), eq(col(0, OUT_VAR_ID), col(0, 0))]));
+        let mut m = Normalizer::new(HashMap::from([(0, 2), (OUT_VAR_ID, 1)]), 1_000_000).with_ics(u_keyed_on_0());
+        let want = m.normalize(&alone).unwrap();
+        assert!(crate::alpha::alpha_eq(&got, &n.widths, &want, &m.widths), "{got:?}\n  vs\n{want:?}");
+    }
+
+    #[test]
+    fn a_left_join_without_a_key_or_whose_columns_are_read_keeps_both_branches() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (3, 2), (OUT_VAR_ID, 2)]);
+        // Without the key, a row of t may match two rows of u.
+        let got = Normalizer::new(widths.clone(), 1_000_000).normalize(&left_join(false)).unwrap();
+        assert!(matches!(got, UTerm::Add(_)), "got {got:?}");
+        // With it, but reading u.1: the branches differ in what they output.
+        let got = Normalizer::new(widths, 1_000_000).with_ics(u_keyed_on_0()).normalize(&left_join(true)).unwrap();
+        assert!(matches!(got, UTerm::Add(_)), "got {got:?}");
+    }
+
+    #[test]
+    fn under_a_squash_an_unread_left_join_needs_no_key() {
+        // ‖matched + padded‖: only whether a row of t exists matters, however many rows of u match.
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (3, 2), (OUT_VAR_ID, 1)]);
+        let mut n = Normalizer::new(widths.clone(), 1_000_000);
+        let got = n.normalize(&UTerm::Squash(Rc::new(left_join(false)))).unwrap();
+        let alone = UTerm::Squash(Rc::new(sum(&[0], mul(vec![scan("t", 0), eq(col(0, OUT_VAR_ID), col(0, 0))]))));
+        let mut m = Normalizer::new(HashMap::from([(0, 2), (OUT_VAR_ID, 1)]), 1_000_000);
+        let want = m.normalize(&alone).unwrap();
+        assert!(crate::alpha::alpha_eq(&got, &n.widths, &want, &m.widths), "{got:?}\n  vs\n{want:?}");
+        // Reading u's columns still keeps the branches apart.
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (3, 2), (OUT_VAR_ID, 2)]);
+        let mut n = Normalizer::new(widths, 1_000_000);
+        let got = n.normalize(&UTerm::Squash(Rc::new(left_join(true)))).unwrap();
+        assert!(!crate::alpha::alpha_eq(&got, &n.widths, &want, &m.widths), "{got:?}");
+    }
+
+    /// `SELECT a FROM (SELECT a, b [, COUNT(*)] FROM t GROUP BY a, b) g`: the group var's key
+    /// columns, plus a count column only when `counted`, and the group's existence.
+    fn grouped(counted: bool) -> UTerm {
+        let group = |v: u32| mul(vec![scan("t", v), eq(col(0, v), col(0, 0)), eq(col(1, v), col(1, 0))]);
+        let mut fs = vec![eq(col(0, OUT_VAR_ID), col(0, 0)), UTerm::Squash(Rc::new(sum(&[1], group(1))))];
+        if counted {
+            fs.push(eq(col(2, 0), sum(&[2], group(2))));
+        }
+        sum(&[0], mul(fs))
+    }
+
+    #[test]
+    fn an_unread_aggregate_column_of_a_group_drops_out() {
+        let norm = |counted: bool| {
+            let width = if counted { 3 } else { 2 };
+            let mut n = Normalizer::new(HashMap::from([(0, width), (1, 2), (2, 2), (OUT_VAR_ID, 1)]), 1_000_000);
+            let t = n.normalize(&grouped(counted)).unwrap();
+            (t, n.widths)
+        };
+        let ((a, wa), (b, wb)) = (norm(true), norm(false));
+        assert!(crate::alpha::alpha_eq(&a, &wa, &b, &wb), "{a:?}\n  vs\n{b:?}");
+        // The unfixed key column b still ranges: one column narrower, but a sum.
+        let UTerm::Sum { vars, .. } = &b else { panic!("got {b:?}") };
+        let [UVar::Base(g)] = vars.as_slice() else { panic!("got {b:?}") };
+        assert_eq!(wb.get(g), Some(&1));
     }
 
     #[test]

@@ -243,6 +243,9 @@ What is ported, in the order the ladder runs it:
   (`UNormalization`, `QueryUExprNormalizer`), **integrity-constraint rewriting**
   (`QueryUExprICRewriter`, with the constraints read from the IR's own schemas) and
   **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
+  Normalization also merges a row's matched and unmatched summands (`Σ X·N + Σ X·¬N` is `Σ X`
+  when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
+  LIA\* rung.
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
   or negation.
 

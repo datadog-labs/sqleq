@@ -50,7 +50,7 @@ fn same_const(a: &UConst, b: &UConst) -> bool {
 
 /// A hash that ignores every var id, so alpha-equivalent terms always agree on it. Used to skip
 /// candidate pairs that cannot match before paying for a full comparison.
-fn shape(t: &UTerm) -> u64 {
+pub(crate) fn shape(t: &UTerm) -> u64 {
     fn go(t: &UTerm, h: &mut std::collections::hash_map::DefaultHasher) {
         std::mem::discriminant(t).hash(h);
         match t {
