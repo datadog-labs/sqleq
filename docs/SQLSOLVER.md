@@ -238,11 +238,13 @@ What is ported, in the order the ladder runs it:
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
   or negation.
 
-Not ported: the **LIA\* rung**. The pairs it would add need integer reasoning across the
-conversions between dates and timestamps (`ts >= k AND ts < k + 1` is not `ts = k` for a
-timestamp). The IR keeps those types apart and names every conversion (`q_conv_date_timestamp` and
-the like), which is what such a rung would have to interpret; the commonest of these pairs, a
-truncated timestamp against the range of its day, the frontend already lowers to one term.
+Not ported: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
+summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
+its encodings do not hold for Postgres as written. Its integer reading of dates and timestamps is one:
+`ts >= k AND ts < k + 1` is not `ts = k` for a timestamp, and `'infinity'::date + 1` is `infinity`,
+so even `d + 1 > d` fails. The IR names every temporal operation and conversion
+(`q_arith_add_date_integer`, `q_conv_date_timestamp` and the like), which is what such a rung would
+have to interpret, infinities included.
 **`LIMIT`/`OFFSET`** (`OrderbySupport`) is not ported either; a bare `ORDER BY` is erased, which is
 sound under the bag semantics `sqleq` decides.
 
