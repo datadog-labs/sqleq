@@ -86,6 +86,7 @@ impl Normalizer {
             next = self.drop_key_squash(&next);
         }
         let next = canonicalize_congruence(&next);
+        let next = self.contradict_neg_sum(&next);
         let next = self.eliminate_bound(&next);
         let next = self.rename_apart(&next);
         // Squash spines strip set markers (`‖T(x)‖` inside a squash is `T(x)`), and removing a
@@ -287,6 +288,95 @@ impl Normalizer {
         candidates
             .into_iter()
             .find(|&y| self.widths.get(&y) == Some(&width) && (0..width).all(|i| classes.same(&col(i, xid), &col(i, y))))
+    }
+
+    /// `simplifySumToZeroByContradictNegSum`: a product with a factor `¬Σ_Y b` is 0 when its other
+    /// factors already hold a witness for the sum -- an assignment σ of `Y` to rows in scope under
+    /// which every factor of `b` is one of the other factors, or an equality theirs imply. Wherever
+    /// the other factors are non-zero, `b[σ] ≥ 1`, and `b[σ]` is one summand of `Σ_Y b`, so the
+    /// negation is 0. `b` must be a count, so that no summand is negative. This is how a `LEFT JOIN`
+    /// whose row an inner join has already matched loses its null-padded branch.
+    fn contradict_neg_sum(&self, t: &UTerm) -> UTerm {
+        match t {
+            UTerm::Mul(fs) => {
+                let factors: Vec<UTerm> = fs.iter().map(|f| self.contradict_neg_sum(f)).collect();
+                if (0..factors.len()).any(|i| self.witnessed(&factors, i)) {
+                    return int(0);
+                }
+                UTerm::Mul(factors.into_iter().map(Rc::new).collect())
+            }
+            UTerm::Add(ts) => UTerm::Add(ts.iter().map(|c| Rc::new(self.contradict_neg_sum(c))).collect()),
+            UTerm::Squash(c) => UTerm::Squash(Rc::new(self.contradict_neg_sum(c))),
+            UTerm::Neg(c) => UTerm::Neg(Rc::new(self.contradict_neg_sum(c))),
+            UTerm::Sum { vars, body } => UTerm::Sum { vars: vars.clone(), body: Rc::new(self.contradict_neg_sum(body)) },
+            other => pass_args(other, &mut |x| self.contradict_neg_sum(x)),
+        }
+    }
+
+    /// Whether `factors[i]` is `¬Σ_Y b` and the other factors hold a witness for `Σ_Y b`. Each
+    /// var of `Y` may be sent to any row the other factors scan from the same table, of the same
+    /// width; σ need not be injective, since any assignment of `Y` is one point of the sum.
+    fn witnessed(&self, factors: &[UTerm], i: usize) -> bool {
+        let UTerm::Neg(n) = &factors[i] else { return false };
+        let UTerm::Sum { vars, body } = &**n else { return false };
+        if !is_count(body) {
+            return false;
+        }
+        let others: Vec<UTerm> = factors.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, f)| f.clone()).collect();
+        let scanned = direct_tables(&UTerm::Mul(others.iter().cloned().map(Rc::new).collect()));
+        let inner = direct_tables(body);
+        let mut choices: Vec<(u32, Vec<u32>)> = Vec::new();
+        for v in vars {
+            let UVar::Base(y) = *v else { return false };
+            let Some(width) = self.widths.get(&y) else { return false };
+            let mut rows: Vec<u32> = inner
+                .iter()
+                .filter(|(_, id)| *id == y)
+                .flat_map(|(name, _)| scanned.iter().filter(move |(n, _)| n == name).map(|(_, z)| *z))
+                .filter(|z| self.widths.get(z) == Some(width))
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            if rows.is_empty() {
+                return false;
+            }
+            choices.push((y, rows));
+        }
+        let assignments = choices.iter().try_fold(1usize, |n, (_, rows)| n.checked_mul(rows.len()));
+        if assignments.is_none_or(|n| n > MAX_WITNESSES) {
+            return false;
+        }
+        let held: HashSet<&UTerm> = others.iter().collect();
+        let classes = Congruence::from_factors(&others);
+        let mut pick = vec![0usize; choices.len()];
+        loop {
+            let b = choices.iter().zip(&pick).fold((**body).clone(), |b, ((y, rows), &k)| b.rename_base(*y, rows[k]));
+            if factors_of(&b).iter().all(|g| implied_nonzero(g, &held, &classes)) {
+                return true;
+            }
+            // Next assignment, odometer-style; done once every position has wrapped.
+            let Some(pos) = (0..pick.len()).find(|&p| pick[p] + 1 < choices[p].1.len()) else { return false };
+            pick[pos] += 1;
+            pick[..pos].iter_mut().for_each(|k| *k = 0);
+        }
+    }
+}
+
+/// Assignments [`Normalizer::witnessed`] tries for one negated sum before giving up.
+const MAX_WITNESSES: usize = 64;
+
+/// Whether a factor `g` of a count is at least 1 wherever the factors `held` are all non-zero: it is
+/// one of them (a count that is non-zero is at least 1), a squash of one or the operand of a squashed
+/// one (`‖h‖ ≠ 0` iff `h ≠ 0`), an equality `held`'s equalities imply, or a positive constant.
+fn implied_nonzero(g: &UTerm, held: &HashSet<&UTerm>, classes: &Congruence) -> bool {
+    if held.contains(g) {
+        return true;
+    }
+    match g {
+        UTerm::Const(UConst::Int(n)) => *n >= 1,
+        UTerm::Pred { kind: PredKind::Eq, args } if args.len() == 2 => classes.same(&args[0], &args[1]),
+        UTerm::Squash(h) => held.contains(&**h),
+        other => held.contains(&UTerm::Squash(Rc::new(other.clone()))),
     }
 }
 
@@ -1264,6 +1354,51 @@ mod tests {
         let (a, wa) = norm(&joined, HashMap::from([(0, 2), (1, 2), (OUT_VAR_ID, 2)]), ics.clone());
         let (b, wb) = norm(&single, HashMap::from([(0, 2), (OUT_VAR_ID, 2)]), ics);
         assert!(crate::alpha::alpha_eq(&a, &wa, &b, &wb), "{a:?}\n  vs\n{b:?}");
+    }
+
+    fn scan(name: &str, v: u32) -> UTerm {
+        UTerm::Table { name: name.into(), var: UVar::Base(v) }
+    }
+
+    fn not(t: UTerm) -> UTerm {
+        UTerm::Neg(Rc::new(t))
+    }
+
+    /// `t JOIN u ON t.1 = u.0 LEFT JOIN u AS u1 ON u1.0 = t.1`'s null-padded branch, with `extra`
+    /// as further conditions on `u1`, and `joined` the table the inner join scans.
+    fn padded_branch(joined: &str, extra: Vec<UTerm>) -> UTerm {
+        let mut matched = vec![scan("u", 2), eq(col(0, 2), col(1, 0))];
+        matched.extend(extra);
+        sum(
+            &[0, 1],
+            mul(vec![scan("t", 0), scan(joined, 1), eq(col(1, 0), col(0, 1)), not(sum(&[2], mul(matched))), eq(col(0, OUT_VAR_ID), col(0, 0))]),
+        )
+    }
+
+    #[test]
+    fn a_left_join_the_inner_join_already_matched_has_no_padding() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", vec![])).unwrap();
+        assert_eq!(got, int(0));
+    }
+
+    #[test]
+    fn a_witness_must_satisfy_every_condition_of_the_negated_sum() {
+        // The joined row need not have u.1 = 5, so the left join may still pad.
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let extra = vec![eq(col(1, 2), int(5))];
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", extra)).unwrap();
+        assert_ne!(got, int(0));
+    }
+
+    #[test]
+    fn a_witness_must_be_a_row_of_the_same_table_and_width() {
+        let widths = HashMap::from([(0, 2), (1, 2), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("v", vec![])).unwrap();
+        assert_ne!(got, int(0));
+        let widths = HashMap::from([(0, 2), (1, 3), (2, 2), (OUT_VAR_ID, 1)]);
+        let got = Normalizer::new(widths, 1_000_000).normalize(&padded_branch("u", vec![])).unwrap();
+        assert_ne!(got, int(0));
     }
 
     #[test]
