@@ -8,13 +8,17 @@ conventions are not the ones you would guess from the code — this file is the 
 ```sh
 cargo test                 # the frontend: 204 + 179 + 17 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
+cargo test -p sqleq-solver # the SQLSolver port: 49 (needs Z3, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
 ```
 
-`cargo test` deliberately does not build `sqleq-fuzz`. Its first build downloads DuckDB's release
-library (~40 MB, cached in `target/`), so the root manifest sets `default-members = ["."]` and the
-disprover is opt-in. CI splits them into two jobs for the same reason.
+`cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
+`sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and `sqleq-solver`
+links a Z3 you supply — `$SQLEQ_Z3_LIB_DIR` names the directory holding `libz3.so` and
+`$Z3_SYS_Z3_HEADER` a `z3.h` from the same release — so the root manifest sets
+`default-members = ["."]` and both are opt-in. CI gives each its own job for the same reason, and
+fetches Z3 from a digest-pinned release archive.
 
 ### Licensing
 
@@ -26,8 +30,8 @@ cargo install dd-rust-license-tool --version 1.0.6 --locked   # once
 sh tools/update_license_3rdparty.sh
 ```
 
-Components that are not crates (the DuckDB library, and what the SQLSolver bridge compiles against)
-are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
+Components that are not crates (the DuckDB and Z3 libraries, and what the SQLSolver bridge compiles
+against) are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
 Dependencies must be under a permissive licence: `cargo deny --workspace check licenses` enforces
 the allow-list in [`deny.toml`](deny.toml), and a licence outside it needs a discussion first.
 
@@ -44,8 +48,8 @@ lines of each:
 
 ## Lints
 
-`cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per
-crate.
+`cargo clippy --workspace --all-targets -- -D warnings` must be clean (with the two Z3 variables
+set, since the workspace includes `sqleq-solver`), and CI enforces it per crate.
 
 **`cargo fmt` is not used and must not be added to CI.** There is no `rustfmt.toml`, over a
 thousand source lines already run past 100 columns, and `src/dml.rs` has never been formatted — a

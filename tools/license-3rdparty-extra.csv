@@ -3,3 +3,4 @@ libduckdb,https://github.com/duckdb/duckdb,MIT,Copyright 2018-2025 Stichting Duc
 guava,https://github.com/google/guava,Apache-2.0,The Guava Authors
 jackson-databind,https://github.com/FasterXML/jackson-databind,Apache-2.0,"Copyright 2007-, Tatu Saloranta"
 SQLSolver,https://github.com/SJTU-IPADS/SQLSolver,Apache-2.0,Copyright 2022 OpenSource
+libz3,https://github.com/Z3Prover/z3,MIT,Copyright (c) Microsoft Corporation

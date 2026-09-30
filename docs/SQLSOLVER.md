@@ -23,6 +23,9 @@ public:
 
 * The **SQL-text path** needs `$SQLEQ_SQLSOLVER_PRISTINE`, an unmodified upstream checkout, plus a
   JDK. That checkout is public, so anything described here about that path can be re-checked.
+* The **Rust port** (`sqleq-solver`, [below](#the-rust-port-sqleq-solver)) is reproducible
+  from this repository plus a system `libz3`: `--sqlsolver --sqlsolver-impl=rust` needs neither
+  checkout.
 * The **IR bridge** and everything downstream of it — including `--sqlsolver` in `sqleq_check.py` —
   need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That fork is not
   published.** The sections below state what the fork has to do, which is enough to redo the work,
@@ -223,3 +226,61 @@ So `run_case` does one sqlsolver-axis thing — it packages the plan, while the 
 directory still exists — and a single sequential pass at the end asks the fork about every job. The
 packaging cost is discounted from the case wall time, so a `--sqlsolver` run's timings stay
 comparable to one without it.
+
+## The Rust port, `sqleq-solver`
+
+`sqleq-solver/` reimplements the part of SQLSolver that the IR bridge reaches: from the
+`Input` JSON to a verdict, without Calcite, without SQL text, and without a JVM. Its binary takes
+`IrDriver`'s arguments and writes `IrDriver`'s rows, so `--sqlsolver-impl=rust` in
+`sqleq_check.py` swaps one command for the other and leaves the buckets, the resume loop and the
+report unchanged.
+
+What is ported, in the order the ladder runs it:
+
+* **Tier 0** on the raw IR: two identical trees answer `EQ` with `literal: true`, before anything
+  is parsed, exactly as `IrDriver` does.
+* **Translation** to U-expressions (`UExprConcreteTranslator`), then **normalization**
+  (`UNormalization`, `QueryUExprNormalizer`), **integrity-constraint rewriting**
+  (`QueryUExprICRewriter`, with the constraints read from the IR's own schemas) and
+  **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
+* **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
+  or negation.
+
+Not ported: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
+summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
+its encodings do not hold for Postgres as written. Its integer reading of dates and timestamps is one:
+`ts >= k AND ts < k + 1` is not `ts = k` for a timestamp, and `'infinity'::date + 1` is `infinity`,
+so even `d + 1 > d` fails. The IR names every temporal operation and conversion
+(`q_arith_add_date_integer`, `q_conv_date_timestamp` and the like), which is what such a rung would
+have to interpret, infinities included.
+**`LIMIT`/`OFFSET`** (`OrderbySupport`) is not ported either; a bare `ORDER BY` is erased, which is
+sound under the bag semantics `sqleq` decides.
+
+Where the port deliberately differs from the fork, each for soundness:
+
+* **Three-valued logic is explicit.** A predicate translates to separate TRUE and FALSE terms, so
+  `NOT` of an UNKNOWN comparison stays UNKNOWN and `NOT IN` gets its `NULL` rule. A single 0/1 term
+  per predicate would make `NOT (a = 1)` hold on a `NULL` `a`.
+* **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
+  fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
+  types is not treated as an identity either, since the frontend drops the ones that are.
+* **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
+  is derive their nullness; any other function — parameter carriers included, since a parameter
+  may be bound to `NULL` — gets an uninterpreted nullness of its own.
+* **Rules that are unsound as written in the fork are not ported**, and sums compare as true
+  multisets (`UAdd.equals` is a one-way set comparison under which `a + a` equals `a + b`).
+
+So the two drivers disagree in both directions: some pairs the fork proves the port does not (the
+LIA\* rung, and pairs that rely on a parameter never being `NULL`), and some the port proves the
+fork does not (rewrites it does not normalize, and pairs where it runs out of time). Either way an
+`EQ` is a claim to be checked against `sqleq-fuzz`, as with the fork.
+
+How it is checked: `examples/phase2_gate.rs` runs the ladder over a job file and joins it row by
+row against `IrDriver`'s results and the fuzz axis's verdicts, failing on any `EQ` over a pair the
+fuzz axis refutes. `examples/normalize_check.rs` evaluates each side before and after
+normalization, and both sides of every proved pair, on small random databases that satisfy the
+schemas' constraints, using the crate's concrete evaluator. The crate's unit tests pin the
+three-valued truth tables against a reference evaluator.
+
+Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
+`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.

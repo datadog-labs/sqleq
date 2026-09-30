@@ -83,7 +83,9 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--keep DIR` | Keep intermediates instead of using temp dirs. |
 | `--no-retry` | Don't re-run transient failures serially at the end. |
 | `--sqlsolver` | Ask SQLSolver about the same cases too — see [Second opinion](#second-opinion-sqlsolver). Never changes the exit code. |
-| `--sqlsolver-tree DIR` | The fork to run it from. Required for `--sqlsolver`, either as this flag or as `$SQLEQ_SQLSOLVER`. |
+| `--sqlsolver-impl {jvm,rust}` | Which SQLSolver to ask: the JVM fork through `tools/sqlsolver/IrDriver` (default), or this repo's Rust port, `sqleq-solver`. Same jobs, same result rows, same buckets. |
+| `--sqlsolver-tree DIR` | With `jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
+| `--sqlsolver-bin PATH` | With `rust`: the `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--sqlsolver-timeout MS` | Per-row cap for that prover (default: `-t` in ms). Its own, because the two provers are not comparably fast. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
 
@@ -195,11 +197,17 @@ Mechanics worth knowing before reading a slow run:
   line reports `N JVM self-halt(s) in M pass(es)` when that happened.
 - Setup is checked **before any case runs**, and a missing classpath or
   `javac` exits 2 with the fix rather than reporting `s-missing` for every row.
-  Requires the fork tree (its `lib/` holds the Z3 natives), a JDK, and
-  `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded dependency directory the fork
-  was compiled against. The driver compiles itself on first use and recompiles
-  when `tools/sqlsolver/IrDriver.java` or `IrToRel.java` is newer than the
-  class.
+  With `--sqlsolver-impl=jvm` (the default) it requires the fork tree (its
+  `lib/` holds the Z3 natives), a JDK, and `$SQLEQ_SQLSOLVER_DEPS` pointing at
+  the exploded dependency directory the fork was compiled against. The driver
+  compiles itself on first use and recompiles when `tools/sqlsolver/IrDriver.java`
+  or `IrToRel.java` is newer than the class.
+- With `--sqlsolver-impl=rust` it needs only the `sqleq-solver` binary:
+  `cargo build --release -p sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` (a
+  directory holding `libz3.so`) and `$Z3_SYS_Z3_HEADER` (a matching `z3.h`) set.
+  The library's location is baked into the binary, so nothing is needed at run
+  time. It takes the same arguments and writes the same rows, including the
+  exit-3 self-halt when a row outlives its cap and grace period.
 
 See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for the bridge, the
 Calcite-ectomy behind it, and what each bucket was measured to be worth.

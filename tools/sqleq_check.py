@@ -32,7 +32,8 @@ beneath the raw `proved` count.
 
 `--sqlsolver` adds a **second opinion** on the same cases: SQLSolver, run over
 the very `Input` JSON this harness hands the QED prover, through the bridge in
-`tools/sqlsolver/`. It is off by default and it never changes the exit code —
+`tools/sqlsolver/` or, with `--sqlsolver-impl=rust`, through this repo's Rust
+port of it. It is off by default and it never changes the exit code —
 the qed axis decides the policy — because it answers a different question. Two
 things
 must be read off it carefully, and the summary says both:
@@ -547,6 +548,50 @@ def _compile_driver(cp: str) -> Path:
     return out
 
 
+@dataclass
+class SsDriver:
+    """How to run the second opinion's driver: the command up to its positional arguments,
+    where to run it, and with what environment. Both implementations take the same
+    `<jobs> <results> --timeout-ms=N` and write the same rows, so everything after the
+    command is shared."""
+    impl: str
+    cmd: list
+    cwd: Path
+    env: dict
+    where: str
+
+
+def discover_sqlsolver_rust(override: Optional[str]) -> SsDriver:
+    """Resolve the Rust port's driver: explicit override -> $SQLEQ_SOLVER_BIN -> PATH ->
+    this repo's own build (release preferred over debug).
+
+    No JDK, no fork tree and no library path: Z3 is linked at build time and its
+    location baked into the binary (`sqleq-solver/build.rs`)."""
+    for c in (override, os.environ.get("SQLEQ_SOLVER_BIN")):
+        if c:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return SsDriver("rust", [c], REPO, dict(os.environ), c)
+            sys.exit(f"error: sqleq-solver not found or not executable at: {c}")
+    found = shutil.which("sqleq-solver") or _newest(
+        [str(REPO / "target" / p / "sqleq-solver") for p in ("release", "debug")])
+    if found:
+        return SsDriver("rust", [found], REPO, dict(os.environ), found)
+    sys.exit(
+        "error: could not find 'sqleq-solver'. Build it with "
+        "`cargo build --release -p sqleq-solver` (it links Z3; see "
+        "sqleq-solver/build.rs), put it on PATH, or pass "
+        "--sqlsolver-bin/$SQLEQ_SOLVER_BIN.")
+
+
+def discover_sqlsolver_jvm(override: Optional[str]) -> SsDriver:
+    """The JVM driver (`tools/sqlsolver/IrDriver.java`) over the de-Calcited fork."""
+    cp, tree = discover_sqlsolver(override)
+    return SsDriver(
+        "jvm",
+        ["java", f"-Djava.library.path={tree / 'lib'}", "-cp", cp, "IrDriver"],
+        tree, dict(os.environ, LD_LIBRARY_PATH=str(tree / "lib")), str(tree))
+
+
 def discover_sqlsolver(override: Optional[str]) -> tuple[str, Path]:
     """Resolve the second prover as (classpath, working directory).
 
@@ -610,7 +655,7 @@ def _ss_answered(path: Path) -> dict:
     return out
 
 
-def run_second_opinion(cases: list[Case], ss_dir: Path, cp: str, cwd: Path,
+def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
                        timeout_ms: int) -> dict:
     """Ask SQLSolver about every case that produced a job, and attach the answers.
 
@@ -639,8 +684,6 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, cp: str, cwd: Path,
 
     todo_path = ss_dir / "todo.jsonl"
     out_path = ss_dir / "results.jsonl"
-    env = dict(os.environ, LD_LIBRARY_PATH=str(cwd / "lib"))
-    cmd_head = ["java", f"-Djava.library.path={cwd / 'lib'}", "-cp", cp, "IrDriver"]
     passes, halts, stall = 0, 0, None
     while True:
         have = _ss_answered(out_path)
@@ -650,10 +693,11 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, cp: str, cwd: Path,
         todo_path.write_text("".join(json.dumps(j) + "\n" for j in todo))
         passes += 1
         proc = subprocess.run(
-            cmd_head + [str(todo_path), str(out_path), f"--timeout-ms={timeout_ms}"],
-            cwd=str(cwd), env=env, capture_output=True, text=True)
-        # Exit 3 is the driver taking its own JVM down because a row ignored its
-        # interrupt. It writes the row first, so resuming always advances.
+            driver.cmd + [str(todo_path), str(out_path), f"--timeout-ms={timeout_ms}"],
+            cwd=str(driver.cwd), env=driver.env, capture_output=True, text=True)
+        # Exit 3 is the driver taking its own process down because a row would not
+        # stop (the JVM's interrupt missed; the Rust driver's grace period ran out).
+        # It writes the row first, so resuming always advances.
         if proc.returncode == 3:
             halts += 1
             continue
@@ -1001,10 +1045,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "only: it never changes the exit code, and its NEQ is not "
                         "a refutation. Needs a JDK and the de-Calcited fork; see "
                         "docs/SQLSOLVER.md.")
+    p.add_argument("--sqlsolver-impl", choices=("jvm", "rust"), default="jvm",
+                   help="Which SQLSolver to ask: the JVM fork through "
+                        "tools/sqlsolver/IrDriver (default), or this repo's Rust "
+                        "port, sqleq-solver. Same jobs, same result rows, same "
+                        "buckets; the Rust port needs no JDK.")
     p.add_argument("--sqlsolver-tree", metavar="DIR",
-                   help="The SQLSolver fork to run (else $SQLEQ_SQLSOLVER; one "
-                        "of the two is required). Its exploded dependency "
-                        "directory comes from $SQLEQ_SQLSOLVER_DEPS.")
+                   help="With --sqlsolver-impl=jvm: the SQLSolver fork to run (else "
+                        "$SQLEQ_SQLSOLVER; one of the two is required). Its "
+                        "exploded dependency directory comes from "
+                        "$SQLEQ_SQLSOLVER_DEPS.")
+    p.add_argument("--sqlsolver-bin", metavar="PATH",
+                   help="With --sqlsolver-impl=rust: the sqleq-solver binary (else "
+                        "$SQLEQ_SOLVER_BIN / PATH / this repo's "
+                        "target/{release,debug}).")
     p.add_argument("--sqlsolver-timeout", type=int, default=None, metavar="MS",
                    help="Per-row cap for the second opinion, in ms "
                         "(default: --timeout). Its rows run sequentially, so this "
@@ -1020,9 +1074,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     prover_bin = discover_prover(args.prover)
     # Resolved before a single case runs — including the driver rebuild — so a
     # fork that is missing or will not compile costs a second, not a full pass.
-    ss_cp, ss_cwd = (None, None)
+    ss_driver: Optional[SsDriver] = None
     if args.sqlsolver:
-        ss_cp, ss_cwd = discover_sqlsolver(args.sqlsolver_tree)
+        ss_driver = (discover_sqlsolver_rust(args.sqlsolver_bin)
+                     if args.sqlsolver_impl == "rust"
+                     else discover_sqlsolver_jvm(args.sqlsolver_tree))
 
     files = collect_inputs(args.paths)
     if not files:
@@ -1061,8 +1117,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.quiet:
         print(c.dim(f"sqleq-frontend: {frontend_bin}"))
         print(c.dim(f"qed-prover:   {prover_bin}"))
-        if ss_cwd:
-            print(c.dim(f"sqlsolver:    {ss_cwd}"))
+        if ss_driver:
+            print(c.dim(f"sqlsolver:    {ss_driver.where} ({ss_driver.impl})"))
         print(c.bold(f"Checking {len(files)} case(s) "
                      f"with {args.jobs} worker(s), {args.timeout:.0f}s/case…"))
         print()
@@ -1127,7 +1183,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(c.dim(f"  asking SQLSolver about {n} case(s), "
                         f"sequentially, {ss_timeout_ms}ms/row…"))
         t1 = time.monotonic()
-        ss_stats = run_second_opinion(cases, ss_dir, ss_cp, ss_cwd, ss_timeout_ms)
+        ss_stats = run_second_opinion(cases, ss_dir, ss_driver, ss_timeout_ms)
         ss_stats["wall_s"] = round(time.monotonic() - t1, 3)
 
     cases.sort(key=lambda x: (STATUS_ORDER.index(x.status)
@@ -1149,7 +1205,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "triviality": triviality_split(cases),
     }
     if args.sqlsolver:
-        meta["sqlsolver"] = dict(ss_stats, tree=str(ss_cwd),
+        meta["sqlsolver"] = dict(ss_stats, impl=ss_driver.impl, where=ss_driver.where,
                                  timeout_ms=ss_timeout_ms)
     if ss_tmp:
         shutil.rmtree(ss_tmp, ignore_errors=True)

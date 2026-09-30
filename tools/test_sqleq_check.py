@@ -19,9 +19,16 @@ Standard library only, like the harness itself.
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
-from sqleq_check import _statements, triviality_from_ir, triviality_from_text
+from sqleq_check import (REPO, SQLSOLVER_NO_PROOF, SQLSOLVER_PROVED, SQLSOLVER_PROVED_LITERAL,
+                         SQLSOLVER_UNSUPPORTED, Case, SsDriver, _statements, run_second_opinion,
+                         ss_slug, triviality_from_ir, triviality_from_text)
 
 
 class StatementSplitting(unittest.TestCase):
@@ -114,6 +121,65 @@ class TrivialityFromIR(unittest.TestCase):
         self.assertIsNone(triviality_from_ir({}))
         self.assertIsNone(triviality_from_ir({"queries": [{"scan": 0}]}))
         self.assertIsNone(triviality_from_ir({"queries": "not a list"}))
+
+
+def _rust_driver():
+    """This repo's build of sqleq-solver, if there is one (it needs Z3 to build)."""
+    for profile in ("release", "debug"):
+        b = REPO / "target" / profile / "sqleq-solver"
+        if b.is_file() and os.access(b, os.X_OK):
+            return SsDriver("rust", [str(b)], REPO, dict(os.environ), str(b))
+    return None
+
+
+@unittest.skipIf(_rust_driver() is None, "sqleq-solver is not built")
+class SecondOpinionThroughTheRustDriver(unittest.TestCase):
+    """`run_second_opinion` end to end against the Rust port: the driver reads the jobs,
+    writes IrDriver-shaped rows, and the harness buckets them exactly as it buckets the
+    JVM's."""
+
+    SCHEMA = [{"types": ["INTEGER"], "key": [], "nullable": [True]}]
+    SCAN = {"scan": 0}
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="sqleq-ss-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def job(self, name, ir, refusal=None):
+        row = {"name": name, "ir": ir, "schema": ""}
+        if refusal:
+            row["refusal"] = refusal
+        (self.dir / f"{ss_slug(name)}.job.jsonl").write_text(json.dumps(row) + "\n")
+        return Case(name=name, path=name)
+
+    def test_rows_are_bucketed_like_the_jvm_drivers(self):
+        filtered = {"filter": {"source": self.SCAN,
+                               "condition": {"operator": "=", "type": "BOOLEAN", "operand": [
+                                   {"column": 0, "type": "INTEGER"},
+                                   {"operator": "1", "operand": [], "type": "INTEGER"}]}}}
+        sorted_scan = {"sort": {"source": self.SCAN,
+                                "collation": [[0, "INTEGER", "ASCENDING NULLS LAST"]]}}
+        cases = [
+            self.job("same", {"schemas": self.SCHEMA, "queries": [self.SCAN, self.SCAN]}),
+            # A bare ORDER BY is erased under bag semantics, so this is a real proof.
+            self.job("proved", {"schemas": self.SCHEMA, "queries": [self.SCAN, sorted_scan]}),
+            self.job("differs", {"schemas": self.SCHEMA, "queries": [self.SCAN, filtered]}),
+            self.job("refused", None, refusal="unknown table t"),
+            Case(name="no-job", path="no-job"),
+        ]
+        stats = run_second_opinion(cases, self.dir, _rust_driver(), 10_000)
+        got = {c.name: c.s_bucket for c in cases}
+        self.assertEqual(got, {
+            "same": SQLSOLVER_PROVED_LITERAL,
+            "proved": SQLSOLVER_PROVED,
+            "differs": SQLSOLVER_NO_PROOF,
+            "refused": SQLSOLVER_UNSUPPORTED,
+            "no-job": SQLSOLVER_UNSUPPORTED,
+        })
+        self.assertEqual((stats["rows"], stats["answered"], stats["halts"]), (4, 4, 0))
+        self.assertEqual({c.name: c.s_note for c in cases}["refused"], "unknown table t")
 
 
 if __name__ == "__main__":

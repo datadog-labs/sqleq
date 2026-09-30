@@ -129,6 +129,8 @@ windows_x86_64_gnu,https://github.com/microsoft/windows-rs,MIT OR Apache-2.0,Mic
 windows_x86_64_gnullvm,https://github.com/microsoft/windows-rs,MIT OR Apache-2.0,Microsoft
 windows_x86_64_msvc,https://github.com/microsoft/windows-rs,MIT OR Apache-2.0,Microsoft
 wit-bindgen,https://github.com/bytecodealliance/wit-bindgen,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,Alex Crichton <alex@alexcrichton.com>
+z3,https://github.com/prove-rs/z3.rs,MIT,"Graydon Hoare <graydon@pobox.com>, Bruce Mitchener <bruce.mitchener@gmail.com>, Nick Fitzgerald <fitzgen@gmail.com>"
+z3-sys,https://github.com/prove-rs/z3.rs,MIT,"Graydon Hoare <graydon@pobox.com>, Bruce Mitchener <bruce.mitchener@gmail.com>, Nick Fitzgerald <fitzgen@gmail.com>"
 zerocopy,https://github.com/google/zerocopy,BSD-2-Clause OR Apache-2.0 OR MIT,"Joshua Liebow-Feeser <joshlf@google.com>, Jack Wrenn <jswrenn@amazon.com>"
 zerocopy-derive,https://github.com/google/zerocopy,BSD-2-Clause OR Apache-2.0 OR MIT,"Joshua Liebow-Feeser <joshlf@google.com>, Jack Wrenn <jswrenn@amazon.com>"
 zmij,https://github.com/dtolnay/zmij,MIT,David Tolnay <dtolnay@gmail.com>
@@ -136,3 +138,4 @@ libduckdb,https://github.com/duckdb/duckdb,MIT,Copyright 2018-2025 Stichting Duc
 guava,https://github.com/google/guava,Apache-2.0,The Guava Authors
 jackson-databind,https://github.com/FasterXML/jackson-databind,Apache-2.0,"Copyright 2007-, Tatu Saloranta"
 SQLSolver,https://github.com/SJTU-IPADS/SQLSolver,Apache-2.0,Copyright 2022 OpenSource
+libz3,https://github.com/Z3Prover/z3,MIT,Copyright (c) Microsoft Corporation
