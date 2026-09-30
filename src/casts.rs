@@ -82,7 +82,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     DataType, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, Value as SqlValue, VisitMut,
+    FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, TimezoneInfo, Value as SqlValue, VisitMut,
     VisitorMut,
 };
 
@@ -142,8 +142,19 @@ fn data_type(t: Ty) -> DataType {
         Ty::Real => DataType::Double(ExactNumberInfo::None),
         Ty::Str => DataType::Varchar(None),
         Ty::Bool => DataType::Boolean,
+        Ty::Date => DataType::Date,
+        Ty::Time => DataType::Time(None, TimezoneInfo::None),
+        Ty::Timestamp => DataType::Timestamp(None, TimezoneInfo::None),
+        Ty::TimestampTz => DataType::Timestamp(None, TimezoneInfo::WithTimeZone),
+        Ty::Interval => DataType::Interval { fields: None, precision: None },
         Ty::Opaque => DataType::Varbinary(None),
     }
+}
+
+/// Whether `t` is one of the temporal types, which never cross into each other or into anything else
+/// without a named conversion (see `types.rs`).
+fn is_temporal(t: Ty) -> bool {
+    matches!(t, Ty::Date | Ty::Time | Ty::Timestamp | Ty::TimestampTz | Ty::Interval)
 }
 
 /// `name(arg)` — the shape both `qcastK` and `qpN` take.
@@ -317,6 +328,19 @@ fn decide(
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
             } else if cqt == Ty::Int && tq == Ty::Real {
                 dec.insert(nid(e), Decision::Retarget(Ty::Real));
+            } else if target.is_some()
+                && !qualified
+                && cqt != Ty::Opaque
+                && (is_temporal(cqt) || is_temporal(tq))
+            {
+                // A crossing between two known types, one of them temporal: the cast stays, and the
+                // lowering turns it into the conversion named after both types
+                // (`types::lower_cast`). Named after the types rather than after this operand's text,
+                // because a conversion is a function of its source type, its target and its value,
+                // and the source type is known here -- so `ts::date` on both sides of a pair is one
+                // function, where a `qcast` keyed on each operand's text would split it. An operand
+                // of unknown type still takes rule 5b below.
+                dec.insert(nid(e), Decision::Retarget(tq));
             } else {
                 rw.dropped.qcast += 1;
                 // Keyed on the operand's *pre-rewrite* text, so `(x::varchar)::varchar(8)` and

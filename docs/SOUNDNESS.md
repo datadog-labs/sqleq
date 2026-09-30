@@ -2,7 +2,8 @@
 
 `sqleq` answers "are these two queries equivalent?" — and a `provable` answer is only worth the
 argument behind it. This document is that argument: what the tool refuses to do rather than guess,
-why refusing is the right trade, and the single place where it assumes something it cannot check.
+why refusing is the right trade, what a proof leaves out, and the single place where it assumes
+something it cannot check.
 
 Read [VALIDATION.md](VALIDATION.md) first if you want the method — how the axes check each other,
 and the defects that has caught. This page is the narrower question of what any one verdict means.
@@ -31,6 +32,57 @@ completeness, not soundness. Two such misses are known and measured: `pgddl` doe
 declared by `CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`.
 Between them they account for nearly all the remaining functional-dependence refusals — completeness
 work, in the safe direction.
+
+### Dates and timestamps are not one integer
+
+A DATE counts days, a TIMESTAMP counts microseconds, and an INTERVAL may count months. The frontend
+used to lower all of them as `INTEGER`, and both provers then accepted pairs that are not equivalent:
+`ts < d + 1` against `ts <= d` (over integers `x < y + 1` is `x <= y`, but `d + 1` is the next *day*),
+and `CAST(ts AS DATE) = d` against `ts = d` (the cast truncates, and it was dropped as an identity).
+One row with a mid-day `ts` separates each pair. Nothing in the pipeline disagreed about these; they
+were found by probing the lowering directly, and the disprover confirms each witness.
+
+The rule now is that a comparison of two values of one temporal type stays native, and every
+*operation* on a temporal value is an uninterpreted function. Comparisons are exact: the values of
+one type, `-infinity` and `infinity` included, form a bounded total order, so they embed
+order-preservingly into the integers a prover reads them as.
+
+Arithmetic is not exact there, because of the infinities. Postgres leaves `infinity` unchanged under
+`date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error for
+`infinity - date`. Read as integer addition, `d + 1 > d` would hold for every date, and
+`d >= $1 AND d < $1 + 1` would mean `d = $1`; at `d = $1 = 'infinity'` neither does. So
+`date ± integer`, `date - date` and all interval arithmetic (an interval may count months, and
+months have no fixed length) are functions named after their operand types (`q_arith_add_date_integer`).
+So is every crossing between two types — the promotion in `d < ts`, an explicit cast, a literal cast
+such as `'2024-01-01'::date` (`q_conv_date_timestamp`) — and never a `CAST`, because both provers erase
+casts they consider trivial. A function nobody interprets can only cost a proof; a prover that knows
+its Postgres meaning, infinities included, can interpret the name.
+
+For the same reason a truncation is compared as it stands. `ts::date = $1` and the range written out
+by hand, `ts >= $1::date AND ts < $1::date + 1`, look like the same predicate and are not: at
+`ts = $1 = 'infinity'` the truncation holds and `ts < 'infinity'` does not. A restatement of one as
+the other would have made the pair lower to one term and every prover call it equivalent.
+
+An `UPDATE` of a temporal column converts the assigned value to the column's type, as Postgres's
+assignment cast does, so `SET d = ts` and `SET d = ts::date` store the same thing. That is done where
+the value's type is evident from its shape (a column, a literal, a parameter, a cast); elsewhere the
+value keeps its own type, which costs exactness and not soundness. Where a relation
+would put two temporal types in one column with no comparison to hang a conversion on — a set
+operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
+
+## A query that raises an error
+
+Neither prover models runtime errors: both assume every operation yields a value. So a proof says
+that the two queries return the same rows on every database on which both run without an error,
+and nothing about which databases make one of them fail. A stronger claim would not be well
+defined for Postgres, which does not fix the order in which it evaluates a query's conditions:
+whether `b <> 0 AND a / b > 1` raises a division by zero depends on the plan, not on the data.
+
+Dates show this at the top of their range. A DATE reaches the year 5874897 and a TIMESTAMP only
+294276. Compared with a timestamp, a later date orders above every finite one and below
+`infinity`; cast to a timestamp, it raises an error. The frontend lowers both through one
+conversion, so `d < ts` and `d::timestamp < ts` lower alike, and they do return the same rows
+wherever the cast succeeds.
 
 ## The one assumption: `$N` on one side is `$N` on the other
 

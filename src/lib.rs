@@ -319,10 +319,11 @@ fn emit(
     let q0 = lower::lower_query(catalog, decls, &queries[0])?;
     let q1 = lower::lower_query(catalog, decls, &queries[1])?;
 
-    let input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
+    let mut input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
     verify::check_levels(&input)?;
+    types::rename_emitted_types(&mut input);
     Ok(input)
 }
 

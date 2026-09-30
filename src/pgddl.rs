@@ -9,8 +9,8 @@
 //! Postgres types, real constraint syntax, and a good deal that the input format's own
 //! `CREATE TABLE` subset does not accept. Reading it here, rather than translating it into that
 //! subset first, is what lets the frontend lower a row directly — and it keeps the translation
-//! from becoming an unreviewed part of the semantics, where `timestamp without time zone`
-//! silently becomes `INTEGER`, `numeric` becomes `DOUBLE`, and `integer PRIMARY KEY` becomes
+//! from becoming an unreviewed part of the semantics, where `timestamp with time zone` silently
+//! becomes a plain `TIMESTAMP`, `numeric` becomes `DOUBLE`, and `integer PRIMARY KEY` becomes
 //! `INTEGER` plus a separate `unique (...)`, each read back in as if it had been declared that way.
 //!
 //! ## Why not `types::map_type`
@@ -60,6 +60,8 @@ pub fn map_pg_type(rendered: &str) -> Option<&'static str> {
         Ty::Real => "REAL",
         Ty::Str => "VARCHAR",
         Ty::Bool => "BOOLEAN",
+        // The temporal types keep their own names, as `types::map_type` gives them.
+        t @ (Ty::Date | Ty::Time | Ty::Timestamp | Ty::TimestampTz | Ty::Interval) => t.sql(),
         Ty::Opaque => OPAQUE,
     })
 }
@@ -458,7 +460,11 @@ mod tests {
 
     #[test]
     fn base_names_classify_off_the_head_of_the_type() {
-        assert_eq!(map_pg_type("timestamp without time zone"), Some("INTEGER"));
+        assert_eq!(map_pg_type("timestamp without time zone"), Some("TIMESTAMP"));
+        assert_eq!(map_pg_type("timestamp with time zone"), Some("TIMESTAMPTZ"));
+        assert_eq!(map_pg_type("date"), Some("DATE"));
+        assert_eq!(map_pg_type("interval"), Some("INTERVAL"));
+        assert_eq!(map_pg_type("time with time zone"), None);
         assert_eq!(map_pg_type("numeric(10,2)"), Some("REAL"));
         assert_eq!(map_pg_type("character varying(255)"), Some("VARCHAR"));
         assert_eq!(map_pg_type("double precision"), Some("REAL"));
@@ -500,7 +506,7 @@ mod tests {
                 ("total".into(), "REAL".into()),
                 ("note".into(), "VARCHAR".into()),
                 ("tags".into(), "VARBINARY".into()),
-                ("created_at".into(), "INTEGER".into()),
+                ("created_at".into(), "TIMESTAMP".into()),
             ]
         );
         assert_eq!(t.keys, vec![vec![0]]);

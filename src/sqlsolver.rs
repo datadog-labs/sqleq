@@ -437,13 +437,20 @@ fn ident(name: &str) -> String {
 /// The MySQL spelling of a prover type.
 ///
 /// The domain is closed: [`pgddl`] types every column through `map_pg_type`, which returns one of
-/// five names, and falls back to `VARBINARY` for everything it does not recognise. That closure is
-/// load-bearing — their grammar rejects `json`, `uuid`, `inet`, `money` and `xml`, and **one
-/// unparseable type name loses the whole `CREATE TABLE`**, so a schema is all-or-nothing per table.
-/// All five spellings below were checked against the built jar.
+/// the five builtin names or a temporal one, and falls back to `VARBINARY` for everything it does not
+/// recognise. That closure is load-bearing — their grammar rejects `json`, `uuid`, `inet`, `money`
+/// and `xml`, and **one unparseable type name loses the whole `CREATE TABLE`**, so a schema is
+/// all-or-nothing per table. All five spellings below were checked against the built jar.
+///
+/// The temporal types are `int`, as they have always been here. Within one type that is exact (a
+/// date is a count of days, a timestamp a count of microseconds), and the IR never lets two temporal
+/// types meet except through a conversion, which `IrToRel` turns into an uninterpreted function. A
+/// real `date` or `datetime` column type would buy nothing and would lose the column: their set
+/// translators throw on any type outside a short numeric-and-string list.
 fn mysql_type(prover_type: &str) -> &'static str {
     match prover_type {
         "INTEGER" => "int",
+        "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" => "int",
         "REAL" => "double",
         "VARCHAR" => "varchar(255)",
         "BOOLEAN" => "boolean",
