@@ -2,7 +2,8 @@
 
 `sqleq` answers "are these two queries equivalent?" — and a `provable` answer is only worth the
 argument behind it. This document is that argument: what the tool refuses to do rather than guess,
-why refusing is the right trade, and the single place where it assumes something it cannot check.
+why refusing is the right trade, what a proof leaves out, and the single place where it assumes
+something it cannot check.
 
 Read [VALIDATION.md](VALIDATION.md) first if you want the method — how the axes check each other,
 and the defects that has caught. This page is the narrower question of what any one verdict means.
@@ -68,6 +69,20 @@ the value's type is evident from its shape (a column, a literal, a parameter, a 
 value keeps its own type, which costs exactness and not soundness. Where a relation
 would put two temporal types in one column with no comparison to hang a conversion on — a set
 operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
+
+## A query that raises an error
+
+Neither prover models runtime errors: both assume every operation yields a value. So a proof says
+that the two queries return the same rows on every database on which both run without an error,
+and nothing about which databases make one of them fail. A stronger claim would not be well
+defined for Postgres, which does not fix the order in which it evaluates a query's conditions:
+whether `b <> 0 AND a / b > 1` raises a division by zero depends on the plan, not on the data.
+
+Dates show this at the top of their range. A DATE reaches the year 5874897 and a TIMESTAMP only
+294276. Compared with a timestamp, a later date orders above every finite one and below
+`infinity`; cast to a timestamp, it raises an error. The frontend lowers both through one
+conversion, so `d < ts` and `d::timestamp < ts` lower alike, and they do return the same rows
+wherever the cast succeeds.
 
 ## The one assumption: `$N` on one side is `$N` on the other
 
