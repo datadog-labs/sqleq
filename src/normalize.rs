@@ -63,10 +63,12 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, Cte, DataType, Distinct, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, UnaryOperator, Visit, VisitMut, Visitor, VisitorMut,
+    AccessExpr, ArrayElemTypeDef, BinaryOperator, CastKind, CeilFloorKind, Cte, DataType, DateTimeField, Distinct,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    Ident, Interval,
+    JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
+    Statement, TableAlias, TableFactor, TypedString, UnaryOperator, Value, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 
 use crate::error::{unsupported, FrontendError, Result};
@@ -135,6 +137,97 @@ fn is_is_operator(e: &Expr) -> bool {
             | Expr::IsDistinctFrom(..)
             | Expr::IsNotDistinctFrom(..)
     )
+}
+
+/// Rewrite the parser's special forms as the general forms they mean, so that two spellings of one
+/// thing lower alike and the lowering needs no arm of its own for either:
+///
+/// * a typed literal as a cast: `DATE '2024-01-01'` as `CAST('2024-01-01' AS DATE)`, and
+///   `INTERVAL '1 day'` as `CAST('1 day' AS INTERVAL)`. Postgres hands a typed literal's string to
+///   the type's input function, which is what a cast of the untyped literal does. A statement captured
+///   with its constants replaced by placeholders spells the same literal `DATE $1`, and there the
+///   rewrite is also what puts the placeholder in an expression position: inside a typed literal it
+///   is invisible to the passes that number and type parameters. A typmod (`TIMESTAMP(0) '..'`) stays
+///   on the cast, where it is kept;
+/// * `CEIL(x)` and `FLOOR(x)`, which sqlparser parses into nodes of their own, as the calls
+///   `ceil(x)` and `floor(x)`, and `ceiling(x)` as `ceil(x)`, which Postgres defines it to be;
+/// * `t.a[1]`, which sqlparser parses as a field `a` selected out of `t` and then subscripted, as
+///   the column `t.a` subscripted. Postgres reads an unparenthesised `t.a` as a qualified column,
+///   always; a field of a composite value is spelled `(t).a`.
+///
+/// Left alone, and so refused downstream:
+/// * an `INTERVAL` with a field qualifier (`INTERVAL '1' DAY`). The qualifier changes how the string
+///   is read (`INTERVAL '1'` is one second), and over a placeholder it would be dropped silently;
+/// * a typed literal whose value is not a string literal or a placeholder, which is not Postgres, and
+///   the ODBC `{d '..'}` spelling, which is not either;
+/// * `CEIL(x TO DAY)` and `FLOOR(x, 2)`, neither of which Postgres has.
+pub fn desugar_special_forms(statements: &mut [Statement]) {
+    for st in statements {
+        let _ = st.visit(&mut Desugar);
+    }
+}
+
+struct Desugar;
+
+impl VisitorMut for Desugar {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        let literal = |v: &Value| matches!(v, Value::SingleQuotedString(_) | Value::Placeholder(_));
+        let plain = |k: &CeilFloorKind| matches!(k, CeilFloorKind::DateTimeField(DateTimeField::NoDateTime));
+        let new = match e {
+            Expr::TypedString(TypedString { data_type, value, uses_odbc_syntax: false }) if literal(&value.value) => {
+                Some(cast(Expr::Value(value.clone()), data_type.clone()))
+            }
+            Expr::Interval(Interval {
+                value,
+                leading_field: None,
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            }) if matches!(&**value, Expr::Value(v) if literal(&v.value)) => {
+                Some(cast((**value).clone(), DataType::Interval { fields: None, precision: None }))
+            }
+            Expr::Ceil { expr, field } if plain(field) => Some(call1("ceil", (**expr).clone())),
+            Expr::Floor { expr, field } if plain(field) => Some(call1("floor", (**expr).clone())),
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                if let Expr::Identifier(r) = &**root {
+                    let quals: Vec<Ident> = access_chain
+                        .iter()
+                        .map_while(|a| match a {
+                            AccessExpr::Dot(Expr::Identifier(i)) => Some(i.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !quals.is_empty() && matches!(access_chain.get(quals.len()), Some(AccessExpr::Subscript(_))) {
+                        let name: Vec<Ident> = std::iter::once(r.clone()).chain(quals.iter().cloned()).collect();
+                        access_chain.drain(..quals.len());
+                        **root = Expr::CompoundIdentifier(name);
+                    }
+                }
+                None
+            }
+            Expr::Function(f) => {
+                if let [ObjectNamePart::Identifier(id)] = f.name.0.as_mut_slice() {
+                    if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("ceiling") {
+                        *id = Ident::new("ceil");
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(new) = new {
+            *e = new;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// `expr::data_type`, in the spelling Postgres users write, so a desugared literal renders like the
+/// cast a hand-written side would have.
+fn cast(expr: Expr, data_type: DataType) -> Expr {
+    Expr::Cast { kind: CastKind::DoubleColon, expr: Box::new(expr), data_type, format: None }
 }
 
 /// A throwaway value to leave behind while a node is being moved out. Every one written is
@@ -758,11 +851,10 @@ fn body_has_distinct_on(body: &SetExpr) -> bool {
 /// ## Why it is worth doing
 ///
 /// [`casts`][crate::casts] refuses a cast over an `Expr::Array` on purpose, and correctly:
-/// `lower_expr` has no arm for a cast whose operand is an array, so wrapping it in a `qcast`
-/// would move the refusal rather than lift it, *and* it would cost the exact OR-expansion
-/// [`lower_quantified`][crate::lower] gives a bare array literal under `= ANY` / `<> ALL`. The
-/// fix is not to weaken that refusal but to make the shape not arise: after this rewrite there
-/// is no cast over an array anywhere, and each element cast is an ordinary scalar cast that
+/// wrapping it in a `qcast` would cost the exact OR-expansion [`lower_quantified`][crate::lower]
+/// gives a bare array literal under `= ANY` / `<> ALL`. The fix is not to weaken that refusal but
+/// to make the shape not arise: after this rewrite there is no cast over an array anywhere, and
+/// each element cast is an ordinary scalar cast that
 /// `casts`'s rules already handle — `$1::bigint` hits rule 1 and hoists, so inference types the
 /// placeholder from the element type.
 ///

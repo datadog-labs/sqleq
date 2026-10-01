@@ -239,6 +239,42 @@ fn canon_target(txt: &str, target: Option<Ty>, qualified: bool) -> String {
     }
 }
 
+/// The dedup key's view of a cast operand: its text, with unquoted names folded to lower case.
+///
+/// The text stands in for what the operand computes, its type included, and Postgres folds an
+/// unquoted name before it reads it, so `SUM(x)` and `sum(X)` are one call and their casts one
+/// function. Literals and quoted names are compared as written.
+fn operand_key(op: &Expr) -> String {
+    let mut e = op.clone();
+    let _ = e.visit(&mut FoldNames);
+    e.to_string()
+}
+
+struct FoldNames;
+
+impl VisitorMut for FoldNames {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        let fold = |id: &mut Ident| {
+            if id.quote_style.is_none() {
+                id.value = id.value.to_lowercase();
+            }
+        };
+        match e {
+            Expr::Identifier(id) => fold(id),
+            Expr::CompoundIdentifier(ids) => ids.iter_mut().for_each(fold),
+            Expr::Function(f) => f.name.0.iter_mut().for_each(|p| {
+                if let ObjectNamePart::Identifier(id) = p {
+                    fold(id)
+                }
+            }),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Read the untouched tree and record what should happen to each cast.
 fn decide(
     queries: &[Query],
@@ -312,10 +348,10 @@ fn decide(
                 Expr::Function(f) => builtin_rtype(&obj_name(&f.name))
                     .or_else(|| inf.fn_ret.get(&nid(op)).copied())
                     .unwrap_or(Ty::Opaque),
-                // The two kinds still worth refusing. `lower.rs`'s `lower_expr` has no arm for
-                // either, so wrapping them in a `qcast` would move the refusal rather than lift it
-                // — and it would cost the exact OR-expansion `lower_quantified` gives an array
-                // literal under `= ANY`.
+                // The two kinds still worth refusing. `lower.rs`'s `lower_expr` has no arm for a
+                // tuple, so wrapping one in a `qcast` would move the refusal rather than lift it;
+                // and a `qcast` around an array literal would cost the exact OR-expansion
+                // `lower_quantified` gives one under `= ANY`.
                 other @ (Expr::Array(_) | Expr::Tuple(_)) => {
                     return Err(unsupported(format!(
                         "cast over unsupported operand {}",
@@ -354,7 +390,7 @@ fn decide(
                 // hoisted away and the two render identically afterwards. Splitting is sound (see
                 // the module docs); it costs a cancellation, which is the same trade the key
                 // already makes everywhere else.
-                let key = (canon_target(&txt, target, qualified), op.to_string());
+                let key = (canon_target(&txt, target, qualified), operand_key(op));
                 let idx = *seen.entry(key).or_insert_with(|| {
                     rw.qcasts.push(QCast {
                         name: format!("qcast{}", rw.qcasts.len()),
@@ -828,9 +864,9 @@ mod tests {
 
     #[test]
     fn an_array_or_tuple_operand_still_refuses() {
-        // Not conservatism for its own sake: `lower_expr` has no arm for either, so a `qcast` around
-        // one would move the refusal to `expr: Array(..)` rather than lift it -- and under `= ANY` it
-        // would cost `lower_quantified`'s exact OR-expansion of an array literal.
+        // Not conservatism for its own sake: under `= ANY` a `qcast` around an array literal would
+        // cost `lower_quantified`'s exact OR-expansion of it, and `lower_expr` has no arm for a
+        // tuple, so a `qcast` around one would move the refusal rather than lift it.
         let e = run("SELECT t.a FROM t WHERE t.a = ANY(ARRAY[$1]::bigint[])")
             .unwrap_err()
             .to_string();

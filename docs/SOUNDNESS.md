@@ -83,6 +83,12 @@ what it is or refused:
   opaque operand is a function, not text concatenation, because array `||` is not strict
   (`'{a}' || NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every
   element is a scalar, since over `ARRAY[arr]` it ranges over the leaves.
+- **A row against a parameter is a record comparison.** In `(a, b) IN ($1, ..)` each parameter
+  stands for a composite value, and Postgres compares a row with one under record semantics, where
+  two NULL fields are equal. Each such item is one opaque predicate, never per-field comparisons.
+- **A subscript chain is not a composition.** `m[1][2]` is one function of `m` and both indices:
+  over a two-dimensional array `(m[1])[2]` is NULL, because `m[1]` has too few subscripts. Slices
+  are refused, and so is an `INTERVAL` with a field qualifier, which changes how its string is read.
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
