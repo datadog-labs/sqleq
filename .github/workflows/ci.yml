@@ -41,6 +41,13 @@ jobs:
   frontend:
     name: frontend + tools
     runs-on: ubuntu-latest
+    # Each integration test is its own binary, and at full debug info each one links to a few hundred
+    # MB on top of a restored `target/`. Past the runner's disk the linker dies of SIGBUS writing its
+    # mapped output, not with a clean "no space" error. Line tables keep file and line in a panic's
+    # backtrace, which is all a CI log reads, and incremental state is never reused on a fresh runner.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       # Actions are pinned to a full-length commit SHA with the release tag alongside. A tag
       # is mutable, so a compromised one re-points silently, and some organisations reject
