@@ -9,6 +9,7 @@ conventions are not the ones you would guess from the code — this file is the 
 cargo test                 # the frontend: 204 + 179 + 17 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
 cargo test -p sqleq-solver # the SQLSolver port: 57 (needs Z3, see below)
+cargo test -p sqleq-lean   # the Lean axis: 24 + 2 (needs Lean, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
 ```
@@ -17,8 +18,12 @@ python3 tools/linkcheck.py # every relative link in every tracked Markdown file 
 `sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and `sqleq-solver`
 links a Z3 you supply — `$SQLEQ_Z3_LIB_DIR` names the directory holding `libz3.so` and
 `$Z3_SYS_Z3_HEADER` a `z3.h` from the same release — so the root manifest sets
-`default-members = ["."]` and both are opt-in. CI gives each its own job for the same reason, and
-fetches Z3 from a digest-pinned release archive.
+`default-members = ["."]` and both are opt-in. `sqleq-lean` is opt-in too: it runs the Lean 4
+toolchain that `lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a
+release's `bin` there yourself), and its integration test fails rather than skips without it.
+`cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks its controls. CI gives
+each crate its own job for the same reason, and fetches Z3 and Lean from digest-pinned release
+archives.
 
 ### Licensing
 

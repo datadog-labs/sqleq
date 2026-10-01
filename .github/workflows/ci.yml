@@ -3,10 +3,11 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
 # Copyright 2026-Present Datadog, Inc.
 
-# Four jobs, split on build cost rather than on subject.
+# Five jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
-# cache than anything else here -- and `sqleq-solver` links Z3. Keeping each in its own job means
+# cache than anything else here -- `sqleq-solver` links Z3, and `sqleq-lean` needs a Lean
+# toolchain, the largest download of all. Keeping each in its own job means
 # the frontend's answer -- the one that gates most changes -- arrives in under a minute, and the
 # caches do not evict each other. Each job lints the crate it builds, so the union is
 # `cargo clippy --workspace` without any job paying for another's dependencies.
@@ -240,3 +241,67 @@ jobs:
         run: |
           test -x target/debug/sqleq-solver
           cd tools && python3 -m unittest -v test_sqleq_check.SecondOpinionThroughTheRustDriver
+
+  lean:
+    name: sqleq-lean
+    runs-on: ubuntu-latest
+    env:
+      # The release `lean/lean-toolchain` names; the first step below checks the two agree. Bump the
+      # version, that file and the digest together.
+      LEAN_VERSION: 4.34.1
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustc --version && cargo --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            lean/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'lean/lean-toolchain', 'lean/**/*.lean') }}
+          restore-keys: lean-${{ runner.os }}-
+
+      # The toolchain itself, cached apart from the build because it is large (the archive is over
+      # half a gigabyte) and changes only with the version. The key carries the digest, so a cached
+      # copy can only have come from an archive that passed the check below.
+      - id: lean-toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/lean-toolchain
+          key: lean-toolchain-${{ runner.os }}-4.34.1-47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4
+
+      # No elan and no toolchain action: the release archive carries `lean` and `lake`, and putting
+      # its `bin` on PATH is all `lake build` and sqleq-lean need. Pinned by digest like Z3 below:
+      # the value is the SHA-256 GitHub lists for the release asset, so a replaced upload fails the
+      # build.
+      - name: fetch Lean (digest-pinned)
+        run: |
+          set -euo pipefail
+          test "$(cat lean/lean-toolchain)" = "leanprover/lean4:v$LEAN_VERSION"
+          name="lean-$LEAN_VERSION-linux"
+          dir="$HOME/.cache/lean-toolchain"
+          if [ ! -x "$dir/$name/bin/lake" ]; then
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.tar.zst" \
+              "https://github.com/leanprover/lean4/releases/download/v$LEAN_VERSION/$name.tar.zst"
+            echo "47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  $RUNNER_TEMP/$name.tar.zst" \
+              | sha256sum -c -
+            mkdir -p "$dir"
+            tar --zstd -xf "$RUNNER_TEMP/$name.tar.zst" -C "$dir"
+            rm "$RUNNER_TEMP/$name.tar.zst"
+          fi
+          echo "$dir/$name/bin" >> "$GITHUB_PATH"
+
+      # The library, and the checker's controls: pairs it must accept or refuse, with kernel-checked
+      # counterexamples for the refusals that are genuine non-equivalences.
+      - name: Lean library and controls
+        run: cd lean && lake build Sqleq SqleqTest
+
+      # The integration test runs every example under examples/lean through real Lean and asserts
+      # the verdict its header declares; it fails, rather than skips, without `lake` on PATH.
+      - run: cargo test -p sqleq-lean
+      - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings
