@@ -700,7 +700,7 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
 /// The walk is the derived AST visitor rather than a hand-written match on purpose. Every caller
 /// uses this as a soundness guard, so the failure mode that matters is missing a variant — and a
 /// hand-written match silently misses every variant added by a parser upgrade.
-fn is_closed(e: &Expr) -> bool {
+pub(crate) fn is_closed(e: &Expr) -> bool {
     visit_expressions(e, |x| match x {
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
@@ -715,23 +715,21 @@ fn is_closed(e: &Expr) -> bool {
     .is_continue()
 }
 
-/// A `FROM`-less `SELECT e1, ..., en`: one row, no input relation — i.e. `VALUES (e1, ..., en)`,
-/// which is how it is emitted.
+/// A `FROM`-less `SELECT e1, ..., en`: one row, no input relation.
 ///
-/// The restriction to closed expressions is what makes that rewrite safe. The prover evaluates a
-/// `Values` row's content one level *above* the row itself (`Env(.., lvl + scope.len())`), so a
-/// correlated column or a nested subquery in one of these expressions would have to be numbered
-/// differently here than everywhere else in the frontend. Rather than special-case the numbering,
-/// only closed expressions are accepted and every other FROM-less SELECT is refused.
-fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select) -> Result<(Value, OutCols)> {
+/// When every expression is closed it is `VALUES (e1, ..., en)`, which is how it is emitted. The
+/// prover evaluates a `Values` row's content one level *above* the row itself
+/// (`Env(.., lvl + scope.len())`), so a correlated column or a nested subquery there would have to
+/// be numbered differently than everywhere else in the frontend. Such a projection goes over the
+/// prover's one-row, zero-column `singleton` instead, where the targets see the enclosing row and
+/// nothing else -- the scope a `FROM` with no items would have.
+fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select, outer: &[Binding]) -> Result<(Value, OutCols)> {
     // Every remaining clause needs a source row to mean anything; none of them are degenerate
     // enough to just drop, so a FROM-less SELECT carrying one is refused.
     if s.selection.is_some() || s.having.is_some() || !group_by_empty(s) || s.distinct.is_some() {
         return Err(unsupported("FROM-less SELECT with WHERE/GROUP BY/HAVING/DISTINCT"));
     }
-    let empty = Scope::empty();
-    let mut content: Vec<Value> = Vec::new();
-    let mut out_cols: OutCols = Vec::new();
+    let mut items: Vec<(&Expr, String)> = Vec::new();
     for (idx, item) in s.projection.iter().enumerate() {
         let (e, name) = match item {
             SelectItem::UnnamedExpr(e) => (e, expr_name(e, idx)),
@@ -739,23 +737,33 @@ fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select) -> Result<(Value,
             // A wildcard needs a FROM to expand against, so this is not valid SQL to begin with.
             other => return Err(unsupported(format!("FROM-less SELECT projection {other:?}"))),
         };
-        if !is_closed(e) {
-            return Err(unsupported("FROM-less SELECT over a column or subquery"));
-        }
-        // An aggregate here has no rows to fold over; `contains_agg` keeps it out of `Values`,
+        // An aggregate here has no rows to fold over; `contains_agg` keeps it out of both shapes,
         // where it would otherwise be emitted as if it were a scalar.
         if contains_agg(fns, e) {
             return Err(unsupported("aggregate in a FROM-less SELECT"));
         }
-        let v = lower_expr(cat, &empty, fns, e)?;
-        out_cols.push((name, ty_of(&v)));
-        content.push(v);
+        items.push((e, name));
     }
-    if content.is_empty() {
+    if items.is_empty() {
         return Err(unsupported("FROM-less SELECT with no projection"));
     }
-    let schema: Vec<String> = content.iter().map(ty_of).collect();
-    Ok((json!({ "values": { "schema": schema, "content": [content] } }), out_cols))
+    if items.iter().all(|(e, _)| is_closed(e)) {
+        let empty = Scope::empty();
+        let content = items.iter().map(|(e, _)| lower_expr(cat, &empty, fns, e)).collect::<Result<Vec<_>>>()?;
+        let out_cols: OutCols = items.iter().zip(&content).map(|((_, n), v)| (n.clone(), ty_of(v))).collect();
+        let schema: Vec<String> = content.iter().map(ty_of).collect();
+        return Ok((json!({ "values": { "schema": schema, "content": [content] } }), out_cols));
+    }
+    let scope = Scope {
+        binds: outer.to_vec(),
+        inner_count: 0,
+        base: Scope::outer_width(outer),
+        merged: Vec::new(),
+        merged_outer: false,
+    };
+    let targets = items.iter().map(|(e, _)| lower_expr(cat, &scope, fns, e)).collect::<Result<Vec<_>>>()?;
+    let out_cols: OutCols = items.iter().zip(&targets).map(|((_, n), v)| (n.clone(), ty_of(v))).collect();
+    Ok((json!({ "project": { "target": targets, "source": "singleton" } }), out_cols))
 }
 
 fn lower_select_ctx(
@@ -776,7 +784,7 @@ fn lower_select_ctx(
         return Err(unsupported("QUALIFY"));
     }
     if s.from.is_empty() {
-        let (rel, cols) = lower_fromless_select(cat, fns, s)?;
+        let (rel, cols) = lower_fromless_select(cat, fns, s, outer)?;
         return Ok((rel, cols, None));
     }
 

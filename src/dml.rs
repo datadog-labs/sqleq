@@ -28,6 +28,21 @@
 //! equivalent exactly when the original one is. That is an *iff*, so unusually for this frontend the
 //! rewrite loses nothing rather than being conservative in one direction.
 //!
+//! ## `DELETE ... USING` and `UPDATE ... FROM`
+//!
+//! ```text
+//! DELETE FROM T USING U WHERE P       ~>   SELECT * FROM T WHERE EXISTS (SELECT 1 FROM U WHERE P)
+//! UPDATE T SET c = e FROM F WHERE P   ~>   the projection below, with P read as that EXISTS
+//! ```
+//!
+//! Postgres deletes or updates a target row once if some row of the join makes `P` TRUE, so the
+//! rows affected are exactly the ones the `EXISTS` keeps, and the arguments here go through
+//! unchanged. What the join adds is a second source of values: when several rows match, an `UPDATE`
+//! takes its new values from an unspecified one of them, and a `RETURNING` item that reads `U` or `F`
+//! reports an unspecified one too. So the reduction applies only where nothing the statement assigns
+//! or returns may read the joined relations ([`check_using`], [`from_is_a_filter`]). An `UPDATE`
+//! whose `SET` reads `F` is a keyed join-update, and stays refused.
+//!
 //! ## `UPDATE`, and the columns that must be projected even though neither side assigns them
 //!
 //! ```text
@@ -133,11 +148,14 @@
 //! the tree it copies has to be the one the SQL means; before the normalizations, because then no other pass
 //! needs to know that DML exists — everything downstream of here sees two queries.
 
+use std::ops::ControlFlow;
+
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    CaseWhen, CastKind, Delete, Expr, FromTable, Ident, Insert, ObjectName, Query, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    Update, WildcardAdditionalOptions,
+    visit_expressions, CaseWhen, CastKind, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, Insert, ObjectName, Query, SelectItem, SelectItemQualifiedWildcardKind,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
+    WildcardAdditionalOptions,
 };
 use sqlparser::parser::Parser;
 
@@ -186,6 +204,8 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
             target_not_shadowed(&statements[i], da)?;
             target_not_shadowed(&statements[j], db)?;
             let (qa, qb) = (target_qual(da)?, target_qual(db)?);
+            check_using(cat, a, da, &qa)?;
+            check_using(cat, b, db, &qb)?;
             same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "DELETE")?;
             same_target(da, db)?;
             let (ra, rb) = (delete_to_select(a)?, delete_to_select(b)?);
@@ -321,14 +341,10 @@ fn target_not_shadowed(st: &Statement, target: &TableWithJoins) -> Result<()> {
     Ok(())
 }
 
-/// `DELETE FROM T WHERE P` -> `SELECT * FROM T WHERE P`. See the module docs for the argument.
+/// `DELETE FROM T WHERE P` -> `SELECT * FROM T WHERE P`, and `DELETE FROM T USING U WHERE P` ->
+/// `SELECT * FROM T WHERE EXISTS (SELECT 1 FROM U WHERE P)`. See the module docs for the argument,
+/// and [`check_using`] for what the second needs besides.
 fn delete_to_select(d: &Delete) -> Result<Query> {
-    // A join-delete deletes the rows of `T` that a semi-join with the `USING` relations keeps. That
-    // is still a bag of `T`'s rows and the argument would still go through, but the projection is not
-    // `SELECT * FROM T WHERE P` — 8 statements in the corpus, none of whose pairs lower anyway.
-    if d.using.is_some() {
-        return Err(unsupported("DELETE ... USING (join-delete)"));
-    }
     // MySQL's `DELETE t1, t2 FROM …` deletes from several tables at once, so its effect is not one
     // bag and there is nothing for a single `SELECT` to compute.
     if !d.tables.is_empty() {
@@ -345,11 +361,106 @@ fn delete_to_select(d: &Delete) -> Result<Query> {
         return Err(unsupported("DELETE ... OUTPUT"));
     }
     let target = delete_target(d)?;
-    Ok(select(
-        vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
-        target.clone(),
-        d.selection.clone(),
-    ))
+    let selection = match &d.using {
+        None => d.selection.clone(),
+        Some(using) => Some(exists(using.clone(), d.selection.clone())),
+    };
+    Ok(select(vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())], target.clone(), selection))
+}
+
+/// The guards a `DELETE ... USING` needs on top of a plain `DELETE`'s.
+///
+/// Postgres deletes a target row once if some combination of `USING` rows makes the predicate TRUE,
+/// which is exactly the rows the `EXISTS` of [`delete_to_select`] keeps: the deleted bag is still a
+/// bag of the target's rows, and the plain argument goes through. Two things it does not settle:
+///
+/// * A `USING` relation named like the target. Inside the `EXISTS` its name would shadow the
+///   target's, and a reference to the deleted row would read the joined one. (Postgres rejects the
+///   statement; refusing keeps the reduction from depending on that.)
+/// * `RETURNING`. Dropping it is sound only when the deleted bag determines what it returns, and an
+///   item that reads a `USING` relation is evaluated against whichever matching row the join
+///   produced. So only items that read the target alone are accepted: `q.*` and `q.c` with `q` the
+///   target, a closed expression, and a bare name the catalog declares for the target and for no
+///   `USING` table. A bare `*` expands to the `USING` relations' columns too.
+fn check_using(cat: &Catalog, d: &Delete, target: &TableWithJoins, qual: &str) -> Result<()> {
+    let Some(using) = &d.using else { return Ok(()) };
+    let mut factors = Vec::new();
+    for twj in using {
+        using_factors(&twj.relation, &mut factors);
+        twj.joins.iter().for_each(|j| using_factors(&j.relation, &mut factors));
+    }
+    // The columns a bare name in `RETURNING` could reach in the `USING` relations, or `None` when
+    // some relation's columns are not known.
+    let mut using_cols: Option<Vec<String>> = Some(Vec::new());
+    for tf in factors {
+        if factor_name(tf).as_deref() == Some(qual) {
+            return Err(unsupported("DELETE ... USING a relation named like the target"));
+        }
+        let cols = match tf {
+            TableFactor::Table { name, alias, args: None, .. }
+                if alias.as_ref().is_none_or(|a| a.columns.is_empty()) =>
+            {
+                find_target(cat, &obj_name(name)).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
+            }
+            _ => None,
+        };
+        match (&mut using_cols, cols) {
+            (Some(all), Some(c)) => all.extend(c),
+            _ => using_cols = None,
+        }
+    }
+    let Some(items) = &d.returning else { return Ok(()) };
+    let target_cols: Vec<String> = find_target(cat, &obj_name(target_name(target)?))
+        .map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()).collect())
+        .unwrap_or_default();
+    let names_target = |q: &Ident| fold_ident(q) == qual;
+    for item in items {
+        let reads_target_only = match item {
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), o) => {
+                *o == WildcardAdditionalOptions::default()
+                    && matches!(n.0.as_slice(), [p] if p.as_ident().is_some_and(names_target))
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => matches!(parts.as_slice(), [q, _] if names_target(q)),
+            SelectItem::UnnamedExpr(Expr::Identifier(c)) => {
+                let c = fold_ident(c);
+                target_cols.contains(&c) && using_cols.as_ref().is_some_and(|u| !u.contains(&c))
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => crate::lower::is_closed(e),
+            _ => false,
+        };
+        if !reads_target_only {
+            return Err(unsupported("DELETE ... USING with a RETURNING item that may read a USING relation"));
+        }
+    }
+    Ok(())
+}
+
+/// The relations a `USING` item brings into scope, looking through parenthesised joins.
+fn using_factors<'a>(tf: &'a TableFactor, out: &mut Vec<&'a TableFactor>) {
+    match tf {
+        TableFactor::NestedJoin { table_with_joins, alias: None } => {
+            using_factors(&table_with_joins.relation, out);
+            table_with_joins.joins.iter().for_each(|j| using_factors(&j.relation, out));
+        }
+        other => out.push(other),
+    }
+}
+
+/// The name a relation is referred to by: its alias, or a table's own bare name.
+fn factor_name(tf: &TableFactor) -> Option<String> {
+    let alias = match tf {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+        _ => None,
+    };
+    match (alias, tf) {
+        (Some(a), _) => Some(fold_ident(&a.name)),
+        (None, TableFactor::Table { name, .. }) => name.0.last().and_then(|p| p.as_ident()).map(fold_ident),
+        _ => None,
+    }
 }
 
 /// The single table a `DELETE` deletes from.
@@ -431,9 +542,9 @@ fn target_qual(t: &TableWithJoins) -> Result<String> {
 /// to spans and formatting and sensitive to everything else.
 #[derive(PartialEq, Debug)]
 enum RetItem<'a> {
-    /// `*`, or `q.*` where `q` names the target. The target is the only relation in scope — a
-    /// `USING`/`FROM` join is refused before this runs — so both expand to its declared columns,
-    /// in declared order.
+    /// `*`, or `q.*` where `q` names the target. Both expand to the target's declared columns, in
+    /// declared order: the target is the only relation in scope, and under a `USING`/`FROM` join,
+    /// where it is not, a bare `*` is refused before this runs.
     Star,
     /// A column of the target, written bare or qualified by the target's name or alias.
     Col(String),
@@ -495,18 +606,13 @@ fn same_returning(
 }
 
 /// The parts of an `UPDATE` the reduction reads: its target, its assignments as
-/// `(lowercased column, value)`, and its predicate. All borrowed from the statement, because the
-/// value expressions are spliced into the projection unchanged.
-type Parts<'a> = (&'a TableWithJoins, Vec<(String, &'a Expr)>, Option<&'a Expr>);
+/// `(lowercased column, value)`, and its predicate. The first two are borrowed from the statement,
+/// because the value expressions are spliced into the projection unchanged; the predicate is owned,
+/// because under `FROM` it is the `EXISTS` [`set_map`] builds around the statement's own.
+type Parts<'a> = (&'a TableWithJoins, Vec<(String, &'a Expr)>, Option<Expr>);
 
 /// Read an `UPDATE` into its [`Parts`], refusing every shape the projection does not model.
-fn set_map(u: &Update) -> Result<Parts<'_>> {
-    // `UPDATE t SET c = u.c FROM u WHERE …` is a join-update: which row of `u` supplies the value is
-    // decided by the join, and a row of `t` matching several of them updates once with an
-    // unspecified one of them. That is not a projection of `t`.
-    if u.from.is_some() {
-        return Err(unsupported("UPDATE ... FROM (join-update)"));
-    }
+fn set_map<'a>(cat: &Catalog, u: &'a Update) -> Result<Parts<'a>> {
     if !u.order_by.is_empty() || u.limit.is_some() {
         return Err(unsupported("UPDATE with ORDER BY / LIMIT"));
     }
@@ -525,7 +631,7 @@ fn set_map(u: &Update) -> Result<Parts<'_>> {
         let sqlparser::ast::AssignmentTarget::ColumnName(c) = &a.target else {
             // `SET (a, b) = (SELECT …)` assigns a row value: each target takes one column of a
             // subquery whose cardinality SQL constrains but the tree does not, so splitting it into
-            // per-column expressions is not a rewrite of this shape. 4 statements in the corpus.
+            // per-column expressions is not a rewrite of this shape.
             return Err(unsupported("UPDATE SET (a, b) = ... (row assignment)"));
         };
         // Postgres does not allow the target to be qualified, and a multi-part name here would name a
@@ -547,13 +653,110 @@ fn set_map(u: &Update) -> Result<Parts<'_>> {
     if sets.is_empty() {
         return Err(unsupported("UPDATE with no SET clause"));
     }
-    Ok((&u.table, sets, u.selection.as_ref()))
+    let pred = match &u.from {
+        None => u.selection.clone(),
+        Some(UpdateTableFromKind::AfterSet(from)) => {
+            from_is_a_filter(cat, u, from)?;
+            Some(exists(from.clone(), u.selection.clone()))
+        }
+        Some(UpdateTableFromKind::BeforeSet(_)) => return Err(unsupported("UPDATE FROM ... SET")),
+    };
+    Ok((&u.table, sets, pred))
+}
+
+/// Refuse an `UPDATE ... FROM` whose `FROM` is more than a filter.
+///
+/// Postgres updates a target row once if some row of the join makes the predicate TRUE, and when
+/// several do, it takes the new values from an unspecified one of them. So the statement is the
+/// projection of the module docs over the rows `EXISTS (SELECT 1 FROM F WHERE P)` keeps exactly
+/// when nothing it computes reads `F`: then every matching row gives the same new values. This
+/// refuses a `SET` value or a `RETURNING` item that may read `F` (see [`may_read`]), a bare
+/// `RETURNING *`, which expands to `F`'s columns too, and an `F` relation named like the target,
+/// whose name would shadow the target's inside the `EXISTS`.
+fn from_is_a_filter(cat: &Catalog, u: &Update, from: &[TableWithJoins]) -> Result<()> {
+    let qual = target_qual(&u.table)?;
+    let mut factors = Vec::new();
+    for twj in from {
+        using_factors(&twj.relation, &mut factors);
+        twj.joins.iter().for_each(|j| using_factors(&j.relation, &mut factors));
+    }
+    let mut names = Vec::new();
+    let mut cols: Option<Vec<String>> = Some(Vec::new());
+    for tf in factors {
+        let name = factor_name(tf);
+        if name.as_deref() == Some(qual.as_str()) {
+            return Err(unsupported("UPDATE ... FROM a relation named like the target"));
+        }
+        names.extend(name);
+        let known = match tf {
+            TableFactor::Table { name, alias, args: None, .. }
+                if alias.as_ref().is_none_or(|a| a.columns.is_empty()) =>
+            {
+                find_target(cat, &obj_name(name)).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
+            }
+            _ => None,
+        };
+        match (&mut cols, known) {
+            (Some(all), Some(c)) => all.extend(c),
+            _ => cols = None,
+        }
+    }
+    let reads = |e: &Expr| may_read(e, &names, cols.as_deref());
+    if u.assignments.iter().any(|a| reads(&a.value)) {
+        return Err(unsupported("UPDATE ... FROM with a SET value that may read the FROM list"));
+    }
+    for item in u.returning.iter().flatten() {
+        let bad = match item {
+            SelectItem::Wildcard(_) => true,
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
+                n.0.last().and_then(|p| p.as_ident()).is_none_or(|q| fold_ident(q) != qual)
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => reads(e),
+            _ => true,
+        };
+        if bad {
+            return Err(unsupported("UPDATE ... FROM with a RETURNING item that may read the FROM list"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `e` may read one of an `UPDATE`'s `FROM` relations, judged conservatively: a name
+/// qualified by one of `names`, a bare name in `cols` (any bare name when `cols` is unknown), a
+/// wildcard qualified by one of `names`, or a subquery, whose own scope this does not follow.
+fn may_read(e: &Expr, names: &[String], cols: Option<&[String]>) -> bool {
+    let from_name = |n: &ObjectName| n.0.last().and_then(|p| p.as_ident()).is_some_and(|q| names.contains(&fold_ident(q)));
+    visit_expressions(e, |x| {
+        let hit = match x {
+            Expr::Identifier(c) => cols.is_none_or(|cs| cs.contains(&fold_ident(c))),
+            Expr::CompoundIdentifier(p) => p.len() >= 2 && names.contains(&fold_ident(&p[p.len() - 2])),
+            Expr::QualifiedWildcard(n, _) => from_name(n),
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+            Expr::Function(f) => match &f.args {
+                FunctionArguments::List(l) => l.args.iter().any(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n))
+                    | FunctionArg::Named { arg: FunctionArgExpr::QualifiedWildcard(n), .. } => from_name(n),
+                    _ => false,
+                }),
+                FunctionArguments::Subquery(_) => true,
+                FunctionArguments::None => false,
+            },
+            _ => false,
+        };
+        if hit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 /// Reduce a pair of `UPDATE`s to the pair of projections computing their final tables.
 fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query)> {
-    let (ta, sets_a, pred_a) = set_map(a)?;
-    let (tb, sets_b, pred_b) = set_map(b)?;
+    let (ta, sets_a, pred_a) = set_map(cat, a)?;
+    let (tb, sets_b, pred_b) = set_map(cat, b)?;
+    let (pred_a, pred_b) = (pred_a.as_ref(), pred_b.as_ref());
     same_target(ta, tb)?;
     let returning = same_returning(
         a.returning.as_deref(),
@@ -872,6 +1075,20 @@ fn select(projection: Vec<SelectItem>, from: TableWithJoins, selection: Option<E
     *q
 }
 
+/// `EXISTS (SELECT 1 FROM <from> [WHERE <selection>])`, from the same kind of constant skeleton as
+/// [`select`] and for the same reasons.
+fn exists(from: Vec<TableWithJoins>, selection: Option<Expr>) -> Expr {
+    let mut parsed =
+        Parser::parse_sql(&crate::DIALECT, "SELECT 1 FROM t").expect("the skeleton is a constant");
+    let Some(Statement::Query(mut q)) = parsed.pop() else {
+        unreachable!("the skeleton is one query")
+    };
+    let SetExpr::Select(select) = &mut *q.body else { unreachable!("the skeleton is a SELECT") };
+    select.from = from;
+    select.selection = selection;
+    Expr::Exists { subquery: q, negated: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,10 +1244,20 @@ mod tests {
     }
 
     #[test]
-    fn join_delete_is_refused() {
+    fn a_join_delete_is_a_semi_join() {
         let cat = catalog("t", &["a"]);
-        assert!(err(&cat, "DELETE FROM t USING u WHERE t.a = u.a; DELETE FROM t;")
-            .contains("join-delete"));
+        assert_eq!(
+            reduced(&cat, "DELETE FROM t USING u WHERE t.a = u.a; DELETE FROM t;").unwrap()[0],
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.a = u.a)"
+        );
+        // A `RETURNING` item that may read `u` is computed from whichever `u` row matched.
+        for (sql, want) in [
+            ("DELETE FROM t USING u WHERE t.a = u.a RETURNING *; DELETE FROM t RETURNING *;", "RETURNING item"),
+            ("DELETE FROM t USING u WHERE t.a = u.a RETURNING u.a; DELETE FROM t RETURNING a;", "RETURNING item"),
+            ("DELETE FROM t USING u AS t WHERE t.a = 1; DELETE FROM t;", "named like the target"),
+        ] {
+            assert!(err(&cat, sql).contains(want), "{sql}");
+        }
     }
 
     #[test]
@@ -1150,12 +1377,16 @@ mod tests {
     }
 
     #[test]
-    fn row_assignment_and_join_update_are_refused() {
+    fn row_assignment_and_a_join_update_reading_the_join_are_refused() {
         let cat = catalog("t", &["a", "b"]);
         assert!(err(&cat, "UPDATE t SET (a, b) = (SELECT 1, 2); UPDATE t SET a = 1;")
             .contains("row assignment"));
+        // Which `u` row supplies the value is unspecified when several match.
         assert!(err(&cat, "UPDATE t SET a = u.a FROM u; UPDATE t SET a = 1;")
-            .contains("join-update"));
+            .contains("SET value that may read the FROM list"));
+        // A `FROM` that only filters is a semi-join.
+        let r = reduced(&cat, "UPDATE t SET a = 1 FROM u WHERE t.b = u.b; UPDATE t SET a = 1;").unwrap();
+        assert!(r[0].contains("CASE WHEN EXISTS (SELECT 1 FROM u WHERE t.b = u.b) THEN 1 ELSE a END"), "{}", r[0]);
     }
 
     #[test]
