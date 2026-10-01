@@ -78,7 +78,8 @@ what it is or refused:
 - **A typmod is a computation.** `$1::varchar(2)` truncates and `$1::timestamp(0)` rounds, so only an
   *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over a
   parameter, a literal or anything else, is a function named after the full spelling of its target.
-- **An array is not its element type.** An array column is opaque whatever it holds; `||` over an
+- **An array is not its element type.** An array column is opaque whatever it holds, and a cast to an
+  array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
   opaque operand is a function, not text concatenation, because array `||` is not strict
   (`'{a}' || NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every
   element is a scalar, since over `ARRAY[arr]` it ranges over the leaves.

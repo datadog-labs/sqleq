@@ -312,11 +312,7 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
     let target = map_type(dt);
     let from = ty_of(&v);
     if !is_temporal(&target) && !is_temporal(&from) {
-        // A typmod is a computation the IR type does not carry: `varchar(2)` truncates and
-        // `numeric(10,2)` rounds, yet both map to the type an unqualified target maps to, and a
-        // `CAST` between equal types is the identity to a prover. So a qualified target is a
-        // function named after its full spelling instead.
-        if let Some(name) = qualified_cast_name(dt) {
+        if let Some(name) = named_cast(dt, &target) {
             return json!({ "operator": name, "operand": [v], "type": target });
         }
         return json!({ "operator": "CAST", "operand": [v], "type": target });
@@ -328,11 +324,20 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
     convert_qualified(v, &target, qualifier.as_deref())
 }
 
-/// The function a non-temporal cast to a *qualified* target lowers to, named after the target's
-/// full spelling (`varchar(2)` -> `q_cast_varchar_2`); `None` for an unqualified target.
-fn qualified_cast_name(dt: &DataType) -> Option<String> {
-    let spelled = format!("{dt}").to_lowercase();
-    spelled.contains('(').then(|| {
+/// The function a non-temporal cast lowers to where a bare `CAST` would say too little, named after
+/// the target's full spelling (`varchar(2)` -> `q_cast_varchar_2`, `int[]` -> `q_cast_int_array`);
+/// `None` where a `CAST` to the IR type is exact.
+///
+/// A `CAST` between equal IR types is the identity to a prover, and two kinds of target map to an IR
+/// type that does not say what the cast computes:
+///
+/// * a qualified one. A typmod is a computation the IR type does not carry: `varchar(2)` truncates
+///   and `numeric(10,2)` rounds, yet both map to the type an unqualified target maps to;
+/// * an opaque one. VARBINARY carries every array type and the binary ones, so `ys::int[]` over a
+///   `text[]` would read as `ys`, while it parses each element.
+fn named_cast(dt: &DataType, target: &str) -> Option<String> {
+    let spelled = format!("{dt}").to_lowercase().replace("[]", " array");
+    (spelled.contains('(') || target == "VARBINARY").then(|| {
         let safe: String = spelled.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         format!("q_cast_{}", safe.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"))
     })

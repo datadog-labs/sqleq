@@ -101,6 +101,23 @@ fn a_typmod_on_a_column_cast_is_kept_in_declared_mode() {
 }
 
 #[test]
+fn a_cast_to_an_array_type_is_not_the_identity() {
+    // Every array is one opaque IR type, and a cast between equal IR types reads as the identity;
+    // but `ys::int[]` parses each element of a `text[]`.
+    let ddl = "CREATE TABLE u (id integer, s text, xs int[], ys text[]);";
+    let q = "SELECT ys::int[], xs::text[], s::varchar(1), ys::varchar(1)[] FROM u";
+    let v = lower_with(&format!("{ddl}\n{q};\n{q};"), CatalogSource::Declared)
+        .unwrap_or_else(|e| panic!("expected Ok, got {e}"));
+    let mut ops = Vec::new();
+    operators(&v["queries"][0], &mut ops);
+    assert!(!ops.iter().any(|o| o == "CAST"), "{ops:?}");
+    // A scalar typmod and the same one on an array are two functions.
+    for name in ["q_cast_int_array", "q_cast_text_array", "q_cast_varchar_1", "q_cast_varchar_1_array"] {
+        assert!(ops.iter().any(|o| o == name), "{name} in {ops:?}");
+    }
+}
+
+#[test]
 fn a_set_returning_function_over_aggregates_is_refused() {
     refused(
         "SELECT jsonb_array_elements_text(jsonb_build_array(count(t.id), count(t.id))) FROM t",
