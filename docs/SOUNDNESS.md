@@ -92,6 +92,10 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A join-delete or join-update is a semi-join only when nothing it assigns or returns reads the
+  join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
+  but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of
+  them. Those are refused, and so is a bare `RETURNING *`, which reaches `u`'s columns.
 - **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
   unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
   only in case (`"s"` and `"S"`) is refused rather than resolved to one of them.

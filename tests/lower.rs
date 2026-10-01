@@ -547,15 +547,24 @@ fn refuses_fromless_select_with_a_where() {
 }
 
 #[test]
-fn refuses_fromless_select_over_a_column() {
+fn a_fromless_select_over_a_subquery_or_an_outer_column_projects_over_singleton() {
     // The prover evaluates a `Values` row's content one level *above* the row itself, so a
-    // correlated column here would need different numbering than everywhere else in the frontend.
-    refused(&same(r#"SELECT "a""#), "FROM-less SELECT over a column or subquery");
+    // correlated column or a subquery there would need different numbering than everywhere else in
+    // the frontend. Such a projection goes over the one-row `singleton` instead.
+    let singleton = serde_json::json!("singleton");
+    let v = ok(&same(r#"SELECT (SELECT "a" FROM "t")"#));
+    assert!(collect_field(&v["queries"][0], "source").contains(&singleton), "{v}");
+    let v = ok(&same(r#"SELECT "a" FROM "t" WHERE EXISTS (SELECT "t"."b")"#));
+    assert!(collect_field(&v["queries"][0], "source").contains(&singleton), "{v}");
+    // A closed projection is still the one-row `Values`.
+    let v = ok(&same("SELECT 1"));
+    assert!(find_with_field(&v["queries"][0], "values").is_some(), "{v}");
 }
 
 #[test]
-fn refuses_fromless_select_over_a_subquery() {
-    refused(&same(r#"SELECT (SELECT "a" FROM "t")"#), "FROM-less SELECT over a column or subquery");
+fn a_fromless_select_over_a_column_nothing_binds_is_refused() {
+    let e = lower_sql(&same(r#"SELECT "a""#)).unwrap_err().to_string();
+    assert!(e.contains("unresolved column a"), "{e}");
 }
 
 #[test]

@@ -152,3 +152,39 @@ fn an_array_constructor_is_an_opaque_value() {
     // Under `= ANY` it is still expanded, exactly.
     assert!(same_on(U, "SELECT id FROM u WHERE id = ANY(ARRAY[1, 2])", "SELECT id FROM u WHERE id = 1 OR id = 2", SEEDED));
 }
+
+const V: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" VARCHAR, unique ("id")); create table "u" ("uid" INTEGER, "ua" INTEGER, "s" VARCHAR, unique ("uid"));"#;
+
+#[test]
+fn a_join_delete_lowers_like_its_semi_join() {
+    for src in [SEEDED, DECLARED] {
+        assert!(same_on(
+            V,
+            "DELETE FROM t USING u WHERE t.a = u.ua RETURNING t.*",
+            "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.a = u.ua) RETURNING *",
+            src
+        ));
+        // What a returned `u` column holds depends on which `u` row the join matched.
+        refused_on(V, "DELETE FROM t USING u WHERE t.a = u.ua RETURNING u.ua", src, "RETURNING item");
+        refused_on(V, "DELETE FROM t USING u WHERE t.a = u.ua RETURNING *", src, "RETURNING item");
+        // `s` is a column of both, so the bare name may be `u`'s.
+        refused_on(V, "DELETE FROM t USING u WHERE t.a = u.ua RETURNING s", src, "RETURNING item");
+    }
+}
+
+#[test]
+fn a_join_update_that_only_filters_lowers_like_its_semi_join() {
+    for src in [SEEDED, DECLARED] {
+        assert!(same_on(
+            V,
+            "UPDATE t SET a = a + 1 FROM u WHERE t.id = u.uid RETURNING t.*",
+            "UPDATE t SET a = a + 1 WHERE EXISTS (SELECT 1 FROM u WHERE t.id = u.uid) RETURNING *",
+            src
+        ));
+        // When several `u` rows match, the value would come from an unspecified one.
+        refused_on(V, "UPDATE t SET a = u.ua FROM u WHERE t.id = u.uid", src, "SET value");
+        refused_on(V, "UPDATE t SET a = ua FROM u WHERE t.id = u.uid", src, "SET value");
+        refused_on(V, "UPDATE t SET a = 0 FROM u WHERE t.id = u.uid RETURNING *", src, "RETURNING item");
+        refused_on(V, "UPDATE t SET a = 0 FROM u AS t WHERE t.uid = 1", src, "named like the target");
+    }
+}
