@@ -35,11 +35,13 @@ trap 'rm -rf "$tmp"' EXIT
 # vanishing into `sort`.
 dd-rust-license-tool --manifest-path Cargo.toml dump >"$tmp/frontend.csv"
 dd-rust-license-tool --manifest-path sqleq-fuzz/Cargo.toml dump >"$tmp/fuzz.csv"
+dd-rust-license-tool --manifest-path sqleq-lean/Cargo.toml dump >"$tmp/lean.csv"
 dd-rust-license-tool --manifest-path sqleq-solver/Cargo.toml dump >"$tmp/solver.csv"
 
 {
     echo "Component,Origin,License,Copyright"
-    { tail -n +2 "$tmp/frontend.csv"; tail -n +2 "$tmp/fuzz.csv"; tail -n +2 "$tmp/solver.csv"; } \
+    { tail -n +2 "$tmp/frontend.csv"; tail -n +2 "$tmp/fuzz.csv"; tail -n +2 "$tmp/lean.csv"
+      tail -n +2 "$tmp/solver.csv"; } \
         | LC_ALL=C sort -u
     tail -n +2 tools/license-3rdparty-extra.csv
 } >"$tmp/new.csv"

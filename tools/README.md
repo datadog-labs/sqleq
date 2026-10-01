@@ -6,6 +6,7 @@
 | `linkcheck.py` | every relative link in every tracked Markdown file resolves |
 | `update_license_3rdparty.sh` | regenerates `LICENSE-3rdparty.csv`; `--check` is the CI gate — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | `sqlsolver/` | our side of the IR bridge to the second prover — see [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) |
+| `lean_replay.py` | re-runs the Lean axis's INSERT pairs on a real Postgres, as an independent check — see [`../docs/LEAN.md`](../docs/LEAN.md) |
 
 Standard library only, Python 3.8+. `test_sqleq_check.py` covers `sqleq_check.py`; run it with
 `python3 -m unittest discover -s tools -p 'test_*.py'`.
@@ -87,6 +88,8 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--sqlsolver-tree DIR` | With `jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
 | `--sqlsolver-bin PATH` | With `rust`: the `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--sqlsolver-timeout MS` | Per-row cap for that prover (default: `-t` in ms). Its own, because the two provers are not comparably fast. |
+| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. Never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
+| `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
 
 ### Status taxonomy

@@ -19,6 +19,13 @@ repository: it needs a separate Java checkout, and the plan-level bridge needs a
 not published. It never changes a verdict or an exit code. See
 [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md), *Reproducing this*.
 
+The **Lean axis** (`sqleq-lean`) is narrower still. It decides one class of `INSERT` pair the other
+axes cannot even state: `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a
+parameter is a scalar on one side and an array on the other. It proves such a pair under an explicit
+rule for how the two sides' parameters correspond, and has the Lean kernel check the proof. It
+needs a Lean toolchain, and `tools/sqleq_check.py --lean` runs it as a second opinion that never
+changes an exit code. See [`docs/LEAN.md`](docs/LEAN.md).
+
 ## Quick start
 
 The two things you might want have very different prerequisites, so pick first:
