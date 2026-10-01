@@ -141,6 +141,13 @@ pub fn temporal_data_type(t: &str) -> Option<DataType> {
 pub fn map_type(dt: &DataType) -> String {
     let s = format!("{dt}").to_uppercase();
     let base = s.split('(').next().unwrap_or(&s).trim();
+    // An array is opaque whatever its element type, and is tested first because every arm below
+    // reads only the element's spelling: `int[]` would be an INTEGER and `timestamp[]` a
+    // TIMESTAMP, and a scalar reading of an array value lets `||` and `= ANY` be modelled as
+    // their scalar forms.
+    if s.contains('[') || s.starts_with("ARRAY") || s.split_whitespace().any(|w| w == "ARRAY") {
+        return "VARBINARY".into();
+    }
     if let Some(t) = temporal_class(&s) {
         // Before the `INT` arm below, which INTERVAL would otherwise reach through its spelling.
         t.unwrap_or("VARBINARY").into()
@@ -305,6 +312,13 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
     let target = map_type(dt);
     let from = ty_of(&v);
     if !is_temporal(&target) && !is_temporal(&from) {
+        // A typmod is a computation the IR type does not carry: `varchar(2)` truncates and
+        // `numeric(10,2)` rounds, yet both map to the type an unqualified target maps to, and a
+        // `CAST` between equal types is the identity to a prover. So a qualified target is a
+        // function named after its full spelling instead.
+        if let Some(name) = qualified_cast_name(dt) {
+            return json!({ "operator": name, "operand": [v], "type": target });
+        }
         return json!({ "operator": "CAST", "operand": [v], "type": target });
     }
     let qualifier = cast_qualifier(&format!("{dt}").to_uppercase());
@@ -312,6 +326,16 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
         return v;
     }
     convert_qualified(v, &target, qualifier.as_deref())
+}
+
+/// The function a non-temporal cast to a *qualified* target lowers to, named after the target's
+/// full spelling (`varchar(2)` -> `q_cast_varchar_2`); `None` for an unqualified target.
+fn qualified_cast_name(dt: &DataType) -> Option<String> {
+    let spelled = format!("{dt}").to_lowercase();
+    spelled.contains('(').then(|| {
+        let safe: String = spelled.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        format!("q_cast_{}", safe.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"))
+    })
 }
 
 /// Whether two column types are two *different temporal types*. Where a relation-shaped construct
@@ -401,6 +425,18 @@ pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
     let (a, b) = (ty_of(&l), ty_of(&r));
     if is_temporal(&a) || is_temporal(&b) {
         return temporal_arith(opstr, l, r);
+    }
+    // `||` is text concatenation only over text and the other builtin scalars, and there it is
+    // strict. Over anything opaque it may be something else: array `||` is not strict
+    // (`'{a}' || NULL` is `{a}`), so the native operator, which provers read as strict text
+    // concatenation, would make `(a || $1) IS NULL` mean `a IS NULL OR $1 IS NULL`. Such an `||` is
+    // a function named after both operand types.
+    if opstr == "||" && !(is_builtin(&a) && is_builtin(&b)) {
+        return json!({
+            "operator": format!("q_op_concat_{}_{}", a.to_lowercase(), b.to_lowercase()),
+            "operand": [l, r],
+            "type": "VARBINARY"
+        });
     }
     if a == b || (is_num(&a) && is_num(&b)) {
         return json!({ "operator": opstr, "operand": [l, r], "type": num_ty });

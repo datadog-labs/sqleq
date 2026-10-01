@@ -183,6 +183,8 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
             let (i, j) = (deletes[0], deletes[1]);
             let (a, b) = (delete_at(statements, i), delete_at(statements, j));
             let (da, db) = (delete_target(a)?, delete_target(b)?);
+            target_not_shadowed(&statements[i], da)?;
+            target_not_shadowed(&statements[j], db)?;
             let (qa, qb) = (target_qual(da)?, target_qual(db)?);
             same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "DELETE")?;
             same_target(da, db)?;
@@ -199,6 +201,8 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
         0 => {}
         2 => {
             let (i, j) = (updates[0], updates[1]);
+            target_not_shadowed(&statements[i], &update_at(statements, i).table)?;
+            target_not_shadowed(&statements[j], &update_at(statements, j).table)?;
             let (qa, qb) = update_pair(cat, update_at(statements, i), update_at(statements, j))?;
             install(&mut statements[i], qa)?;
             install(&mut statements[j], qb)?;
@@ -292,6 +296,28 @@ fn install(st: &mut Statement, mut reduced: Query) -> Result<()> {
         }
     }
     *st = Statement::Query(Box::new(reduced));
+    Ok(())
+}
+
+/// Refuse a `WITH` binding that has the DML target's name.
+///
+/// The target of a `DELETE` or `UPDATE` always names the table, never a binding of the statement's
+/// own `WITH`, while every other mention of that name in the statement does mean the binding. The
+/// reduced query cannot keep the two apart: the target becomes an ordinary `FROM` item, and
+/// [`inline_ctes`][crate::normalize::inline_ctes] then replaces it with the binding. So
+/// `WITH t AS (SELECT * FROM t WHERE a = 1) DELETE FROM t`, which empties `t`, would lower like
+/// `DELETE FROM t WHERE a = 1`. Compared on the bare name, because a schema qualifier on the target
+/// is stripped later and would not keep the two apart either.
+fn target_not_shadowed(st: &Statement, target: &TableWithJoins) -> Result<()> {
+    let Statement::Query(wrapper) = st else { return Ok(()) };
+    let Some(with) = &wrapper.with else { return Ok(()) };
+    let Some(bare) = target_name(target)?.0.last().and_then(|p| p.as_ident()) else {
+        return Ok(());
+    };
+    let bare = fold_ident(bare);
+    if with.cte_tables.iter().any(|cte| fold_ident(&cte.alias.name) == bare) {
+        return Err(unsupported("WITH binding named like the DML target"));
+    }
     Ok(())
 }
 
@@ -886,6 +912,24 @@ mod tests {
 
     fn err(cat: &Catalog, sql: &str) -> String {
         reduced(cat, sql).expect_err("should refuse")
+    }
+
+    #[test]
+    fn a_with_binding_named_like_the_target_is_refused() {
+        // `WITH t AS (..) DELETE FROM t` empties the table `t`: the target names the table, and only
+        // the statement's other mentions of `t` mean the binding. Reduced, the target would be
+        // inlined as the binding and lower like `DELETE FROM t WHERE a = 1`.
+        let cat = catalog("t", &["a", "b"]);
+        let shadow = "WITH binding named like the DML target";
+        let e = err(&cat, "WITH t AS (SELECT * FROM t WHERE a = 1) DELETE FROM t; DELETE FROM t WHERE a = 1;");
+        assert!(e.contains(shadow), "{e}");
+        let e = err(&cat, "WITH t AS (SELECT a, 0 AS b FROM t) UPDATE t SET b = b; UPDATE t SET b = 0;");
+        assert!(e.contains(shadow), "{e}");
+        // A qualifier on the target does not keep them apart: it is stripped later.
+        let e = err(&cat, "WITH t AS (SELECT * FROM t WHERE a = 1) DELETE FROM s.t; DELETE FROM s.t;");
+        assert!(e.contains(shadow), "{e}");
+        // A binding under another name is carried across as before.
+        assert!(reduced(&cat, "WITH x AS (SELECT a FROM t) DELETE FROM t WHERE a IN (SELECT a FROM x); DELETE FROM t;").is_ok());
     }
 
     #[test]

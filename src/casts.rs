@@ -262,7 +262,11 @@ fn decide(
             let tq = target.unwrap_or(Ty::Opaque);
             let op = unwrap_nested(expr);
 
-            if placeholder_index(op).is_some() {
+            // A typmod is a computation, not a type: `$1::varchar(2)` truncates and
+            // `$1::timestamp(0)` rounds, so only an unqualified cast over a parameter is the
+            // parameter's type and nothing more. A qualified one takes rule 5b, keyed on the
+            // qualified spelling.
+            if placeholder_index(op).is_some() && !qualified {
                 rw.dropped.param += 1;
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
                 return Ok(());
