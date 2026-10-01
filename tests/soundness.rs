@@ -83,6 +83,17 @@ fn a_typmod_on_a_parameter_cast_is_kept() {
 }
 
 #[test]
+fn a_typmod_on_a_literal_cast_is_kept() {
+    assert!(!identical("SELECT id FROM t WHERE s = 'abc'::varchar(2)", "SELECT id FROM t WHERE s = 'abc'::varchar(3)"));
+    assert!(!identical(
+        "SELECT id FROM t WHERE ts = '2020-01-01 01:00:00.5'::timestamp(0)",
+        "SELECT id FROM t WHERE ts = '2020-01-01 01:00:00.5'::timestamp"
+    ));
+    // One spelling on both sides is still one function.
+    assert!(identical("SELECT id FROM t WHERE s = 'abc'::varchar(2)", "SELECT id FROM t WHERE s = 'abc'::VARCHAR(2)"));
+}
+
+#[test]
 fn a_typmod_on_a_column_cast_is_kept_in_declared_mode() {
     let declared = CatalogSource::Declared;
     assert!(!identical_in("SELECT k::varchar(2) FROM t", "SELECT k::varchar(3) FROM t", declared));

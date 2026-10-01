@@ -271,7 +271,9 @@ fn decide(
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
                 return Ok(());
             }
-            if is_literal(op) {
+            // The same holds over a literal: `'abc'::varchar(2)` is `'ab'`, and retargeting it to the
+            // bare type would make it a cast between equal types, which is the identity.
+            if is_literal(op) && !qualified {
                 dec.insert(nid(e), Decision::Retarget(tq));
                 return Ok(());
             }
