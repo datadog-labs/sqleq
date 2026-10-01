@@ -236,12 +236,14 @@ pub fn check(
     let ms = start.elapsed().as_millis() as u64 * jobs.max(1) as u64 / todo.len().max(1) as u64;
     // (proof outcome, witness outcome) per case; `None` when the batch timed out.
     let mut got: Vec<Option<(run::Outcome, Option<run::Outcome>)>> = vec![None; cases.len()];
-    for ((members, entries), out) in batches.iter().zip(&layouts).zip(&outputs) {
+    for (((members, entries), out), file) in batches.iter().zip(&layouts).zip(&outputs).zip(&files) {
         let Some(text) = out else { continue };
+        // The audit reads the file Lean read, not the string that was written to it.
         let proofs: Vec<_> = entries.iter().map(|e| e.proof.clone()).collect();
-        let po = run::outcomes(text, &proofs);
+        let src = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let po = run::outcomes(&src, text, &proofs);
         for ((&i, e), p) in members.iter().zip(entries).zip(po) {
-            let w = e.witness.as_ref().map(|w| run::outcomes(text, std::slice::from_ref(w)).remove(0));
+            let w = e.witness.as_ref().map(|w| run::outcomes(&src, text, std::slice::from_ref(w)).remove(0));
             got[i] = Some((p, w));
         }
     }

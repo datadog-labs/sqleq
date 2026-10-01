@@ -107,9 +107,22 @@ credit or withhold credit wrongly.
 | `invalid-sql` | Postgres rejects the pair as written, e.g. a `VALUES` row narrower than the column list. |
 | `error`, `timeout` | Lean did not accept the proof, or did not finish. |
 
-A proof counts only if `#print axioms` on it lists nothing beyond `propext`, `Classical.choice` and
-`Quot.sound`. A proof that fell back to `sorry` shows `sorryAx`, and `native_decide` shows
-`Lean.ofReduceBool`; both are rejected.
+A proof counts only if both of these checks pass:
+
+- **What was proved.** Before any proof in a generated Lean file is believed, the file must pass an
+  audit (`run::audit`), a second definition of the file format written apart from the emitter:
+  - every line must be one the emitter writes;
+  - each proof must state exactly `EquivGather A B` of its own pair's `A` and `B`;
+  - every definition must be pure data, built only from the package's constructors, numerals and
+    booleans;
+  - nothing else may appear, so no `axiom`, no `set_option` (such as `debug.skipKernelTC`), and no
+    macro or tactic that could change how the file is checked.
+- **How it was proved.** `#print axioms` on the proof lists nothing beyond `propext`,
+  `Classical.choice` and `Quot.sound`. A proof that fell back to `sorry` shows `sorryAx`, and
+  `native_decide` shows `Lean.ofReduceBool`; both are rejected.
+
+Lean's own kernel is still trusted. Re-checking the proofs with an independent kernel (for example
+`nanoda` through `lean4export`, as Lean's `comparator` does) is a natural next step.
 
 ## Checking it against Postgres
 

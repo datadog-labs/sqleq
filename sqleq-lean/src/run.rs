@@ -6,13 +6,17 @@
 //! Run Lean on a batch file and read off which pairs the kernel accepted.
 //!
 //! A pair counts as proved only if **all** of these hold:
+//! - the batch file passes [`audit`]: it holds nothing but the forms `emit::batch` writes, so each
+//!   proof states exactly `EquivGather A B` of its own pair, and nothing in the file can change how
+//!   it is checked;
 //! - Lean reported no error inside the pair's lines;
 //! - `#print axioms` printed a line for its `equiv`;
 //! - every axiom on that line is in [`ALLOWED`].
 //!
-//! The axiom check is the trust boundary, not the exit code. A theorem whose proof failed to
-//! elaborate is still added to the environment with `sorryAx`, and `native_decide` would add
-//! `Lean.ofReduceBool`; both fall outside the allow-list.
+//! The axiom check, not the exit code, says the kernel accepted the proof on its own: a theorem
+//! whose proof failed to elaborate is still added to the environment with `sorryAx`, and
+//! `native_decide` would add `Lean.ofReduceBool`, and both fall outside the allow-list. The audit
+//! says *what* was proved, which the axiom check cannot.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -107,9 +111,124 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// Read Lean's output for a batch. Each entry is the 0-based line range it occupies and the
-/// theorem whose axiom report stands for it.
-pub fn outcomes(output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcome> {
+/// The only names a definition in a batch may mention: the Lean package's constructors. With
+/// these, numerals and booleans, a definition is pure data. It cannot refer to a theorem, an axiom
+/// or another definition.
+const CONSTRUCTORS: [&str; 20] = [
+    "Sqleq.Insert.mk", "Sqleq.Source.values", "Sqleq.Source.unnest", "Sqleq.Arg.mk",
+    "Sqleq.Cell.p", "Sqleq.Cell.pc", "Sqleq.Cell.null", "Sqleq.Tok.word", "Sqleq.Tok.param",
+    "Sqleq.Spec.mk", "Sqleq.Col.mk", "Sqleq.Dflt.null", "Sqleq.Dflt.same", "Sqleq.Dflt.fresh",
+    "Sqleq.Uniq.mk", "Sqleq.Conflict.none", "Sqleq.Conflict.nothing", "Sqleq.Conflict.nothingOn",
+    "Sqleq.Conflict.update", "Sqleq.Conflict.noArbiter",
+];
+
+fn is_data(term: &str) -> bool {
+    let mut words = term
+        .split(|c: char| c.is_whitespace() || "[](),".contains(c))
+        .filter(|w| !w.is_empty())
+        .peekable();
+    words.peek().is_some()
+        && words.all(|w| {
+            w.bytes().all(|b| b.is_ascii_digit()) || w == "true" || w == "false" || CONSTRUCTORS.contains(&w)
+        })
+}
+
+/// Check a batch file before any of its proofs is believed.
+///
+/// [`ALLOWED`] says the kernel accepted `Q<i>.equiv` using no axiom beyond the standard three. It
+/// says nothing about what `Q<i>.equiv` states, or about whether something else in the file changed
+/// how it was checked: an `axiom`, a `set_option` such as `debug.skipKernelTC`, a macro or a
+/// tactic. This closes both. A batch passes only if every line is one `emit::batch` writes, in
+/// order:
+/// - each proof is literally `theorem equiv : EquivGather A B := checkGather_sound tys A B ok`
+///   inside `namespace Q<i>`, so it is about that namespace's own `A` and `B`;
+/// - each witness is literally `(witness Q<i>.spec Q<i>.A).isOk = true` in `namespace W<i>`;
+/// - every definition is data, built only from [`CONSTRUCTORS`], numerals and booleans;
+/// - nothing else appears.
+///
+/// It is written separately from `emit` on purpose: it is a second statement of the format, so an
+/// emitter change that alters what is proved fails here instead of passing silently.
+pub fn audit(src: &str) -> Result<(), String> {
+    let mut lines = src.lines().enumerate().filter(|(_, l)| !l.is_empty()).peekable();
+    let fail = |at: Option<(usize, &str)>, want: &str| -> String {
+        match at {
+            Some((n, l)) => format!("line {}: expected {want}, found `{}`", n + 1, l.chars().take(80).collect::<String>()),
+            None => format!("end of file: expected {want}"),
+        }
+    };
+    let mut exact = |want: &str| -> Result<(), String> {
+        match lines.next() {
+            Some((_, l)) if l == want => Ok(()),
+            other => Err(fail(other, &format!("`{want}`"))),
+        }
+    };
+    exact("import Sqleq")?;
+    exact("open Sqleq")?;
+    let mut i = 0usize;
+    while let Some(&(n, l)) = lines.peek() {
+        if l != format!("namespace Q{i}") {
+            return Err(fail(Some((n, l)), &format!("`namespace Q{i}`")));
+        }
+        lines.next();
+        let mut def = |head: &str, required: bool| -> Result<bool, String> {
+            match lines.peek().copied() {
+                Some((n, l)) if l.starts_with(head) => {
+                    lines.next();
+                    if is_data(&l[head.len()..]) {
+                        Ok(true)
+                    } else {
+                        Err(format!("line {}: a definition that is not pure data: `{}`", n + 1, l.chars().take(80).collect::<String>()))
+                    }
+                }
+                other if required => Err(fail(other, &format!("`{head}…`"))),
+                _ => Ok(false),
+            }
+        };
+        def("noncomputable def tys : List Nat := ", true)?;
+        def("noncomputable def A : Insert := ", true)?;
+        def("noncomputable def B : Insert := ", true)?;
+        let spec = def("noncomputable def spec : Spec := ", false)?;
+        let mut exact = |want: String| -> Result<(), String> {
+            match lines.next() {
+                Some((_, l)) if l == want => Ok(()),
+                other => Err(fail(other, &format!("`{want}`"))),
+            }
+        };
+        exact("theorem ok : checkGather tys A B = true := by decide +kernel".into())?;
+        exact("theorem equiv : EquivGather A B := checkGather_sound tys A B ok".into())?;
+        exact(format!("end Q{i}"))?;
+        exact(format!("#print axioms Q{i}.equiv"))?;
+        if lines.peek().is_some_and(|&(_, l)| l == format!("namespace W{i}")) {
+            if !spec {
+                return Err(format!("namespace W{i} without a witness spec in Q{i}"));
+            }
+            lines.next();
+            let mut exact = |want: String| -> Result<(), String> {
+                match lines.next() {
+                    Some((_, l)) if l == want => Ok(()),
+                    other => Err(fail(other, &format!("`{want}`"))),
+                }
+            };
+            exact(format!("theorem wit : (witness Q{i}.spec Q{i}.A).isOk = true := by decide +kernel"))?;
+            exact(format!("end W{i}"))?;
+            exact(format!("#print axioms W{i}.wit"))?;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Read Lean's output for the batch whose source is `src`. Each entry is the 0-based line range it
+/// occupies and the theorem whose axiom report stands for it. If `src` fails [`audit`], no entry
+/// counts as proved.
+pub fn outcomes(src: &str, output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcome> {
+    match audit(src) {
+        Ok(()) => read_outcomes(output, entries),
+        Err(e) => entries.iter().map(|_| Outcome::Failed(format!("audit: {e}"))).collect(),
+    }
+}
+
+fn read_outcomes(output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcome> {
     // `<file>:<line>:<col>: error: <message>`, lines 1-based.
     let mut errors: Vec<(usize, String)> = Vec::new();
     let mut axioms: HashMap<String, Vec<String>> = HashMap::new();
@@ -191,7 +310,7 @@ mod tests {
             .enumerate()
             .map(|(i, r)| (r, format!("Q{i}.equiv")))
             .collect();
-        let got = outcomes(out, &ranges);
+        let got = read_outcomes(out, &ranges);
         assert_eq!(got[0], Outcome::Proved);
         assert!(matches!(&got[1], Outcome::Failed(m) if m.starts_with("lean:")));
         assert!(matches!(&got[2], Outcome::Failed(m) if m.contains("Lean.ofReduceBool")));
