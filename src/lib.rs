@@ -398,8 +398,13 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
         }
     }
     let sql = sql_lines.join("\n");
-    let statements =
-        Parser::parse_sql(&DIALECT, &sql).map_err(|e| FrontendError::Parse(e.to_string()))?;
+    // The default nesting limit (50) is below what generated SQL reaches; the parser's own recursion
+    // is stack-protected, and the lowering walks an `AND`/`OR` chain iteratively.
+    let statements = Parser::new(&DIALECT)
+        .with_recursion_limit(1024)
+        .try_with_sql(&sql)
+        .and_then(|mut p| p.parse_statements())
+        .map_err(|e| FrontendError::Parse(e.to_string()))?;
     Ok((fns, statements))
 }
 

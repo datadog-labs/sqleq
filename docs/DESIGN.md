@@ -78,8 +78,8 @@ The preprocessor's passes were a mix of the two. The decision was to keep them a
 passes in the port, and to split them by which kind they are:
 
 - **Sound, general rewrites** (always on): DISTINCT-in-IN strip, DELETE/UPDATE→SELECT reduction,
-  identical-pagination strip, CTE inlining, ANY(ARRAY) desugar, builtins/operators →
-  uninterpreted.
+  identical-pagination strip, CTE inlining, ANY(ARRAY) desugar, an `AND`/`OR` chain as one n-ary
+  node, builtins/operators → uninterpreted.
 - **Corpus-coping heuristics** (configurable, default-on for messy input, off for clean catalogs):
   opaque sort for untyped columns, type-confidence inference, schema synthesis when DDL is absent.
 
