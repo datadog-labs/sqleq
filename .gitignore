@@ -13,6 +13,9 @@
 # The scratch directory the README's quick start creates
 /out
 
+# Lean build output for the `lean/` package
+/lean/.lake
+
 # Editor / OS noise
 *.swp
 .DS_Store
