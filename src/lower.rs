@@ -1717,6 +1717,13 @@ impl AggCtx<'_> {
         match e {
             Expr::Nested(i) => self.lower_post(i),
             Expr::Value(v) => lower_value(&v.value),
+            // A sub-chain can itself be a GROUP BY key, so the descent stops at one.
+            Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And | BinaryOperator::Or) => {
+                let parts = chain_operands(left, op, right, |x| Ok(self.key_match(x)?.is_some()))?;
+                let parts =
+                    parts.into_iter().map(|x| Ok(coerce_bool(self.lower_post(x)?))).collect::<Result<_>>()?;
+                Ok(connective(op, parts))
+            }
             Expr::BinaryOp { left, op, right } => {
                 use BinaryOperator::*;
                 let l = self.lower_post(left)?;
@@ -1724,8 +1731,6 @@ impl AggCtx<'_> {
                 let (s, t) = binop(op, &l, &r)?;
                 if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) {
                     Ok(make_cmp(&s, l, r))
-                } else if matches!(op, And | Or) {
-                    Ok(json!({ "operator": s, "operand": [coerce_bool(l), coerce_bool(r)], "type": t }))
                 } else {
                     Ok(make_arith(&s, l, r, &t))
                 }
@@ -2231,6 +2236,12 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             let m = row_match(&ls, re, cat, scope, fns)?;
             Ok(if negated { not_bool(m) } else { m })
         }
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And | BinaryOperator::Or) => {
+            let parts = chain_operands(left, op, right, |_| Ok(false))?;
+            let parts =
+                parts.into_iter().map(|x| Ok(coerce_bool(lower_expr(cat, scope, fns, x)?))).collect::<Result<_>>()?;
+            Ok(connective(op, parts))
+        }
         Expr::BinaryOp { left, op, right } => {
             use BinaryOperator::*;
             let l = lower_expr(cat, scope, fns, left)?;
@@ -2238,8 +2249,6 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             let (opstr, ty) = binop(op, &l, &r)?;
             if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) {
                 Ok(make_cmp(&opstr, l, r))
-            } else if matches!(op, And | Or) {
-                Ok(json!({ "operator": opstr, "operand": [coerce_bool(l), coerce_bool(r)], "type": ty }))
             } else {
                 Ok(make_arith(&opstr, l, r, &ty))
             }
@@ -2426,14 +2435,65 @@ fn lower_bool(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
     match e {
         Expr::Nested(i) => lower_bool(cat, scope, fns, i),
         Expr::BinaryOp { left, op, right } if matches!(op, And | Or) => {
-            let l = lower_bool(cat, scope, fns, left)?;
-            let r = lower_bool(cat, scope, fns, right)?;
-            let opstr = if matches!(op, And) { "AND" } else { "OR" };
-            Ok(json!({ "operator": opstr, "operand": [l, r], "type": "BOOLEAN" }))
+            let parts = chain_operands(left, op, right, |_| Ok(false))?;
+            let parts = parts.into_iter().map(|x| lower_bool(cat, scope, fns, x)).collect::<Result<_>>()?;
+            Ok(connective(op, parts))
         }
         Expr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(not_bool(lower_bool(cat, scope, fns, expr)?)),
         _ => Ok(coerce_bool(lower_expr(cat, scope, fns, e)?)),
     }
+}
+
+/// The operands of the `AND` or `OR` chain that `left op right` heads, left to right, looking through
+/// parentheses. `atomic` stops the descent at a node that is to be lowered whole.
+///
+/// Iterative on purpose: generated predicates run to hundreds of terms, a chain parses left-deep,
+/// and recursing down it would cost a stack frame per term.
+fn chain_operands<'e>(
+    left: &'e Expr,
+    op: &BinaryOperator,
+    right: &'e Expr,
+    mut atomic: impl FnMut(&Expr) -> Result<bool>,
+) -> Result<Vec<&'e Expr>> {
+    let mut out = Vec::new();
+    let mut todo = vec![right, left];
+    while let Some(e) = todo.pop() {
+        if atomic(e)? {
+            out.push(e);
+            continue;
+        }
+        match e {
+            Expr::Nested(i) => todo.push(i),
+            Expr::BinaryOp { left, op: o, right } if o == op => todo.extend([&**right, &**left]),
+            _ => out.push(e),
+        }
+    }
+    Ok(out)
+}
+
+/// One n-ary `AND` or `OR` node over lowered operands, splicing in any operand that is itself a node
+/// of the same operator.
+///
+/// Sound by associativity, which holds in three-valued logic. The IR stays as shallow as the
+/// predicate is wide (the prover's case reader has a nesting limit), and a chain lowers like any of
+/// its regroupings. Nothing is spliced across the two operators, and a `NOT` stays where it is.
+fn connective(op: &BinaryOperator, operands: Vec<Value>) -> Value {
+    let name = if matches!(op, BinaryOperator::And) { "AND" } else { "OR" };
+    let mut flat = Vec::with_capacity(operands.len());
+    for v in operands {
+        match v {
+            Value::Object(mut m)
+                if m.get("operator").and_then(Value::as_str) == Some(name)
+                    && m.get("operand").is_some_and(Value::is_array) =>
+            {
+                if let Some(Value::Array(a)) = m.remove("operand") {
+                    flat.extend(a);
+                }
+            }
+            v => flat.push(v),
+        }
+    }
+    json!({ "operator": name, "operand": flat, "type": "BOOLEAN" })
 }
 
 /// `expr IN (subquery)`, and its negation. Non-correlated and correlated alike: the subquery sees
