@@ -12,7 +12,7 @@ use sqlparser::ast::{
     ObjectNamePart, Query, Statement, TableConstraint,
 };
 
-use crate::error::{schema, Result};
+use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
 use crate::types::map_type;
 
@@ -92,6 +92,28 @@ impl Catalog {
     pub fn find(&self, name: &str) -> Option<usize> {
         let n = name.to_lowercase();
         self.tables.iter().position(|t| t.name == n)
+    }
+
+    /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
+    /// only in case.
+    ///
+    /// The catalog folds every name to lower case, quoted or not, and resolution goes by the folded
+    /// name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its case: `"s"`
+    /// and `"S"` are two columns, and resolving both to one slot makes `SELECT "S"` lower like
+    /// `SELECT "s"`. Where no two names collide, folding loses nothing a query that runs could
+    /// need, because a reference whose case differs from the declaration fails in Postgres.
+    pub fn check_case_collisions(&self) -> Result<()> {
+        let mut tables = std::collections::HashSet::new();
+        for t in &self.tables {
+            if !tables.insert(t.name.as_str()) {
+                return Err(unsupported(format!("two tables named {} up to case", t.name)));
+            }
+            let mut cols = std::collections::HashSet::new();
+            if let Some((c, _)) = t.cols.iter().find(|(c, _)| !cols.insert(c.as_str())) {
+                return Err(unsupported(format!("two columns of {} named {c} up to case", t.name)));
+            }
+        }
+        Ok(())
     }
 }
 

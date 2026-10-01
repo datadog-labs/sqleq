@@ -606,6 +606,7 @@ fn parse_input(
     // The catalog next, because the DML reduction needs the target table's columns; and the reduction
     // before every rewrite below it, so that nothing downstream of here has to know DML exists.
     let mut catalog = ddl_catalog.unwrap_or_else(|| catalog::scan_ddl(&statements));
+    catalog.check_case_collisions()?;
     dml::reduce(&catalog, &mut statements)?;
     // Then the normalizations, which are rewrites of a correct tree rather than repairs of a
     // wrong one — so each carries its equivalence argument and that argument's guards.

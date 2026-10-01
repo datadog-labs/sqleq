@@ -118,6 +118,18 @@ fn a_cast_to_an_array_type_is_not_the_identity() {
 }
 
 #[test]
+fn two_columns_whose_names_differ_only_in_case_are_refused() {
+    // Quoted names keep their case, so `"S"` and `"s"` are two columns; the catalog folds both.
+    let ddl = r#"create table "u" ("id" INTEGER, "s" VARCHAR, "S" VARCHAR);"#;
+    for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        match lower_with(&format!("{ddl}\nSELECT \"S\" FROM u;\nSELECT \"s\" FROM u;"), src) {
+            Err(FrontendError::Unsupported(m)) => assert!(m.contains("up to case"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_set_returning_function_over_aggregates_is_refused() {
     refused(
         "SELECT jsonb_array_elements_text(jsonb_build_array(count(t.id), count(t.id))) FROM t",

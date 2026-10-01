@@ -86,6 +86,9 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
+  unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
+  only in case (`"s"` and `"S"`) is refused rather than resolved to one of them.
 - **The target of a `DELETE` or `UPDATE` always names the table.** A `WITH` binding of the same name
   would be inlined over it by the reduction, so `WITH t AS (…) DELETE FROM t`, which empties `t`, is
   refused rather than lowered as a filtered delete.
