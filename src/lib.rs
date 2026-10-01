@@ -428,10 +428,11 @@ impl Rewrites {
     pub const STRIP_SCHEMA: Rewrites = Rewrites(1 << 7);
     pub const DISTRIBUTE_ARRAY_CAST: Rewrites = Rewrites(1 << 8);
     pub const STRIP_IDENTICAL_LOCKS: Rewrites = Rewrites(1 << 9);
-    /// The ten bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
+    pub const DESUGAR_SPECIAL_FORMS: Rewrites = Rewrites(1 << 10);
+    /// The eleven bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
     /// is a rewrite an attribution pass reports as "no rewrite was necessary" for every row it
     /// closes, so the two are pinned equal by a test and this mask is what makes that pin possible.
-    pub const ALL: Rewrites = Rewrites((1 << 10) - 1);
+    pub const ALL: Rewrites = Rewrites((1 << 11) - 1);
     /// Every rewrite except one — the single-subtraction counterfactual.
     pub const NONE: Rewrites = Rewrites(0);
 
@@ -449,8 +450,9 @@ impl Rewrites {
 
     /// The individual rewrites, in the order [`reflexive_with`] runs them, each with the stable name
     /// an attribution pass reports it under.
-    pub const EACH: [(&'static str, Rewrites); 10] = [
+    pub const EACH: [(&'static str, Rewrites); 11] = [
         ("fix_precedence", Rewrites::FIX_PRECEDENCE),
+        ("desugar_special_forms", Rewrites::DESUGAR_SPECIAL_FORMS),
         ("demote_operators", Rewrites::DEMOTE_OPERATORS),
         ("strip_in_exists_distinct", Rewrites::STRIP_IN_EXISTS_DISTINCT),
         ("unnest_in_to_any", Rewrites::UNNEST_IN_TO_ANY),
@@ -541,6 +543,9 @@ fn normalized_pair(
     {
         return None;
     }
+    if rewrites.has(Rewrites::DESUGAR_SPECIAL_FORMS) {
+        normalize::desugar_special_forms(&mut statements);
+    }
     if rewrites.has(Rewrites::DEMOTE_OPERATORS) {
         normalize::demote_operators(&mut statements);
     }
@@ -603,6 +608,9 @@ fn parse_input(
     // Before anything reads the tree: sqlparser mis-parses `IS [NOT] DISTINCT FROM`, and lowering
     // the mis-parse is a false-proof channel. See `normalize`.
     normalize::fix_precedence(&mut statements)?;
+    // Before the shape check and the placeholder passes, which see a `$N` only in an expression
+    // position, and a typed literal's `DATE $1` is not one.
+    normalize::desugar_special_forms(&mut statements);
     // Before the DML reduction, and so before every refusal in it: a pair whose two halves want a row
     // value and an array at the same `$N` is not a question the reduction's capability has anything to
     // say about. The other two alignment sub-reasons are raised *last* instead;

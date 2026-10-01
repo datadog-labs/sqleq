@@ -122,6 +122,15 @@ fn an_identical_dml_pair_is_reflexive() {
     assert!(!reflexive(&pair("UPDATE t SET a = 1 WHERE a = 2", "UPDATE t SET a = 1 WHERE a = 3")));
 }
 
+/// A typed literal is the cast it spells, and `CEIL` the call.
+#[test]
+fn a_special_form_and_its_general_form_are_reflexive() {
+    let p = pair("SELECT a FROM t WHERE d = DATE '2024-01-01' AND CEIL(b) > 1",
+                 "SELECT a FROM t WHERE d = '2024-01-01'::date AND ceil(b) > 1");
+    assert!(reflexive_with(&p, Rewrites::ALL));
+    assert!(!reflexive_with(&p, Rewrites::ALL.without(Rewrites::DESUGAR_SPECIAL_FORMS)));
+}
+
 /// Case *inside* a string literal is a difference, and the parser keeps it — so the AST comparison
 /// gets this right without the special-casing the textual predicate needs.
 #[test]
@@ -164,7 +173,7 @@ fn clearing_a_rewrite_disables_exactly_that_rewrite() {
 /// rewrite missing from `EACH` would be reported as "no rewrite was necessary" for every row it closes.
 #[test]
 fn every_rewrite_is_reachable_from_all() {
-    assert_eq!(Rewrites::EACH.len(), 10);
+    assert_eq!(Rewrites::EACH.len(), 11);
     let rebuilt = Rewrites::EACH.iter().fold(Rewrites::NONE, |acc, (_, b)| acc.with(*b));
     assert_eq!(rebuilt, Rewrites::ALL);
     for (_, bit) in Rewrites::EACH {

@@ -15,11 +15,11 @@ use std::ops::ControlFlow;
 use serde_json::{json, Value};
 use sqlparser::ast::visit_expressions;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
     Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
-    TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue, Values,
+    Subscript, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue, Values,
 };
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
@@ -1549,6 +1549,14 @@ fn contains_agg(fns: &Fns, e: &Expr) -> bool {
         }
         Expr::InList { expr, list, .. } => contains_agg(fns, expr) || any(list),
         Expr::Tuple(es) => any(es),
+        Expr::Array(a) => any(&a.elem),
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            contains_agg(fns, root)
+                || access_chain.iter().any(|a| match a {
+                    AccessExpr::Subscript(Subscript::Index { index }) => contains_agg(fns, index),
+                    _ => false,
+                })
+        }
         Expr::Case { operand, conditions, else_result, .. } => {
             operand.as_deref().is_some_and(|o| contains_agg(fns, o))
                 || conditions
@@ -1785,6 +1793,18 @@ impl AggCtx<'_> {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 Err(unsupported("column not functionally dependent on GROUP BY"))
             }
+            Expr::Array(arr) => {
+                array_shape(arr)?;
+                let elems = arr.elem.iter().map(|x| self.lower_post(x)).collect::<Result<Vec<_>>>()?;
+                Ok(array_call(elems))
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut operand = vec![self.lower_post(root)?];
+                for i in subscript_indices(access_chain)? {
+                    operand.push(self.lower_post(i)?);
+                }
+                Ok(subscript_call(operand))
+            }
             other => Err(unsupported(format!("post-aggregate expression {other:?}"))),
         }
     }
@@ -1922,6 +1942,19 @@ fn post_columns(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr, out: &mut Vec
         Expr::BinaryOp { left, right, .. } => {
             post_columns(cat, scope, fns, left, out);
             post_columns(cat, scope, fns, right, out);
+        }
+        Expr::Array(a) => {
+            for x in &a.elem {
+                post_columns(cat, scope, fns, x, out);
+            }
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            post_columns(cat, scope, fns, root, out);
+            for a in access_chain {
+                if let AccessExpr::Subscript(Subscript::Index { index }) = a {
+                    post_columns(cat, scope, fns, index, out);
+                }
+            }
         }
         Expr::Case { conditions, else_result, .. } => {
             for w in conditions {
@@ -2303,9 +2336,27 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 let ls: Vec<Value> =
                     lhs_elems.iter().map(|e| lower_expr(cat, scope, fns, e)).collect::<Result<Vec<_>>>()?;
                 for item in list {
-                    let relems = match item {
+                    let mut bare = item;
+                    while let Expr::Nested(inner) = bare {
+                        bare = inner;
+                    }
+                    let relems = match bare {
                         Expr::Tuple(r) => r,
-                        _ => return Err(unsupported("row IN list item must be a tuple")),
+                        // A parameter standing for a whole row is a composite value, and Postgres
+                        // compares a row with a composite value under record semantics, where two
+                        // NULL fields are equal -- not field by field as against a row constructor.
+                        // So the item is one opaque predicate over the row and the value, never
+                        // expanded into per-field comparisons.
+                        p if crate::infer::param_index(p).is_some() => {
+                            let mut operand = ls.clone();
+                            operand.push(lower_expr(cat, scope, fns, p)?);
+                            let m = json!({
+                                "operator": format!("q_row_eq_{}", ls.len()), "operand": operand, "type": "BOOLEAN",
+                            });
+                            terms.push(if *negated { not_bool(m) } else { m });
+                            continue;
+                        }
+                        _ => return Err(unsupported("row IN list item that is neither a row nor a parameter")),
                     };
                     if relems.len() != ls.len() {
                         return Err(unsupported("row IN arity mismatch"));
@@ -2423,6 +2474,18 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             Ok(json!({
                 "operator": "$SCALAR_QUERY", "operand": [], "query": rel, "type": cols[0].1
             }))
+        }
+        Expr::Array(arr) => {
+            array_shape(arr)?;
+            let elems = arr.elem.iter().map(|x| lower_expr(cat, scope, fns, x)).collect::<Result<Vec<_>>>()?;
+            Ok(array_call(elems))
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut operand = vec![lower_expr(cat, scope, fns, root)?];
+            for i in subscript_indices(access_chain)? {
+                operand.push(lower_expr(cat, scope, fns, i)?);
+            }
+            Ok(subscript_call(operand))
         }
         other => Err(unsupported(format!("expr: {other:?}"))),
     }
@@ -2686,6 +2749,54 @@ fn row_match(ls: &[Value], relems: &[Expr], cat: &Catalog, scope: &Scope, fns: &
     } else {
         json!({ "operator": "AND", "operand": eqs, "type": "BOOLEAN" })
     })
+}
+
+/// Refuse the array constructors [`array_call`] does not take: the empty one, whose element type
+/// only a cast around it can say, and the bare `[..]`, which is not Postgres.
+fn array_shape(arr: &sqlparser::ast::Array) -> Result<()> {
+    if !arr.named {
+        return Err(unsupported("array constructor without ARRAY"));
+    }
+    if arr.elem.is_empty() {
+        return Err(unsupported("empty ARRAY[]"));
+    }
+    Ok(())
+}
+
+/// `ARRAY[e1, .., en]` as an opaque constructor over its elements, each converted to their common
+/// type, and named after that type.
+///
+/// Opaque, and so not strict: `ARRAY[NULL]` is a one-element array, not NULL. The element type is in
+/// the name because the IR carries every array as one opaque type, and `ARRAY[1]` and `ARRAY['1']`
+/// are different values. Only reached outside `= ANY(..)`, where the constructor is expanded
+/// instead (`lower_quantified`).
+fn array_call(elems: Vec<Value>) -> Value {
+    let ty = elems.iter().map(ty_of).reduce(|a, b| common_type(&a, &b)).unwrap_or_else(|| "VARBINARY".into());
+    let operand: Vec<Value> = elems.into_iter().map(|v| cast_to(v, &ty)).collect();
+    json!({ "operator": format!("q_array_{}", ty.to_lowercase()), "operand": operand, "type": "VARBINARY" })
+}
+
+/// The indices of a subscript chain `a[i]..[j]`, refusing a slice and a field selection.
+fn subscript_indices(chain: &[AccessExpr]) -> Result<Vec<&Expr>> {
+    chain
+        .iter()
+        .map(|a| match a {
+            AccessExpr::Subscript(Subscript::Index { index }) => Ok(index),
+            AccessExpr::Subscript(Subscript::Slice { .. }) => Err(unsupported("array slice")),
+            AccessExpr::Dot(_) => Err(unsupported("field selected from a composite value")),
+        })
+        .collect()
+}
+
+/// `a[i]..[j]` as one opaque call over the base and every index, named after their types.
+///
+/// One call, not one per index, because the chain is not a composition: over a two-dimensional `m`,
+/// `m[1][2]` is an element, while `(m[1])[2]` is NULL, since a subscript with too few indices is.
+/// Typed VARBINARY, because the element type is not something the IR carries (an array is opaque
+/// whatever it holds).
+fn subscript_call(operand: Vec<Value>) -> Value {
+    let types: Vec<String> = operand.iter().map(|v| ty_of(v).to_lowercase()).collect();
+    json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": "VARBINARY" })
 }
 
 /// Lower one of the pattern-matching predicates to its named uninterpreted operator.
