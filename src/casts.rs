@@ -262,12 +262,18 @@ fn decide(
             let tq = target.unwrap_or(Ty::Opaque);
             let op = unwrap_nested(expr);
 
-            if placeholder_index(op).is_some() {
+            // A typmod is a computation, not a type: `$1::varchar(2)` truncates and
+            // `$1::timestamp(0)` rounds, so only an unqualified cast over a parameter is the
+            // parameter's type and nothing more. A qualified one takes rule 5b, keyed on the
+            // qualified spelling.
+            if placeholder_index(op).is_some() && !qualified {
                 rw.dropped.param += 1;
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
                 return Ok(());
             }
-            if is_literal(op) {
+            // The same holds over a literal: `'abc'::varchar(2)` is `'ab'`, and retargeting it to the
+            // bare type would make it a cast between equal types, which is the identity.
+            if is_literal(op) && !qualified {
                 dec.insert(nid(e), Decision::Retarget(tq));
                 return Ok(());
             }

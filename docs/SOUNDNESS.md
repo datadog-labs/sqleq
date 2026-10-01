@@ -70,6 +70,29 @@ value keeps its own type, which costs exactness and not soundness. Where a relat
 would put two temporal types in one column with no comparison to hang a conversion on — a set
 operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 
+### Shapes that look like something simpler
+
+A few constructs read like a simpler one and compute something else, and each is either lowered as
+what it is or refused:
+
+- **A typmod is a computation.** `$1::varchar(2)` truncates and `$1::timestamp(0)` rounds, so only an
+  *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over a
+  parameter, a literal or anything else, is a function named after the full spelling of its target.
+- **An array is not its element type.** An array column is opaque whatever it holds, and a cast to an
+  array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
+  opaque operand is a function, not text concatenation, because array `||` is not strict
+  (`'{a}' || NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every
+  element is a scalar, since over `ARRAY[arr]` it ranges over the leaves.
+- **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
+  TRUE, so it is not a strict `LIKE` against one opaque pattern.
+- **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
+  unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
+  only in case (`"s"` and `"S"`) is refused rather than resolved to one of them.
+- **The target of a `DELETE` or `UPDATE` always names the table.** A `WITH` binding of the same name
+  would be inlined over it by the reduction, so `WITH t AS (…) DELETE FROM t`, which empties `t`, is
+  refused rather than lowered as a filtered delete.
+
 ## A query that raises an error
 
 Neither prover models runtime errors: both assume every operation yields a value. So a proof says

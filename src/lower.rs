@@ -1761,6 +1761,12 @@ impl AggCtx<'_> {
                 reject_qualified_builtin_agg(&name, &bare)?;
                 reject_nondeterministic(&name, &bare)?;
                 reject_order_sensitive_agg(&name, &bare)?;
+                // SOUNDNESS GUARD, the same as `lower_expr`'s: a set-returning function over
+                // aggregates is no more a scalar than one over columns, and lowering it as one
+                // understates the row count.
+                if SET_RETURNING.contains(&bare.as_str()) {
+                    return Err(unsupported(format!("set-returning function {name} in scalar position")));
+                }
                 let (raw_args, _, _) = fn_args(f)?;
                 let mut operand: Vec<Value> = Vec::new();
                 for a in raw_args {
@@ -1777,6 +1783,26 @@ impl AggCtx<'_> {
             other => Err(unsupported(format!("post-aggregate expression {other:?}"))),
         }
     }
+}
+
+/// Refuse a pattern spelled `ALL(..)`, `ANY(..)` or `SOME(..)`.
+///
+/// sqlparser reads `s LIKE ALL($1)` as a `LIKE` whose pattern is a call to a function named `ALL`
+/// (only `LIKE ANY` gets its own flag, refused above). Lowered that way it is one match against one
+/// opaque pattern, which a prover reads as strict -- but the quantified form is not:
+/// `NULL LIKE ALL('{}')` is TRUE, as an `ALL` over no elements is.
+fn refuse_quantified_pattern(op: &str, pattern: &Expr) -> Result<()> {
+    if let Expr::Function(f) = pattern {
+        if let [part] = f.name.0.as_slice() {
+            if let Some(id) = part.as_ident() {
+                let q = id.value.to_uppercase();
+                if id.quote_style.is_none() && matches!(q.as_str(), "ALL" | "ANY" | "SOME") {
+                    return Err(unsupported(format!("{op} {q}(..)")));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The absolute column level a lowered expression *is*, if it is a bare column reference.
@@ -2321,9 +2347,11 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             if *any {
                 return Err(unsupported(format!("{op} ANY")));
             }
+            refuse_quantified_pattern(op, pattern)?;
             lower_match(cat, scope, fns, op, *negated, expr, pattern, escape_char.is_some())
         }
         Expr::SimilarTo { negated, expr, pattern, escape_char } => {
+            refuse_quantified_pattern("SIMILAR TO", pattern)?;
             lower_match(cat, scope, fns, "SIMILAR TO", *negated, expr, pattern, escape_char.is_some())
         }
         Expr::Between { expr, negated, low, high } => {
@@ -2519,11 +2547,36 @@ fn lower_quantified(
         Expr::Array(arr) => {
             let l = lower_expr(cat, scope, fns, left)?;
             let cmp = if all { "<>" } else { "=" };
-            let terms: Vec<Value> = arr
-                .elem
-                .iter()
-                .map(|e| Ok(make_cmp(cmp, l.clone(), lower_expr(cat, scope, fns, e)?)))
-                .collect::<Result<_>>()?;
+            let elems: Vec<Value> =
+                arr.elem.iter().map(|e| lower_expr(cat, scope, fns, e)).collect::<Result<_>>()?;
+            // The expansion compares `x` with each *element*, which is only what `ANY` does when
+            // every element is a scalar: over `ARRAY[t.tags]`, with `tags` an array, `ANY` ranges
+            // over the leaves of the two-dimensional result, not over `tags` itself. Arrays lower
+            // to the opaque VARBINARY, as do other values that are not arrays, so a column or an
+            // expression of opaque type is refused rather than guessed at. A parameter or a literal
+            // is a scalar whatever its inferred type: under the binding contract each `$N` is one
+            // value, typed by what it is compared with.
+            // By this point `casts::rewrite` has spelled each `$N` as a call `qpN(0)`.
+            let leaf = |e: &Expr| {
+                let mut e = e;
+                while let Expr::Nested(inner) = e {
+                    e = inner;
+                }
+                match e {
+                    Expr::Value(_) => true,
+                    Expr::Function(f) => {
+                        let n = obj_name(&f.name).to_lowercase();
+                        n.strip_prefix("qp").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                    }
+                    _ => false,
+                }
+            };
+            if arr.elem.iter().zip(&elems).any(|(e, v)| !leaf(e) && ty_of(v) == "VARBINARY") {
+                return Err(unsupported(format!(
+                    "{op} {quant} over an ARRAY[..] with an element of opaque type"
+                )));
+            }
+            let terms: Vec<Value> = elems.into_iter().map(|v| make_cmp(cmp, l.clone(), v)).collect();
             Ok(match terms.len() {
                 0 => {
                     let lit = if all { "TRUE" } else { "FALSE" };
