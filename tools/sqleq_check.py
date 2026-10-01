@@ -316,6 +316,12 @@ class Case:
     s_verdict: Optional[str] = None
     s_ms: Optional[int] = None
     s_note: str = ""
+    # The Lean axis, only when --lean is on: sqleq-lean's own verdict on the pair
+    # file (it reads the .sql itself, so it answers whatever the frontend did).
+    l_verdict: Optional[str] = None
+    l_reason: str = ""
+    l_shape: str = ""
+    l_ms: Optional[int] = None
 
 
 def classify_refusal(err: str) -> tuple[str, str]:
@@ -741,6 +747,88 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
 
 
 # ---------------------------------------------------------------------------
+# The Lean axis
+# ---------------------------------------------------------------------------
+#
+# `sqleq-lean` decides one class the frontend refuses outright, `INSERT … VALUES`
+# against `INSERT … SELECT * FROM unnest(…)`, under the gather rule (see
+# docs/LEAN.md). It parses the pair file itself, so it runs over every `.sql`
+# case regardless of what the frontend made of it, and like `--sqlsolver` it is
+# a second opinion that never moves the exit code.
+
+LEAN_ORDER = ["proved-gather", "no-witness", "unsupported", "invalid-sql",
+              "error", "timeout", "missing"]
+
+
+def discover_lean(override: Optional[str]) -> str:
+    for cand in (override, os.environ.get("SQLEQ_LEAN"),
+                 str(REPO / "target" / "release" / "sqleq-lean"),
+                 str(REPO / "target" / "debug" / "sqleq-lean")):
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            return str(Path(cand).resolve())
+    sys.exit("error: --lean needs the sqleq-lean binary: `cargo build --release -p "
+             "sqleq-lean` (it also needs a Lean toolchain on PATH), or pass "
+             "--lean-bin / set $SQLEQ_LEAN.")
+
+
+def run_lean(cases: list[Case], lean_bin: str, jobs: int, timeout_s: float,
+             keep_dir: Optional[Path]) -> dict:
+    """Run sqleq-lean over every `.sql` case and attach its verdicts in place."""
+    todo = [x for x in cases if x.path.endswith(".sql")]
+    if not todo:
+        return {"rows": 0}
+    with tempfile.TemporaryDirectory(prefix="sqleq-lean-") as tmp:
+        out = Path(tmp) / "lean.json"
+        cmd = [lean_bin, "--full-names", "--json", str(out), "--jobs", str(max(1, jobs)),
+               "--timeout", str(max(60, int(timeout_s * 10)))]
+        if keep_dir is not None:
+            cmd += ["--keep", str((keep_dir / "lean").resolve())]
+        t0 = time.monotonic()
+        proc = subprocess.run(cmd + [x.path for x in todo], capture_output=True, text=True)
+        wall = time.monotonic() - t0
+        try:
+            got = json.loads(out.read_text())
+        except (OSError, ValueError):
+            for x in todo:
+                x.l_verdict, x.l_reason = "missing", _tail(proc.stderr) or "no output"
+            return {"rows": len(todo), "wall_s": wall, "failed": _tail(proc.stderr)}
+    for x in todo:
+        rec = got.get(x.path)
+        if rec is None:
+            x.l_verdict, x.l_reason = "missing", "no record"
+            continue
+        x.l_verdict = rec.get("verdict")
+        x.l_reason = rec.get("reason", "")
+        x.l_shape = rec.get("shape", "")
+        x.l_ms = rec.get("ms")
+    return {"rows": len(todo), "wall_s": wall}
+
+
+def print_lean(c: Color, cases: list[Case], stats: dict):
+    scored = [x for x in cases if x.l_verdict is not None]
+    if not scored:
+        return
+    counts: dict = {}
+    for x in scored:
+        counts[x.l_verdict] = counts.get(x.l_verdict, 0) + 1
+    print()
+    print(c.bold("  Lean axis") + c.dim("  — INSERT … VALUES vs INSERT … SELECT * FROM unnest(…)"))
+    print(c.dim("  " + "─" * 40))
+    for v in LEAN_ORDER + sorted(set(counts) - set(LEAN_ORDER)):
+        if counts.get(v):
+            print(f"  {v:<22} {counts[v]:>5}")
+    print(c.dim("  " + "─" * 40))
+    for x in scored:
+        if x.l_verdict == "proved-gather":
+            print(c.dim(f"  {'proved-gather':<22}       {x.name}"))
+    if stats.get("wall_s") is not None:
+        print(c.dim(f"  {'wall time':<22} {stats['wall_s']:.2f}s"))
+    print(c.dim("  note  `proved-gather` is proved under the gather rule: the unnest\n"
+                "        side's array $j is column j of the VALUES rows. It is not the\n"
+                "        same-$N claim `provable` makes. See docs/LEAN.md."))
+
+
+# ---------------------------------------------------------------------------
 # Input collection
 # ---------------------------------------------------------------------------
 
@@ -977,7 +1065,8 @@ def write_csv(path: str, cases: list[Case]):
     cols = ["name", "status", "trivial", "trivial_basis", "refuse_kind", "wall",
             "lower_wall", "prove_wall", "complete_fragment", "smt_timed_out",
             "nontrivial_perms", "message",
-            "s_bucket", "s_verdict", "s_ms", "s_note"]
+            "s_bucket", "s_verdict", "s_ms", "s_note",
+            "l_verdict", "l_reason", "l_shape", "l_ms"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -1059,6 +1148,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="With --sqlsolver-impl=rust: the sqleq-solver binary (else "
                         "$SQLEQ_SOLVER_BIN / PATH / this repo's "
                         "target/{release,debug}).")
+    p.add_argument("--lean", action="store_true",
+                   help="Also run the Lean axis (sqleq-lean) over the .sql cases: "
+                        "INSERT ... VALUES vs INSERT ... SELECT * FROM unnest(..) "
+                        "pairs, proved under the gather rule. Never changes the exit code.")
+    p.add_argument("--lean-bin", metavar="PATH",
+                   help="Path to sqleq-lean (else $SQLEQ_LEAN / target/{release,debug}).")
     p.add_argument("--sqlsolver-timeout", type=int, default=None, metavar="MS",
                    help="Per-row cap for the second opinion, in ms "
                         "(default: --timeout). Its rows run sequentially, so this "
@@ -1079,6 +1174,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ss_driver = (discover_sqlsolver_rust(args.sqlsolver_bin)
                      if args.sqlsolver_impl == "rust"
                      else discover_sqlsolver_jvm(args.sqlsolver_tree))
+    lean_bin = discover_lean(args.lean_bin) if args.lean else None
 
     files = collect_inputs(args.paths)
     if not files:
@@ -1186,6 +1282,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ss_stats = run_second_opinion(cases, ss_dir, ss_driver, ss_timeout_ms)
         ss_stats["wall_s"] = round(time.monotonic() - t1, 3)
 
+    # The Lean axis, likewise apart from both: it reads the pair files itself.
+    lean_stats: dict = {}
+    if lean_bin:
+        if not args.quiet:
+            if live:
+                print(" " * 30, end="\r")
+            n = sum(1 for x in cases if x.path.endswith(".sql"))
+            print(c.dim(f"  asking sqleq-lean about {n} .sql case(s)…"))
+        lean_stats = run_lean(cases, lean_bin, args.jobs, args.timeout, keep_dir)
+
     cases.sort(key=lambda x: (STATUS_ORDER.index(x.status)
                               if x.status in STATUS_ORDER else 99, x.name))
 
@@ -1193,6 +1299,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(" " * 30, end="\r")  # clear progress line
     print_summary(c, cases, wall)
     print_second_opinion(c, cases, ss_stats)
+    print_lean(c, cases, lean_stats)
 
     meta = {
         "frontend": frontend_bin,
@@ -1207,6 +1314,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.sqlsolver:
         meta["sqlsolver"] = dict(ss_stats, impl=ss_driver.impl, where=ss_driver.where,
                                  timeout_ms=ss_timeout_ms)
+    if lean_bin:
+        meta["lean"] = dict(lean_stats, bin=lean_bin)
     if ss_tmp:
         shutil.rmtree(ss_tmp, ignore_errors=True)
     if args.json:

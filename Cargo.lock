@@ -1292,6 +1292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqleq-lean"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqleq-frontend",
+ "sqlparser",
+]
+
+[[package]]
 name = "sqleq-solver"
 version = "0.1.0"
 dependencies = [

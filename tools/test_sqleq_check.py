@@ -182,5 +182,42 @@ class SecondOpinionThroughTheRustDriver(unittest.TestCase):
         self.assertEqual({c.name: c.s_note for c in cases}["refused"], "unknown table t")
 
 
+class LeanAxis(unittest.TestCase):
+    """`--lean` attaches sqleq-lean's verdicts to the right cases, by path."""
+
+    def test_verdicts_attach_by_path_and_json_cases_are_skipped(self):
+        import json
+        import os
+        import stat
+        import tempfile
+        from pathlib import Path
+
+        from sqleq_check import Case, run_lean
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "sqleq-lean"
+            # A stand-in: answers `proved-gather` for a path ending in a.sql, and says nothing
+            # at all about any other, which the harness must report as `missing`.
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "a = sys.argv[1:]\n"
+                "out = a[a.index('--json') + 1]\n"
+                "paths = [x for x in a if x.endswith('.sql')]\n"
+                "rec = {p: {'verdict': 'proved-gather', 'shape': 'row-major', 'ms': 3}\n"
+                "       for p in paths if p.endswith('a.sql')}\n"
+                "json.dump(rec, open(out, 'w'))\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            a = Case(name="dir1/a.sql", path=os.path.join(tmp, "dir1", "a.sql"))
+            b = Case(name="dir2/b.sql", path=os.path.join(tmp, "dir2", "b.sql"))
+            plan = Case(name="p.json", path=os.path.join(tmp, "p.json"))
+            stats = run_lean([a, b, plan], str(fake), jobs=2, timeout_s=10, keep_dir=None)
+        self.assertEqual(stats["rows"], 2)
+        self.assertEqual((a.l_verdict, a.l_shape, a.l_ms), ("proved-gather", "row-major", 3))
+        self.assertEqual(b.l_verdict, "missing")
+        self.assertIsNone(plan.l_verdict, "a pre-parsed .json plan has no pair file to read")
+
+
 if __name__ == "__main__":
     unittest.main()

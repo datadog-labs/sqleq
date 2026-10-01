@@ -1,0 +1,98 @@
+-- Unless explicitly stated otherwise all files in this repository are licensed under the
+-- Apache License Version 2.0.
+-- This product includes software developed at Datadog (https://www.datadoghq.com/).
+-- Copyright 2026-Present Datadog, Inc.
+
+/-!
+# INSERT sources as row sequences
+
+The syntax the translator emits, and what an INSERT's source denotes: the *sequence* of rows it
+feeds to the insert. Order is kept on purpose. Serial ids, which duplicate `ON CONFLICT DO NOTHING`
+keeps, and `RETURNING` order all depend on it, so a bag here would be unsound.
+
+Every name (table, column, type, tail token) is interned to a `Nat` by the translator. The kernel
+then compares numbers, never strings, and every function is structurally recursive so that
+`decide +kernel` can evaluate it.
+
+Values are abstract: `V` is any type, and `Option V` is a value that may be NULL. Nothing here
+interprets a value, which is what lets a proof hold for every column type at once.
+-/
+
+namespace Sqleq
+
+/-- One cell of a `VALUES` row. There is no `Option` argument for the cast: measured, a `none` per
+cell costs about a third of elaboration on a 60-row pair. -/
+inductive Cell where
+  /-- `$n` -/
+  | p (n : Nat)
+  /-- `$n::t`, where `t` is a type id -/
+  | pc (n t : Nat)
+  /-- `NULL` -/
+  | null
+  deriving DecidableEq, Repr
+
+/-- One argument of a multi-argument `unnest`: `$param::ty[]`, where `ty` is the element type. -/
+structure Arg where
+  param : Nat
+  ty : Nat
+  deriving DecidableEq, Repr
+
+/-- The row source of an `INSERT`. -/
+inductive Source where
+  /-- `VALUES (…), (…)`, rows in order. -/
+  | values (rows : List (List Cell))
+  /-- `SELECT * FROM unnest($p₁::T₁[], …, $pₖ::Tₖ[])`. -/
+  | unnest (args : List Arg)
+  deriving Repr
+
+/-- A token of the statement's tail: everything after the source (conflict clause, `RETURNING`),
+in the translator's canonical rendering. A parameter stays visible as its own token so the
+checker can see it. -/
+inductive Tok where
+  | word (n : Nat)
+  | param (n : Nat)
+  deriving DecidableEq, Repr
+
+/-- An `INSERT INTO target (cols) <src> <tail>`. -/
+structure Insert where
+  target : Nat
+  cols : List Nat
+  src : Source
+  tail : List Tok
+  deriving Repr
+
+variable {V : Type}
+
+/-- A scalar binding gives each `$n` a value; an array binding gives each `$n` an array. -/
+abbrev Scalars (V : Type) := Nat → Option V
+abbrev Arrays (V : Type) := Nat → List (Option V)
+
+def cellVal (β : Scalars V) : Cell → Option V
+  | .p n => β n
+  | .pc n _ => β n
+  | .null => none
+
+/-- The rows `VALUES` produces, in order. -/
+def valuesRows (β : Scalars V) (rows : List (List Cell)) : List (List (Option V)) :=
+  rows.map (·.map (cellVal β))
+
+/-- The longest array's length. -/
+def maxLen : List (List (Option V)) → Nat
+  | [] => 0
+  | a :: as => max a.length (maxLen as)
+
+/-- Postgres's multi-argument `unnest` in `FROM`: row `i` holds element `i` of each array, and
+arrays shorter than the longest are padded with NULL. -/
+def zipPad (arrays : List (List (Option V))) : List (List (Option V)) :=
+  (List.range (maxLen arrays)).map fun i => arrays.map fun a => a.getD i none
+
+/-- The rows `SELECT * FROM unnest(…)` produces, in order. -/
+def unnestRows (γ : Arrays V) (args : List Arg) : List (List (Option V)) :=
+  zipPad (args.map fun a => γ a.param)
+
+/-- **The gather rule.** The unnest side's array `$j` is column `j` of the `VALUES` rows, in row
+order, evaluated under the scalar binding `β`. Column `j` is the (j-1)-th cell of each row. -/
+def gather (rows : List (List Cell)) (β : Scalars V) : Arrays V :=
+  fun p => rows.map fun r => cellVal β (r.getD (p - 1) .null)
+
+end Sqleq

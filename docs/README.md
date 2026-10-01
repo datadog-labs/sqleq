@@ -22,6 +22,7 @@ should.
 | [SQLSOLVER.md](SQLSOLVER.md) | The second proving backend, reached through the same IR — how it is wired in, and the defects that shaped the wiring. |
 | [../tools/README.md](../tools/README.md) | The batch harness: running a directory of pairs, and the CI exit code. |
 | [../sqleq-fuzz/README.md](../sqleq-fuzz/README.md) | The refuting axis: how a counterexample is produced, and the rules that keep one honest. |
+| [LEAN.md](LEAN.md) | The Lean axis: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` under the gather rule — what a proof claims, what it assumes, and what the kernel checks. |
 | [logo/](logo/) | The `⊢≡` mark, its variants, and the script that renders them. |
 
 ## Unfiled upstream notes

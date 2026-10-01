@@ -77,6 +77,17 @@ fn unescape(raw: &str) -> String {
     s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"")
 }
 
+/// Raw Postgres DDL as the statements this module reads it as, each as the original text, before
+/// any parse. For a caller that must hand the DDL to a real database rather than to our parser.
+pub fn split_ddl(raw: &str) -> Vec<String> {
+    let sql = unescape(raw);
+    split_statements(&sql)
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Split SQL text into top-level statements on `;`, ignoring separators inside string literals,
 /// quoted identifiers, dollar-quoted bodies and comments.
 ///
@@ -331,6 +342,34 @@ pub fn parse_provided_schema(raw: &str) -> Catalog {
     parse_reporting(raw).0
 }
 
+/// Raw Postgres DDL, parsed one statement at a time, plus one report per statement that would not
+/// parse even after the retry.
+///
+/// The `bool` is `true` for a statement that only parsed after [`simplify_for_retry`]. A caller that
+/// reads more than the catalog does must know which those are: the retry replaces every default in
+/// the table with `qed_unparsed_default()`, and it quotes every column name, so an unquoted `MyCol`
+/// (which Postgres folds to `mycol`) comes back looking case-sensitive.
+pub fn parse_statements_reporting(raw: &str) -> (Vec<(Statement, bool)>, Vec<Rejected>) {
+    let sql = unescape(raw);
+    let mut errors = Vec::new();
+    let statements = split_statements(&sql)
+        .into_iter()
+        .filter_map(|s| match Parser::parse_sql(&PostgreSqlDialect {}, s) {
+            Ok(st) => Some(st.into_iter().map(|st| (st, false)).collect::<Vec<_>>()),
+            Err(e) => {
+                let retry = simplify_for_retry(s)
+                    .and_then(|r| Parser::parse_sql(&PostgreSqlDialect {}, &r).ok());
+                if retry.is_none() {
+                    errors.push(Rejected { message: e.to_string(), statement: s.trim().to_string() });
+                }
+                retry.map(|st| st.into_iter().map(|st| (st, true)).collect())
+            }
+        })
+        .flatten()
+        .collect();
+    (statements, errors)
+}
+
 /// One statement this module could not read, and why.
 ///
 /// The statement is carried in full rather than truncated into the message, because the only useful
@@ -349,25 +388,9 @@ pub struct Rejected {
 /// exist so that question stays answerable: a batch harness can route them to a second parser and
 /// learn what the first one choked on, and a production caller can log them.
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
-    let sql = unescape(raw);
-    let mut errors = Vec::new();
-    let statements: Vec<Statement> = split_statements(&sql)
-        .into_iter()
-        .filter_map(|s| match Parser::parse_sql(&PostgreSqlDialect {}, s) {
-            Ok(st) => Some(st),
-            Err(e) => {
-                let retry = simplify_for_retry(s)
-                    .and_then(|r| Parser::parse_sql(&PostgreSqlDialect {}, &r).ok());
-                if retry.is_none() {
-                    errors.push(Rejected { message: e.to_string(), statement: s.trim().to_string() });
-                }
-                retry
-            }
-        })
-        .flatten()
-        .collect();
+    let (statements, errors) = parse_statements_reporting(raw);
     let mut tables = Vec::new();
-    for st in statements {
+    for (st, _) in statements {
         let Statement::CreateTable(ct) = st else { continue };
         // `public.orders` is the table `orders`: the pipeline strips schema qualifiers, so the
         // catalog is keyed on the bare name.

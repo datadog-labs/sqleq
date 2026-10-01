@@ -70,6 +70,20 @@ pub mod internals {
     /// Aliased rather than re-exported: `DIALECT` sits at the crate root, where making it
     /// `pub` would widen the default API even with this feature off.
     pub const DIALECT: sqlparser::dialect::PostgreSqlDialect = crate::DIALECT;
+
+    /// A pair file's statements, parsed, and checked by `normalize::fix_precedence` for the
+    /// precedence shapes where sqlparser's tree is not Postgres's (an `Err` names the shape), and
+    /// nothing else: no other refusal, no reduction, no rewrite. `declare ... function` lines are
+    /// dropped.
+    ///
+    /// This is the tree *before* `params::check_shape` and `dml::reduce`, which both refuse the
+    /// `INSERT ... VALUES` vs `INSERT ... SELECT * FROM unnest(..)` pairs that `sqleq-lean` exists
+    /// to decide.
+    pub fn parse_pair(src: &str) -> crate::Result<Vec<sqlparser::ast::Statement>> {
+        let (_, mut statements) = crate::parse_statements(src)?;
+        crate::normalize::fix_precedence(&mut statements)?;
+        Ok(statements)
+    }
 }
 
 use std::collections::{BTreeSet, HashMap};
