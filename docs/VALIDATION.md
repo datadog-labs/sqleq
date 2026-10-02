@@ -51,6 +51,12 @@ this very run, that it is awake and can still refute things. If it ever collapse
 Earlier work paired each claim with a hand-built negative control; in a two-axis run that control
 set *is* a cell of the table, so it is reported as a first-class number instead.
 
+The [pinned pairs](../tests/pairs/README.md) are not such a batch. They record what each axis said
+about pairs whose truth is already known — most of them defects found once, below — and fail when
+any answer moves. That catches a regression on every axis, including the ones that did not find
+the defect, but it cannot stand in for the cross-tab: a pinned pair only fails in a way someone has
+already seen.
+
 ## Refuse, never guess
 
 The frontend's hard rule: **if a construct cannot be lowered faithfully, emit nothing and say why.**
@@ -72,7 +78,8 @@ each given up provable pairs. That trade is accepted every time.
 ## Defects this method has caught
 
 These are the durable findings — each one checkable in the code today, and each found by one axis
-disagreeing with another rather than by inspection.
+disagreeing with another rather than by inspection. Those that can be stated as a pair are pinned,
+minimized, under [`tests/pairs/`](../tests/pairs/README.md).
 
 **In the QED prover** (external, upstream). A scalar aggregate over an empty input returns one row;
 the prover's grouping model did not, making it unsound on that shape. Found by the concrete

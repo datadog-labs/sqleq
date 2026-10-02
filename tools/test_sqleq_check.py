@@ -30,8 +30,8 @@ from pathlib import Path
 
 from sqleq_check import (REPO, SQLSOLVER_NO_PROOF, SQLSOLVER_PROVED, SQLSOLVER_PROVED_LITERAL,
                          SQLSOLVER_UNSUPPORTED, Case, SsDriver, _statements, build_parser,
-                         run_second_opinion, second_opinion, ss_slug, triviality_from_ir,
-                         triviality_from_text)
+                         resolve_axes, run_second_opinion, second_opinion, ss_slug,
+                         triviality_from_ir, triviality_from_text)
 
 
 class StatementSplitting(unittest.TestCase):
@@ -190,8 +190,7 @@ class SecondOpinionOptions(unittest.TestCase):
     before sqleq-solver was the default still mean what they meant."""
 
     def asks(self, *argv):
-        p = build_parser()
-        return second_opinion(p.parse_args(["x.sql", *argv]), p)
+        return second_opinion(build_parser().parse_args(["x.sql", *argv]))
 
     def refused(self, *argv):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
@@ -216,6 +215,14 @@ class SecondOpinionOptions(unittest.TestCase):
 
     def test_an_unknown_implementation_is_refused(self):
         self.refused("--sqlsolver", "--sqlsolver-impl", "java")
+
+    def test_the_switches_and_the_old_axis_name_choose_the_axis(self):
+        axes = lambda *argv: resolve_axes(build_parser().parse_args(["x.sql", *argv]))
+        self.assertEqual(axes("--sqleq-solver"), ["frontend", "qed", "sqleq-solver"])
+        self.assertEqual(axes("--sqlsolver-jvm"), ["frontend", "qed", "sqlsolver-jvm"])
+        self.assertEqual(axes("--axes", "sqlsolver-rust"), ["frontend", "sqleq-solver"])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            axes("--axes", "sqleq-solver", "--sqlsolver-jvm")
 
 
 class LeanAxis(unittest.TestCase):

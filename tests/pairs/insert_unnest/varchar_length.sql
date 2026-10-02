@@ -3,7 +3,16 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- expect: proved-gather
+-- truth: equivalent
+-- expect frontend: refuse:parameter-misaligned
+-- expect fuzz: error
+-- expect qed: no-plan
+-- expect sqleq-solver: no-plan
+-- expect sqlsolver-jvm: no-plan
+-- expect lean: proved-gather
+-- binding: gather
+-- origin: a column's length reached by the same assignment on both sides
+
 -- A column with a length and an unnest cast without one: both sides reach varchar(8) through the
 -- same assignment coercion, which raises on a long value rather than truncating it.
 CREATE TABLE t (a int, code varchar(8));

@@ -24,6 +24,7 @@ for a counterexample. See [DESIGN.md](DESIGN.md) for why it is arranged that way
 | `src/sqlsolver.rs` | the `sqlsolver` axis's job files, which `sqleq-solver` and the JVM SQLSolver both read ([SQLSOLVER.md](SQLSOLVER.md)) |
 | `tests/lower.rs` | integration tests (parse/lower shape + soundness refusals) |
 | `tests/reflexive.rs` | integration tests for the reflexivity check — that it reaches past a lowering refusal, and never widens one into a proof |
+| `tests/pairs/` | pinned pairs: known truth, each axis's last answer, run by `sqleq_check.py --expect pinned` ([README](../tests/pairs/README.md)) |
 
 ## The second proving axis (`sqleq-solver/`)
 
@@ -44,6 +45,7 @@ what it must never call a counterexample — are in [`sqleq-fuzz/README.md`](../
 | path | what |
 |---|---|
 | `tools/sqleq_check.py` | a corpus of `.sql` pairs → verdicts + CI exit code, via frontend + prover ([manual](../tools/README.md)) |
+| `tools/sqleq_suite.py` | the pinned-pair grammar, judgement and `--bless` behind `sqleq_check.py --expect pinned` |
 | `tools/linkcheck.py` | every relative link in every tracked Markdown file resolves |
 | `tools/sqlsolver/` | our side of the IR bridge to the JVM SQLSolver, `sqleq-solver`'s cross-check: `IrToRel.java` builds the plan pair, `IrDriver.java` runs it ([SQLSOLVER.md](SQLSOLVER.md)) |
 

@@ -12,6 +12,10 @@
 # caches do not evict each other. Each job lints the crate it builds, so the union is
 # `cargo clippy --workspace` without any job paying for another's dependencies.
 #
+# Three of them also run the pinned pairs under tests/pairs on the axes they build: the frontend,
+# sqleq-fuzz and the Rust solver. The QED prover and the JVM SQLSolver are never installed here, so
+# their pins are checked where those tools exist -- see tests/pairs/README.md.
+#
 # `licenses` builds nothing. It checks that every dependency is under a permissive licence and
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
 # attribution changing with it.
@@ -88,6 +92,15 @@ jobs:
 
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
 
+      # The pinned pairs on the frontend axis. A non-equivalent pair that lowers to the same IR on
+      # both sides fails here, with no prover anywhere in the job.
+      - run: cargo build --bin sqleq-frontend
+      - name: pinned pairs (frontend)
+        run: |
+          test -x target/debug/sqleq-frontend
+          python3 tools/sqleq_check.py --expect pinned --axes frontend \
+            --frontend target/debug/sqleq-frontend tests/pairs examples/*.sql
+
       # Every relative link in every tracked Markdown file resolves. See tools/linkcheck.py for
       # why this is a gate and not a habit.
       - run: python3 tools/linkcheck.py
@@ -146,6 +159,15 @@ jobs:
 
       - run: cargo test -p sqleq-fuzz
       - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
+
+      # The pinned pairs on the only axis that refutes. It reads each pair file itself, so it needs
+      # no frontend.
+      - run: cargo build -p sqleq-fuzz --bin sqleq-fuzz
+      - name: pinned pairs (fuzz)
+        run: |
+          test -x target/debug/sqleq-fuzz
+          python3 tools/sqleq_check.py --expect pinned --axes fuzz \
+            --fuzz-bin target/debug/sqleq-fuzz tests/pairs examples/*.sql
 
   licenses:
     name: licenses
@@ -248,10 +270,19 @@ jobs:
       # the second opinion through it skips. Here it must run, so the binary's presence is asserted
       # first and the test is named.
       - run: cargo build -p sqleq-solver --bin sqleq-solver
-      - name: second opinion through the Rust driver
+      - name: second opinion through sqleq-solver
         run: |
           test -x target/debug/sqleq-solver
-          cd tools && python3 -m unittest -v test_sqleq_check.SecondOpinionThroughTheRustDriver
+          cd tools && python3 -m unittest -v test_sqleq_check.SecondOpinionThroughSqleqSolver
+
+      # The pinned pairs on the Rust solver. It proves from the frontend's IR, so this job builds the
+      # frontend binary too; the frontend's own pins are checked again on the way, at no extra cost.
+      - run: cargo build --bin sqleq-frontend
+      - name: pinned pairs (sqleq-solver)
+        run: |
+          python3 tools/sqleq_check.py --expect pinned --axes sqleq-solver \
+            --frontend target/debug/sqleq-frontend --sqleq-solver-bin target/debug/sqleq-solver \
+            tests/pairs examples/*.sql
 
   lean:
     name: sqleq-lean
@@ -312,7 +343,8 @@ jobs:
       - name: Lean library and controls
         run: cd lean && lake build Sqleq SqleqTest
 
-      # The integration test runs every example under examples/lean through real Lean and asserts
+      # The integration test runs every pinned pair under tests/pairs that pins the Lean axis through
+      # real Lean and asserts
       # the verdict its header declares; it fails, rather than skips, without `lake` on PATH.
       - run: cargo test -p sqleq-lean
       - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings
