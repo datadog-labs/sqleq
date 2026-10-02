@@ -64,14 +64,18 @@ jobs:
       # features. `rust-version = "1.85"` is the floor; an MSRV job can be added later.
       - run: rustc --version && cargo --version
 
+      # The prefix names the build settings in the job's `env`. A `target/` built under other
+      # settings is restored in full but none of it is reused, and with it on disk the runner has no
+      # room left to archive the new one, so the cache is never replaced. Change the prefix whenever
+      # those settings change.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: frontend-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: frontend-${{ runner.os }}-
+          key: frontend-lines-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: frontend-lines-${{ runner.os }}-
 
       # `default-members = ["."]`, so these two cover the frontend crate and nothing else.
       - run: cargo test
