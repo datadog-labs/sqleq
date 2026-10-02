@@ -29,5 +29,6 @@ serde_json = { workspace = true, features = ["unbounded_depth"] }
 
 # "vendored": Z3 itself is compiled from the source crate `z3-src` (checksum-pinned in Cargo.lock)
 # and linked statically, so there is no Z3 to install and nothing to find at run time. The first
-# build compiles Z3 and needs cmake and a C++20 compiler.
+# build compiles Z3 and needs cmake and a C++20 compiler. The root manifest builds it optimised in
+# every profile (`[profile.dev.package.z3-sys]`).
 z3 = { version = "0.21.1", features = ["vendored"] }

@@ -228,8 +228,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: solver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: solver-${{ runner.os }}-
+          # The prefix names how Z3 is built: `[profile.dev.package.z3-sys]` in Cargo.toml. A key
+          # that matches exactly is never saved again, so a `target/` holding a Z3 built another way
+          # would be restored and recompiled on every run. Change the prefix whenever that changes.
+          key: solver-z3release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: solver-z3release-${{ runner.os }}-
 
       # Z3 is compiled from the `z3-src` crate, whose checksum Cargo.lock pins, and linked
       # statically; the cache above keeps that compile to the first build after a lockfile change.
