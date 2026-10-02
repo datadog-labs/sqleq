@@ -6,7 +6,7 @@
 # Five jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
-# cache than anything else here -- `sqleq-solver` links Z3, and `sqleq-lean` needs a Lean
+# cache than anything else here -- `sqleq-solver` compiles Z3, and `sqleq-lean` needs a Lean
 # toolchain, the largest download of all. Keeping each in its own job means
 # the frontend's answer -- the one that gates most changes -- arrives in under a minute, and the
 # caches do not evict each other. Each job lints the crate it builds, so the union is
@@ -215,8 +215,6 @@ jobs:
   solver:
     name: sqleq-solver
     runs-on: ubuntu-latest
-    env:
-      Z3_VERSION: 5.1.0
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,23 +231,10 @@ jobs:
           key: solver-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: solver-${{ runner.os }}-
 
-      # The crate's build script reads the library's directory from this variable and bakes it into
-      # every binary's rpath, so nothing is needed at run time. This
-      # library is linked into every test executable, so it is pinned by digest like DuckDB's above:
-      # the value is the SHA-256 GitHub lists for the release asset, checked here so that a replaced
-      # upload fails the build. Bump the version, the glibc suffix of the asset name and the digest
-      # together. $RUNNER_TEMP is the same path on every run, which keeps the cached build's rpath
-      # valid.
-      - name: fetch Z3 (digest-pinned)
-        run: |
-          set -euo pipefail
-          name="z3-$Z3_VERSION-x64-glibc-2.39"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.zip" \
-            "https://github.com/Z3Prover/z3/releases/download/z3-$Z3_VERSION/$name.zip"
-          echo "f47be8d27d3230e823bf1eeede2fe0abaca55bb78d0b59974370e6689a92284a  $RUNNER_TEMP/$name.zip" \
-            | sha256sum -c -
-          unzip -q -o "$RUNNER_TEMP/$name.zip" -d "$RUNNER_TEMP"
-          echo "SQLEQ_Z3_LIB_DIR=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
+      # Z3 is compiled from the `z3-src` crate, whose checksum Cargo.lock pins, and linked
+      # statically; the cache above keeps that compile to the first build after a lockfile change.
+      # It needs cmake and a C++20 compiler, which the runner image provides.
+      - run: cmake --version && c++ --version
 
       - run: cargo test -p sqleq-solver
       - run: cargo clippy -p sqleq-solver --all-targets -- -D warnings

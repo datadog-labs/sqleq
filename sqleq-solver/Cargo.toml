@@ -11,7 +11,6 @@ rust-version = "1.85"
 description = "Rust port of SQLSolver's equivalence-checking proof engine"
 license = "Apache-2.0"
 publish = false
-build = "build.rs"
 
 [lib]
 name = "sqleq_solver"
@@ -28,5 +27,7 @@ serde = { version = "1", features = ["derive"] }
 # AND/OR/CAST chains), which is ordinary input, not adversarial.
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 
-# Links the libz3 that `$SQLEQ_Z3_LIB_DIR` names; see build.rs.
-z3 = "0.21.1"
+# "vendored": Z3 itself is compiled from the source crate `z3-src` (checksum-pinned in Cargo.lock)
+# and linked statically, so there is no Z3 to install and nothing to find at run time. The first
+# build compiles Z3 and needs cmake and a C++20 compiler.
+z3 = { version = "0.21.1", features = ["vendored"] }
