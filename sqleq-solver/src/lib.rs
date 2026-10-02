@@ -38,46 +38,45 @@ pub mod uterm;
 #[cfg(test)]
 mod smoke_tests {
     use std::time::{Duration, Instant};
-    use z3::ast::{Ast, Int};
-    use z3::{Config, Context, SatResult, Solver};
+    use z3::ast::Int;
+    use z3::{Params, SatResult, Solver};
 
-    /// Z3 links against the configured `libz3.so` and answers a trivial query.
+    /// Z3 links and answers a trivial query.
     #[test]
     fn z3_links_and_answers() {
-        let cfg = Config::new();
-        let ctx = Context::new(&cfg);
-        let solver = Solver::new(&ctx);
+        let solver = Solver::new();
 
         // x + 1 == x is unsat for any integer x.
-        let x = Int::new_const(&ctx, "x");
-        let one = Int::from_i64(&ctx, 1);
-        solver.assert(&(&x + &one)._eq(&x));
+        let x = Int::new_const("x");
+        let one = Int::from_i64(1);
+        solver.assert((&x + &one).eq(&x));
         assert_eq!(solver.check(), SatResult::Unsat);
 
         // x == 5 is sat, and the model should say so.
         solver.reset();
-        let five = Int::from_i64(&ctx, 5);
-        solver.assert(&x._eq(&five));
+        let five = Int::from_i64(5);
+        solver.assert(x.eq(&five));
         assert_eq!(solver.check(), SatResult::Sat);
         let model = solver.get_model().expect("sat query must produce a model");
         assert_eq!(model.eval(&x, true).and_then(|v| v.as_i64()), Some(5));
     }
 
-    /// The `timeout` config param is wired up and doesn't hang the process. This is a smoke test of
-    /// the mechanism, not a proof it always bites in time; the driver's per-row cap is the backstop.
+    /// The solver's `timeout` param, which is how `setsolver` bounds each query, is wired up and
+    /// doesn't hang the process. This is a smoke test of the mechanism, not a proof it always bites
+    /// in time; the driver's per-row cap is the backstop.
     #[test]
     fn timeout_param_does_not_hang() {
-        let mut cfg = Config::new();
-        cfg.set_timeout_msec(1);
-        let ctx = Context::new(&cfg);
-        let solver = Solver::new(&ctx);
+        let solver = Solver::new();
+        let mut params = Params::new();
+        params.set_u32("timeout", 1);
+        solver.set_params(&params);
 
-        let x = Int::new_const(&ctx, "x");
-        let y = Int::new_const(&ctx, "y");
-        let zero = Int::from_i64(&ctx, 0);
-        solver.assert(&x.gt(&zero));
-        solver.assert(&y.gt(&zero));
-        solver.assert(&(&x * &y)._eq(&Int::from_i64(&ctx, 1_000_003 * 1_000_033)));
+        let x = Int::new_const("x");
+        let y = Int::new_const("y");
+        let zero = Int::from_i64(0);
+        solver.assert(x.gt(&zero));
+        solver.assert(y.gt(&zero));
+        solver.assert((&x * &y).eq(Int::from_i64(1_000_003 * 1_000_033)));
 
         let start = Instant::now();
         let result = solver.check();

@@ -8,7 +8,7 @@ conventions are not the ones you would guess from the code — this file is the 
 ```sh
 cargo test                 # the frontend: 205 + 9 + 7 + 179 + 18 + 11 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
-cargo test -p sqleq-solver # the SQLSolver port: 57 (needs Z3, see below)
+cargo test -p sqleq-solver # the SQLSolver port: 61 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 25 + 3 (needs Lean, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
@@ -20,15 +20,14 @@ the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries built. Their Lean
 `cargo test -p sqleq-lean`.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
-`sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and `sqleq-solver`
-links a Z3 you supply — `$SQLEQ_Z3_LIB_DIR` names the directory holding `libz3.so` and
-`$Z3_SYS_Z3_HEADER` a `z3.h` from the same release — so the root manifest sets
-`default-members = ["."]` and both are opt-in. `sqleq-lean` is opt-in too: it runs the Lean 4
-toolchain that `lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a
-release's `bin` there yourself), and its integration test fails rather than skips without it.
-`cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks its controls. CI gives
-each crate its own job for the same reason, and fetches Z3 and Lean from digest-pinned release
-archives.
+`sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and the first build
+of `sqleq-solver` compiles Z3 from source, which takes minutes and needs cmake and a C++20
+compiler — so the root manifest sets `default-members = ["."]` and both are opt-in. `sqleq-lean`
+is opt-in too: it runs the Lean 4 toolchain that `lean/lean-toolchain` names, with `lake` on `PATH`
+(elan installs it, or put a release's `bin` there yourself), and its integration test fails rather
+than skips without it. `cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks
+its controls. CI gives each crate its own job for the same reason, and fetches Lean from a
+digest-pinned release archive.
 
 ### Licensing
 
@@ -58,8 +57,8 @@ lines of each:
 
 ## Lints
 
-`cargo clippy --workspace --all-targets -- -D warnings` must be clean (with the two Z3 variables
-set, since the workspace includes `sqleq-solver`), and CI enforces it per crate.
+`cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per
+crate.
 
 **`cargo fmt` is not used and must not be added to CI.** There is no `rustfmt.toml`, over a
 thousand source lines already run past 100 columns, and `src/dml.rs` has never been formatted — a

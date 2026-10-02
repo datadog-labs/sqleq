@@ -24,7 +24,7 @@ public:
 * The **SQL-text path** needs `$SQLEQ_SQLSOLVER_PRISTINE`, an unmodified upstream checkout, plus a
   JDK. That checkout is public, so anything described here about that path can be re-checked.
 * The **Rust port** (`sqleq-solver`, [below](#the-rust-port-sqleq-solver)) is reproducible
-  from this repository plus a system `libz3`: `--sqlsolver --sqlsolver-impl=rust` needs neither
+  from this repository alone, Z3 included: `--sqlsolver --sqlsolver-impl=rust` needs neither
   checkout.
 * The **IR bridge** and everything downstream of it — including `--sqlsolver` in `sqleq_check.py` —
   need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That fork is not
@@ -288,5 +288,6 @@ normalization, and both sides of every proved pair, on small random databases th
 schemas' column types and constraints, using the crate's concrete evaluator. The crate's unit tests pin the
 three-valued truth tables against a reference evaluator.
 
-Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
-`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.
+`cargo build --release -p sqleq-solver` compiles Z3 from source and links it statically, so the
+binary needs nothing at run time; the first build takes minutes and needs cmake and a C++20
+compiler.
