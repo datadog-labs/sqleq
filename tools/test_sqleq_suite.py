@@ -329,6 +329,21 @@ class ThroughMain(unittest.TestCase):
         self.assertEqual(self.run_main("--bless"), 1)
         self.assertEqual(self.case.read_text(), text)
 
+    def test_relative_binary_paths_work(self):
+        """Each case runs in its own working directory, so a relative `--frontend` used to
+        name nothing there. CI passes `target/debug/...`, which is how this was found."""
+        self.case.write_text(pair(*NEQ_OK, "-- expect frontend: emit",
+                                  "-- expect fuzz: no-counterexample",
+                                  "-- expect sqlsolver-rust: no-proof"))
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            self.frontend, self.solver, self.fuzz = "fe", "ss", "fz"
+            self.assertEqual(self.run_main(axes="frontend,fuzz,sqlsolver-rust",
+                                           paths=["case.sql"]), 0, self.out + self.err)
+        finally:
+            os.chdir(cwd)
+
     def test_the_catalog_header_reaches_the_frontend(self):
         self.case.write_text(pair(*NEQ_OK, "-- catalog: inferred-seeded"))
         self.run_main()

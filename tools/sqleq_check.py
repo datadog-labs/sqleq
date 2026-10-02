@@ -91,15 +91,18 @@ def _newest(paths: list[str]) -> Optional[str]:
 
 def discover_frontend(override: Optional[str]) -> str:
     """Resolve sqleq-frontend: explicit override -> $SQLEQ_FRONTEND -> PATH -> this
-    repo's own build (release preferred over debug)."""
+    repo's own build (release preferred over debug).
+
+    Every `discover_*` returns an absolute path: each case runs in its own working
+    directory, where a relative `--frontend target/debug/...` names nothing."""
     for c in (override, os.environ.get("SQLEQ_FRONTEND")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
+                return os.path.abspath(c)
             sys.exit(f"error: sqleq-frontend not found or not executable at: {c}")
     found = shutil.which("sqleq-frontend")
     if found:
-        return found
+        return os.path.abspath(found)
     local = _newest([str(REPO / "target" / p / "sqleq-frontend")
                      for p in ("release", "debug")])
     if local:
@@ -115,11 +118,11 @@ def discover_prover(override: Optional[str]) -> str:
     for c in (override, os.environ.get("QED_PROVER")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
+                return os.path.abspath(c)
             sys.exit(f"error: qed-prover not found or not executable at: {c}")
     found = shutil.which("qed-prover")
     if found:
-        return found
+        return os.path.abspath(found)
     # Fallback: the Nix-wrapped prover (it carries z3 + cvc5 on its own PATH),
     # useful when not inside the dev shell.
     store = _newest(glob("/nix/store/*-qed-prover*/bin/qed-prover"))
@@ -137,12 +140,12 @@ def discover_fuzz(override: Optional[str]) -> str:
     for c in (override, os.environ.get("SQLEQ_FUZZ")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
+                return os.path.abspath(c)
             sys.exit(f"error: sqleq-fuzz not found or not executable at: {c}")
     found = shutil.which("sqleq-fuzz") or _newest(
         [str(REPO / "target" / p / "sqleq-fuzz") for p in ("release", "debug")])
     if found:
-        return found
+        return os.path.abspath(found)
     sys.exit(
         "error: could not find 'sqleq-fuzz'. Build it with "
         "`cargo build --release -p sqleq-fuzz`, put it on PATH, or pass "
@@ -664,11 +667,13 @@ def discover_sqlsolver_rust(override: Optional[str]) -> SsDriver:
     for c in (override, os.environ.get("SQLEQ_SOLVER_BIN")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
+                c = os.path.abspath(c)
                 return SsDriver("rust", [c], REPO, dict(os.environ), c)
             sys.exit(f"error: sqleq-solver not found or not executable at: {c}")
     found = shutil.which("sqleq-solver") or _newest(
         [str(REPO / "target" / p / "sqleq-solver") for p in ("release", "debug")])
     if found:
+        found = os.path.abspath(found)
         return SsDriver("rust", [found], REPO, dict(os.environ), found)
     sys.exit(
         "error: could not find 'sqleq-solver'. Build it with "
