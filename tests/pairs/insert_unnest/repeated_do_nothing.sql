@@ -3,7 +3,16 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- expect: proved-gather
+-- truth: equivalent
+-- expect frontend: refuse:parameter-misaligned
+-- expect fuzz: error
+-- expect qed: no-plan
+-- expect sqlsolver-rust: no-plan
+-- expect sqlsolver-jvm: no-plan
+-- expect lean: proved-gather
+-- binding: gather
+-- origin: a non-vacuous proof over repeated tuples: DO NOTHING keeps the first of two
+
 -- The same tuple twice under DO NOTHING: the second row is skipped, the first is inserted, so the
 -- VALUES side can succeed and the proof is not vacuous.
 CREATE TABLE subs (email text PRIMARY KEY, plan text NOT NULL, since timestamptz DEFAULT now());

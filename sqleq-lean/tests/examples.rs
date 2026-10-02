@@ -3,34 +3,52 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Every pair under `examples/lean/` gets the verdict its `-- expect:` line declares. That line is
-//! the first after the license header, in the file's leading comment block.
+//! Every pinned pair under `tests/pairs/` that pins the Lean axis gets the verdict its
+//! `-- expect lean:` line declares (see `tests/pairs/README.md`). The line is read from the file's
+//! leading comment block; a `!known-unsound` after the verdict is not part of it.
 //!
 //! This runs real Lean, so it needs `lake` (or `$LAKE`) and fails without it. It does not skip: a
 //! test that passes when Lean is missing would say nothing about the proofs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqleq_lean::translate::translate;
 use sqleq_lean::{check, run::Lean, Case, PROVED};
 
-fn examples() -> Vec<(String, String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/lean");
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(&dir).unwrap() {
+fn pairs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/pairs")
+}
+
+fn sql_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();
-        if p.extension().is_some_and(|x| x == "sql") {
-            let text = std::fs::read_to_string(&p).unwrap();
-            // Only the leading comment block is searched, so a statement cannot carry the line.
-            let expect = text
-                .lines()
-                .take_while(|l| l.starts_with("--") || l.trim().is_empty())
-                .find_map(|l| l.strip_prefix("-- expect: "))
-                .unwrap_or_else(|| panic!("{} has no `-- expect:` line in its header", p.display()))
-                .trim()
-                .to_string();
-            out.push((p.file_name().unwrap().to_string_lossy().into(), text, expect));
+        if p.is_dir() {
+            sql_files(&p, out);
+        } else if p.extension().is_some_and(|x| x == "sql") {
+            out.push(p);
+        }
+    }
+}
+
+/// (name relative to `tests/pairs/`, file text, pinned Lean verdict), for every pair that pins one.
+fn examples() -> Vec<(String, String, String)> {
+    let root = pairs_dir();
+    let mut files = Vec::new();
+    sql_files(&root, &mut files);
+    let mut out = Vec::new();
+    for p in files {
+        let text = std::fs::read_to_string(&p).unwrap();
+        // Only the leading comment block is searched, so a statement cannot carry the line.
+        let expect = text
+            .lines()
+            .take_while(|l| l.starts_with("--") || l.trim().is_empty())
+            .find_map(|l| l.strip_prefix("-- expect lean: "))
+            .and_then(|v| v.split_whitespace().next())
+            .map(str::to_string);
+        if let Some(expect) = expect {
+            let name = p.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            out.push((name, text, expect));
         }
     }
     out.sort();
@@ -40,7 +58,7 @@ fn examples() -> Vec<(String, String, String)> {
 #[test]
 fn examples_get_their_declared_verdicts() {
     let ex = examples();
-    assert!(ex.len() >= 8, "expected the golden pairs, found {}", ex.len());
+    assert!(ex.len() >= 8, "expected the pinned pairs, found {}", ex.len());
     let cases: Vec<Case> = ex.iter().map(|(n, t, _)| Case::from_file(n.clone(), t)).collect();
     let lean = Lean::from_env(Duration::from_secs(600));
     let got = check(&cases, &lean, 50, 2, None, false).expect("Lean must be available: set $LAKE or put lake on PATH");
@@ -56,7 +74,7 @@ fn examples_get_their_declared_verdicts() {
 /// the Rust comparison. Forge a translation whose tails differ and check Lean rejects it.
 #[test]
 fn the_kernel_rechecks_what_rust_compared() {
-    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/lean/row_major.sql")).unwrap();
+    let text = std::fs::read_to_string(pairs_dir().join("insert_unnest/row_major.sql")).unwrap();
     let case = Case::from_file("forged".into(), &text);
     let (a, b) = case.pair.as_ref().unwrap();
     let mut p = translate(a, b, &case.schema).unwrap();

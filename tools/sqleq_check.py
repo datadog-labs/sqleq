@@ -46,6 +46,11 @@ must be read off it carefully, and the summary says both:
   bug yields the same wrong plan on both axes; agreement corroborates the
   provers, not the frontend.
 
+`--expect pinned` is the other policy: every case carries its own expected
+answer per axis in its header (`tests/pairs/README.md`), `--axes` picks which
+axes run — `sqleq-fuzz` among them — and any movement fails. The grammar and the
+judgement live in `sqleq_suite.py`.
+
 The harness itself is dependency-free (Python 3.8+ standard library only).
 """
 
@@ -68,6 +73,8 @@ from glob import glob
 from pathlib import Path
 from typing import Optional
 
+import sqleq_suite as suite
+
 # ---------------------------------------------------------------------------
 # Binary discovery
 # ---------------------------------------------------------------------------
@@ -84,15 +91,18 @@ def _newest(paths: list[str]) -> Optional[str]:
 
 def discover_frontend(override: Optional[str]) -> str:
     """Resolve sqleq-frontend: explicit override -> $SQLEQ_FRONTEND -> PATH -> this
-    repo's own build (release preferred over debug)."""
+    repo's own build (release preferred over debug).
+
+    Every `discover_*` returns an absolute path: each case runs in its own working
+    directory, where a relative `--frontend target/debug/...` names nothing."""
     for c in (override, os.environ.get("SQLEQ_FRONTEND")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
+                return os.path.abspath(c)
             sys.exit(f"error: sqleq-frontend not found or not executable at: {c}")
     found = shutil.which("sqleq-frontend")
     if found:
-        return found
+        return os.path.abspath(found)
     local = _newest([str(REPO / "target" / p / "sqleq-frontend")
                      for p in ("release", "debug")])
     if local:
@@ -108,11 +118,11 @@ def discover_prover(override: Optional[str]) -> str:
     for c in (override, os.environ.get("QED_PROVER")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
-                return c
+                return os.path.abspath(c)
             sys.exit(f"error: qed-prover not found or not executable at: {c}")
     found = shutil.which("qed-prover")
     if found:
-        return found
+        return os.path.abspath(found)
     # Fallback: the Nix-wrapped prover (it carries z3 + cvc5 on its own PATH),
     # useful when not inside the dev shell.
     store = _newest(glob("/nix/store/*-qed-prover*/bin/qed-prover"))
@@ -122,6 +132,50 @@ def discover_prover(override: Optional[str]) -> str:
         "error: could not find 'qed-prover'. Enter the QED Nix shell, or pass "
         "--prover/$QED_PROVER."
     )
+
+
+def discover_fuzz(override: Optional[str]) -> str:
+    """Resolve sqleq-fuzz: explicit override -> $SQLEQ_FUZZ -> PATH -> this repo's own
+    build (release preferred over debug)."""
+    for c in (override, os.environ.get("SQLEQ_FUZZ")):
+        if c:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return os.path.abspath(c)
+            sys.exit(f"error: sqleq-fuzz not found or not executable at: {c}")
+    found = shutil.which("sqleq-fuzz") or _newest(
+        [str(REPO / "target" / p / "sqleq-fuzz") for p in ("release", "debug")])
+    if found:
+        return os.path.abspath(found)
+    sys.exit(
+        "error: could not find 'sqleq-fuzz'. Build it with "
+        "`cargo build --release -p sqleq-fuzz`, put it on PATH, or pass "
+        "--fuzz-bin/$SQLEQ_FUZZ.")
+
+
+# The crate whose sources each binary is built from, for `stale_build`.
+CRATE_DIR = {"sqleq-frontend": REPO, "sqleq-fuzz": REPO / "sqleq-fuzz",
+             "sqleq-solver": REPO / "sqleq-solver", "sqleq-lean": REPO / "sqleq-lean"}
+
+
+def stale_build(binary: str) -> Optional[str]:
+    """Why a binary built in this repo's `target/` is older than what it was built from, or None.
+
+    A pin blessed against a stale build records what an older tree said, and the next fresh
+    build reports it as a regression nobody made. Only binaries under this repo's `target/` are
+    judged; one from anywhere else has no sources here to compare with."""
+    path = Path(binary).resolve()
+    try:
+        path.relative_to((REPO / "target").resolve())
+    except ValueError:
+        return None
+    crate = CRATE_DIR.get(path.name)
+    if crate is None:
+        return None
+    srcs = [REPO / "Cargo.lock", crate / "Cargo.toml"] + list((crate / "src").rglob("*.rs"))
+    newest = max((f for f in srcs if f.is_file()), key=lambda f: f.stat().st_mtime, default=None)
+    if newest is not None and newest.stat().st_mtime > path.stat().st_mtime:
+        return f"{binary} is older than {os.path.relpath(newest, REPO)}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +313,9 @@ REFUSED = "refused"          # frontend would not lower the SQL (see refuse_kind
 PANIC = "panic"              # prover panicked / crashed on the case
 TIMEOUT = "timeout"          # exceeded the per-case wall-clock budget
 ERROR = "error"              # anything else (e.g. JSON it couldn't read)
+LOWERED = "lowered"          # lowered, and the qed axis was not asked (see --axes)
 
-STATUS_ORDER = [PROVABLE, UNPROVABLE, TIMEOUT, REFUSED, PANIC, ERROR]
+STATUS_ORDER = [PROVABLE, UNPROVABLE, TIMEOUT, REFUSED, PANIC, ERROR, LOWERED]
 
 # The second opinion has its own vocabulary, deliberately disjoint from the one
 # above so the two can never be averaged into a single "status". The collapse of
@@ -301,7 +356,8 @@ class Case:
     wall: float = 0.0            # harness-measured total wall time (s)
     lower_wall: float = 0.0
     prove_wall: float = 0.0
-    refuse_kind: str = ""        # parse | unsupported | schema, when refused
+    refuse_kind: str = ""        # parse | unsupported | schema | parameter-misaligned
+    lowered: bool = False        # the frontend produced a plan (or the input was one)
     complete_fragment: bool = False
     smt_timed_out: bool = False
     nontrivial_perms: bool = False
@@ -322,13 +378,19 @@ class Case:
     l_reason: str = ""
     l_shape: str = ""
     l_ms: Optional[int] = None
+    # The sqleq-fuzz axis, only when `fuzz` is among --axes: its label's kind (the part
+    # before the first `:`), the counterexample or the reason, and its wall time.
+    f_verdict: Optional[str] = None
+    f_note: str = ""
+    f_ms: Optional[int] = None
 
 
 def classify_refusal(err: str) -> tuple[str, str]:
     """Map the frontend's stderr to (refuse_kind, one-line reason).
 
-    The three kinds mirror FrontendError: a `PARSE ERROR:` prefix means sqlparser
-    rejected the text, `unsupported:` means we declined to lower a construct, and
+    The four kinds mirror FrontendError: a `PARSE ERROR:` prefix means sqlparser
+    rejected the text, `unsupported:` means we declined to lower a construct,
+    `parameter-misaligned:` means the two queries' `$N` do not line up, and
     anything else is a schema/shape complaint (unresolved column, wrong number of
     queries, bad DDL) — which Display leaves unprefixed because those messages are
     already self-describing.
@@ -339,7 +401,23 @@ def classify_refusal(err: str) -> tuple[str, str]:
         return "parse", reason
     if reason.startswith("unsupported:"):
         return "unsupported", reason
+    if reason.startswith("parameter-misaligned:"):
+        return "parameter-misaligned", reason
     return "schema", reason
+
+
+def catalog_flags(src: Path) -> list:
+    """The frontend flags a `.sql` case's `-- catalog:` header asks for (none when absent).
+
+    A pair whose queries use `$N` needs an inferred catalog: under the default, declared one
+    the frontend refuses a bare placeholder. An unknown value raises, rather than silently
+    lowering against a catalog the case did not ask for."""
+    if src.suffix != ".sql":
+        return []
+    h = suite.parse_header(src.read_text())
+    if h.catalog not in suite.CATALOG_FLAGS:
+        raise ValueError(f"unknown `catalog: {h.catalog}`")
+    return suite.CATALOG_FLAGS[h.catalog]
 
 
 def set_triviality(case: Case, plan_path: Optional[Path], src: Path) -> None:
@@ -368,7 +446,7 @@ def run_case(
     src: Path,
     name: str,
     frontend: str,
-    prover: str,
+    prover: Optional[str],
     case_timeout: float,
     smt_timeout_ms: Optional[int],
     keep_dir: Optional[Path],
@@ -397,7 +475,14 @@ def run_case(
             # 1) Lower SQL -> JSON
             local_sql = Path(workdir) / f"{stem}.sql"
             shutil.copyfile(src, local_sql)
-            fr = run_cmd([frontend, local_sql.name, json_path.name], workdir, case_timeout)
+            try:
+                flags = catalog_flags(src)
+            except ValueError as e:
+                case.message = str(e)
+                case.wall = time.monotonic() - t0
+                return case
+            fr = run_cmd([frontend] + flags + [local_sql.name, json_path.name], workdir,
+                         case_timeout)
             case.lower_wall = fr.wall
             if fr.timed_out:
                 case.status = TIMEOUT
@@ -415,6 +500,7 @@ def run_case(
                 case.wall = time.monotonic() - t0
                 return case
 
+        case.lowered = True
         set_triviality(case, json_path, src)
 
         # 1b) Package the plan for the second opinion, while the workdir still
@@ -432,6 +518,11 @@ def run_case(
             if pack.rc != 0 or not job.exists():
                 case.s_bucket = SQLSOLVER_UNSUPPORTED
                 case.s_note = _tail(pack.err) or f"could not package the plan (exit {pack.rc})"
+
+        if prover is None:
+            case.status = LOWERED
+            case.wall = time.monotonic() - t0
+            return case
 
         # 2) Prove equivalence
         env = dict(os.environ)
@@ -576,11 +667,13 @@ def discover_sqlsolver_rust(override: Optional[str]) -> SsDriver:
     for c in (override, os.environ.get("SQLEQ_SOLVER_BIN")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
+                c = os.path.abspath(c)
                 return SsDriver("rust", [c], REPO, dict(os.environ), c)
             sys.exit(f"error: sqleq-solver not found or not executable at: {c}")
     found = shutil.which("sqleq-solver") or _newest(
         [str(REPO / "target" / p / "sqleq-solver") for p in ("release", "debug")])
     if found:
+        found = os.path.abspath(found)
         return SsDriver("rust", [found], REPO, dict(os.environ), found)
     sys.exit(
         "error: could not find 'sqleq-solver'. Build it with "
@@ -829,6 +922,196 @@ def print_lean(c: Color, cases: list[Case], stats: dict):
 
 
 # ---------------------------------------------------------------------------
+# The fuzz axis
+# ---------------------------------------------------------------------------
+#
+# `sqleq-fuzz` is the only axis that can refute: it runs both statements on random
+# instances in DuckDB and compares the results. It reads the pair file itself and
+# binds `$N` on its own, so it needs no frontend and ignores the catalog header.
+# The trial budget is always passed explicitly — the tool's defaults are free to
+# change, and a pinned `no-counterexample` is only a claim about one budget.
+
+FUZZ_ARGS = ["--trials", "120", "--rows", "5", "--seed", "0"]
+
+# The label's kind is the part before the first `:` (`ERROR:…`, `PARAM-MISALIGNED:…`).
+_FUZZ_WORD = {
+    "NOT-EQUIVALENT": "counterexample", "NO-COUNTEREXAMPLE": "no-counterexample",
+    "PARAM-MISALIGNED": "param-misaligned", "NOT-COMPARABLE": "not-comparable",
+    "NONDET-SKIP": "nondet-skip", "NO-SCHEMA": "no-schema", "NO-TABLES": "no-tables",
+    "ERROR": "error",
+}
+
+
+def fuzz_one(fuzz_bin: str, path: str, timeout_s: float) -> tuple:
+    """(word, note, ms) for one pair file."""
+    path = os.path.abspath(path)
+    r = run_cmd([fuzz_bin, "file", path] + FUZZ_ARGS, os.path.dirname(path), timeout_s)
+    ms = int(r.wall * 1000)
+    if r.timed_out:
+        return "timeout", "", ms
+    lines = [ln.strip() for ln in r.out.splitlines() if ln.strip()]
+    if r.rc != 0 or not lines:
+        return "error", _tail(r.err) or f"sqleq-fuzz exit {r.rc}", ms
+    label = lines[0]
+    word = _FUZZ_WORD.get(label.split(":", 1)[0], "error")
+    note = next((ln[len("counterexample: "):] for ln in lines[1:]
+                 if ln.startswith("counterexample: ")), "")
+    if not note and ":" in label:
+        note = label.split(":", 1)[1].strip()
+    return word, note, ms
+
+
+def run_fuzz(cases: list[Case], fuzz_bin: str, jobs: int, timeout_s: float) -> dict:
+    """Run sqleq-fuzz over every `.sql` case and attach its verdicts in place."""
+    todo = [x for x in cases if x.path.endswith(".sql")]
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        futs = {ex.submit(fuzz_one, fuzz_bin, x.path, timeout_s): x for x in todo}
+        for fut in as_completed(futs):
+            x = futs[fut]
+            x.f_verdict, x.f_note, x.f_ms = fut.result()
+    return {"rows": len(todo), "wall_s": round(time.monotonic() - t0, 3)}
+
+
+def print_fuzz(c: Color, cases: list[Case], stats: dict):
+    scored = [x for x in cases if x.f_verdict is not None]
+    if not scored:
+        return
+    counts: dict = {}
+    for x in scored:
+        counts[x.f_verdict] = counts.get(x.f_verdict, 0) + 1
+    print()
+    print(c.bold("  Fuzz axis") + c.dim("  — sqleq-fuzz, random instances in DuckDB"))
+    print(c.dim("  " + "─" * 40))
+    for v in sorted(counts):
+        print(f"  {v:<22} {counts[v]:>5}")
+    print(c.dim("  " + "─" * 40))
+    for x in scored:
+        if x.f_verdict == "counterexample":
+            print(c.dim(f"  {'counterexample':<22}       {x.name}"))
+    if stats.get("wall_s") is not None:
+        print(c.dim(f"  {'wall time':<22} {stats['wall_s']:.2f}s"))
+    print(c.dim("  note  `no-counterexample` is not a proof: it is the verdict of "
+                f"{FUZZ_ARGS[1]} trials\n        over a small value domain "
+                "(see sqleq-fuzz/README.md)."))
+
+
+# ---------------------------------------------------------------------------
+# Pinned mode
+# ---------------------------------------------------------------------------
+#
+# Each axis's answer, reduced to the one word `sqleq_suite.WORDS` lets a case pin.
+# A prover asked about a pair the frontend refused has nothing to say about it,
+# and says `no-plan` — the refusal itself is the frontend axis's answer.
+
+_QED_WORD = {PROVABLE: "proved", UNPROVABLE: "no-proof", PANIC: "panic", TIMEOUT: "timeout",
+             ERROR: "error"}
+
+
+def observe(case: Case, axes: list) -> dict:
+    """axis -> (word, note) for every axis in `axes` that this run asked about the case."""
+    out = {}
+    if "frontend" in axes:
+        if case.lowered:
+            out["frontend"] = ("emit-reflexive" if case.trivial else "emit", "")
+        elif case.status == REFUSED:
+            out["frontend"] = (f"refuse:{case.refuse_kind}", case.message)
+        elif case.status == TIMEOUT:
+            out["frontend"] = ("timeout", case.message)
+        else:
+            out["frontend"] = ("missing", case.message)
+    no_plan = not case.lowered
+    if "qed" in axes:
+        if no_plan:
+            out["qed"] = ("no-plan", "")
+        else:
+            word = _QED_WORD.get(case.status, "error")
+            if word == "proved" and case.trivial:
+                word = "proved-literal"
+            out["qed"] = (word, case.message)
+    for axis in ("sqlsolver-rust", "sqlsolver-jvm"):
+        if axis in axes:
+            out[axis] = (("no-plan", "") if no_plan
+                         else (case.s_bucket or SQLSOLVER_MISSING, case.s_note))
+    if "fuzz" in axes:
+        out["fuzz"] = (case.f_verdict or "missing", case.f_note)
+    if "lean" in axes:
+        out["lean"] = (case.l_verdict or "missing", case.l_reason)
+    return out
+
+
+@dataclass
+class Pinned:
+    case: Case
+    header: suite.Header
+    lint: list
+    judgements: list
+
+    @property
+    def passed(self) -> bool:
+        return not self.lint and all(j.passed for j in self.judgements)
+
+
+def judge_cases(cases: list[Case], axes: list) -> list:
+    out = []
+    for x in cases:
+        h = suite.parse_header(Path(x.path).read_text())
+        errs = suite.lint(h)
+        out.append(Pinned(x, h, errs, [] if errs else suite.judge(h, observe(x, axes))))
+    return out
+
+
+def bless(pinned: list) -> list:
+    """Rewrite the `expect` lines of every lint-clean case; the names of the files changed."""
+    changed = []
+    for p in pinned:
+        if p.lint:
+            continue
+        path = Path(p.case.path)
+        text = path.read_text()
+        if suite.write_if_changed(path, suite.bless_text(text, p.header, p.judgements)):
+            changed.append(p.case.name)
+    return changed
+
+
+def print_pinned(c: Color, pinned: list, axes: list):
+    cols = [a for a in suite.AXES if a in axes]
+    name_w = min(64, max((len(p.case.name) for p in pinned), default=10))
+    truth = {suite.EQUIVALENT: "EQ", suite.NOT_EQUIVALENT: "NEQ"}
+    grid = []
+    for p in pinned:
+        by = {j.axis: j for j in p.judgements}
+        grid.append([p.case.name, truth.get(p.header.truth, "?")]
+                    + (["lint"] * len(cols) if p.lint else [suite.cell(by.get(a)) for a in cols]))
+    widths = [name_w, 5] + [max([len(a)] + [len(r[2 + i]) for r in grid])
+                            for i, a in enumerate(cols)]
+    print()
+    print(c.bold("  " + "  ".join(h.ljust(w) for h, w in zip(["case", "truth"] + cols, widths))))
+    print(c.dim("  " + "─" * (sum(widths) + 2 * len(widths))))
+    for row, p in zip(grid, pinned):
+        line = "  ".join(v.ljust(w) for v, w in zip(row, widths))
+        print("  " + (line if p.passed else c.red(line)))
+    failed = [p for p in pinned if not p.passed]
+    print(c.dim("  " + "─" * (sum(widths) + 2 * len(widths))))
+    print(c.dim("  ✓ pin holds  ≈ known-unsound, still reproducing  ✗ moved  + unpinned  "
+                "‼ contradicts truth  ⏱ no answer  · axis not run"))
+    if failed:
+        print()
+        for p in failed:
+            print(c.bold(f"  {p.case.name}"))
+            for e in p.lint:
+                print(c.red(f"    lint: {e}"))
+            for j in p.judgements:
+                if not j.passed:
+                    print(c.red(f"    {suite.explain(j, p.header.truth)}"))
+                    if j.note:
+                        print(c.dim(f"      {j.note}"))
+    held = len(pinned) - len(failed)
+    print()
+    print(f"  {c.bold('pinned')} {held}/{len(pinned)} case(s) hold on {', '.join(cols)}")
+
+
+# ---------------------------------------------------------------------------
 # Input collection
 # ---------------------------------------------------------------------------
 
@@ -902,6 +1185,7 @@ STATUS_GLYPH = {
     REFUSED: ("⚠", "yellow"),
     PANIC: ("💥", "red"),
     ERROR: ("?", "red"),
+    LOWERED: ("·", "dim"),
 }
 
 
@@ -969,7 +1253,7 @@ def print_capability(c: Color, cases: list[Case]):
     print(c.dim(f"  {'':<13} {detail}"))
 
 
-def print_summary(c: Color, cases: list[Case], wall: float):
+def print_summary(c: Color, cases: list[Case], wall: float, qed: bool = True):
     counts = {s: 0 for s in STATUS_ORDER}
     for case in cases:
         counts[case.status] = counts.get(case.status, 0) + 1
@@ -992,10 +1276,13 @@ def print_summary(c: Color, cases: list[Case], wall: float):
                 detail = ", ".join(f"{k} {n}" for k, n in sorted(kinds.items()))
                 print(c.dim(f"  {'':<24}{detail}"))
     print(c.dim("  " + "─" * 40))
-    provable = counts[PROVABLE]
-    pct = (100.0 * provable / total) if total else 0.0
-    print(f"  {c.bold('proved'):<13} {provable}/{total}  ({pct:.1f}%)")
-    print_capability(c, cases)
+    # Without the qed axis nothing was proved or left unproved, and a `proved 0/N`
+    # line would read as a prover that failed everything.
+    if qed:
+        provable = counts[PROVABLE]
+        pct = (100.0 * provable / total) if total else 0.0
+        print(f"  {c.bold('proved'):<13} {provable}/{total}  ({pct:.1f}%)")
+        print_capability(c, cases)
     print(f"  {c.dim('wall time'):<13} {wall:.2f}s")
     if cases:
         avg = sum(x.wall for x in cases) / len(cases)
@@ -1066,7 +1353,8 @@ def write_csv(path: str, cases: list[Case]):
             "lower_wall", "prove_wall", "complete_fragment", "smt_timed_out",
             "nontrivial_perms", "message",
             "s_bucket", "s_verdict", "s_ms", "s_note",
-            "l_verdict", "l_reason", "l_shape", "l_ms"]
+            "l_verdict", "l_reason", "l_shape", "l_ms",
+            "f_verdict", "f_note", "f_ms"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -1090,7 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Exit codes:\n"
             "  0  policy satisfied (see --expect)\n"
             "  1  policy not satisfied (some case failed expectation)\n"
-            "  2  usage / setup error\n"
+            "  2  usage / setup error (a missing tool, a bad flag)\n"
         ),
     )
     p.add_argument("paths", nargs="+", metavar="PATH",
@@ -1105,11 +1393,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smt-timeout", type=int, default=None, metavar="MS",
                    help="QED_SMT_TIMEOUT for each SMT request, in ms "
                         "(default: prover's own default of 10000).")
-    p.add_argument("--expect", choices=["equivalent", "report-only"],
+    p.add_argument("--expect", choices=["equivalent", "report-only", "pinned"],
                    default="equivalent",
                    help="Exit-code policy. 'equivalent' (default): nonzero exit "
                         "unless every case is provable — for validating known-"
-                        "equivalent rewrite pairs in CI. 'report-only': always 0.")
+                        "equivalent rewrite pairs in CI. 'report-only': always 0. "
+                        "'pinned': every case's header pins each axis's answer, and "
+                        "any movement fails (tests/pairs/README.md).")
+    p.add_argument("--axes", metavar="LIST",
+                   help="Comma-separated axes to run: frontend, fuzz, qed, sqlsolver-rust, "
+                        "sqlsolver-jvm, lean (default: frontend,qed). A prover axis brings in "
+                        "frontend; at most one SQLSolver per run.")
+    p.add_argument("--bless", action="store_true",
+                   help="With --expect pinned: rewrite each case's `expect` lines for the "
+                        "axes that ran. Never pins an answer that contradicts the case's "
+                        "truth, nor a timeout.")
+    p.add_argument("--fuzz-bin", metavar="PATH",
+                   help="Path to sqleq-fuzz (else $SQLEQ_FUZZ / PATH / this repo's "
+                        "target/{release,debug}).")
     p.add_argument("--json", metavar="FILE", help="Write full results as JSON.")
     p.add_argument("--csv", metavar="FILE", help="Write results as CSV.")
     p.add_argument("--keep", metavar="DIR", default=None,
@@ -1151,7 +1452,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lean", action="store_true",
                    help="Also run the Lean axis (sqleq-lean) over the .sql cases: "
                         "INSERT ... VALUES vs INSERT ... SELECT * FROM unnest(..) "
-                        "pairs, proved under the gather rule. Never changes the exit code.")
+                        "pairs, proved under the gather rule. The same as adding `lean` to "
+                        "--axes; outside --expect pinned it never changes the exit code.")
     p.add_argument("--lean-bin", metavar="PATH",
                    help="Path to sqleq-lean (else $SQLEQ_LEAN / target/{release,debug}).")
     p.add_argument("--sqlsolver-timeout", type=int, default=None, metavar="MS",
@@ -1161,25 +1463,91 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    c = Color(on=not args.no_color and sys.stdout.isatty())
+def resolve_axes(args) -> list:
+    """The axes this run asks, in canonical order. The legacy flags still work: `--sqlsolver`
+    adds the SQLSolver axis its `--sqlsolver-impl` names, so an old invocation runs what it
+    always ran. A prover is handed the frontend's plan, so asking one asks the frontend."""
+    if args.axes is None:
+        axes = {"frontend", "qed"}
+    else:
+        axes = {a.strip() for a in args.axes.split(",") if a.strip()}
+        unknown = sorted(axes - set(suite.AXES))
+        if unknown:
+            sys.exit(f"error: unknown axis {', '.join(unknown)} (one of {', '.join(suite.AXES)})")
+    if args.sqlsolver:
+        axes.add(f"sqlsolver-{args.sqlsolver_impl}")
+    if args.lean:
+        axes.add("lean")
+    if axes & set(suite.PROVERS):
+        axes.add("frontend")
+    if {"sqlsolver-rust", "sqlsolver-jvm"} <= axes:
+        sys.exit("error: one SQLSolver per run; --bless only touches the axes that ran, so "
+                 "two runs combine.")
+    if not axes:
+        sys.exit("error: --axes names no axis")
+    return [a for a in suite.AXES if a in axes]
 
-    frontend_bin = discover_frontend(args.frontend)
-    prover_bin = discover_prover(args.prover)
+
+def setup(args) -> dict:
+    """Every check that can fail before a case runs. Exits with a message, which `main`
+    turns into exit code 2: a missing tool is not a failed case."""
+    axes = resolve_axes(args)
+    pinned = args.expect == "pinned"
+    if args.bless and not pinned:
+        sys.exit("error: --bless needs --expect pinned")
+    if args.expect == "equivalent" and "qed" not in axes:
+        sys.exit("error: --expect equivalent is a policy on the qed axis, which --axes leaves "
+                 "out; use --expect pinned or report-only")
+    env = {"axes": axes}
+    env["frontend"] = discover_frontend(args.frontend) if "frontend" in axes else None
+    env["prover"] = discover_prover(args.prover) if "qed" in axes else None
     # Resolved before a single case runs — including the driver rebuild — so a
     # fork that is missing or will not compile costs a second, not a full pass.
-    ss_driver: Optional[SsDriver] = None
-    if args.sqlsolver:
-        ss_driver = (discover_sqlsolver_rust(args.sqlsolver_bin)
-                     if args.sqlsolver_impl == "rust"
-                     else discover_sqlsolver_jvm(args.sqlsolver_tree))
-    lean_bin = discover_lean(args.lean_bin) if args.lean else None
+    env["ss"] = None
+    if "sqlsolver-rust" in axes:
+        env["ss"] = discover_sqlsolver_rust(args.sqlsolver_bin)
+    elif "sqlsolver-jvm" in axes:
+        env["ss"] = discover_sqlsolver_jvm(args.sqlsolver_tree)
+    env["fuzz"] = discover_fuzz(args.fuzz_bin) if "fuzz" in axes else None
+    env["lean"] = discover_lean(args.lean_bin) if "lean" in axes else None
 
     files = collect_inputs(args.paths)
     if not files:
-        print("error: no .sql or .json inputs found.", file=sys.stderr)
-        return 2
+        sys.exit("error: no .sql or .json inputs found.")
+    if pinned:
+        plans = [str(f) for f in files if f.suffix == ".json"]
+        if plans:
+            sys.exit("error: --expect pinned reads each case's header, and a .json plan has "
+                     "none: " + ", ".join(plans[:3]))
+    env["files"] = files
+
+    bins = [env["frontend"], env["fuzz"], env["lean"]]
+    if env["ss"] is not None and env["ss"].impl == "rust":
+        bins.append(env["ss"].where)
+    for b in bins:
+        why = b and stale_build(b)
+        if why and args.bless:
+            sys.exit(f"error: {why}; rebuild it before blessing, or the pins record an "
+                     f"older tree's answers")
+        if why:
+            print(f"warning: {why}; its answers may not be this tree's", file=sys.stderr)
+    return env
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    c = Color(on=not args.no_color and sys.stdout.isatty())
+    try:
+        env = setup(args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+            return 2
+        raise
+    axes, files = env["axes"], env["files"]
+    frontend_bin, prover_bin, ss_driver = env["frontend"], env["prover"], env["ss"]
+    fuzz_bin, lean_bin = env["fuzz"], env["lean"]
+    pinned_mode = args.expect == "pinned"
 
     root = common_root(files)
 
@@ -1197,7 +1565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # driver's `todo`/`results`. Under --keep it sits beside the kept workdirs,
     # where a refused or surprising row can be replayed by hand.
     ss_dir, ss_tmp = None, None
-    if args.sqlsolver:
+    if ss_driver is not None:
         if keep_dir:
             # Cleared, not reused, unlike the per-case workdirs beside it: the
             # driver resumes from `results.jsonl`, so a previous run's answers
@@ -1211,11 +1579,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         ss_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.quiet:
-        print(c.dim(f"sqleq-frontend: {frontend_bin}"))
-        print(c.dim(f"qed-prover:   {prover_bin}"))
+        if frontend_bin:
+            print(c.dim(f"sqleq-frontend: {frontend_bin}"))
+        if prover_bin:
+            print(c.dim(f"qed-prover:   {prover_bin}"))
         if ss_driver:
             print(c.dim(f"sqlsolver:    {ss_driver.where} ({ss_driver.impl})"))
-        print(c.bold(f"Checking {len(files)} case(s) "
+        if fuzz_bin:
+            print(c.dim(f"sqleq-fuzz:   {fuzz_bin}"))
+        print(c.bold(f"Checking {len(files)} case(s) on {', '.join(axes)} "
                      f"with {args.jobs} worker(s), {args.timeout:.0f}s/case…"))
         print()
 
@@ -1224,29 +1596,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     cases: list[Case] = []
     t0 = time.monotonic()
     done = 0
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
-        futs = {
-            ex.submit(run_case, f, disp(f), frontend_bin, prover_bin,
-                      args.timeout, args.smt_timeout, keep_dir, ss_dir): f
-            for f in files
-        }
-        for fut in as_completed(futs):
-            case = fut.result()
-            cases.append(case)
-            done += 1
-            if args.verbose:
-                print_case_line(c, case, name_w)
-            elif not args.quiet:
-                if case.status != PROVABLE:
+    if frontend_bin is None:
+        # Only axes that read the pair file themselves: nothing to lower.
+        cases = [Case(name=disp(f), path=str(f), status=LOWERED) for f in files]
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+            futs = {
+                ex.submit(run_case, f, disp(f), frontend_bin, prover_bin,
+                          args.timeout, args.smt_timeout, keep_dir, ss_dir): f
+                for f in files
+            }
+            for fut in as_completed(futs):
+                case = fut.result()
+                cases.append(case)
+                done += 1
+                if args.verbose and not pinned_mode:
                     print_case_line(c, case, name_w)
-                elif live:
+                elif not args.quiet and not pinned_mode and case.status not in (PROVABLE,
+                                                                                LOWERED):
+                    print_case_line(c, case, name_w)
+                elif not args.quiet and live:
                     print(c.dim(f"  [{done}/{len(files)}] "), end="\r", flush=True)
 
     # Retry transient failures serially (no contention) — a heavy case starved
     # or OOM-killed under -j shouldn't be misreported as a real failure. A
     # refusal is deterministic, so it is never retried.
     TRANSIENT = (PANIC, TIMEOUT, ERROR)
-    if not args.no_retry:
+    if not args.no_retry and frontend_bin is not None:
         retry = [c for c in cases if c.status in TRANSIENT]
         if retry:
             if not args.quiet and live:
@@ -1262,7 +1638,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     STATUS_ORDER.index(new.status) < STATUS_ORDER.index(old.status))
                 if better:
                     cases[idx[old.name]] = new
-                    if not args.quiet:
+                    if not args.quiet and not pinned_mode:
                         print_case_line(c, new, name_w)
 
     wall = time.monotonic() - t0
@@ -1271,7 +1647,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # second opinion is a separate question and must not be able to move the
     # numbers above, nor they it.
     ss_stats: dict = {}
-    if args.sqlsolver and ss_dir is not None:
+    if ss_driver is not None and ss_dir is not None:
         if not args.quiet:
             if live:
                 print(" " * 30, end="\r")
@@ -1281,6 +1657,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         t1 = time.monotonic()
         ss_stats = run_second_opinion(cases, ss_dir, ss_driver, ss_timeout_ms)
         ss_stats["wall_s"] = round(time.monotonic() - t1, 3)
+
+    # The fuzz axis reads the pair files itself, so it is independent of the
+    # passes above — though not of the pair, which is the point.
+    fuzz_stats: dict = {}
+    if fuzz_bin:
+        if not args.quiet:
+            if live:
+                print(" " * 30, end="\r")
+            n = sum(1 for x in cases if x.path.endswith(".sql"))
+            print(c.dim(f"  asking sqleq-fuzz about {n} .sql case(s)…"))
+        fuzz_stats = run_fuzz(cases, fuzz_bin, args.jobs, args.timeout)
 
     # The Lean axis, likewise apart from both: it reads the pair files itself.
     lean_stats: dict = {}
@@ -1292,16 +1679,37 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(c.dim(f"  asking sqleq-lean about {n} .sql case(s)…"))
         lean_stats = run_lean(cases, lean_bin, args.jobs, args.timeout, keep_dir)
 
-    cases.sort(key=lambda x: (STATUS_ORDER.index(x.status)
-                              if x.status in STATUS_ORDER else 99, x.name))
+    if pinned_mode:
+        cases.sort(key=lambda x: x.name)
+    else:
+        cases.sort(key=lambda x: (STATUS_ORDER.index(x.status)
+                                  if x.status in STATUS_ORDER else 99, x.name))
 
     if not args.quiet and live:
         print(" " * 30, end="\r")  # clear progress line
-    print_summary(c, cases, wall)
-    print_second_opinion(c, cases, ss_stats)
-    print_lean(c, cases, lean_stats)
+    pinned: list = []
+    blessed: list = []
+    if pinned_mode:
+        pinned = judge_cases(cases, axes)
+        if args.bless:
+            blessed = bless(pinned)
+            # Judged again from the rewritten files, so what is printed and what decides
+            # the exit code are the pins as they now stand.
+            pinned = judge_cases(cases, axes)
+        print_pinned(c, pinned, axes)
+        if args.bless:
+            print(f"  {c.bold('blessed')} {len(blessed)} file(s)")
+            for name in blessed:
+                print(c.dim(f"    {name}"))
+    else:
+        if frontend_bin is not None:
+            print_summary(c, cases, wall, qed="qed" in axes)
+        print_second_opinion(c, cases, ss_stats)
+        print_fuzz(c, cases, fuzz_stats)
+        print_lean(c, cases, lean_stats)
 
     meta = {
+        "axes": axes,
         "frontend": frontend_bin,
         "prover": prover_bin,
         "jobs": args.jobs,
@@ -1311,11 +1719,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         "wall_s": round(wall, 3),
         "triviality": triviality_split(cases),
     }
-    if args.sqlsolver:
+    if ss_driver is not None:
         meta["sqlsolver"] = dict(ss_stats, impl=ss_driver.impl, where=ss_driver.where,
                                  timeout_ms=ss_timeout_ms)
+    if fuzz_bin:
+        meta["fuzz"] = dict(fuzz_stats, bin=fuzz_bin, args=FUZZ_ARGS)
     if lean_bin:
         meta["lean"] = dict(lean_stats, bin=lean_bin)
+    if pinned_mode:
+        meta["pinned"] = {"held": sum(p.passed for p in pinned), "total": len(pinned),
+                          "blessed": blessed}
+        meta["findings"] = (
+            [{"case": p.case.name, "lint": e} for p in pinned for e in p.lint]
+            + [{"case": p.case.name, "axis": j.axis, "state": j.state, "observed": j.observed,
+                "pinned": j.pin.word if j.pin else None, "note": j.note}
+               for p in pinned for j in p.judgements if not j.passed])
     if ss_tmp:
         shutil.rmtree(ss_tmp, ignore_errors=True)
     if args.json:
@@ -1329,12 +1747,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.expect == "report-only":
         return 0
+    if pinned_mode:
+        # Blessing never clears an invariant, a timeout or a lint error, so a bless run
+        # that leaves one of those behind still fails.
+        return 0 if all(p.passed for p in pinned) else 1
     # 'equivalent' policy: every case must be provable — by *our* prover. The
     # second opinion is deliberately not part of the policy: adding an axis must
     # not be able to turn a red CI run green, and its `no-proof` is not a
     # failure to begin with.
     return 0 if all(x.status == PROVABLE for x in cases) else 1
-
 
 if __name__ == "__main__":
     try:

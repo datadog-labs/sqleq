@@ -3,7 +3,16 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- expect: proved-gather
+-- truth: equivalent
+-- expect frontend: refuse:parameter-misaligned
+-- expect fuzz: error
+-- expect qed: no-plan
+-- expect sqlsolver-rust: no-plan
+-- expect sqlsolver-jvm: no-plan
+-- expect lean: proved-gather
+-- binding: gather
+-- origin: the gather rule itself: VALUES rows against one unnest of their columns
+
 -- A three-row insert rewritten as one unnest of three-element arrays: under the gather rule
 -- $1 is (the first column of every row), so unnest yields the same rows in the same order.
 CREATE TABLE events (id bigint NOT NULL, kind text, at timestamptz);
