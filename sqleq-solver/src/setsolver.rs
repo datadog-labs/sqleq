@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use z3::ast::{self, Ast, Bool, Dynamic, Int};
-use z3::{Config, Context, FuncDecl, Params, SatResult, Solver, Sort, Symbol};
+use z3::{FuncDecl, Params, SatResult, Solver, Sort, Symbol};
 
 use crate::translate::OUT_VAR_ID;
 use crate::uterm::{PredKind, UConst, UTerm, UVar};
@@ -70,25 +70,25 @@ pub fn applicable(t: &UTerm) -> bool {
 /// `Some(true)` when Z3 shows the two terms equal on every database; `Some(false)` when it does not
 /// (a counter-model, a timeout, or `unknown` -- never a disproof); `None` when the rung does not
 /// apply to one of them.
+///
+/// Terms live in the calling thread's Z3 context, which the binding creates implicitly, so the time
+/// limit and seed are set on the solver rather than on a context.
 pub fn prove(a: &UTerm, widths_a: &HashMap<u32, usize>, b: &UTerm, widths_b: &HashMap<u32, usize>) -> Option<bool> {
     if !applicable(a) || !applicable(b) {
         return None;
     }
-    let mut cfg = Config::new();
-    cfg.set_timeout_msec(TIMEOUT_MS as u64);
-    let ctx = Context::new(&cfg);
-    let mut enc = Encoder::new(&ctx);
+    let mut enc = Encoder::new();
     let ea = enc.count(a, Side::A, widths_a)?;
     let eb = enc.count(b, Side::B, widths_b)?;
-    let solver = Solver::new(&ctx);
-    let mut params = Params::new(&ctx);
+    let solver = Solver::new();
+    let mut params = Params::new();
     params.set_u32("timeout", TIMEOUT_MS);
     params.set_u32("random_seed", 9876);
     solver.set_params(&params);
     if let Some(distinct) = enc.distinct_constants() {
         solver.assert(&distinct);
     }
-    solver.assert(&ea._eq(&eb).not());
+    solver.assert(ea.eq(&eb).not());
     Some(solver.check() == SatResult::Unsat)
 }
 
@@ -127,37 +127,34 @@ fn canonical_decimal(s: &str) -> Option<String> {
     Some(if neg && body != "0" { format!("-{body}") } else { body })
 }
 
-struct Encoder<'ctx> {
-    ctx: &'ctx Context,
-    val: Sort<'ctx>,
+struct Encoder {
+    val: Sort,
     /// Constants by canonical spelling (or, for one without, by a spelling of its own).
-    consts: HashMap<String, (Dynamic<'ctx>, bool)>,
+    consts: HashMap<String, (Dynamic, bool)>,
     /// The `Val` constants standing for each base var's columns. The output var is shared by both
     /// sides; every other var belongs to one side.
-    vars: HashMap<(Option<Side>, u32), Vec<Dynamic<'ctx>>>,
-    funcs: HashMap<String, FuncDecl<'ctx>>,
+    vars: HashMap<(Option<Side>, u32), Vec<Dynamic>>,
+    funcs: HashMap<String, FuncDecl>,
 }
 
-impl<'ctx> Encoder<'ctx> {
-    fn new(ctx: &'ctx Context) -> Self {
+impl Encoder {
+    fn new() -> Self {
         Encoder {
-            ctx,
-            val: Sort::uninterpreted(ctx, Symbol::String("Val".into())),
+            val: Sort::uninterpreted(Symbol::String("Val".into())),
             consts: HashMap::new(),
             vars: HashMap::new(),
             funcs: HashMap::new(),
         }
     }
 
-    fn distinct_constants(&self) -> Option<Bool<'ctx>> {
-        let vals: Vec<&Dynamic<'ctx>> = self.consts.values().filter(|(_, exact)| *exact).map(|(v, _)| v).collect();
-        (vals.len() >= 2).then(|| Dynamic::distinct(self.ctx, &vals))
+    fn distinct_constants(&self) -> Option<Bool> {
+        let vals: Vec<&Dynamic> = self.consts.values().filter(|(_, exact)| *exact).map(|(v, _)| v).collect();
+        (vals.len() >= 2).then(|| Dynamic::distinct(&vals))
     }
 
     /// Applies the function `name` (declared on first use with this signature) to `args`.
-    fn apply(&mut self, name: String, domain: &[&Sort<'ctx>], range: &Sort<'ctx>, args: &[&dyn Ast<'ctx>]) -> Dynamic<'ctx> {
-        let ctx = self.ctx;
-        self.funcs.entry(name.clone()).or_insert_with(|| FuncDecl::new(ctx, name, domain, range)).apply(args)
+    fn apply(&mut self, name: String, domain: &[&Sort], range: &Sort, args: &[&dyn Ast]) -> Dynamic {
+        self.funcs.entry(name.clone()).or_insert_with(|| FuncDecl::new(name, domain, range)).apply(args)
     }
 
     fn key(side: Side, id: u32) -> (Option<Side>, u32) {
@@ -168,90 +165,89 @@ impl<'ctx> Encoder<'ctx> {
         }
     }
 
-    fn columns(&mut self, side: Side, id: u32, widths: &HashMap<u32, usize>) -> Option<Vec<Dynamic<'ctx>>> {
+    fn columns(&mut self, side: Side, id: u32, widths: &HashMap<u32, usize>) -> Option<Vec<Dynamic>> {
         let key = Self::key(side, id);
         if let Some(cols) = self.vars.get(&key) {
             return Some(cols.clone());
         }
         let width = *widths.get(&id)?;
-        let cols: Vec<Dynamic<'ctx>> = (0..width).map(|_| Dynamic::fresh_const(self.ctx, "c", &self.val)).collect();
+        let cols: Vec<Dynamic> = (0..width).map(|_| Dynamic::fresh_const("c", &self.val)).collect();
         self.vars.insert(key, cols.clone());
         Some(cols)
     }
 
-    fn constant(&mut self, c: &UConst) -> Dynamic<'ctx> {
+    fn constant(&mut self, c: &UConst) -> Dynamic {
         let (spelling, exact) = match canonical(c) {
             Some(s) => (s, true),
             None => (format!("raw:{c:?}"), false),
         };
-        let ctx = self.ctx;
         let val = &self.val;
-        self.consts.entry(spelling).or_insert_with(|| (Dynamic::fresh_const(ctx, "k", val), exact)).0.clone()
+        self.consts.entry(spelling).or_insert_with(|| (Dynamic::fresh_const("k", val), exact)).0.clone()
     }
 
-    fn table(&mut self, name: &str, var: &UVar, side: Side, widths: &HashMap<u32, usize>) -> Option<Int<'ctx>> {
+    fn table(&mut self, name: &str, var: &UVar, side: Side, widths: &HashMap<u32, usize>) -> Option<Int> {
         let UVar::Base(id) = var else { return None };
         let cols = self.columns(side, *id, widths)?;
-        let domain: Vec<Sort<'ctx>> = vec![self.val.clone(); cols.len()];
-        let refs: Vec<&Sort<'ctx>> = domain.iter().collect();
-        let args: Vec<&dyn Ast<'ctx>> = cols.iter().map(|c| c as &dyn Ast<'ctx>).collect();
-        self.apply(format!("T:{name}/{}", cols.len()), &refs, &Sort::int(self.ctx), &args).as_int()
+        let domain: Vec<Sort> = vec![self.val.clone(); cols.len()];
+        let refs: Vec<&Sort> = domain.iter().collect();
+        let args: Vec<&dyn Ast> = cols.iter().map(|c| c as &dyn Ast).collect();
+        self.apply(format!("T:{name}/{}", cols.len()), &refs, &Sort::int(), &args).as_int()
     }
 
     /// A multiplicity position.
-    fn count(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Int<'ctx>> {
-        let one = Int::from_i64(self.ctx, 1);
-        let zero = Int::from_i64(self.ctx, 0);
+    fn count(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Int> {
+        let one = Int::from_i64(1);
+        let zero = Int::from_i64(0);
         Some(match t {
-            UTerm::Const(UConst::Int(n)) => Int::from_i64(self.ctx, *n),
+            UTerm::Const(UConst::Int(n)) => Int::from_i64(*n),
             UTerm::Table { name, var } => self.table(name, var, side, widths)?,
             UTerm::Pred { kind, args } => self.pred(*kind, args, side, widths)?.ite(&one, &zero),
             UTerm::Squash(c) => self.set(c, side, widths)?.ite(&one, &zero),
             UTerm::Neg(c) => self.set(c, side, widths)?.ite(&zero, &one),
             UTerm::Add(ts) => {
-                let parts: Vec<Int<'ctx>> = ts.iter().map(|c| self.count(c, side, widths)).collect::<Option<_>>()?;
-                Int::add(self.ctx, &parts.iter().collect::<Vec<_>>())
+                let parts: Vec<Int> = ts.iter().map(|c| self.count(c, side, widths)).collect::<Option<_>>()?;
+                Int::add(&parts)
             }
             UTerm::Mul(ts) => {
-                let parts: Vec<Int<'ctx>> = ts.iter().map(|c| self.count(c, side, widths)).collect::<Option<_>>()?;
-                Int::mul(self.ctx, &parts.iter().collect::<Vec<_>>())
+                let parts: Vec<Int> = ts.iter().map(|c| self.count(c, side, widths)).collect::<Option<_>>()?;
+                Int::mul(&parts)
             }
             _ => return None,
         })
     }
 
     /// A set position: only whether the multiplicity is non-zero matters.
-    fn set(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Bool<'ctx>> {
+    fn set(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Bool> {
         Some(match t {
-            UTerm::Const(UConst::Int(n)) => Bool::from_bool(self.ctx, *n != 0),
-            UTerm::Table { name, var } => self.table(name, var, side, widths)?.gt(&Int::from_i64(self.ctx, 0)),
+            UTerm::Const(UConst::Int(n)) => Bool::from_bool(*n != 0),
+            UTerm::Table { name, var } => self.table(name, var, side, widths)?.gt(Int::from_i64(0)),
             UTerm::Pred { kind, args } => self.pred(*kind, args, side, widths)?,
             UTerm::Squash(c) => self.set(c, side, widths)?,
             UTerm::Neg(c) => self.set(c, side, widths)?.not(),
             UTerm::Add(ts) => {
-                let parts: Vec<Bool<'ctx>> = ts.iter().map(|c| self.set(c, side, widths)).collect::<Option<_>>()?;
-                Bool::or(self.ctx, &parts.iter().collect::<Vec<_>>())
+                let parts: Vec<Bool> = ts.iter().map(|c| self.set(c, side, widths)).collect::<Option<_>>()?;
+                Bool::or(&parts)
             }
             UTerm::Mul(ts) => {
-                let parts: Vec<Bool<'ctx>> = ts.iter().map(|c| self.set(c, side, widths)).collect::<Option<_>>()?;
-                Bool::and(self.ctx, &parts.iter().collect::<Vec<_>>())
+                let parts: Vec<Bool> = ts.iter().map(|c| self.set(c, side, widths)).collect::<Option<_>>()?;
+                Bool::and(&parts)
             }
             UTerm::Sum { vars, body } => {
-                let mut bound: Vec<Dynamic<'ctx>> = Vec::new();
+                let mut bound: Vec<Dynamic> = Vec::new();
                 for v in vars {
                     let UVar::Base(id) = v else { return None };
                     bound.extend(self.columns(side, *id, widths)?);
                 }
                 let body = self.set(body, side, widths)?;
-                let refs: Vec<&dyn Ast<'ctx>> = bound.iter().map(|c| c as &dyn Ast<'ctx>).collect();
-                ast::exists_const(self.ctx, &refs, &[], &body)
+                let refs: Vec<&dyn Ast> = bound.iter().map(|c| c as &dyn Ast).collect();
+                ast::exists_const(&refs, &[], &body)
             }
             _ => return None,
         })
     }
 
     /// A value position (a `Pred`/`Func` argument).
-    fn value(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Dynamic<'ctx>> {
+    fn value(&mut self, t: &UTerm, side: Side, widths: &HashMap<u32, usize>) -> Option<Dynamic> {
         Some(match t {
             UTerm::Const(c) => self.constant(c),
             UTerm::Var(UVar::Proj { index, base }) => {
@@ -264,32 +260,32 @@ impl<'ctx> Encoder<'ctx> {
             // A multiplicity used as a value: some fixed injection of the integer into `Val`.
             UTerm::Pred { .. } | UTerm::Squash(_) | UTerm::Neg(_) | UTerm::Table { .. } => {
                 let n = self.count(t, side, widths)?;
-                let (int_sort, val) = (Sort::int(self.ctx), self.val.clone());
+                let (int_sort, val) = (Sort::int(), self.val.clone());
                 self.apply("int2val".to_string(), &[&int_sort], &val, &[&n])
             }
             UTerm::Var(UVar::Base(_)) | UTerm::Sum { .. } => return None,
         })
     }
 
-    fn apply_val(&mut self, name: String, args: &[UTerm], side: Side, widths: &HashMap<u32, usize>) -> Option<Dynamic<'ctx>> {
-        let vals: Vec<Dynamic<'ctx>> = args.iter().map(|a| self.value(a, side, widths)).collect::<Option<_>>()?;
-        let domain: Vec<Sort<'ctx>> = vec![self.val.clone(); vals.len()];
-        let refs: Vec<&Sort<'ctx>> = domain.iter().collect();
+    fn apply_val(&mut self, name: String, args: &[UTerm], side: Side, widths: &HashMap<u32, usize>) -> Option<Dynamic> {
+        let vals: Vec<Dynamic> = args.iter().map(|a| self.value(a, side, widths)).collect::<Option<_>>()?;
+        let domain: Vec<Sort> = vec![self.val.clone(); vals.len()];
+        let refs: Vec<&Sort> = domain.iter().collect();
         let range = self.val.clone();
-        let args: Vec<&dyn Ast<'ctx>> = vals.iter().map(|v| v as &dyn Ast<'ctx>).collect();
+        let args: Vec<&dyn Ast> = vals.iter().map(|v| v as &dyn Ast).collect();
         Some(self.apply(format!("{name}/{}", vals.len()), &refs, &range, &args))
     }
 
-    fn pred(&mut self, kind: PredKind, args: &[UTerm], side: Side, widths: &HashMap<u32, usize>) -> Option<Bool<'ctx>> {
+    fn pred(&mut self, kind: PredKind, args: &[UTerm], side: Side, widths: &HashMap<u32, usize>) -> Option<Bool> {
         let [a, b] = args else { return None };
         let (va, vb) = (self.value(a, side, widths)?, self.value(b, side, widths)?);
-        let rel = |enc: &mut Self, name: &str, x: &Dynamic<'ctx>, y: &Dynamic<'ctx>| -> Option<Bool<'ctx>> {
-            let (val, boolean) = (enc.val.clone(), Sort::bool(enc.ctx));
+        let rel = |enc: &mut Self, name: &str, x: &Dynamic, y: &Dynamic| -> Option<Bool> {
+            let (val, boolean) = (enc.val.clone(), Sort::bool());
             enc.apply(name.to_string(), &[&val, &val], &boolean, &[x, y]).as_bool()
         };
         match kind {
-            PredKind::Eq => Some(va._eq(&vb)),
-            PredKind::Ne => Some(va._eq(&vb).not()),
+            PredKind::Eq => Some(va.eq(&vb)),
+            PredKind::Ne => Some(va.eq(&vb).not()),
             PredKind::Lt => rel(self, "lt", &va, &vb),
             PredKind::Le => rel(self, "lt", &vb, &va).map(|lt| lt.not()),
             PredKind::Gt => rel(self, "lt", &vb, &va),

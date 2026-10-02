@@ -28,11 +28,10 @@ for a counterexample. See [DESIGN.md](DESIGN.md) for why it is arranged that way
 
 ## The second proving axis (`sqleq-solver/`)
 
-A Rust rewrite of SQLSolver's proof engine, opt-in because it links a Z3 you supply: `cargo build -p
-sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. It reads the same `Input` JSON
-the QED prover gets and answers in the JVM driver's row format, so the original SQLSolver, kept as
-its cross-check, can be swapped in. What it rewrites, and where it deliberately differs from the
-original, is in [SQLSOLVER.md](SQLSOLVER.md).
+A Rust rewrite of SQLSolver's proof engine, opt-in because its first build compiles Z3 from source:
+`cargo build -p sqleq-solver`. It reads the same `Input` JSON the QED prover gets and answers in the
+JVM driver's row format, so the original SQLSolver, kept as its cross-check, can be swapped in. What
+it rewrites, and where it deliberately differs from the original, is in [SQLSOLVER.md](SQLSOLVER.md).
 
 ## The disproving axis (`sqleq-fuzz/`)
 

@@ -16,7 +16,7 @@ independent — which is what lets them check each other. Any pair a prover call
 
 The second prover is **`sqleq-solver`**, a Rust rewrite of
 [SQLSolver](https://github.com/SQLSolver/SQLSolver)'s proof engine that reads the same Input JSON
-and builds from this repository against a Z3 you supply. It is a second opinion:
+and builds from this repository alone, Z3 included. It is a second opinion:
 `tools/sqleq_check.py --sqleq-solver` reports its answer beside the prover's, and it never changes a
 verdict or an exit code. The original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a
 backup cross-check, but that needs a fork of it that is not published. See
@@ -175,10 +175,10 @@ on `sqlparser`, `serde_json` and `csv`.
 Build it with `cargo build --release -p sqleq-fuzz`. To link a libduckdb you already have instead,
 set `DUCKDB_LIB_DIR`; the build script checks it before it considers downloading anything.
 
-`sqleq-solver` is outside `default-members` too, because it links a Z3 you supply:
-`$SQLEQ_Z3_LIB_DIR` names the directory holding `libz3.so` and `$Z3_SYS_Z3_HEADER` a `z3.h` from the
-same release. Then `cargo build --release -p sqleq-solver`; the library's location is baked into the
-binary.
+`sqleq-solver` is outside `default-members` too: its first build compiles Z3 from source, which
+takes minutes and needs cmake and a C++20 compiler. Build it with
+`cargo build --release -p sqleq-solver`; Z3 is linked in statically, so the binary needs nothing at
+run time.
 
 The prover binary is external (from the upstream `qed-solver` project) and is not vendored here. It
 needs the native `z3` and `cvc5` solvers, and its Nix flake bundles them, so Nix is the most

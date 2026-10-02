@@ -664,8 +664,8 @@ def discover_sqleq_solver(override: Optional[str]) -> SsDriver:
     """Resolve `sqleq-solver`: explicit override -> $SQLEQ_SOLVER_BIN -> PATH ->
     this repo's own build (release preferred over debug).
 
-    No JDK, no fork tree and no library path: Z3 is linked at build time and its
-    location baked into the binary (`sqleq-solver/build.rs`)."""
+    No JDK, no fork tree and no library path: the build compiles Z3 from source and
+    links it in statically."""
     for c in (override, os.environ.get("SQLEQ_SOLVER_BIN")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
@@ -679,8 +679,8 @@ def discover_sqleq_solver(override: Optional[str]) -> SsDriver:
         return SsDriver("sqleq-solver", [found], REPO, dict(os.environ), found)
     sys.exit(
         "error: could not find 'sqleq-solver'. Build it with "
-        "`cargo build --release -p sqleq-solver` (it links Z3; see "
-        "sqleq-solver/build.rs), put it on PATH, or pass "
+        "`cargo build --release -p sqleq-solver` (its first build compiles Z3, "
+        "which needs cmake and a C++20 compiler), put it on PATH, or pass "
         "--sqleq-solver-bin/$SQLEQ_SOLVER_BIN.")
 
 

@@ -213,9 +213,8 @@ Mechanics worth knowing before reading a slow run:
 - Setup is checked **before any case runs**: a missing binary, classpath or
   `javac` exits 2 with the fix rather than reporting `s-missing` for every row.
 - `sqleq-solver` (the default) needs only its binary: `cargo build --release
-  -p sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` (a directory holding `libz3.so`) and
-  `$Z3_SYS_Z3_HEADER` (a matching `z3.h`) set. The library's location is baked
-  into the binary, so nothing is needed at run time.
+  -p sqleq-solver`, which compiles Z3 from source and links it in, so nothing is
+  needed at run time (the first build needs cmake and a C++20 compiler).
 - With `--sqlsolver-jvm` it requires the fork tree (its `lib/` holds the Z3
   natives), a JDK, and `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded
   dependency directory the fork was compiled against. The driver compiles itself

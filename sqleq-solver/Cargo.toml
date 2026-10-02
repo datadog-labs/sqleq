@@ -11,7 +11,6 @@ rust-version = "1.85"
 description = "A Rust rewrite of SQLSolver's equivalence-checking proof engine"
 license = "Apache-2.0"
 publish = false
-build = "build.rs"
 
 [lib]
 name = "sqleq_solver"
@@ -28,9 +27,7 @@ serde = { version = "1", features = ["derive"] }
 # AND/OR/CAST chains), which is ordinary input, not adversarial.
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 
-# The same fork (and pinned commit) the QED prover uses for its Z3 bindings -- a version already
-# known to build and link against a system libz3, rather than the current upstream `z3`/`z3-sys`
-# crates untested. Pinned by `rev` rather than tracking the branch
-# head, so this crate can't silently drift onto a different resolved commit than the one this was
-# built and validated against.
-z3 = { git = "https://github.com/wsx-ucb/z3.rs", rev = "255189446ce4ac65627229ce3bd5e97d7d781cec" }
+# "vendored": Z3 itself is compiled from the source crate `z3-src` (checksum-pinned in Cargo.lock)
+# and linked statically, so there is no Z3 to install and nothing to find at run time. The first
+# build compiles Z3 and needs cmake and a C++20 compiler.
+z3 = { version = "0.21.1", features = ["vendored"] }

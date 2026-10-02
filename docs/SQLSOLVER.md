@@ -37,7 +37,7 @@ to check against `sqleq-fuzz`.
 
 ## Reproducing this
 
-`sqleq-solver` is reproducible from this repository plus a `libz3`: `cargo build --release -p
+`sqleq-solver` is reproducible from this repository alone, Z3 included: `cargo build --release -p
 sqleq-solver`, and `--sqleq-solver` in `sqleq_check.py` finds it. The JVM fork is **not reproducible
 from this repository alone.** Neither of its two checkouts is vendored here, and only one of them is
 public:
@@ -175,8 +175,9 @@ tables against a reference evaluator.
 
 ### Building
 
-Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
-`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.
+`cargo build --release -p sqleq-solver` compiles Z3 from source and links it statically, so the
+binary needs nothing at run time; the first build takes minutes and needs cmake and a C++20
+compiler.
 
 ## The JVM fork
 
