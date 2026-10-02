@@ -3,12 +3,14 @@
 | script | what it does |
 |---|---|
 | `sqleq_check.py` | the batch harness: a directory of `.sql` pairs in, verdicts and a CI exit code out |
+| `sqleq_suite.py` | the pinned-pair header grammar, its judgement and `--bless`, used by `sqleq_check.py --expect pinned` — see [`../tests/pairs/README.md`](../tests/pairs/README.md) |
 | `linkcheck.py` | every relative link in every tracked Markdown file resolves |
 | `update_license_3rdparty.sh` | regenerates `LICENSE-3rdparty.csv`; `--check` is the CI gate — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | `sqlsolver/` | our side of the IR bridge to the second prover — see [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) |
 | `lean_replay.py` | re-runs the Lean axis's INSERT pairs on a real Postgres, as an independent check — see [`../docs/LEAN.md`](../docs/LEAN.md) |
 
-Standard library only, Python 3.8+. `test_sqleq_check.py` covers `sqleq_check.py`; run it with
+Standard library only, Python 3.8+. `test_sqleq_check.py` covers `sqleq_check.py` and
+`test_sqleq_suite.py` its pinned mode; run both with
 `python3 -m unittest discover -s tools -p 'test_*.py'`.
 
 To lower a whole corpus CSV in one pass instead, the frontend has its own
@@ -80,6 +82,10 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--smt-timeout MS` | Sets `QED_SMT_TIMEOUT` per SMT request (prover default is 10000 ms). |
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable`. |
 | `--expect report-only` | Always exit 0; just report. |
+| `--expect pinned` | Each case's header pins every axis's answer; exit non-zero on any movement. See [Pinned pairs](#pinned-pairs). |
+| `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqlsolver-rust`, `sqlsolver-jvm` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. |
+| `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. |
+| `--fuzz-bin PATH` | The `sqleq-fuzz` binary (else `$SQLEQ_FUZZ`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--json` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs. |
 | `--no-retry` | Don't re-run transient failures serially at the end. |
@@ -215,11 +221,36 @@ Mechanics worth knowing before reading a slow run:
 See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for the bridge, the
 Calcite-ectomy behind it, and what each bucket was measured to be worth.
 
+### Pinned pairs
+
+`--expect pinned` is the policy for [`../tests/pairs/`](../tests/pairs/README.md): every case says
+in its header whether it is equivalent, and what each axis answered when it was last reviewed. The
+run asks the axes in `--axes` again and fails on any movement — an improvement as much as a
+regression — and on any answer that contradicts the case's truth, which `--bless` will never pin.
+
+```sh
+# What CI checks, one axis per job:
+python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
+# After a change that moves answers: rewrite the pins, then review the diff.
+python3 tools/sqleq_check.py --expect pinned --bless --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
+```
+
+Two things differ from the other policies:
+
+* **The fuzz axis.** `fuzz` runs `sqleq-fuzz file` on each pair with its trial budget passed
+  explicitly (`--trials 120 --rows 5 --seed 0`), so a change to the tool's defaults cannot move a
+  pin. It reads the pair itself, so `--axes fuzz` alone needs no frontend.
+* **The catalog header.** A case may say `-- catalog: inferred` or `-- catalog: inferred-seeded`,
+  and the frontend is run with the matching flag; any `.sql` input may, not only a pinned one.
+
+A binary in this repository's `target/` that is older than its sources gets a warning, and stops
+`--bless` outright: pins blessed against a stale build record an older tree's answers.
+
 ### Exit codes
 
 - `0` — policy satisfied (see `--expect`).
 - `1` — policy not satisfied (some case failed the expectation).
-- `2` — usage / setup error (no inputs, binary not found, …).
+- `2` — usage / setup error (no inputs, binary not found, a flag that does not combine, …).
 
 ### Implementation notes
 

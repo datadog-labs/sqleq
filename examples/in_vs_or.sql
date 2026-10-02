@@ -3,6 +3,15 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
+-- truth: equivalent
+-- expect frontend: emit-reflexive
+-- expect fuzz: no-counterexample
+-- expect qed: proved-literal
+-- expect sqlsolver-rust: proved-literal
+-- expect sqlsolver-jvm: proved-literal
+-- origin: the README's quick start: IN against the OR it abbreviates
+-- argument: `tier IN (1, 2)` is defined as `tier = 1 OR tier = 2`
+
 -- Schema for the pair.
 create table "users" (
   "id"      INTEGER,
