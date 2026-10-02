@@ -8,7 +8,7 @@ name = "sqleq-solver"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Rust port of SQLSolver's equivalence-checking proof engine"
+description = "A Rust rewrite of SQLSolver's equivalence-checking proof engine"
 license = "Apache-2.0"
 publish = false
 build = "build.rs"
@@ -17,7 +17,7 @@ build = "build.rs"
 name = "sqleq_solver"
 path = "src/lib.rs"
 
-# IrDriver's command line and JSONL contract over the Rust port; see src/main.rs.
+# IrDriver's command line and JSONL contract, so a harness drives either one; see src/main.rs.
 [[bin]]
 name = "sqleq-solver"
 path = "src/main.rs"

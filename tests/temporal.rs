@@ -154,7 +154,7 @@ fn temporal_types_keep_their_names_in_the_ir() {
 #[test]
 fn timestamptz_never_leaves_the_frontend_under_its_own_name() {
     // Every type position, the sort collation's included: a stray TIMESTAMPTZ would be an
-    // equality-only sort to QED, an unknown type to the Rust port and `ANY` to the JVM bridge.
+    // equality-only sort to QED, an unknown type to sqleq-solver and `ANY` to the JVM bridge.
     for src in [CatalogSource::InferredSeeded, CatalogSource::Declared] {
         let q = r#"SELECT "tz", "tz" > "ts" FROM "t" ORDER BY "tz" DESC LIMIT 5"#;
         let s = lower(q, q, src).to_string();

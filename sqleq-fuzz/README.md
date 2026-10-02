@@ -3,7 +3,7 @@
 A **license-clean concrete differential tester** — the `fuzz` axis of `sqleq`, and the only one of
 its three axes that can *refute*. It is a SQL non-equivalence disprover, and so also an independent
 oracle/soundness check on the two proving axes: the [QED](https://github.com/qed-solver/prover)
-prover and SQLSolver. The approach has already earned its keep: an earlier prototype of it found a
+prover and `sqleq-solver`, a Rust rewrite of SQLSolver. The approach has already earned its keep: an earlier prototype of it found a
 genuine soundness bug in the QED prover.
 
 ## What it does

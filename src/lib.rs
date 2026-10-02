@@ -6,8 +6,8 @@
 //! `sqleq-frontend` — read a SQL equivalence pair, and lower it to a prover's input IR.
 //!
 //! This crate parses a SQL equivalence pair, resolves names and types, and lowers it to the
-//! `Relation`/`Expr` JSON both proving axes consume: the QED prover directly, and SQLSolver through
-//! the IR bridge in [`sqlsolver`]. It replaces the legacy Python preprocessor + Java/Calcite parser
+//! `Relation`/`Expr` JSON both proving axes consume: the QED prover directly, and `sqleq-solver` (a
+//! Rust rewrite of SQLSolver) through the job files [`sqlsolver`] writes. It replaces the legacy Python preprocessor + Java/Calcite parser
 //! with a single Rust frontend (see `docs/DESIGN.md`). The third axis, `sqleq-fuzz`, does not read
 //! IR at all — it runs the two queries against DuckDB and looks for a counterexample.
 //!

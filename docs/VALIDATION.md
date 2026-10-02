@@ -19,8 +19,9 @@ Query equivalence is undecidable in general, so no tool decides every pair. What
 | a **disprover** | non-equivalent | equivalent | nothing about the pair |
 
 `sqleq` runs both kinds over one frontend. Two proving axes — the
-[QED](https://github.com/qed-solver/prover) prover and SQLSolver, both reading IR this repo
-produces — and one refuting axis, `sqleq-fuzz`, which runs the pair against DuckDB on generated
+[QED](https://github.com/qed-solver/prover) prover and `sqleq-solver`, a Rust rewrite of
+[SQLSolver](https://github.com/SQLSolver/SQLSolver), both reading IR this repo produces — and one
+refuting axis, `sqleq-fuzz`, which runs the pair against DuckDB on generated
 instances and reports the first divergence.
 
 The single most important consequence: **"not proved" is not "not equivalent."** It is a statement

@@ -6,9 +6,9 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 205 + 9 + 7 + 179 + 18 + 11 + 11
+cargo test                 # the frontend: 206 + 10 + 7 + 190 + 18 + 11 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
-cargo test -p sqleq-solver # the SQLSolver port: 57 (needs Z3, see below)
+cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (needs Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 25 + 3 (needs Lean, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves

@@ -1,42 +1,61 @@
-# SQLSolver as the `sqlsolver` axis
+# SQLSolver: `sqleq-solver`, with the JVM fork as a cross-check
 
 [SQLSolver](https://github.com/SQLSolver/SQLSolver) (SIGMOD 2024, Apache 2.0) is a second SQL
-equivalence prover. It is wired in here as a **research axis only**: `tools/sqleq_check.py` can ask
-it with `--sqlsolver`, but the answer is reported alongside and never changes a verdict or an exit
-code. The point of having it is that two provers of different construction, reading the same IR,
-check each other — see [VALIDATION.md](VALIDATION.md).
+equivalence prover. This repository answers the `sqlsolver` axis with **`sqleq-solver`**, a Rust
+rewrite of SQLSolver's proof engine ([below](#sqleq-solver)): it reads the same `Input` JSON the QED
+prover gets, needs no JVM, and is what `tools/sqleq_check.py --sqlsolver` asks by default. The
+original, run as a JVM fork through `tools/sqlsolver/`, is kept as a **backup cross-check**
+([below](#the-jvm-fork)): `--sqlsolver-impl=jvm` asks it instead, and running both on the same jobs
+shows where they disagree.
 
-Two checkouts of it are involved, named throughout by the environment variables the harnesses read:
+Either way the axis is a **second opinion**: its answer is reported beside QED's and never changes a
+verdict or an exit code. The point of having it is that two provers of different construction,
+reading the same IR, check each other — see [VALIDATION.md](VALIDATION.md).
 
-| variable | tree |
-| --- | --- |
-| `$SQLEQ_SQLSOLVER_PRISTINE` | an unmodified upstream checkout — the control, and what serves the SQL-text path |
-| `$SQLEQ_SQLSOLVER` | the fork with Calcite removed, which serves the IR bridge |
-| `$SQLEQ_SQLSOLVER_DEPS` | the fork's exploded dependency directory |
+The fork is the cross-check rather than the axis because it proves some pairs that Postgres does not
+treat as equivalent, and because it cannot be rebuilt from public sources. The false proofs known so
+far, and what stands between each and a reported verdict:
 
-Nothing in the pristine checkout is modified by any of this, and nothing is filed against it.
+* **Any two `UPDATE`s of one table are `EQ`**
+  ([below](#the-update-unsoundness--why-unsupported-exists)). The harness buckets every row that is
+  not a query `unsupported`, whatever the fork answers.
+* **`UNIQUE` is read as "no duplicate rows at all"**, while Postgres allows any number of NULLs
+  ([below](#unique-means-something-different-here)). The schema declares `UNIQUE` only over `NOT
+  NULL` columns.
+* **Every `CAST` is erased**, which equates `CAST(a AS REAL) / b` with `a / b`. The conversions the
+  frontend names as functions (temporal conversions, qualified and opaque targets) survive as such;
+  a plain `CAST` does not, and nothing guards it.
+* **A boolean value in a `SELECT` list is read as two-valued.** The fork proves `SELECT x IS NOT
+  NULL AND x <= 5 FROM t` equivalent to `SELECT x <= 5 FROM t`, but on a row where `x` is NULL the
+  first is FALSE and the second is NULL. In a `WHERE` the two filter alike, so only a projected
+  value is affected. Nothing guards this either.
+
+`sqleq-solver` gets each of these right by construction (see [*Where it deliberately
+differs*](#where-it-deliberately-differs-from-the-fork)). So an `EQ` from the fork that
+`sqleq-solver` does not share is a prompt to look, not a proof; and an `EQ` from either is a claim
+to check against `sqleq-fuzz`.
 
 ## Reproducing this
 
-**Not from this repository alone.** Neither checkout is vendored here, and only one of the two is
+`sqleq-solver` is reproducible from this repository plus a `libz3`: `cargo build --release -p
+sqleq-solver`, and `--sqlsolver` in `sqleq_check.py` finds it. The JVM fork is **not reproducible
+from this repository alone.** Neither of its two checkouts is vendored here, and only one of them is
 public:
 
 * The **SQL-text path** needs `$SQLEQ_SQLSOLVER_PRISTINE`, an unmodified upstream checkout, plus a
   JDK. That checkout is public, so anything described here about that path can be re-checked.
-* The **Rust port** (`sqleq-solver`, [below](#the-rust-port-sqleq-solver)) is reproducible
-  from this repository plus a system `libz3`: `--sqlsolver --sqlsolver-impl=rust` needs neither
-  checkout.
-* The **IR bridge** and everything downstream of it — including `--sqlsolver` in `sqleq_check.py` —
-  need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That fork is not
-  published.** The sections below state what the fork has to do, which is enough to redo the work,
-  but redoing it is a rebuild rather than a checkout.
+* The **IR bridge** and everything downstream of it — including `--sqlsolver --sqlsolver-impl=jvm`
+  in `sqleq_check.py` — need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That
+  fork is not published.** The sections below state what the fork has to do, which is enough to redo
+  the work, but redoing it is a rebuild rather than a checkout.
 
 The Java sources that *are* in this repository — `tools/sqlsolver/` — are our side of the bridge.
 They compile against the fork and do nothing without it.
 
 ## Verdicts are not symmetric
 
-`VerificationResult` has four values and only one of them is a claim:
+Both implementations answer with SQLSolver's four `VerificationResult` values, and only one of them
+is a claim:
 
 | raw | means | bucket |
 |---|---|---|
@@ -45,21 +64,21 @@ They compile against the fork and do nothing without it.
 | `UNKNOWN` | no proof found | `no-proof` |
 | `TIMEOUT` | no proof found | `timeout` |
 
-**`NEQ` is not a counterexample.** SQLSolver is sound but incomplete, and `NEQ` is what it returns
-when a proof attempt fails, not when it has refuted anything. The harness collapses `NEQ` and
-`UNKNOWN` into one bucket deliberately, so that no downstream reader can read `NEQ` as a
+**`NEQ` is not a counterexample.** SQLSolver is meant to be sound and is incomplete, and `NEQ` is
+what it returns when a proof attempt fails, not when it has refuted anything. The harness collapses
+`NEQ` and `UNKNOWN` into one bucket deliberately, so that no downstream reader can read `NEQ` as a
 refutation. `sqleq-fuzz` remains the only disprover in the system.
 
 `HANG` and `DIED` are this harness's labels rather than SQLSolver's: a worker that ignored its
-interrupt, and a JVM that never answered.
+interrupt, and a driver process that never answered.
 
 ### Two kinds of `EQ`
 
-`getVerifyResult` answers `EQ` on either of two grounds, and they are not worth the same. Before it
-solves anything it asks `PlanSupport.isLiteralEq`, which re-parses both sides and compares the
-assembled plan trees structurally. An `EQ` from there says the two queries are the same query — not
-that the prover related two different ones. Counting those as capability repeats the mistake the
-qed axis's own reflexivity check exists to avoid.
+In the fork, `getVerifyResult` answers `EQ` on either of two grounds, and they are not worth the
+same. Before it solves anything it asks `PlanSupport.isLiteralEq`, which re-parses both sides and
+compares the assembled plan trees structurally. An `EQ` from there says the two queries are the same
+query — not that the prover related two different ones. Counting those as capability repeats the
+mistake the qed axis's own reflexivity check exists to avoid.
 
 So the driver asks the same question again, after verification and only on `EQ`, and emits
 `"literal":true|false` beside the verdict: `proved` means the solver proved it, `proved-literal`
@@ -68,7 +87,113 @@ extra parse on the `EQ` rows alone and cannot perturb the verdict it explains. A
 could not label reads as a proof rather than being quietly downgraded, so the inflation this guards
 against cannot come back as an undercount.
 
-## The `UPDATE` unsoundness — why `unsupported` exists
+`sqleq-solver` makes the same split earlier: its tier 0 compares the two raw IR trees before
+anything is parsed, and labels an `EQ` from there `literal: true` in the same field.
+
+## `--sqlsolver` in `sqleq_check.py`
+
+`tools/sqleq_check.py --sqlsolver` asks `sqleq-solver` about every pair in a run, or the fork with
+`--sqlsolver-impl=jvm`, and reports the answer beside the qed one. Three design constraints shaped
+it, all from the fork, and the pass keeps them for both so that the two implementations' answers
+stay comparable:
+
+1. **One driver process, at the end, sequentially.** A JVM start is a large fraction of what a
+   `.sql` pair costs, so paying it per case would swamp the run.
+2. **The JVM self-halts** rather than unwinding, so something has to notice the missing answers and
+   resume. A per-case call has nowhere to put that loop.
+3. **The per-row cap is load-sensitive.** Under `-j 8` a row near the cap decides differently than
+   it does alone, and a second opinion that changes with `-j` is not a second opinion.
+
+So `run_case` does one sqlsolver-axis thing — it packages the plan, while the case's working
+directory still exists — and a single sequential pass at the end asks the driver about every job.
+The packaging cost is discounted from the case wall time, so a `--sqlsolver` run's timings stay
+comparable to one without it.
+
+## `sqleq-solver`
+
+`sqleq-solver/` is a Rust rewrite of the part of SQLSolver that the IR bridge reaches: from the
+`Input` JSON to a verdict, without Calcite, without SQL text, and without a JVM. Its binary takes
+`IrDriver`'s arguments and writes `IrDriver`'s rows, so `sqleq_check.py` drives either
+implementation with the same buckets, the same resume loop and the same report.
+
+What it rewrites, in the order the ladder runs it:
+
+* **Tier 0** on the raw IR: two identical trees answer `EQ` with `literal: true`, before anything
+  is parsed, exactly as `IrDriver` does.
+* **Translation** to U-expressions (`UExprConcreteTranslator`), then **normalization**
+  (`UNormalization`, `QueryUExprNormalizer`), **integrity-constraint rewriting**
+  (`QueryUExprICRewriter`, with the constraints read from the IR's own schemas) and
+  **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
+  Normalization also merges a row's matched and unmatched summands (`Σ X·N + Σ X·¬N` is `Σ X`
+  when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
+  LIA\* rung.
+* **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
+  or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings,
+  so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
+  used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
+  of one type are totally ordered.
+
+Not rewritten: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
+summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
+its encodings do not hold for Postgres as written. Its integer reading of dates and timestamps is
+one: `ts >= k AND ts < k + 1` is not `ts = k` for a timestamp, and `'infinity'::date + 1` is
+`infinity`, so even `d + 1 > d` fails. The IR names every temporal operation and conversion
+(`q_arith_add_date_integer`, `q_conv_date_timestamp` and the like), which is what such a rung would
+have to interpret, infinities included. **`LIMIT`/`OFFSET`** (`OrderbySupport`) is not rewritten
+either; a bare `ORDER BY` is erased, which is sound under the bag semantics `sqleq` decides.
+
+### Where it deliberately differs from the fork
+
+Each difference is there for soundness:
+
+* **Three-valued logic is explicit.** A predicate translates to separate TRUE and FALSE terms, so
+  `NOT` of an UNKNOWN comparison stays UNKNOWN and `NOT IN` gets its `NULL` rule. A single 0/1 term
+  per predicate would make `NOT (a = 1)` hold on a `NULL` `a`, and a projected boolean FALSE where
+  Postgres returns NULL.
+* **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
+  fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
+  types is not treated as an identity either, since the frontend drops the ones that are.
+* **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
+  is derive their nullness; any other function — parameter carriers included, since a parameter
+  may be bound to `NULL` — gets an uninterpreted nullness of its own.
+* **Rules that are unsound as written in the fork are left out**, and sums compare as true
+  multisets (`UAdd.equals` is a one-way set comparison under which `a + a` equals `a + b`).
+
+So the two disagree in both directions: some pairs the fork proves `sqleq-solver` does not (the
+LIA\* rung, pairs that rely on a parameter never being `NULL`, and the false proofs listed at the
+top), and some `sqleq-solver` proves the fork does not (rewrites the fork does not normalize, and
+pairs where it runs out of time). Either way an `EQ` is a claim to be checked against `sqleq-fuzz`.
+
+### How it is checked
+
+`examples/phase2_gate.rs` runs the ladder over a job file and joins it row by row against
+`IrDriver`'s results and the fuzz axis's verdicts, failing on any `EQ` over a pair the fuzz axis
+refutes. `examples/normalize_check.rs` evaluates each side before and after normalization, and both
+sides of every proved pair, on small random databases that respect the schemas' column types and
+constraints, using the crate's concrete evaluator. The crate's unit tests pin the three-valued truth
+tables against a reference evaluator.
+
+### Building
+
+Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
+`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.
+
+## The JVM fork
+
+The original SQLSolver, run through `tools/sqlsolver/` over a fork with Calcite removed, kept as the
+backup cross-check described at the top. Two checkouts of it are involved, named throughout by the
+environment variables the harnesses read:
+
+| variable | tree |
+| --- | --- |
+| `$SQLEQ_SQLSOLVER_PRISTINE` | an unmodified upstream checkout — the control, and what serves the SQL-text path |
+| `$SQLEQ_SQLSOLVER` | the fork with Calcite removed, which serves the IR bridge |
+| `$SQLEQ_SQLSOLVER_DEPS` | the fork's exploded dependency directory |
+
+Nothing in the pristine checkout is modified by any of this, and nothing is filed against it. Where
+the sections below say SQLSolver, they mean this Java implementation.
+
+### The `UPDATE` unsoundness — why `unsupported` exists
 
 **Any two `UPDATE` statements against the same table are reported `EQ`, whatever they do.**
 
@@ -103,7 +228,7 @@ too even though they currently answer safely. The row is still emitted and still
 verdict is kept beside the bucket, so a refused `EQ` stays visible in the record instead of
 disappearing.
 
-## Parameters: `$1` becomes `_DOLLAR_1()`
+### Parameters: `$1` becomes `_DOLLAR_1()`
 
 `SqlSupport.parsePreprocess` rewrites `$` to `_DOLLAR_`, which turns `$1` into the bare identifier
 `_DOLLAR_1` and fails Calcite validation; there is no dynamic-parameter support anywhere in the
@@ -129,7 +254,7 @@ syntactic slot, neither of which is ours to make.
 Binding is **by index** — `$1` on the left is `$1` on the right — the same choice the qed and fuzz
 axes make. See [SOUNDNESS.md](SOUNDNESS.md).
 
-## The schema must be MySQL-dialect DDL
+### The schema must be MySQL-dialect DDL
 
 `CalciteSupport` hardcodes `DB_TYPE = MySQL`, so `-schema` is parsed by their MySQL ANTLR grammar.
 We render it from the catalog `pgddl::parse_provided_schema` already builds — nothing new parses
@@ -157,14 +282,14 @@ function like any other unknown operator (see [SOUNDNESS.md](SOUNDNESS.md)). SQL
 `CAST`, so a conversion written as one would vanish. INTERVAL, which may count months, is not linear
 in one unit and falls through to `varbinary(255)`.
 
-### `UNIQUE` means something different here
+#### `UNIQUE` means something different here
 
 SQLSolver models `UNIQUE` as "no duplicate rows at all". Postgres allows any number of NULLs in a
 unique column. With a nullable unique `a`, SQLSolver reports `SELECT DISTINCT a FROM t` ≡ `SELECT a
 FROM t` — **false in Postgres**. So the emitter declares `UNIQUE` only when every column of the key
 is `NOT NULL`.
 
-### Schema qualifiers must come off
+#### Schema qualifiers must come off
 
 Calcite's root schema here is flat — `calciteSchema.add(table.name(), calciteTable)`, no
 sub-schemas — so `public.t` cannot resolve, and `sqleq-fuzz`'s trick of creating the table under
@@ -176,7 +301,7 @@ reduce to `t`, two distinct relations become one and a non-equivalent pair could
 equivalent. `qualifier_conflict` detects that and leaves both sides qualified — they then fail to
 resolve, so no proof can come out either.
 
-## The IR bridge — feeding it our plans instead of SQL text
+### The IR bridge — feeding it our plans instead of SQL text
 
 The axis normally re-derives a plan by parsing our emitted SQL with Calcite/Babel in MySQL dialect,
 and that parser, not the prover, is where it mostly loses. The bridge removes the round trip:
@@ -187,7 +312,7 @@ overload. No SQL text is on the path, and the same bytes reach both provers — 
 re-lowering the SQL for the second prover would put a second lowering between the two axes and
 reintroduce exactly the drift the cross-check exists to rule out.
 
-## Operational constraints
+### Operational constraints
 
 Three of these are load-bearing, and getting any one wrong looks like a wrong answer rather than an
 error.
@@ -209,84 +334,3 @@ error.
   the CLI's one-schema-per-batch mode is unusable for a corpus where rows carry their own DDL.
 * The jar runs under a system JDK 21; *rebuilding* SQLSolver needs JDK 17 — another reason not to
   depend on patching it.
-
-## `--sqlsolver` in `sqleq_check.py`
-
-`tools/sqleq_check.py --sqlsolver` asks the fork about every pair in a run and reports the answer
-beside the qed one. Three design constraints shaped it, and each is load-bearing:
-
-1. **One JVM, at the end, sequentially.** A JVM start is a large fraction of what a `.sql` pair
-   costs, so paying it per case would swamp the run.
-2. **The JVM self-halts** rather than unwinding, so something has to notice the missing answers and
-   resume. A per-case call has nowhere to put that loop.
-3. **The per-row cap is load-sensitive.** Under `-j 8` a row near the cap decides differently than
-   it does alone, and a second opinion that changes with `-j` is not a second opinion.
-
-So `run_case` does one sqlsolver-axis thing — it packages the plan, while the case's working
-directory still exists — and a single sequential pass at the end asks the fork about every job. The
-packaging cost is discounted from the case wall time, so a `--sqlsolver` run's timings stay
-comparable to one without it.
-
-## The Rust port, `sqleq-solver`
-
-`sqleq-solver/` reimplements the part of SQLSolver that the IR bridge reaches: from the
-`Input` JSON to a verdict, without Calcite, without SQL text, and without a JVM. Its binary takes
-`IrDriver`'s arguments and writes `IrDriver`'s rows, so `--sqlsolver-impl=rust` in
-`sqleq_check.py` swaps one command for the other and leaves the buckets, the resume loop and the
-report unchanged.
-
-What is ported, in the order the ladder runs it:
-
-* **Tier 0** on the raw IR: two identical trees answer `EQ` with `literal: true`, before anything
-  is parsed, exactly as `IrDriver` does.
-* **Translation** to U-expressions (`UExprConcreteTranslator`), then **normalization**
-  (`UNormalization`, `QueryUExprNormalizer`), **integrity-constraint rewriting**
-  (`QueryUExprICRewriter`, with the constraints read from the IR's own schemas) and
-  **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
-  Normalization also merges a row's matched and unmatched summands (`Σ X·N + Σ X·¬N` is `Σ X`
-  when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
-  LIA\* rung.
-* **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
-  or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings,
-  so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
-  used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
-  of one type are totally ordered.
-
-Not ported: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
-summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
-its encodings do not hold for Postgres as written. Its integer reading of dates and timestamps is one:
-`ts >= k AND ts < k + 1` is not `ts = k` for a timestamp, and `'infinity'::date + 1` is `infinity`,
-so even `d + 1 > d` fails. The IR names every temporal operation and conversion
-(`q_arith_add_date_integer`, `q_conv_date_timestamp` and the like), which is what such a rung would
-have to interpret, infinities included.
-**`LIMIT`/`OFFSET`** (`OrderbySupport`) is not ported either; a bare `ORDER BY` is erased, which is
-sound under the bag semantics `sqleq` decides.
-
-Where the port deliberately differs from the fork, each for soundness:
-
-* **Three-valued logic is explicit.** A predicate translates to separate TRUE and FALSE terms, so
-  `NOT` of an UNKNOWN comparison stays UNKNOWN and `NOT IN` gets its `NULL` rule. A single 0/1 term
-  per predicate would make `NOT (a = 1)` hold on a `NULL` `a`.
-* **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
-  fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
-  types is not treated as an identity either, since the frontend drops the ones that are.
-* **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
-  is derive their nullness; any other function — parameter carriers included, since a parameter
-  may be bound to `NULL` — gets an uninterpreted nullness of its own.
-* **Rules that are unsound as written in the fork are not ported**, and sums compare as true
-  multisets (`UAdd.equals` is a one-way set comparison under which `a + a` equals `a + b`).
-
-So the two drivers disagree in both directions: some pairs the fork proves the port does not (the
-LIA\* rung, and pairs that rely on a parameter never being `NULL`), and some the port proves the
-fork does not (rewrites it does not normalize, and pairs where it runs out of time). Either way an
-`EQ` is a claim to be checked against `sqleq-fuzz`, as with the fork.
-
-How it is checked: `examples/phase2_gate.rs` runs the ladder over a job file and joins it row by
-row against `IrDriver`'s results and the fuzz axis's verdicts, failing on any `EQ` over a pair the
-fuzz axis refutes. `examples/normalize_check.rs` evaluates each side before and after
-normalization, and both sides of every proved pair, on small random databases that respect the
-schemas' column types and constraints, using the crate's concrete evaluator. The crate's unit tests pin the
-three-valued truth tables against a reference evaluator.
-
-Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
-`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.
