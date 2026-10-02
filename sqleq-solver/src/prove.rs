@@ -154,6 +154,32 @@ mod tests {
     }
 
     #[test]
+    fn a_join_reads_a_derived_table_on_its_right_by_the_tables_own_columns() {
+        // `SELECT s.id FROM s JOIN (SELECT * FROM t WHERE t.<k> = 1) AS d ON TRUE` against the same
+        // derived table on the left of the join, with `s(id, t_id)` and `t(id, x, c)`, as the
+        // frontend lowers them: either way the filter names `t`'s columns from the enclosing base.
+        let schemas = json!([
+            { "name": "s", "types": ["INTEGER", "INTEGER"], "key": [[0]], "nullable": [false, true] },
+            { "name": "t", "types": ["INTEGER", "INTEGER", "INTEGER"], "key": [[0]], "nullable": [false, true, true] },
+        ]);
+        let one = json!({ "operator": "1", "operand": [], "type": "INTEGER" });
+        let on_true = json!({ "operator": "TRUE", "operand": [], "type": "BOOLEAN" });
+        let t_where = |k: u32| json!({ "filter": { "source": { "scan": 1 }, "condition": cmp("=", col(k), one.clone()) } });
+        let select = |left: serde_json::Value, right: serde_json::Value, s_id: u32| {
+            json!({ "project": { "target": [col(s_id)], "source": { "join": {
+                "kind": "INNER", "condition": on_true.clone(), "left": left, "right": right } } } })
+        };
+        let on_right = |k: u32| select(json!({ "scan": 0 }), t_where(k), 0);
+        let on_left = |k: u32| select(t_where(k), json!({ "scan": 0 }), 3);
+        let pair = |a: serde_json::Value, b: serde_json::Value| verify(&json!({ "schemas": schemas, "queries": [a, b] }));
+        // Filtering `t.c` is not filtering `t.id`, though `t.c` on the right sits where `t.id`
+        // would if the right input were numbered from after `s`.
+        assert!(!matches!(pair(on_right(2), on_left(0)), Verdict::Eq { .. }));
+        // The inputs of an inner join commute.
+        assert_eq!(pair(on_right(2), on_left(2)), Verdict::Eq { literal: false });
+    }
+
+    #[test]
     fn a_widening_cast_under_division_blocks_the_proof() {
         // Integer division truncates and real division does not, so these differ (7/2 vs 7.0/2).
         let real_div = project_one(json!({ "operator": "/", "type": "REAL", "operand": [
