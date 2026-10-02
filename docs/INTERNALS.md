@@ -6,9 +6,8 @@ start at the [README](../README.md).
 The shape is one frontend feeding three axes. `src/` parses a SQL pair, resolves names and types,
 and lowers it to the `Relation`/`Expr` IR that both proving axes consume — the QED prover directly,
 and `sqleq-solver`, a Rust rewrite of SQLSolver, through the job files `src/sqlsolver.rs` writes.
-The third axis, `sqleq-fuzz/`, reads no IR at all: it runs the two queries against DuckDB looking for
-a counterexample. See
-[DESIGN.md](DESIGN.md) for why it is arranged that way.
+The third axis, `sqleq-fuzz/`, reads no IR at all: it runs the two queries against DuckDB looking
+for a counterexample. See [DESIGN.md](DESIGN.md) for why it is arranged that way.
 
 ## The frontend (`src/`)
 
@@ -29,9 +28,9 @@ a counterexample. See
 ## The second proving axis (`sqleq-solver/`)
 
 A Rust rewrite of SQLSolver's proof engine, opt-in because it links a Z3 you supply: `cargo build -p
-sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. It reads the same `Input` JSON the
-QED prover gets and answers in the JVM driver's row format, so the original SQLSolver, kept as its
-cross-check, can be swapped in. What it rewrites, and where it deliberately differs from the
+sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. It reads the same `Input` JSON
+the QED prover gets and answers in the JVM driver's row format, so the original SQLSolver, kept as
+its cross-check, can be swapped in. What it rewrites, and where it deliberately differs from the
 original, is in [SQLSOLVER.md](SQLSOLVER.md).
 
 ## The disproving axis (`sqleq-fuzz/`)
@@ -51,4 +50,4 @@ what it must never call a counterexample — are in [`sqleq-fuzz/README.md`](../
 Running all three axes over one corpus and cross-tabulating them is what produces the table
 [VALIDATION.md](VALIDATION.md) describes, including the cell that is a soundness alarm. The driver
 that does it is not in this repository — it exists to run corpora that are not public — but
-`sqleq_check.py --sqlsolver` and `sqleq-fuzz` between them reach every axis it reaches.
+`sqleq_check.py --sqleq-solver` and `sqleq-fuzz` between them reach every axis it reaches.

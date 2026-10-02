@@ -15,11 +15,12 @@ independent — which is what lets them check each other. Any pair a prover call
 `sqleq-fuzz` refutes is a bug in one of them; see [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 The second prover is **`sqleq-solver`**, a Rust rewrite of
-[SQLSolver](https://github.com/SQLSolver/SQLSolver)'s proof engine that reads the same Input JSON and
-builds from this repository against a Z3 you supply. It is a second opinion: `tools/sqleq_check.py
---sqlsolver` reports its answer beside the prover's, and it never changes a verdict or an exit code.
-The original Java SQLSolver can be asked instead, as a backup cross-check, but that needs a fork of
-it that is not published. See [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
+[SQLSolver](https://github.com/SQLSolver/SQLSolver)'s proof engine that reads the same Input JSON
+and builds from this repository against a Z3 you supply. It is a second opinion:
+`tools/sqleq_check.py --sqleq-solver` reports its answer beside the prover's, and it never changes a
+verdict or an exit code. The original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a
+backup cross-check, but that needs a fork of it that is not published. See
+[`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
 
 The **Lean axis** (`sqleq-lean`) is narrower still. It decides one class of `INSERT` pair the other
 axes cannot even state: `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a

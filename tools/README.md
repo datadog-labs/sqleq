@@ -55,7 +55,7 @@ them in bulk from a CSV corpus, use the frontend's own `--csv` mode.
 
 An already-lowered `.json` plan is also a first-class case: the harness skips
 the lowering stage and hands it straight to the prover. That is how an archived
-`Input` is re-checked, and it is also the path `--sqlsolver` was built around.
+`Input` is re-checked, and it is also the path `--sqleq-solver` was built around.
 
 ### Usage
 
@@ -83,11 +83,15 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--json` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs. |
 | `--no-retry` | Don't re-run transient failures serially at the end. |
-| `--sqlsolver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Never changes the exit code. |
-| `--sqlsolver-impl {sqleq-solver,jvm}` | Which implementation to ask: `sqleq-solver` (default), or the original SQLSolver as a JVM fork through `tools/sqlsolver/IrDriver`, kept as a cross-check. Same jobs, same result rows, same buckets. `rust` is accepted as the old name of `sqleq-solver`. |
-| `--sqlsolver-tree DIR` | With `jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
-| `--sqlsolver-bin PATH` | With `sqleq-solver`: the binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
-| `--sqlsolver-timeout MS` | Per-row cap for that prover (default: `-t` in ms). Its own, because the two provers are not comparably fast. |
+| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Never changes the exit code. |
+| `--sqleq-solver-bin PATH` | The `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
+| `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check. Same jobs, same result rows, same buckets. Not with `--sqleq-solver`. |
+| `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
+| `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. |
+
+The spellings from before `sqleq-solver` was the default still work and are not listed by `--help`:
+`--sqlsolver` (now `--sqleq-solver`), `--sqlsolver-impl {sqleq-solver,rust,jvm}` with it,
+`--sqlsolver-bin` and `--sqlsolver-timeout`.
 | `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. Never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
@@ -144,13 +148,13 @@ test applies.
 
 ### Second opinion: sqleq-solver
 
-`--sqlsolver` runs a second prover over **the same lowered plan** and prints a
-second table: `sqleq-solver`, this repo's Rust rewrite of SQLSolver, or with
-`--sqlsolver-impl=jvm` the original SQLSolver, kept as a cross-check. It is off
+`--sqleq-solver` runs a second prover over **the same lowered plan** and prints
+a second table: `sqleq-solver`, this repo's Rust rewrite of SQLSolver. With
+`--sqlsolver-jvm` instead, the original SQLSolver answers, kept as a cross-check. It is off
 by default, and it cannot change the exit code.
 
 ```sh
-python3 tools/sqleq_check.py --expect report-only --sqlsolver -j 8 -t 30 corpus/
+python3 tools/sqleq_check.py --expect report-only --sqleq-solver -j 8 -t 30 corpus/
 ```
 
 ```
@@ -206,7 +210,7 @@ Mechanics worth knowing before reading a slow run:
   -p sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` (a directory holding `libz3.so`) and
   `$Z3_SYS_Z3_HEADER` (a matching `z3.h`) set. The library's location is baked
   into the binary, so nothing is needed at run time.
-- With `--sqlsolver-impl=jvm` it requires the fork tree (its `lib/` holds the Z3
+- With `--sqlsolver-jvm` it requires the fork tree (its `lib/` holds the Z3
   natives), a JDK, and `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded
   dependency directory the fork was compiled against. The driver compiles itself
   on first use and recompiles when `tools/sqlsolver/IrDriver.java` or

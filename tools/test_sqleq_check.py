@@ -30,7 +30,8 @@ from pathlib import Path
 
 from sqleq_check import (REPO, SQLSOLVER_NO_PROOF, SQLSOLVER_PROVED, SQLSOLVER_PROVED_LITERAL,
                          SQLSOLVER_UNSUPPORTED, Case, SsDriver, _statements, build_parser,
-                         run_second_opinion, ss_slug, triviality_from_ir, triviality_from_text)
+                         run_second_opinion, second_opinion, ss_slug, triviality_from_ir,
+                         triviality_from_text)
 
 
 class StatementSplitting(unittest.TestCase):
@@ -184,25 +185,37 @@ class SecondOpinionThroughSqleqSolver(unittest.TestCase):
         self.assertEqual({c.name: c.s_note for c in cases}["refused"], "unknown table t")
 
 
-class SqlsolverImplOption(unittest.TestCase):
-    """`--sqlsolver-impl` defaults to sqleq-solver, keeps the fork behind `jvm`, and reads the
-    old value `rust` as sqleq-solver."""
+class SecondOpinionOptions(unittest.TestCase):
+    """`--sqleq-solver` asks sqleq-solver, `--sqlsolver-jvm` the JVM fork, and the spellings from
+    before sqleq-solver was the default still mean what they meant."""
 
-    def impl(self, *argv):
-        return build_parser().parse_args(["x.sql", *argv]).sqlsolver_impl
+    def asks(self, *argv):
+        p = build_parser()
+        return second_opinion(p.parse_args(["x.sql", *argv]), p)
 
-    def test_sqleq_solver_is_the_default(self):
-        self.assertEqual(self.impl(), "sqleq-solver")
-
-    def test_the_fork_is_asked_only_by_name(self):
-        self.assertEqual(self.impl("--sqlsolver-impl", "jvm"), "jvm")
-
-    def test_rust_is_the_old_name_of_sqleq_solver(self):
-        self.assertEqual(self.impl("--sqlsolver-impl", "rust"), "sqleq-solver")
-
-    def test_anything_else_is_refused(self):
+    def refused(self, *argv):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            build_parser().parse_args(["x.sql", "--sqlsolver-impl", "java"])
+            self.asks(*argv)
+
+    def test_nothing_is_asked_by_default(self):
+        self.assertIsNone(self.asks())
+
+    def test_each_switch_asks_its_prover(self):
+        self.assertEqual(self.asks("--sqleq-solver"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver-jvm"), "jvm")
+
+    def test_the_two_switches_together_are_refused(self):
+        self.refused("--sqleq-solver", "--sqlsolver-jvm")
+
+    def test_the_old_spellings_still_work(self):
+        self.assertEqual(self.asks("--sqlsolver"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver", "--sqlsolver-impl", "rust"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver", "--sqlsolver-impl", "jvm"), "jvm")
+        args = build_parser().parse_args(["x.sql", "--sqlsolver-bin", "b", "--sqlsolver-timeout", "5"])
+        self.assertEqual((args.sqleq_solver_bin, args.sqleq_solver_timeout), ("b", 5))
+
+    def test_an_unknown_implementation_is_refused(self):
+        self.refused("--sqlsolver", "--sqlsolver-impl", "java")
 
 
 class LeanAxis(unittest.TestCase):

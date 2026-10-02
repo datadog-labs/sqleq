@@ -3,9 +3,9 @@
 [SQLSolver](https://github.com/SQLSolver/SQLSolver) (SIGMOD 2024, Apache 2.0) is a second SQL
 equivalence prover. This repository answers the `sqlsolver` axis with **`sqleq-solver`**, a Rust
 rewrite of SQLSolver's proof engine ([below](#sqleq-solver)): it reads the same `Input` JSON the QED
-prover gets, needs no JVM, and is what `tools/sqleq_check.py --sqlsolver` asks by default. The
+prover gets, needs no JVM, and is what `tools/sqleq_check.py --sqleq-solver` asks. The
 original, run as a JVM fork through `tools/sqlsolver/`, is kept as a **backup cross-check**
-([below](#the-jvm-fork)): `--sqlsolver-impl=jvm` asks it instead, and running both on the same jobs
+([below](#the-jvm-fork)): `--sqlsolver-jvm` asks it instead, and running both on the same jobs
 shows where they disagree.
 
 Either way the axis is a **second opinion**: its answer is reported beside QED's and never changes a
@@ -38,13 +38,13 @@ to check against `sqleq-fuzz`.
 ## Reproducing this
 
 `sqleq-solver` is reproducible from this repository plus a `libz3`: `cargo build --release -p
-sqleq-solver`, and `--sqlsolver` in `sqleq_check.py` finds it. The JVM fork is **not reproducible
+sqleq-solver`, and `--sqleq-solver` in `sqleq_check.py` finds it. The JVM fork is **not reproducible
 from this repository alone.** Neither of its two checkouts is vendored here, and only one of them is
 public:
 
 * The **SQL-text path** needs `$SQLEQ_SQLSOLVER_PRISTINE`, an unmodified upstream checkout, plus a
   JDK. That checkout is public, so anything described here about that path can be re-checked.
-* The **IR bridge** and everything downstream of it — including `--sqlsolver --sqlsolver-impl=jvm`
+* The **IR bridge** and everything downstream of it — including `--sqlsolver-jvm`
   in `sqleq_check.py` — need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That
   fork is not published.** The sections below state what the fork has to do, which is enough to redo
   the work, but redoing it is a rebuild rather than a checkout.
@@ -90,12 +90,12 @@ against cannot come back as an undercount.
 `sqleq-solver` makes the same split earlier: its tier 0 compares the two raw IR trees before
 anything is parsed, and labels an `EQ` from there `literal: true` in the same field.
 
-## `--sqlsolver` in `sqleq_check.py`
+## The second opinion in `sqleq_check.py`
 
-`tools/sqleq_check.py --sqlsolver` asks `sqleq-solver` about every pair in a run, or the fork with
-`--sqlsolver-impl=jvm`, and reports the answer beside the qed one. Three design constraints shaped
-it, all from the fork, and the pass keeps them for both so that the two implementations' answers
-stay comparable:
+`tools/sqleq_check.py --sqleq-solver` asks `sqleq-solver` about every pair in a run, or
+`--sqlsolver-jvm` the fork, and reports the answer beside the qed one. Three design constraints
+shaped it, all from the fork, and the pass keeps them for both so that the two implementations'
+answers stay comparable:
 
 1. **One driver process, at the end, sequentially.** A JVM start is a large fraction of what a
    `.sql` pair costs, so paying it per case would swamp the run.
@@ -106,7 +106,7 @@ stay comparable:
 
 So `run_case` does one sqlsolver-axis thing — it packages the plan, while the case's working
 directory still exists — and a single sequential pass at the end asks the driver about every job.
-The packaging cost is discounted from the case wall time, so a `--sqlsolver` run's timings stay
+The packaging cost is discounted from the case wall time, so a second-opinion run's timings stay
 comparable to one without it.
 
 ## `sqleq-solver`

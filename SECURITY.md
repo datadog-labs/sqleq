@@ -25,7 +25,7 @@ Things that are working as intended, and not vulnerabilities:
   an in-process DuckDB and runs both queries against them. Pointing it at untrusted SQL is
   equivalent to running that SQL.
 * The frontend invokes the external solver binary named by `$QED_PROVER`, and the SQLSolver axis
-  runs `sqleq-solver` (or, with `--sqlsolver-impl=jvm`, a JVM from `$SQLEQ_SQLSOLVER`). All are
+  runs `sqleq-solver` (or, with `--sqlsolver-jvm`, a JVM from `$SQLEQ_SQLSOLVER`). All are
   paths you supply or binaries you build.
 
 ## Soundness bugs
