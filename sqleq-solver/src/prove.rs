@@ -238,6 +238,23 @@ mod tests {
     }
 
     #[test]
+    fn a_negated_order_comparison_is_its_complement_under_set_semantics() {
+        // `SELECT DISTINCT a FROM t WHERE NOT (b < 1)` against `... WHERE b >= 1`, as the frontend
+        // lowers them (DISTINCT as a keys-only group). Both are UNKNOWN on a NULL `b`; otherwise
+        // they agree, the values of one type being totally ordered.
+        let one = || json!({ "operator": "1", "operand": [], "type": "INTEGER" });
+        let not = |e| json!({ "operator": "NOT", "type": "BOOLEAN", "operand": [e] });
+        let distinct = |cond| json!({ "group": { "function": [], "keys": [col(0)], "source": { "project": {
+            "source": { "filter": { "source": { "scan": 0 }, "condition": cond } },
+            "target": [col(0)] } } } });
+        let pair = |a, b| verify(&json!({ "schemas": schema(), "queries": [distinct(a), distinct(b)] }));
+        assert_eq!(pair(not(cmp("<", col(1), one())), cmp(">=", col(1), one())), Verdict::Eq { literal: false });
+        assert_eq!(pair(not(cmp(">", col(1), one())), cmp("<=", col(1), one())), Verdict::Eq { literal: false });
+        // Strict and non-strict stay apart: `b < 1` is not `b <= 1`.
+        assert_eq!(pair(cmp("<", col(1), one()), cmp("<=", col(1), one())), Verdict::NotProved(NotProvedReason::Exhausted));
+    }
+
+    #[test]
     fn the_same_cast_on_both_sides_still_matches() {
         let cast = || project_one(json!({ "operator": "CAST", "type": "INTEGER", "operand": [col(1)] }));
         let filtered = json!({ "project": {

@@ -247,7 +247,10 @@ What is ported, in the order the ladder runs it:
   when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
   LIA\* rung.
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
-  or negation.
+  or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings,
+  so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
+  used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
+  of one type are totally ordered.
 
 Not ported: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
 summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
@@ -281,8 +284,8 @@ fork does not (rewrites it does not normalize, and pairs where it runs out of ti
 How it is checked: `examples/phase2_gate.rs` runs the ladder over a job file and joins it row by
 row against `IrDriver`'s results and the fuzz axis's verdicts, failing on any `EQ` over a pair the
 fuzz axis refutes. `examples/normalize_check.rs` evaluates each side before and after
-normalization, and both sides of every proved pair, on small random databases that satisfy the
-schemas' constraints, using the crate's concrete evaluator. The crate's unit tests pin the
+normalization, and both sides of every proved pair, on small random databases that respect the
+schemas' column types and constraints, using the crate's concrete evaluator. The crate's unit tests pin the
 three-valued truth tables against a reference evaluator.
 
 Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with

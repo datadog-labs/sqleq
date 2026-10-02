@@ -15,7 +15,11 @@
 //! queries. The encoding here:
 //! * **one uninterpreted sort `Val`** for every value. Each canonical constant is its own `Val`
 //!   constant, all pairwise distinct (distinct canonical constants are distinct values), `Null`
-//!   among them. `Eq` is identity, `Ne` its negation, order comparisons uninterpreted relations.
+//!   among them. `Eq` is identity, `Ne` its negation, `Lt` an uninterpreted relation, and `Le` its
+//!   complement with the operands swapped (`a <= b` is `¬(b < a)`). That is the one order fact
+//!   encoded, and it holds wherever it is used: the translator puts every order comparison under
+//!   its operands' not-null guard, and the non-NULL values of one type are totally ordered
+//!   (preordered, under a collation that ties distinct strings).
 //!   Functions and value-position arithmetic are uninterpreted `Val` functions -- sound, since the
 //!   real ones are among their interpretations, and ours already take (null flag, value) pairs.
 //! * **a table** `T` of width `w` is an uninterpreted `Val^w → Int`: its value at a tuple is the
@@ -287,9 +291,9 @@ impl<'ctx> Encoder<'ctx> {
             PredKind::Eq => Some(va._eq(&vb)),
             PredKind::Ne => Some(va._eq(&vb).not()),
             PredKind::Lt => rel(self, "lt", &va, &vb),
-            PredKind::Le => rel(self, "le", &va, &vb),
+            PredKind::Le => rel(self, "lt", &vb, &va).map(|lt| lt.not()),
             PredKind::Gt => rel(self, "lt", &vb, &va),
-            PredKind::Ge => rel(self, "le", &vb, &va),
+            PredKind::Ge => rel(self, "lt", &va, &vb).map(|lt| lt.not()),
         }
     }
 }
