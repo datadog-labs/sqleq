@@ -207,8 +207,7 @@ final class IrToRel {
     if (r.has("join")) {
       final JsonNode v = r.get("join");
       final RelNode l = rel(v.get("left"), base);
-      final int lw = l.getRowType().getFieldCount();
-      final RelNode rr = rel(v.get("right"), base + lw);
+      final RelNode rr = rel(v.get("right"), base);
       final JoinRelType kind = joinKind(v.get("kind").asText());
       final RexNode cond = expr(v.get("condition"), base, l.getRowType(), rr.getRowType(), 0);
       return LogicalJoin.create(l, rr, cond, kind);

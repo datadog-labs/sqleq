@@ -317,7 +317,7 @@ impl<'s> Translator<'s> {
         base: usize,
     ) -> Result<Translated, TranslateError> {
         let l = self.rel(left, base)?;
-        let r = self.rel(right, base + l.local.len())?;
+        let r = self.rel(right, base)?;
         let local: Vec<UVar> = l.local.iter().chain(r.local.iter()).cloned().collect();
         let scope = Scope { base, local: local.clone() };
         let cond = self.translate_predicate(condition, &scope)?;
@@ -847,6 +847,68 @@ mod tests {
 
     fn one_table(types: Vec<Type>) -> Vec<Schema> {
         vec![Schema { name: "t0".to_string(), types, key: vec![], nullable: vec![] }]
+    }
+
+    #[test]
+    fn a_join_right_input_numbers_its_own_columns_from_the_enclosing_base() {
+        // `s JOIN (SELECT * FROM t WHERE t.x = 1) AS t ON s.id = t.x`, as the frontend lowers it:
+        // the derived table's filter names `t.x` as column 0, from the enclosing base, not as
+        // column 2 after `s`; the join condition sees `s ++ t`.
+        let schemas = vec![
+            Schema { name: "s".to_string(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+        ];
+        let col = |index| Expr::Column { index, ty: Type::Integer };
+        let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
+        let one = Expr::Literal { value: "1".to_string(), ty: Type::Integer };
+        let right = Relation::Filter { source: Box::new(Relation::Scan(1)), condition: eq(col(0), one) };
+        let join = Relation::Join {
+            left: Box::new(Relation::Scan(0)),
+            right: Box::new(right),
+            kind: JoinKind::Inner,
+            condition: eq(col(0), col(2)),
+        };
+        let joined = Translator::new(&schemas).rel(&join, 0).expect("not correlated");
+        assert_eq!(joined.local.len(), 3);
+    }
+
+    /// Every var `t` reads as a value (not the tuple vars of table atoms or binders).
+    fn value_vars(t: &UTerm, out: &mut Vec<UVar>) {
+        match t {
+            UTerm::Var(v) => out.push(v.clone()),
+            UTerm::Const(_) | UTerm::Table { .. } => {}
+            UTerm::Pred { args, .. } | UTerm::Func { args, .. } => args.iter().for_each(|a| value_vars(a, out)),
+            UTerm::Add(ts) | UTerm::Mul(ts) => ts.iter().for_each(|c| value_vars(c, out)),
+            UTerm::Squash(c) | UTerm::Neg(c) => value_vars(c, out),
+            UTerm::Sum { body, .. } => value_vars(body, out),
+        }
+    }
+
+    #[test]
+    fn a_join_right_input_column_past_the_left_width_is_its_own() {
+        // `s JOIN (SELECT * FROM t WHERE t.c = 1) AS d ON s.id = t.a` with `s(id)` and `t(a, b, c)`:
+        // the filter's `t.c` is column 2 from the enclosing base. Numbering the right input from
+        // after `s` would not refuse this one: it would read column 2 as `t.b`.
+        let schemas = vec![
+            Schema { name: "s".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer; 3], key: vec![], nullable: vec![] },
+        ];
+        let col = |index| Expr::Column { index, ty: Type::Integer };
+        let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
+        let one = Expr::Literal { value: "1".to_string(), ty: Type::Integer };
+        let right = Relation::Filter { source: Box::new(Relation::Scan(1)), condition: eq(col(2), one) };
+        let join = Relation::Join {
+            left: Box::new(Relation::Scan(0)),
+            right: Box::new(right),
+            kind: JoinKind::Inner,
+            condition: eq(col(0), col(1)),
+        };
+        let joined = Translator::new(&schemas).rel(&join, 0).expect("translates");
+        let mut read = Vec::new();
+        value_vars(&joined.term, &mut read);
+        // The joined row is `s.id, t.a, t.b, t.c`.
+        assert!(read.contains(&joined.local[3]), "the filter reads t.c");
+        assert!(!read.contains(&joined.local[2]), "nothing reads t.b");
     }
 
     #[test]
