@@ -213,7 +213,7 @@ Mechanics worth knowing before reading a slow run:
   or `IrToRel.java` is newer than the class.
 - With `--sqlsolver-impl=rust` it needs only the `sqleq-solver` binary:
   `cargo build --release -p sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` (a
-  directory holding `libz3.so`) and `$Z3_SYS_Z3_HEADER` (a matching `z3.h`) set.
+  directory holding `libz3.so`) set.
   The library's location is baked into the binary, so nothing is needed at run
   time. It takes the same arguments and writes the same rows, including the
   exit-3 self-halt when a row outlives its cap and grace period.

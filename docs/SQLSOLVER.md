@@ -288,5 +288,5 @@ normalization, and both sides of every proved pair, on small random databases th
 schemas' column types and constraints, using the crate's concrete evaluator. The crate's unit tests pin the
 three-valued truth tables against a reference evaluator.
 
-Building needs a `libz3` and a matching header: `cargo build --release -p sqleq-solver` with
-`$SQLEQ_Z3_LIB_DIR` and `$Z3_SYS_Z3_HEADER` set. The library's location is baked into the binary.
+Building needs a `libz3`: `cargo build --release -p sqleq-solver` with `$SQLEQ_Z3_LIB_DIR` set to
+the directory that holds it. The library's location is baked into the binary.

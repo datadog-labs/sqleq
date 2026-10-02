@@ -28,9 +28,5 @@ serde = { version = "1", features = ["derive"] }
 # AND/OR/CAST chains), which is ordinary input, not adversarial.
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 
-# The same fork (and pinned commit) the QED prover uses for its Z3 bindings -- a version already
-# known to build and link against a system libz3, rather than the current upstream `z3`/`z3-sys`
-# crates untested. Pinned by `rev` rather than tracking the branch
-# head, so this crate can't silently drift onto a different resolved commit than the one this was
-# built and validated against.
-z3 = { git = "https://github.com/wsx-ucb/z3.rs", rev = "255189446ce4ac65627229ce3bd5e97d7d781cec" }
+# Links the libz3 that `$SQLEQ_Z3_LIB_DIR` names; see build.rs.
+z3 = "0.21.1"
