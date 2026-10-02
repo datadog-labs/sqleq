@@ -188,3 +188,23 @@ fn a_join_update_that_only_filters_lowers_like_its_semi_join() {
         refused_on(V, "UPDATE t SET a = 0 FROM u AS t WHERE t.uid = 1", src, "named like the target");
     }
 }
+
+#[test]
+fn a_join_delete_or_update_reads_through_a_parenthesized_join() {
+    for src in [SEEDED, DECLARED] {
+        assert!(same_on(
+            V,
+            "DELETE FROM t USING (u JOIN u AS w ON u.uid = w.ua) WHERE t.a = u.ua",
+            "DELETE FROM t USING u JOIN u AS w ON u.uid = w.ua WHERE t.a = u.ua",
+            src
+        ));
+        assert!(same_on(
+            V,
+            "UPDATE t SET a = a + 1 FROM (u JOIN u AS w ON u.uid = w.ua) WHERE t.id = w.uid",
+            "UPDATE t SET a = a + 1 WHERE EXISTS (SELECT 1 FROM u JOIN u AS w ON u.uid = w.ua WHERE t.id = w.uid)",
+            src
+        ));
+        // A table inside the parentheses is as much a FROM relation as one outside them.
+        refused_on(V, "UPDATE t SET a = w.ua FROM (u JOIN u AS w ON u.uid = w.ua) WHERE t.id = u.uid", src, "SET value");
+    }
+}

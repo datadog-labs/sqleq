@@ -760,6 +760,7 @@ fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select, outer: &[Binding]
         base: Scope::outer_width(outer),
         merged: Vec::new(),
         merged_outer: false,
+        coalesced: Vec::new(),
     };
     let targets = items.iter().map(|(e, _)| lower_expr(cat, &scope, fns, e)).collect::<Result<Vec<_>>>()?;
     let out_cols: OutCols = items.iter().zip(&targets).map(|((_, n), v)| (n.clone(), ty_of(v))).collect();
@@ -800,10 +801,11 @@ fn lower_select_ctx(
     let aggregated = has_agg || !group_by_empty(s) || s.having.is_some();
     let (result, out_cols) = if aggregated {
         lower_aggregate(cat, &scope, fns, rel, s)?
-    } else if is_pure_wildcard(s) && !scope.hides_columns() {
+    } else if is_pure_wildcard(s) && !scope.hides_columns() && scope.merged.is_empty() {
         // `SELECT *` over the FROM relation *is* that relation — but only while every one of its
         // columns is visible. A system column is not, so taking the shortcut there would hand the
-        // caller a relation one column wider than the shape it was just told the query has.
+        // caller a relation one column wider than the shape it was just told the query has. Nor is
+        // it once a `USING` has merged two columns into one: `expand_projection` refuses that `*`.
         (rel, scope.out_cols())
     } else {
         let proj = expand_projection(cat, &scope, fns, s)?;
@@ -1151,11 +1153,30 @@ fn order_key_value(
 /// join (a comma-separated item or a `CROSS JOIN`), lowered to a join on `TRUE`. `on` borrows the
 /// condition from the FROM AST (lifetime `'a`); `precomputed` carries one we built ourselves, which
 /// is how `USING` arrives — its equalities are resolved against the two sides of that one join
-/// rather than the finished scope.
+/// rather than the finished scope. `upto` is how many bindings the FROM clause has once this
+/// step's factor is in: a parenthesized join brings several, so the step's index does not say
+/// where its row ends.
 struct Step<'a> {
     on: Option<&'a Expr>,
     kind: &'static str,
     precomputed: Option<Value>,
+    upto: usize,
+}
+
+/// What one FROM factor brings into scope: one binding, or a parenthesized join's several, with
+/// its relation and the `USING` names merged inside it.
+struct Factor {
+    binds: Vec<Binding>,
+    rel: Value,
+    merged: Vec<String>,
+    merged_outer: bool,
+    coalesced: Vec<String>,
+}
+
+impl Factor {
+    fn width(&self) -> usize {
+        self.binds.iter().map(|b| b.cols.len()).sum()
+    }
 }
 
 /// Build the resolution scope and relation tree for a whole FROM clause (comma items become cross
@@ -1175,42 +1196,55 @@ fn build_from_clause<'a>(
     let mut offset = base;
     let mut merged: Vec<String> = Vec::new();
     let mut merged_outer = false;
+    let mut coalesced: Vec<String> = Vec::new();
 
     for item in from {
-        let (b, leaf) = factor_instance(cat, fns, &item.relation, offset, outer)?;
-        offset += b.cols.len();
-        binds.push(b);
-        leaves.push(leaf);
-        steps.push(Step { on: None, kind: "INNER", precomputed: None }); // first of item: cross-join unless it's the very first
+        let f = from_factor(cat, fns, &item.relation, offset, outer)?;
+        offset += f.width();
+        merged.extend(f.merged);
+        merged_outer |= f.merged_outer;
+        coalesced.extend(f.coalesced);
+        binds.extend(f.binds);
+        leaves.push(f.rel);
+        // First of item: a cross join, unless it is the very first.
+        steps.push(Step { on: None, kind: "INNER", precomputed: None, upto: binds.len() });
         for j in &item.joins {
-            let (b, leaf) = factor_instance(cat, fns, &j.relation, offset, outer)?;
-            offset += b.cols.len();
+            let f = from_factor(cat, fns, &j.relation, offset, outer)?;
+            offset += f.width();
             let (kind, cond) = join_op(&j.join_operator)?;
             // `USING` is resolved here, against the bindings as they stand: its names are looked up
             // on the left of this join and on the factor being added, not through the whole scope.
-            let on = match cond {
-                JoinCond::On(e) => Some(e),
-                JoinCond::Always => None,
+            let (on, precomputed) = match cond {
+                JoinCond::On(e) => (Some(e), None),
+                JoinCond::Always => (None, None),
                 JoinCond::Using(cols) => {
+                    // A name a `RIGHT` or `FULL` join has merged is a coalesce of its two sides,
+                    // which `using_condition` would read as whichever binding has the name first.
+                    if cols.iter().any(|c| coalesced.contains(c) || f.coalesced.contains(c)) {
+                        return Err(unsupported("JOIN ... USING a column a RIGHT or FULL join already merged"));
+                    }
+                    let c = using_condition(&binds, &f.binds, &cols)?;
                     if kind != "INNER" {
                         merged_outer = true;
                     }
-                    let c = using_condition(&binds, &b, &cols)?;
+                    if matches!(kind, "RIGHT" | "FULL") {
+                        coalesced.extend(cols.iter().cloned());
+                    }
                     merged.extend(cols);
-                    steps.push(Step { on: None, kind, precomputed: Some(c) });
-                    binds.push(b);
-                    leaves.push(leaf);
-                    continue;
+                    (None, Some(c))
                 }
             };
-            binds.push(b);
-            leaves.push(leaf);
-            steps.push(Step { on, kind, precomputed: None });
+            merged.extend(f.merged);
+            merged_outer |= f.merged_outer;
+            coalesced.extend(f.coalesced);
+            binds.extend(f.binds);
+            leaves.push(f.rel);
+            steps.push(Step { on, kind, precomputed, upto: binds.len() });
         }
     }
     let inner_count = binds.len();
     binds.extend(outer.iter().cloned()); // outer appended for correlated resolution only
-    let scope = Scope { binds, inner_count, base, merged, merged_outer };
+    let scope = Scope { binds, inner_count, base, merged, merged_outer, coalesced };
 
     let mut rel: Option<Value> = None;
     for (i, step) in steps.iter().enumerate() {
@@ -1221,7 +1255,7 @@ fn build_from_clause<'a>(
                 let cond = match (&step.precomputed, step.on) {
                     (Some(c), _) => c.clone(),
                     // Only the bindings this join actually has in its row -- see [`Scope::prefix`].
-                    (None, Some(on)) => lower_bool(cat, &scope.prefix(i + 1), fns, on)?,
+                    (None, Some(on)) => lower_bool(cat, &scope.prefix(step.upto), fns, on)?,
                     (None, None) => json!({ "operator": "TRUE", "operand": [], "type": "BOOLEAN" }),
                 };
                 json!({ "join": { "condition": cond, "left": left, "right": leaf, "kind": step.kind } })
@@ -1229,6 +1263,30 @@ fn build_from_clause<'a>(
         });
     }
     Ok((scope, rel.expect("non-empty FROM")))
+}
+
+/// One FROM factor, lowered.
+///
+/// A parenthesized join is lowered on its own, against the enclosing context. Its `ON` conditions
+/// may name only its own tables, since Postgres hides the factor's FROM siblings from them, and its
+/// relation numbers its columns from the enclosing width, like every other join input. Its
+/// bindings then move to where its columns sit in this row. The parentheses cannot simply be
+/// dropped: `a LEFT JOIN (b JOIN c ON p) ON q` is not `(a LEFT JOIN b ON q) JOIN c ON p`.
+fn from_factor(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, outer: &[Binding]) -> Result<Factor> {
+    let TableFactor::NestedJoin { table_with_joins, alias } = tf else {
+        let (b, rel) = factor_instance(cat, fns, tf, offset, outer)?;
+        let (merged, coalesced) = (Vec::new(), Vec::new());
+        return Ok(Factor { binds: vec![b], rel, merged, merged_outer: false, coalesced });
+    };
+    // `(b JOIN c) AS x` hides `b` and `c` behind one name, over a row that may carry system
+    // columns and repeat a name; that is not modelled.
+    if alias.is_some() {
+        return Err(unsupported("parenthesized join with an alias"));
+    }
+    let (inner, rel) = build_from_clause(cat, fns, std::slice::from_ref(table_with_joins.as_ref()), outer)?;
+    let shift = offset - Scope::outer_width(outer);
+    let binds = inner.inner().iter().map(|b| Binding { offset: b.offset + shift, ..b.clone() }).collect();
+    Ok(Factor { binds, rel, merged: inner.merged, merged_outer: inner.merged_outer, coalesced: inner.coalesced })
 }
 
 /// A single FROM relation factor -> (binding with output columns, leaf relation Value).
@@ -1275,6 +1333,25 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             }
             let tn = obj_name(name);
             let idx = cat.find(&tn).ok_or_else(|| schema(format!("unknown table {tn}")))?;
+            // An alias's column list renames the table's columns in order, and may stop short:
+            // `t AS x(p, q)` makes `x.p` the first column. Resolving by the declared names instead
+            // would read `x.a` in `t AS x(b, a)` as the table's own `a`.
+            let mut cols = cat.tables[idx].cols.clone();
+            if let Some(a) = alias.as_ref().filter(|a| !a.columns.is_empty()) {
+                if a.columns.iter().any(|c| c.data_type.is_some()) {
+                    return Err(unsupported("column definition list on a table"));
+                }
+                if a.columns.len() > cat.tables[idx].n_declared {
+                    return Err(schema(format!("table {tn} has fewer columns than its alias names")));
+                }
+                for (col, c) in cols.iter_mut().zip(&a.columns) {
+                    col.0 = c.name.value.to_lowercase();
+                }
+                let declared = &cols[..cat.tables[idx].n_declared];
+                if declared.iter().enumerate().any(|(i, (n, _))| declared[..i].iter().any(|(m, _)| m == n)) {
+                    return Err(schema(format!("table alias leaves two columns of {tn} with one name")));
+                }
+            }
             let alias = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -1283,7 +1360,7 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             Ok((
                 Binding {
                     alias,
-                    cols: cat.tables[idx].cols.clone(),
+                    cols,
                     offset,
                     table: Some(idx),
                     n_declared: cat.tables[idx].n_declared,
@@ -1364,8 +1441,9 @@ fn join_op(op: &JoinOperator) -> Result<(&'static str, JoinCond<'_>)> {
 }
 
 /// The `ON` equalities a `USING (c, ...)` stands for: `left.c = right.c` for each name, where
-/// `left` is everything joined so far and `right` is the factor being joined in.
-fn using_condition(left: &[Binding], right: &Binding, cols: &[String]) -> Result<Value> {
+/// `left` is everything joined so far and `right` is the factor being joined in (several bindings,
+/// for a parenthesized join).
+fn using_condition(left: &[Binding], right: &[Binding], cols: &[String]) -> Result<Value> {
     let mut terms: Vec<Value> = Vec::new();
     for c in cols {
         // SQL requires the name to be present and unambiguous on each side.
@@ -1375,8 +1453,7 @@ fn using_condition(left: &[Binding], right: &Binding, cols: &[String]) -> Result
             })
         };
         let (li, lt) = find(left).ok_or_else(|| schema(format!("USING column {c} not on the left")))?;
-        let (ri, rt) =
-            find(std::slice::from_ref(right)).ok_or_else(|| schema(format!("USING column {c} not on the right")))?;
+        let (ri, rt) = find(right).ok_or_else(|| schema(format!("USING column {c} not on the right")))?;
         terms.push(make_cmp("=", json!({ "column": li, "type": lt }), json!({ "column": ri, "type": rt })));
     }
     Ok(match terms.len() {

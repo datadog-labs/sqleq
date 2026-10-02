@@ -104,7 +104,7 @@ Everything below is exercised by the test suite (`tests/lower.rs`, `cargo test`)
 
 | area | supported |
 |---|---|
-| **`FROM`** | base tables, inner / left / right / full outer / cross joins, `JOIN ... USING`, derived tables, `VALUES`, `FROM`-less `SELECT` |
+| **`FROM`** | base tables, inner / left / right / full outer / cross joins, parenthesized joins, `JOIN ... USING`, derived tables, `VALUES`, `FROM`-less `SELECT` |
 | **projection** | arbitrary expressions, `*` and `t.*`, `DISTINCT` |
 | **grouping** | `GROUP BY` (including `(a, b)` row constructors), aggregates, aggregate `FILTER (WHERE …)`, `HAVING`, and Postgres **functional dependence** — a non-grouped column, or a whole expression, accepted because a declared key it reads is grouped on |
 | **subqueries** | non-correlated, correlated, and scalar |
