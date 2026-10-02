@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use sqleq_solver::eval::{Db, Env};
 use sqleq_solver::ic::Ics;
-use sqleq_solver::ir::Input;
+use sqleq_solver::ir::{Input, Type};
 use sqleq_solver::normalize::Normalizer;
 use sqleq_solver::prove::{self, Verdict};
 use sqleq_solver::translate::{translate_input, Query, OUT_VAR_ID};
@@ -53,6 +53,18 @@ fn constants(t: &UTerm, out: &mut BTreeSet<String>, vals: &mut Vec<UConst>) {
         UTerm::Pred { args, .. } | UTerm::Func { args, .. } => args.iter().for_each(|a| constants(a, out, vals)),
         UTerm::Add(ts) | UTerm::Mul(ts) => ts.iter().for_each(|c| constants(c, out, vals)),
         UTerm::Squash(c) | UTerm::Neg(c) | UTerm::Sum { body: c, .. } => constants(c, out, vals),
+    }
+}
+
+/// Whether `v` may sit in a column of type `ty`: a number in a numeric or temporal one (a temporal
+/// type is an integer in its own unit), a string in a VARCHAR one, anything in an opaque one, and
+/// NULL anywhere. The IR is typed, so no query compares a string with a number; a row that put one
+/// in an INTEGER column would test an order comparison on a pair no database can hold.
+fn fits(v: &UConst, ty: &Type) -> bool {
+    match (v, ty) {
+        (UConst::Null, _) | (_, Type::Boolean | Type::Varbinary | Type::Interval) => true,
+        (UConst::Str(_), ty) => *ty == Type::Varchar,
+        (_, ty) => *ty != Type::Varchar,
     }
 }
 
@@ -127,7 +139,8 @@ fn main() {
                         let row: Vec<UConst> = (0..s.types.len())
                             .map(|c| loop {
                                 let v = universe[rng.below(universe.len())].clone();
-                                if v != UConst::Null || !not_null.is_some_and(|nn| nn.contains(&(c as u32))) {
+                                let nullable = !not_null.is_some_and(|nn| nn.contains(&(c as u32)));
+                                if fits(&v, &s.types[c]) && (v != UConst::Null || nullable) {
                                     break v;
                                 }
                             })
