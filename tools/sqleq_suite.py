@@ -26,6 +26,14 @@ fail every run until the bug is fixed, or until a person marks that one line
 the bug reproduces and fails the run that fixes it, so the marker cannot outlive
 the bug.
 
+`truth` is stated under a parameter binding. The default, `index`, is the one
+every axis but Lean answers under: `$N` on one side is `$N` on the other. A pair
+headed `-- binding: gather` states its truth under the gather rule instead (the
+`unnest` side's array `$j` is column `j` of the `VALUES` rows; docs/LEAN.md),
+which only the Lean axis answers under. An answer can contradict a truth only
+when the axis and the pair use the same binding; under the other one it is an
+ordinary pin.
+
 This is the logic only; `sqleq_check.py` runs the axes and calls it. Standard
 library only, like the harness.
 """
@@ -44,8 +52,15 @@ NOT_EQUIVALENT = "not-equivalent"
 TRUTHS = (EQUIVALENT, NOT_EQUIVALENT)
 
 # Canonical order: the order `--bless` inserts missing lines in, and the table's column order.
-AXES = ("frontend", "fuzz", "qed", "sqlsolver-rust", "sqlsolver-jvm")
+AXES = ("frontend", "fuzz", "qed", "sqlsolver-rust", "sqlsolver-jvm", "lean")
 PROVERS = ("qed", "sqlsolver-rust", "sqlsolver-jvm")
+
+INDEX = "index"
+GATHER = "gather"
+BINDINGS = (INDEX, GATHER)
+# The binding each axis answers under. Only Lean reads a scalar and an array at the same `$N` as
+# the gather rule relates them; every other axis refuses such a pair.
+AXIS_BINDING = {a: GATHER if a == "lean" else INDEX for a in AXES}
 
 PROVED_WORDS = ("proved", "proved-literal")
 # What may be pinned, per axis. Only the stable *kind* of an answer is pinned, never its message,
@@ -58,13 +73,20 @@ WORDS = {
     "qed": PROVED_WORDS + ("no-proof", "no-plan", "panic", "error"),
     "sqlsolver-rust": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
     "sqlsolver-jvm": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
+    # `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of equivalence.
+    "lean": ("proved-gather", "no-witness", "unsupported", "invalid-sql", "error"),
 }
+# The answers that claim equivalence, per axis, and the one that claims the opposite.
+CLAIMS_EQUIVALENT = {**{a: PROVED_WORDS for a in PROVERS}, "lean": ("proved-gather", "no-witness")}
+REFUTES = {"fuzz": ("counterexample",)}
+# Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is.
+EVIDENCE_EQUIVALENT = {**CLAIMS_EQUIVALENT, "lean": ("proved-gather",)}
 # Never pinnable: each says the run did not get an answer, not what the answer was.
 UNPINNABLE = ("timeout", "missing")
 
 CATALOG_FLAGS = {"declared": [], "inferred": ["--infer"], "inferred-seeded": ["--infer-seeded"]}
 MARKER = "!known-unsound"
-TEXT_KEYS = ("truth", "catalog", "origin", "witness", "argument")
+TEXT_KEYS = ("truth", "binding", "catalog", "origin", "witness", "argument")
 
 # A directive is `-- key: value` with a lowercase key right after `-- `. Prose in the header starts
 # with a capital or with more indentation, so a typo such as `-- expect fuz:` is a lint error
@@ -82,6 +104,7 @@ class Pin:
 @dataclass
 class Header:
     truth: Optional[str] = None
+    binding: str = INDEX
     catalog: str = "declared"
     text: dict = field(default_factory=dict)      # key -> value, for every TEXT_KEYS key present
     lines: dict = field(default_factory=dict)     # key -> line index, for every directive
@@ -145,19 +168,24 @@ def parse_header(text: str) -> Header:
                 h.truth = value
             elif key == "catalog":
                 h.catalog = value
+            elif key == "binding":
+                h.binding = value
         else:
             h.errors.append(f"line {i + 1}: unknown directive `{key}:`")
     return h
 
 
-def contradicts(truth: Optional[str], axis: str, word: str) -> bool:
+def contradicts(truth: Optional[str], axis: str, word: str, binding: str = INDEX) -> bool:
     """Whether an answer is impossible for a pair of this truth — a soundness failure of that axis
-    (or of the frontend feeding it), as opposed to a capability move."""
+    (or of the frontend feeding it), as opposed to a capability move. An axis answering under
+    another binding than the one the truth is stated under contradicts nothing."""
+    if AXIS_BINDING.get(axis) != binding:
+        return False
     if truth == NOT_EQUIVALENT:
-        return (axis in PROVERS and word in PROVED_WORDS) or (axis == "frontend"
-                                                              and word == "emit-reflexive")
+        return (word in CLAIMS_EQUIVALENT.get(axis, ())
+                or (axis == "frontend" and word == "emit-reflexive"))
     if truth == EQUIVALENT:
-        return axis == "fuzz" and word == "counterexample"
+        return word in REFUTES.get(axis, ())
     return False
 
 
@@ -171,21 +199,32 @@ def lint(h: Header) -> list:
         errs.append(f"`truth: {h.truth}` is not one of {', '.join(TRUTHS)}")
     if h.catalog not in CATALOG_FLAGS:
         errs.append(f"`catalog: {h.catalog}` is not one of {', '.join(CATALOG_FLAGS)}")
+    if h.binding not in BINDINGS:
+        errs.append(f"`binding: {h.binding}` is not one of {', '.join(BINDINGS)}")
     if not h.text.get("origin"):
         errs.append("no `origin:` line saying why this pair is pinned")
     for axis, pin in h.expect.items():
-        if pin.marker and not contradicts(h.truth, axis, pin.word):
+        contra = contradicts(h.truth, axis, pin.word, h.binding)
+        if pin.marker and not contra:
             errs.append(f"`expect {axis}: {pin.word}` carries {MARKER}, but that answer does not "
                         f"contradict `truth: {h.truth}`")
-    if h.truth == NOT_EQUIVALENT:
-        refuted = (h.expect.get("fuzz") is not None and h.expect["fuzz"].word == "counterexample")
-        if not refuted and not h.text.get("witness"):
-            errs.append("a non-equivalent pair needs `expect fuzz: counterexample` or a `witness:`")
-    if h.truth == EQUIVALENT:
-        proved = any(p.word in PROVED_WORDS and not p.marker
-                     for a, p in h.expect.items() if a in PROVERS)
-        if not proved and not h.text.get("argument"):
-            errs.append("an equivalent pair needs a prover's `proved` pin or an `argument:`")
+        # --bless never writes one of these, so it was written by hand. Caught here, it fails
+        # every run, including the CI runs that do not ask that axis.
+        if contra and not pin.marker:
+            errs.append(f"`expect {axis}: {pin.word}` contradicts `truth: {h.truth}`; mark it "
+                        f"{MARKER} if that is a known bug")
+    # Evidence for the truth counts only from an axis answering under the pair's binding.
+    def says(table):
+        return any(p.word in table.get(a, ()) and not p.marker
+                   and AXIS_BINDING[a] == h.binding for a, p in h.expect.items())
+    gather = h.binding == GATHER
+    if h.truth == NOT_EQUIVALENT and not says(REFUTES) and not h.text.get("witness"):
+        errs.append("a non-equivalent pair needs a `witness:`" if gather else
+                    "a non-equivalent pair needs `expect fuzz: counterexample` or a `witness:`")
+    if h.truth == EQUIVALENT and not says(EVIDENCE_EQUIVALENT) and not h.text.get("argument"):
+        errs.append("an equivalent pair needs `expect lean: proved-gather` or an `argument:`"
+                    if gather else "an equivalent pair needs a prover's `proved` pin or an "
+                    "`argument:`")
     return errs
 
 
@@ -225,7 +264,7 @@ def judge(h: Header, observed: dict) -> list:
         pin = h.expect.get(axis)
         if word in UNPINNABLE:
             state = UNANSWERED
-        elif contradicts(h.truth, axis, word):
+        elif contradicts(h.truth, axis, word, h.binding):
             if pin is not None and pin.marker:
                 state = KNOWN if pin.word == word else CHANGED
             else:
@@ -259,7 +298,8 @@ def bless_text(text: str, h: Header, judgements: list) -> str:
     for j in sorted(judgements, key=lambda j: rank[j.axis]):
         if j.state not in BLESSABLE:
             continue
-        keep_marker = j.pin is not None and j.pin.marker and contradicts(h.truth, j.axis, j.observed)
+        keep_marker = (j.pin is not None and j.pin.marker
+                       and contradicts(h.truth, j.axis, j.observed, h.binding))
         new = f"-- expect {j.axis}: {j.observed}" + (f" {MARKER}" if keep_marker else "")
         if j.pin is not None:
             lines[j.pin.line] = new

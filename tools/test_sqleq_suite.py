@@ -85,6 +85,22 @@ class Lint(unittest.TestCase):
              # A proof that is itself marked unsound is no evidence for anything.
              ("-- truth: equivalent", "-- origin: x", "-- expect fuzz: counterexample")),
             ("`catalog: guessed` is not one of", EQ_OK + ("-- catalog: guessed",)),
+            ("`binding: sideways` is not one of", EQ_OK + ("-- binding: sideways",)),
+            # A contradicting pin can only have been written by hand; it is caught without the axis.
+            ("contradicts `truth: not-equivalent`", NEQ_OK + ("-- expect qed: proved",)),
+            ("contradicts `truth: equivalent`", EQ_OK + ("-- expect fuzz: counterexample",)),
+            ("contradicts `truth: not-equivalent`",
+             NEQ_OK + ("-- binding: gather", "-- expect lean: no-witness")),
+            # Under the gather rule only Lean's answers are evidence, and `no-witness` is not.
+            ("a non-equivalent pair needs a `witness:`",
+             ("-- truth: not-equivalent", "-- binding: gather", "-- origin: x",
+              "-- expect fuzz: counterexample")),
+            ("needs `expect lean: proved-gather` or an `argument:`",
+             ("-- truth: equivalent", "-- binding: gather", "-- origin: x",
+              "-- expect qed: proved")),
+            ("needs `expect lean: proved-gather` or an `argument:`",
+             ("-- truth: equivalent", "-- binding: gather", "-- origin: x",
+              "-- expect lean: no-witness")),
         ]
         for needle, directives in rows:
             with self.subTest(needle=needle, directives=directives):
@@ -95,6 +111,14 @@ class Lint(unittest.TestCase):
                                      "-- expect fuzz: counterexample"), [])
         self.assertEqual(self.errors("-- truth: equivalent", "-- origin: x",
                                      "-- expect qed: proved"), [])
+        self.assertEqual(self.errors("-- truth: equivalent", "-- binding: gather", "-- origin: x",
+                                     "-- expect lean: proved-gather"), [])
+
+    def test_an_axis_under_the_other_binding_contradicts_nothing(self):
+        # The other axes refuse a gather pair, and Lean has nothing to say about an index one.
+        self.assertEqual(self.errors("-- truth: equivalent", "-- binding: gather", "-- origin: x",
+                                     "-- argument: a", "-- expect fuzz: counterexample"), [])
+        self.assertEqual(self.errors(*NEQ_OK, "-- expect lean: proved-gather"), [])
 
     def test_a_pin_below_the_sql_is_an_error_not_a_comment(self):
         self.assertLints("below the first SQL line", *NEQ_OK,
@@ -135,6 +159,15 @@ class Judge(unittest.TestCase):
             ("timeout", neq + ("-- expect qed: no-proof",), {"qed": ("timeout", "")},
              s.UNANSWERED),
             ("missing", neq, {"sqlsolver-jvm": ("missing", "")}, s.UNANSWERED),
+            ("lean false proof", neq + ("-- binding: gather",), {"lean": ("proved-gather", "")},
+             s.INVARIANT),
+            ("lean vacuous false proof", neq + ("-- binding: gather",),
+             {"lean": ("no-witness", "")}, s.INVARIANT),
+            ("lean on an index pair", neq, {"lean": ("proved-gather", "")}, s.UNPINNED),
+            ("prover on a gather pair", neq + ("-- binding: gather",), {"qed": ("proved", "")},
+             s.UNPINNED),
+            ("fuzz on a gather pair", eq + ("-- binding: gather",),
+             {"fuzz": ("counterexample", "")}, s.UNPINNED),
         ]
         for label, directives, observed, want in rows:
             with self.subTest(label):

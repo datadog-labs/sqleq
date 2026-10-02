@@ -154,7 +154,7 @@ def discover_fuzz(override: Optional[str]) -> str:
 
 # The crate whose sources each binary is built from, for `stale_build`.
 CRATE_DIR = {"sqleq-frontend": REPO, "sqleq-fuzz": REPO / "sqleq-fuzz",
-             "sqleq-solver": REPO / "sqleq-solver"}
+             "sqleq-solver": REPO / "sqleq-solver", "sqleq-lean": REPO / "sqleq-lean"}
 
 
 def stale_build(binary: str) -> Optional[str]:
@@ -1035,6 +1035,8 @@ def observe(case: Case, axes: list) -> dict:
                          else (case.s_bucket or SQLSOLVER_MISSING, case.s_note))
     if "fuzz" in axes:
         out["fuzz"] = (case.f_verdict or "missing", case.f_note)
+    if "lean" in axes:
+        out["lean"] = (case.l_verdict or "missing", case.l_reason)
     return out
 
 
@@ -1400,7 +1402,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "any movement fails (tests/pairs/README.md).")
     p.add_argument("--axes", metavar="LIST",
                    help="Comma-separated axes to run: frontend, fuzz, qed, sqlsolver-rust, "
-                        "sqlsolver-jvm (default: frontend,qed). A prover axis brings in "
+                        "sqlsolver-jvm, lean (default: frontend,qed). A prover axis brings in "
                         "frontend; at most one SQLSolver per run.")
     p.add_argument("--bless", action="store_true",
                    help="With --expect pinned: rewrite each case's `expect` lines for the "
@@ -1450,7 +1452,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lean", action="store_true",
                    help="Also run the Lean axis (sqleq-lean) over the .sql cases: "
                         "INSERT ... VALUES vs INSERT ... SELECT * FROM unnest(..) "
-                        "pairs, proved under the gather rule. Never changes the exit code.")
+                        "pairs, proved under the gather rule. The same as adding `lean` to "
+                        "--axes; outside --expect pinned it never changes the exit code.")
     p.add_argument("--lean-bin", metavar="PATH",
                    help="Path to sqleq-lean (else $SQLEQ_LEAN / target/{release,debug}).")
     p.add_argument("--sqlsolver-timeout", type=int, default=None, metavar="MS",
@@ -1473,6 +1476,8 @@ def resolve_axes(args) -> list:
             sys.exit(f"error: unknown axis {', '.join(unknown)} (one of {', '.join(suite.AXES)})")
     if args.sqlsolver:
         axes.add(f"sqlsolver-{args.sqlsolver_impl}")
+    if args.lean:
+        axes.add("lean")
     if axes & set(suite.PROVERS):
         axes.add("frontend")
     if {"sqlsolver-rust", "sqlsolver-jvm"} <= axes:
@@ -1493,9 +1498,6 @@ def setup(args) -> dict:
     if args.expect == "equivalent" and "qed" not in axes:
         sys.exit("error: --expect equivalent is a policy on the qed axis, which --axes leaves "
                  "out; use --expect pinned or report-only")
-    if pinned and args.lean:
-        sys.exit("error: the Lean axis pins its own pairs (examples/lean, `-- expect:`); "
-                 "--lean does not combine with --expect pinned")
     env = {"axes": axes}
     env["frontend"] = discover_frontend(args.frontend) if "frontend" in axes else None
     env["prover"] = discover_prover(args.prover) if "qed" in axes else None
@@ -1507,7 +1509,7 @@ def setup(args) -> dict:
     elif "sqlsolver-jvm" in axes:
         env["ss"] = discover_sqlsolver_jvm(args.sqlsolver_tree)
     env["fuzz"] = discover_fuzz(args.fuzz_bin) if "fuzz" in axes else None
-    env["lean"] = discover_lean(args.lean_bin) if args.lean else None
+    env["lean"] = discover_lean(args.lean_bin) if "lean" in axes else None
 
     files = collect_inputs(args.paths)
     if not files:
@@ -1519,7 +1521,7 @@ def setup(args) -> dict:
                      "none: " + ", ".join(plans[:3]))
     env["files"] = files
 
-    bins = [env["frontend"], env["fuzz"]]
+    bins = [env["frontend"], env["fuzz"], env["lean"]]
     if env["ss"] is not None and env["ss"].impl == "rust":
         bins.append(env["ss"].where)
     for b in bins:

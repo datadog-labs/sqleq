@@ -83,7 +83,7 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable`. |
 | `--expect report-only` | Always exit 0; just report. |
 | `--expect pinned` | Each case's header pins every axis's answer; exit non-zero on any movement. See [Pinned pairs](#pinned-pairs). |
-| `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqlsolver-rust`, `sqlsolver-jvm` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. |
+| `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqlsolver-rust`, `sqlsolver-jvm`, `lean` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. |
 | `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. |
 | `--fuzz-bin PATH` | The `sqleq-fuzz` binary (else `$SQLEQ_FUZZ`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--json` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
@@ -94,7 +94,7 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--sqlsolver-tree DIR` | With `jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
 | `--sqlsolver-bin PATH` | With `rust`: the `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--sqlsolver-timeout MS` | Per-row cap for that prover (default: `-t` in ms). Its own, because the two provers are not comparably fast. |
-| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. Never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
+| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
 
