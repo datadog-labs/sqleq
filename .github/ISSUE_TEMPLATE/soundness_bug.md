@@ -9,7 +9,7 @@ assignees: ''
 
 <!--
 This is the most serious kind of bug this project can have, so thank you for reporting it. The
-pair does not need to be minimized.
+pair does not need to be minimized: the fix minimizes it and pins it under tests/pairs/.
 -->
 
 ## The two queries

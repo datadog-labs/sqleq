@@ -20,6 +20,9 @@ explained in https://github.com/datadog-labs/sqleq/blob/main/CONTRIBUTING.md.
 - [ ] A construct the frontend cannot lower faithfully is refused, not approximated.
 - [ ] If this grows the provable set, it was run against `sqleq-fuzz` on the same pairs, and none
       of the newly proven pairs has a counterexample.
+- [ ] If this fixes a defect that can be stated as a pair, the pair is pinned under `tests/pairs/`
+      and was seen failing on a build from before the fix.
+- [ ] Every pin under `tests/pairs/` that moved is explained in the description.
 - [ ] If dependencies changed, `LICENSE-3rdparty.csv` was regenerated with
       `sh tools/update_license_3rdparty.sh`.
 

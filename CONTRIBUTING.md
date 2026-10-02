@@ -12,7 +12,11 @@ cargo test -p sqleq-solver # the SQLSolver port: 57 (needs Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 25 + 3 (needs Lean, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
+python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
 ```
+
+The last line runs the [pinned pairs](tests/pairs/README.md) on the three axes CI has; it needs the
+`sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries built.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
 `sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and `sqleq-solver`
@@ -86,6 +90,12 @@ it is also the control. Do **not** add a separate hand-built negative-control ba
 run that control set already *is* a cell of the table, and building a second one invites reporting
 the easy half. See [`docs/VALIDATION.md`](docs/VALIDATION.md), *Each axis is the other's control*.
 
+The [pinned pairs](tests/pairs/README.md) are not that batch, and passing them is not that evidence.
+They are a regression pin: each records what every axis said about a pair whose truth is already
+known, so that a defect found once is checked on every axis from then on. A pinned pair can only
+fail in a way someone has already seen. Do not grow them into a control set for one change; add the
+pair that change fixed, and run the corpus cross-check as well.
+
 ## Documentation
 
 [`docs/README.md`](docs/README.md) is the index: which document answers which question. The split
@@ -114,10 +124,22 @@ Two consequences:
 * **Defects in the method itself.** [`docs/VALIDATION.md`](docs/VALIDATION.md) lists what this
   approach has caught; an argument for something it would miss is more valuable than a patch.
 
+## Pinning a regression
+
+A fix for a defect that can be stated as a pair — a false proof, a false refutation, two queries
+that lowered alike — comes with that pair under [`tests/pairs/`](tests/pairs/README.md). In short:
+
+1. Minimize it on an invented schema. Nothing in it may come from a corpus that is not public.
+2. Write its `truth`, its `origin`, and a `witness` (not equivalent) or an `argument` (equivalent).
+3. Rebuild every binary, then run `tools/sqleq_check.py --expect pinned --bless` with every axis
+   you have.
+4. Read the diff against `truth`, and show the pair fails on a build from before the fix.
+5. In the pull request, say why every pin that moved, moved.
+
 ## Reporting a soundness bug
 
 A pair where a prover claims equivalence and the queries are not equivalent is the most serious bug
 this project can have. Open an issue with the two queries, the DDL, and the counterexample if you
 have one — it does not need to be minimized. The
 [soundness bug template](https://github.com/datadog-labs/sqleq/issues/new?template=soundness_bug.md)
-asks for exactly that.
+asks for exactly that. The fix will add the pair, minimized, to [`tests/pairs/`](tests/pairs/README.md).

@@ -195,6 +195,7 @@ default. Every `qed-prover` command above assumes it is on `PATH` this way.
 | [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | the second proving backend, on the same IR |
 | [`docs/INTERNALS.md`](docs/INTERNALS.md) | module map, for reading or changing the code |
 | [`tools/README.md`](tools/README.md) | the batch harness |
+| [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |
 | [`sqleq-fuzz/README.md`](sqleq-fuzz/README.md) | the disproving axis, and its own soundness rules |
 
 ## Contributing
