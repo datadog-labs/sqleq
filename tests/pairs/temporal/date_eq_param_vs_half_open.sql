@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: date arithmetic was integer arithmetic, which is wrong at infinity (64af5bf)
 -- witness: t = {(1, NULL, 'infinity')}, $1 = 'infinity': A keeps the row; in B 'infinity' + 1 is 'infinity', so `d < $1 + 1` is false and B drops it

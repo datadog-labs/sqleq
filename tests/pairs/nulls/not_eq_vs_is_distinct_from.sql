@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: three-valued logic: NOT (a = 1) is NULL where a IS DISTINCT FROM 1 is true
 -- witness: t = {(1, NULL, NULL)}: A drops the row, B keeps it
 create table "t" ("id" INTEGER, "a" INTEGER, "b" INTEGER, unique ("id"));

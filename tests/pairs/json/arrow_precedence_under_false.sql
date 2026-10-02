@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqlsolver-rust: unsupported
 -- expect sqlsolver-jvm: proved
+-- expect lean: unsupported
 -- origin: DuckDB binds ->> looser than AND, so sqleq-fuzz once ran a different predicate than Postgres
 -- argument: in Postgres ->> binds tighter than IS NULL and AND, so both predicates are `false AND ...`, false for every row
 create table "t" ("id" INTEGER, "j" JSONB, unique ("id"));

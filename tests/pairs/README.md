@@ -11,7 +11,8 @@ already seen, so passing them says nothing about whether a change that grows the
 sound. That evidence is still the cross-check in [CONTRIBUTING.md](../../CONTRIBUTING.md) rule 2.
 
 `examples/dropped_filter.sql` and `examples/in_vs_or.sql` carry the same header and run with these.
-The Lean axis has its own pinned pairs, in `examples/lean/`.
+The Lean axis's pairs are under `insert_unnest/`, and are stated under the gather rule
+([below](#the-gather-rule)).
 
 ## Running them
 
@@ -21,6 +22,8 @@ python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust
 # The two it never installs (one SQLSolver per run):
 python3 tools/sqleq_check.py --expect pinned --axes qed --prover "$QED_PROVER" tests/pairs examples/*.sql
 python3 tools/sqleq_check.py --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
+# The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
+python3 tools/sqleq_check.py --expect pinned --axes lean tests/pairs examples/*.sql
 ```
 
 The output is one row per pair and one column per axis that ran. Exit code 0 means every pin held,
@@ -55,10 +58,11 @@ an error, not a comment, because a pin nobody reads looks exactly like one that 
 |---|---|---|
 | `truth:` | a person; `--bless` never writes it | `equivalent` or `not-equivalent` |
 | `expect <axis>:` | `--bless` | what that axis said, as one word from the table below |
+| `binding:` | a person | `index` (the default) or `gather`: how the truth binds `$N` across the two sides ([below](#the-gather-rule)) |
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
-| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample`. |
-| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`. |
+| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` (not under `binding: gather`). |
+| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, or, under `binding: gather`, Lean's is `proved-gather`. |
 
 ## What each axis may say
 
@@ -71,6 +75,7 @@ nothing and changing what is refused moves a pin.
 | `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
 | `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend refused), `panic`, `error` |
 | `sqlsolver-rust`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
+| `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
 
 `timeout` and `missing` are never pinnable: they say the run got no answer, not what the answer was.
 
@@ -84,17 +89,33 @@ length, a date at infinity or a second session is pinned `no-counterexample` and
 
 | what the run sees | result |
 |---|---|
-| an answer that contradicts `truth`: a prover proves a non-equivalent pair, the frontend lowers one to the same IR on both sides, or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
+| an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend lowers one to the same IR on both sides, or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
 | the same, on a line marked `!known-unsound` | passes while the bug reproduces |
 | a `!known-unsound` line whose answer no longer contradicts `truth` | fails; `--bless` drops the marker |
 | a pinned answer that moved, either way | fails; `--bless` takes the new answer |
 | an axis that ran with no `expect` line | fails; `--bless` adds one |
 | `timeout` or `missing` | fails; shrink the pair or raise `--timeout` |
-| a header error: no `truth` or `origin`, an unknown key, axis or word, a duplicate, a directive below the SQL, a marker on an answer that contradicts nothing, or no evidence for the truth | fails; `--bless` skips the file |
+| a header error: no `truth` or `origin`, an unknown key, axis or word, a duplicate, a directive below the SQL, a pin that contradicts `truth` without a marker, a marker on one that contradicts nothing, or no evidence for the truth | fails; `--bless` skips the file |
 | a line for an axis this run did not ask | not checked |
 
 An improvement fails too. That is deliberate: the review of the diff is the point, and a proof
 that appeared for no reason the author can give is the shape of a soundness bug.
+
+A pin that contradicts `truth` is a header error even when its axis does not run, so a hand-edited
+pin is caught in every CI run, not only where that axis is installed.
+
+## The gather rule
+
+Every axis but Lean binds `$N` by number: `$1` on one side is `$1` on the other. The Lean axis
+proves `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)` under the gather rule instead:
+the `unnest` side's array `$j` is column `j` of the `VALUES` rows ([LEAN.md](../../docs/LEAN.md)).
+A pair headed `-- binding: gather` states its truth under that rule, and its `witness:` or
+`argument:` binds the parameters the same way.
+
+Only an axis answering under a pair's binding can contradict its truth or stand as evidence for it.
+Under `binding: gather` that is Lean alone; the other axes refuse to compare a scalar with an array
+at the same `$N`, and their pins record exactly that. Under the default binding, Lean's answers are
+ordinary pins.
 
 ## `!known-unsound`
 
@@ -129,4 +150,9 @@ drift between reviews. The last time all five axes were blessed together:
   `aggregates/scalar_agg_empty_group.sql`, and the run fails there, as it should.
 * **sqlsolver-jvm** — the unpublished fork described in [SQLSOLVER.md](../../docs/SQLSOLVER.md),
   at its revision `8c5548b`.
-* **sqlsolver-rust**, **frontend**, **fuzz** — this tree; the solver on Z3 5.1.0, as in CI.
+* **sqlsolver-rust**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
+  the toolchain `lean/lean-toolchain` names, as in CI.
+
+The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared
+statement, the `unnest` side under the gather binding of the `VALUES` side's parameters, once on an
+empty table and once twice over.

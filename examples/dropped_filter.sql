@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: the README's quick start: a rewrite that drops a predicate
 -- witness: users = {(1, 1, 2)}: A drops the row (org 2), B keeps it
 

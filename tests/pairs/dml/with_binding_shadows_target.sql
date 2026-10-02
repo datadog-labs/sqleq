@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqlsolver-rust: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect lean: unsupported
 -- origin: a WITH binding named like the DML target was read as the target (4df30d8)
 -- witness: t = {(1, 0)}: a DELETE's target is always the table, so A deletes the row and B keeps it
 

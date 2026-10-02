@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: the length on a cast over a parameter was dropped (4df30d8)
 -- witness: t = {(1, 'ab')}, $1 = 'abc': A compares 'ab' = 'ab' and keeps the row, B compares 'ab' = 'abc' and drops it

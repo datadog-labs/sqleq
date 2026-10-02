@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: proved
+-- expect lean: unsupported
 -- origin: integer reasoning across a half-open range, which is sound over integers and not
 --   over dates (temporal/date_eq_param_vs_half_open.sql)
 -- argument: over integers, x >= 3 AND x < 4 holds exactly when x = 3, and both are NULL when x is

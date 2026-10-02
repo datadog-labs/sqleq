@@ -3,7 +3,18 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- expect: no-witness
+-- truth: equivalent
+-- expect frontend: refuse:parameter-misaligned
+-- expect fuzz: error
+-- expect qed: no-plan
+-- expect sqlsolver-rust: no-plan
+-- expect sqlsolver-jvm: no-plan
+-- expect lean: no-witness
+-- binding: gather
+-- origin: a proof that may be vacuous is not credited: neither side supplies a NOT NULL column
+-- argument: under the gather rule the array has one element per VALUES row, so both sides insert
+--   two rows with a NULL owner and raise on every run
+
 -- `owner` is NOT NULL with no default and neither side supplies it: every run fails.
 CREATE TABLE docs (id bigserial PRIMARY KEY, owner int NOT NULL, title text);
 INSERT INTO docs (title) VALUES ($1), ($2);

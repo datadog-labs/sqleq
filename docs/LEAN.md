@@ -156,9 +156,14 @@ It needs a Lean toolchain (`elan`, which installs the version in `lean/lean-tool
 
 ```sh
 cargo build -p sqleq-lean
-./target/debug/sqleq-lean examples/lean            # pair files, or directories of them
+./target/debug/sqleq-lean tests/pairs/insert_unnest # pair files, or directories of them
 ./target/debug/sqleq-lean --csv corpus.csv --json out.json
 ```
 
 `$LAKE` overrides the `lake` found on `PATH`, and `$SQLEQ_LEAN_DIR` the Lean package. The checker's
 own positive and negative controls are `lake build SqleqTest` in `lean/`.
+
+The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/README.md), headed
+`-- binding: gather` because their truth is stated under the gather rule. `cargo test -p
+sqleq-lean` checks every `-- expect lean:` pin under `tests/pairs/` against real Lean, and
+`tools/sqleq_check.py --expect pinned --axes lean` does the same with the suite's other rules.

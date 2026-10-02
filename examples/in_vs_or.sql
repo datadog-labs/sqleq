@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqlsolver-rust: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect lean: unsupported
 -- origin: the README's quick start: IN against the OR it abbreviates
 -- argument: `tier IN (1, 2)` is defined as `tier = 1 OR tier = 2`
 

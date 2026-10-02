@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: dates and timestamps both lowered as integers, so `d + 1` read as one microsecond (742935f)
 -- witness: t = {(1, '2024-01-01 10:00', '2024-01-01')}: A keeps the row, B drops it
 create table "t" ("id" INTEGER, "ts" TIMESTAMP, "d" DATE, unique ("id"));

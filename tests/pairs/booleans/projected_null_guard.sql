@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: proved !known-unsound
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a boolean in the SELECT list was read two-valued, as if NULL were false
 -- witness: t = {(1, NULL)}, $1 = 1: A yields false, B yields NULL

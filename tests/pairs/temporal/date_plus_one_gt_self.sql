@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: date arithmetic was integer arithmetic, which is wrong at infinity (64af5bf)
 -- witness: t = {(1, NULL, 'infinity')}: 'infinity' + 1 = 'infinity', so A drops the row and B keeps it
 create table "t" ("id" INTEGER, "ts" TIMESTAMP, "d" DATE, unique ("id"));

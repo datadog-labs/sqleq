@@ -5,14 +5,15 @@
 
 -- truth: not-equivalent
 -- expect frontend: refuse:parameter-misaligned
--- expect fuzz: param-misaligned
+-- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqlsolver-rust: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
--- catalog: inferred-seeded
--- origin: `$N` is bound by index across the pair, so a pair that renumbers its parameters compares statements nobody wrote
--- witness: $1 = 0, $2 = 1, t = {(1, 1, 1)}: A drops the row (a is not 0), B keeps it
-create table "t" ("id" INTEGER, "a" INTEGER, "b" INTEGER, unique ("id"));
-SELECT "id" FROM "t" WHERE "a" = $1 AND "b" = $2;
-SELECT "id" FROM "t" WHERE "a" = $2;
+-- binding: gather
+-- origin: the Lean axis's fragment boundary: the unnest arrays in the wrong order
+-- witness: $1 = 1, $2 = 'x', $3 = 2, $4 = 'y': A inserts (1, x) and (2, y); B is rejected, because
+--   its first column is text and a is integer
+CREATE TABLE t (a int, b text);
+INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4);
+INSERT INTO t (a, b) SELECT * FROM unnest($2::text[], $1::int[]);

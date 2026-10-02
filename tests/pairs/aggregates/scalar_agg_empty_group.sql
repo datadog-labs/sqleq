@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: QED read an aggregate grouped by a key the filter pins to one value as a scalar aggregate
 -- witness: an empty t: A returns no rows (no group), B returns one row (0)
 

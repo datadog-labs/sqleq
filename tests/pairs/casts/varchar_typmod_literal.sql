@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: in an inferred catalog the length on a cast over a literal was dropped, so the cast
 --   read as the identity (5bbe69e)

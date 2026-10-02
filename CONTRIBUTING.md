@@ -15,8 +15,9 @@ python3 tools/linkcheck.py # every relative link in every tracked Markdown file 
 python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
 ```
 
-The last line runs the [pinned pairs](tests/pairs/README.md) on the three axes CI has; it needs the
-`sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries built.
+The last line runs the [pinned pairs](tests/pairs/README.md) on three of the axes CI has; it needs
+the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries built. Their Lean pins are checked by
+`cargo test -p sqleq-lean`.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
 `sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and `sqleq-solver`

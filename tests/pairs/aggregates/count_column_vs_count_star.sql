@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqlsolver-rust: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect lean: unsupported
 -- origin: COUNT(x) must not be read as COUNT(*): one ignores NULLs, the other counts rows
 -- witness: t = {(1, NULL)}: A returns 0, B returns 1
 create table "t" ("id" INTEGER, "x" INTEGER, unique ("id"));

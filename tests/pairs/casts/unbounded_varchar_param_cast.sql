@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqlsolver-rust: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: the control beside the typmod fixes: a cast with no length must still be the identity
 -- argument: $1 is compared with a varchar column either way, and a cast to unbounded varchar changes no value

@@ -343,7 +343,8 @@ jobs:
       - name: Lean library and controls
         run: cd lean && lake build Sqleq SqleqTest
 
-      # The integration test runs every example under examples/lean through real Lean and asserts
+      # The integration test runs every pinned pair under tests/pairs that pins the Lean axis through
+      # real Lean and asserts
       # the verdict its header declares; it fails, rather than skips, without `lake` on PATH.
       - run: cargo test -p sqleq-lean
       - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings

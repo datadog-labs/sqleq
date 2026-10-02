@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqlsolver-rust: proved
 -- expect sqlsolver-jvm: proved
+-- expect lean: unsupported
 -- origin: the equivalent shape beside the two temporal casts above, which must still lower and prove
 -- argument: = is symmetric, and both sides apply the same cast to the same column
 create table "t" ("id" INTEGER, "ts" TIMESTAMP, "d" DATE, unique ("id"));

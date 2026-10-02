@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqlsolver-rust: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect lean: unsupported
 -- origin: a row-locking clause was dropped, so the two sides lowered alike (#16)
 -- witness: while another transaction holds a row lock on a row of t, A skips that row and B returns it
 create table "t" ("id" INTEGER, "a" INTEGER, unique ("id"));

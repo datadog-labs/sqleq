@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqlsolver-rust: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect lean: unsupported
 -- origin: sqleq-fuzz measured a WITH-wrapped DELETE as a query rather than by the table it changes
 -- argument: the CTE is never referenced and modifies nothing, so it has no effect
 create table "t" ("id" INTEGER, "a" INTEGER, unique ("id"));
