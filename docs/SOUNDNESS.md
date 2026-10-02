@@ -102,6 +102,14 @@ what it is or refused:
 - **The target of a `DELETE` or `UPDATE` always names the table.** A `WITH` binding of the same name
   would be inlined over it by the reduction, so `WITH t AS (…) DELETE FROM t`, which empties `t`, is
   refused rather than lowered as a filtered delete.
+- **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
+  two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
+  coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.
+- **An alias's column list renames by position.** In `t AS x(b, a)`, `x.b` is `t`'s first column,
+  whatever that column is called. A list that leaves two columns with one name is refused.
+- **Parentheses in a `FROM` clause group.** `a LEFT JOIN (b JOIN c ON p) ON q` is lowered with its
+  grouping, since it is not `(a LEFT JOIN b ON q) JOIN c ON p`, and the inner `ON` sees only the
+  inner join's own tables. An aliased one, `(b JOIN c) AS x`, is refused.
 
 ## A query that raises an error
 

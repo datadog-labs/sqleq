@@ -1223,6 +1223,147 @@ fn a_join_condition_cannot_reach_a_table_joined_after_it() {
     }
 }
 
+/// The join node at the top of the first query's FROM clause.
+fn top_join(v: &serde_json::Value) -> &serde_json::Value {
+    &find_with_field(&v["queries"][0], "join").expect("a join")["join"]
+}
+
+/// The two column levels a comparison `cond` compares.
+fn compared(cond: &serde_json::Value) -> (u64, u64) {
+    let col = |i: usize| cond["operand"][i]["column"].as_u64().expect("a column operand");
+    (col(0), col(1))
+}
+
+#[test]
+fn a_parenthesized_inner_join_lowers_like_the_same_join_without_parentheses() {
+    let flat = r#"SELECT "x"."a" FROM "t" AS "x" JOIN "t" AS "y" ON "x"."a" = "y"."a""#;
+    for nested in [
+        r#"SELECT "x"."a" FROM ("t" AS "x" JOIN "t" AS "y" ON "x"."a" = "y"."a")"#,
+        r#"SELECT "x"."a" FROM (("t" AS "x" JOIN "t" AS "y" ON "x"."a" = "y"."a"))"#,
+    ] {
+        let v = ok(&pair(flat, nested));
+        assert_eq!(v["queries"][0], v["queries"][1], "{nested}");
+    }
+}
+
+#[test]
+fn a_parenthesized_join_on_the_right_numbers_its_columns_from_the_enclosing_width() {
+    // The inner join is a join input: its condition reads `y.a` and `z.a` as 0 and 3, as if `x`
+    // were not there. The outer condition sees `x ++ y ++ z`, so there `z.a` is 6.
+    let v = ok(&same(
+        r#"SELECT "x"."a" FROM "t" AS "x"
+             JOIN ("t" AS "y" JOIN "t" AS "z" ON "y"."a" = "z"."a") ON "x"."a" = "z"."a""#,
+    ));
+    let outer = top_join(&v);
+    assert_eq!(compared(&outer["condition"]), (0, 6));
+    assert_eq!(compared(&outer["right"]["join"]["condition"]), (0, 3));
+}
+
+#[test]
+fn a_right_nested_chain_without_parentheses_is_the_parenthesized_join() {
+    // Postgres reads `x JOIN y JOIN z ON p ON q` as `x JOIN (y JOIN z ON p) ON q`.
+    let v = ok(&pair(
+        r#"SELECT "x"."a" FROM "t" AS "x" JOIN "t" AS "y" JOIN "t" AS "z" ON "y"."a" = "z"."a" ON "x"."a" = "z"."a""#,
+        r#"SELECT "x"."a" FROM "t" AS "x" JOIN ("t" AS "y" JOIN "t" AS "z" ON "y"."a" = "z"."a") ON "x"."a" = "z"."a""#,
+    ));
+    assert_eq!(v["queries"][0], v["queries"][1]);
+}
+
+#[test]
+fn parentheses_that_group_an_outer_join_are_kept() {
+    // `x LEFT JOIN (y JOIN z)` keeps an `x` row whose `y` has no `z`; `(x LEFT JOIN y) JOIN z` drops it.
+    let v = ok(&pair(
+        r#"SELECT "x"."a" FROM "t" AS "x" LEFT JOIN ("t" AS "y" JOIN "t" AS "z" ON "y"."a" = "z"."a") ON "x"."a" = "y"."a""#,
+        r#"SELECT "x"."a" FROM "t" AS "x" LEFT JOIN "t" AS "y" ON "x"."a" = "y"."a" JOIN "t" AS "z" ON "y"."a" = "z"."a""#,
+    ));
+    assert_ne!(v["queries"][0], v["queries"][1]);
+    let outer = top_join(&v);
+    assert_eq!(outer["kind"], "LEFT");
+    assert!(outer["right"].get("join").is_some(), "the inner join stays the LEFT JOIN's right input");
+}
+
+#[test]
+fn a_later_join_condition_reaches_into_a_parenthesized_join() {
+    // The factor brings two bindings, so the next condition's row ends after three, not two.
+    let v = ok(&same(
+        r#"SELECT "x"."a" FROM ("t" AS "x" JOIN "t" AS "y" ON TRUE) JOIN "t" AS "z" ON "z"."a" = "y"."a""#,
+    ));
+    assert_eq!(compared(&top_join(&v)["condition"]), (6, 3));
+}
+
+#[test]
+fn a_parenthesized_join_condition_sees_the_outer_query_but_not_its_from_siblings() {
+    // Correlated: `w` is the enclosing query's, at level 0; `x` starts after it.
+    let v = ok(&same(
+        r#"SELECT "w"."a" FROM "t" AS "w"
+             WHERE EXISTS (SELECT 1 FROM ("t" AS "x" JOIN "t" AS "y" ON "x"."a" = "w"."a"))"#,
+    ));
+    let sub = &find_op(&v, "EXISTS").expect("an EXISTS node")["query"];
+    assert_eq!(compared(&find_with_field(sub, "join").expect("a join")["join"]["condition"]), (3, 0));
+    // A sibling in the same FROM clause is not in scope, as in Postgres.
+    let sql = same(r#"SELECT "w"."a" FROM "t" AS "w" JOIN ("t" AS "x" JOIN "t" AS "y" ON "x"."a" = "w"."a") ON TRUE"#);
+    match lower_sql(&sql) {
+        Err(FrontendError::Schema(m)) => assert!(m.contains("w.a"), "unexpected reason: {m}"),
+        other => panic!("expected an unresolved-column refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn using_reaches_into_a_parenthesized_join() {
+    // `x.b` against the first `b` of the parenthesized side, `y.b`.
+    let v = ok(&same(r#"SELECT "x"."a" FROM "t" AS "x" JOIN ("t" AS "y" JOIN "t" AS "z" ON TRUE) USING ("b")"#));
+    assert_eq!(compared(&top_join(&v)["condition"]), (1, 4));
+}
+
+#[test]
+fn an_aliased_parenthesized_join_is_refused() {
+    refused(&same(r#"SELECT 1 FROM ("t" AS "x" JOIN "t" AS "y" ON TRUE) AS "j""#), "parenthesized join with an alias");
+}
+
+#[test]
+fn a_bare_star_over_using_is_refused_even_alone_in_the_select_list() {
+    // `USING` merges `a` into one output column, so this has one column fewer than the `ON` form.
+    refused(&same(r#"SELECT * FROM "t" AS "x" JOIN "t" AS "y" USING ("a")"#), "bare * over a JOIN ... USING");
+}
+
+#[test]
+fn a_table_alias_column_list_renames_the_columns_in_order() {
+    // `"t" AS "x"("b", "a")`: `x.b` is the first column (an INTEGER), `x.a` the second (a VARCHAR).
+    let col = |q: &str| ok(&same(q))["queries"][0]["project"]["target"][0].clone();
+    assert_eq!(col(r#"SELECT "x"."b" FROM "t" AS "x"("b", "a")"#), serde_json::json!({ "column": 0, "type": "INTEGER" }));
+    assert_eq!(col(r#"SELECT "a" FROM "t" AS "x"("b", "a")"#), serde_json::json!({ "column": 1, "type": "VARCHAR" }));
+    // A short list renames a prefix; the rest keep their names.
+    assert_eq!(col(r#"SELECT "x"."c" FROM "t" AS "x"("p")"#), serde_json::json!({ "column": 2, "type": "VARBINARY" }));
+    for (q, needle) in [
+        (r#"SELECT 1 FROM "t" AS "x"("p", "q", "r", "s")"#, "fewer columns"),
+        (r#"SELECT 1 FROM "t" AS "x"("b")"#, "two columns"),
+    ] {
+        match lower_sql(&same(q)) {
+            Err(FrontendError::Schema(m)) => assert!(m.contains(needle), "unexpected reason: {m}"),
+            other => panic!("expected a schema refusal for {q}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn using_a_column_a_right_or_full_join_merged_is_refused() {
+    // After `x RIGHT JOIN y USING (a)`, the merged `a` is `COALESCE(x.a, y.a)`, not `x.a`.
+    refused(
+        &same(r#"SELECT 1 FROM "t" AS "x" RIGHT JOIN "t" AS "y" USING ("a") JOIN "t" AS "z" USING ("a")"#),
+        "a RIGHT or FULL join already merged",
+    );
+    refused(
+        &same(r#"SELECT 1 FROM "t" AS "z" JOIN ("t" AS "x" FULL JOIN "t" AS "y" USING ("a")) USING ("a")"#),
+        "a RIGHT or FULL join already merged",
+    );
+    // Under an inner join the merged column equals both sides, and after a `LEFT` join it is the
+    // left side's, `x.a`: a second `USING` reads `x.a` either way, which is exact.
+    for kind in ["JOIN", "LEFT JOIN"] {
+        let v = ok(&same(&format!(r#"SELECT 1 FROM "t" AS "x" {kind} "t" AS "y" USING ("a") JOIN "t" AS "z" USING ("a")"#)));
+        assert_eq!(compared(&top_join(&v)["condition"]), (0, 6), "{kind}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `lower_with_ddl` — the schema comes from raw Postgres DDL, not from the
 // `CREATE TABLE`s in the input.

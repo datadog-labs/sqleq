@@ -67,8 +67,8 @@ use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
     Ident, Interval,
     JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TypedString, UnaryOperator, Value, Visit, VisitMut, Visitor,
-    VisitorMut,
+    Statement, TableAlias, TableFactor, TableWithJoins, TypedString, UnaryOperator, Value, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 
 use crate::error::{unsupported, FrontendError, Result};
@@ -676,11 +676,7 @@ fn rewrite_filters(body: &mut SetExpr) {
             for e in [select.selection.as_mut(), select.having.as_mut()].into_iter().flatten() {
                 rewrite_in_filter(e);
             }
-            for join in select.from.iter_mut().flat_map(|t| t.joins.iter_mut()) {
-                if let Some(e) = join_on_mut(&mut join.join_operator) {
-                    rewrite_in_filter(e);
-                }
-            }
+            select.from.iter_mut().for_each(rewrite_join_filters);
         }
         SetExpr::SetOperation { left, right, .. } => {
             rewrite_filters(left);
@@ -689,6 +685,21 @@ fn rewrite_filters(body: &mut SetExpr) {
         // `SetExpr::Query` is a `Query` and is reached by `pre_visit_query` in its own right, so
         // descending here would process it twice. Everything else owns no filter of its own.
         _ => {}
+    }
+}
+
+/// The `ON` conditions of one FROM item, those of its parenthesized joins included.
+fn rewrite_join_filters(twj: &mut TableWithJoins) {
+    if let TableFactor::NestedJoin { table_with_joins, .. } = &mut twj.relation {
+        rewrite_join_filters(table_with_joins);
+    }
+    for join in &mut twj.joins {
+        if let TableFactor::NestedJoin { table_with_joins, .. } = &mut join.relation {
+            rewrite_join_filters(table_with_joins);
+        }
+        if let Some(e) = join_on_mut(&mut join.join_operator) {
+            rewrite_in_filter(e);
+        }
     }
 }
 
@@ -1678,6 +1689,14 @@ mod tests {
     }
 
     /// The connectives the induction covers, and only those.
+    #[test]
+    fn rewrites_inside_a_parenthesized_join() {
+        assert_eq!(
+            anyed("SELECT x FROM a JOIN (b JOIN c ON c.id IN (SELECT unnest($1))) ON a.id = b.id"),
+            "SELECT x FROM a JOIN (b JOIN c ON c.id = ANY($1)) ON a.id = b.id"
+        );
+    }
+
     #[test]
     fn descends_through_and_or_and_parens() {
         assert_eq!(

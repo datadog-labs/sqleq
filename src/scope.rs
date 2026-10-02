@@ -63,12 +63,23 @@ pub struct Scope {
     /// `USING`. Under an inner join the merged column equals both sides (the equality holds and
     /// excludes NULLs), so resolving to either is faithful.
     pub merged_outer: bool,
+    /// The merged names a `RIGHT` or `FULL` join merged. Each is a coalesce of its two sides, which
+    /// no one binding holds; after a `LEFT` join the merged column is the left side's, which is the
+    /// first binding with that name. A further `USING` over one of these is refused.
+    pub coalesced: Vec<String>,
 }
 
 impl Scope {
     /// An empty scope (e.g. for VALUES, whose expressions are constants).
     pub fn empty() -> Self {
-        Scope { binds: Vec::new(), inner_count: 0, base: 0, merged: Vec::new(), merged_outer: false }
+        Scope {
+            binds: Vec::new(),
+            inner_count: 0,
+            base: 0,
+            merged: Vec::new(),
+            merged_outer: false,
+            coalesced: Vec::new(),
+        }
     }
 
     /// The binding an absolute column level falls in, and the level's index within it.
@@ -116,6 +127,7 @@ impl Scope {
             base: self.base,
             merged: self.merged.clone(),
             merged_outer: self.merged_outer,
+            coalesced: self.coalesced.clone(),
         }
     }
 
