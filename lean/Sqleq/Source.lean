@@ -20,6 +20,18 @@ interprets a value, which is what lets a proof hold for every column type at onc
 
 namespace Sqleq
 
+/-- What fills a generated `VALUES` cell. Only the witness reads the kind; the equivalence claim
+holds for every value a generated cell could take. -/
+inductive GenKind where
+  /-- `DEFAULT`: the column's own default. -/
+  | dflt
+  /-- A generator with a new value per row: `nextval('s')`, `gen_random_uuid()`. -/
+  | fresh
+  /-- A generator not known to differ between rows: `now()`, `current_timestamp`, and
+  `clock_timestamp()`, which can repeat. -/
+  | once
+  deriving DecidableEq, Repr
+
 /-- One cell of a `VALUES` row. There is no `Option` argument for the cast: measured, a `none` per
 cell costs about a third of elaboration on a 60-row pair. -/
 inductive Cell where
@@ -29,6 +41,9 @@ inductive Cell where
   | pc (n t : Nat)
   /-- `NULL` -/
   | null
+  /-- A cell the database fills in: `DEFAULT`, or a generator call such as `now()`. Only
+  `checkGatherGen` admits it. -/
+  | gen (k : GenKind)
   deriving DecidableEq, Repr
 
 /-- One argument of a multi-argument `unnest`: `$param::ty[]`, where `ty` is the element type. -/
@@ -67,10 +82,13 @@ variable {V : Type}
 abbrev Scalars (V : Type) := Nat → Option V
 abbrev Arrays (V : Type) := Nat → List (Option V)
 
+/-- A cell's value under `β`. A generated cell has no value here; no pair `checkGather` accepts has
+one. -/
 def cellVal (β : Scalars V) : Cell → Option V
   | .p n => β n
   | .pc n _ => β n
   | .null => none
+  | .gen _ => none
 
 /-- The rows `VALUES` produces, in order. -/
 def valuesRows (β : Scalars V) (rows : List (List Cell)) : List (List (Option V)) :=
@@ -94,5 +112,32 @@ def unnestRows (γ : Arrays V) (args : List Arg) : List (List (Option V)) :=
 order, evaluated under the scalar binding `β`. Column `j` is the (j-1)-th cell of each row. -/
 def gather (rows : List (List Cell)) (β : Scalars V) : Arrays V :=
   fun p => rows.map fun r => cellVal β (r.getD (p - 1) .null)
+
+/-! ### Generated cells
+
+A generated cell's value is chosen by the database, not by a parameter. `Generated V` gives each
+position a value: `g i j` is what the cell in row `i`, column `j` (both from 0) evaluated to.
+Indexing by position, not by a name the translator assigns, means two cells can never be forced to
+share a value. -/
+
+abbrev Generated (V : Type) := Nat → Nat → Option V
+
+/-- `cellVal`, with `v` the value the cell evaluated to if it is generated. -/
+def cellValG (β : Scalars V) (v : Option V) : Cell → Option V
+  | .p n => β n
+  | .pc n _ => β n
+  | .null => none
+  | .gen _ => v
+
+/-- The rows `VALUES` produces when its generated cells evaluate to `g`. -/
+def valuesRowsG (β : Scalars V) (g : Generated V) (rows : List (List Cell)) :
+    List (List (Option V)) :=
+  rows.mapIdx fun i r => r.mapIdx fun j c => cellValG β (g i j) c
+
+/-- **The gather rule with generated cells.** As `gather`, except that a generated cell
+contributes the value it evaluated to: the unnest side's array `$j` holds column `j` of the rows
+`VALUES` produced. -/
+def gatherG (rows : List (List Cell)) (β : Scalars V) (g : Generated V) : Arrays V :=
+  fun p => rows.mapIdx fun i r => cellValG β (g i (p - 1)) (r.getD (p - 1) .null)
 
 end Sqleq

@@ -9,6 +9,7 @@ import Sqleq.Check
 # Soundness of the gather checker
 
 `checkGather_sound`: if the kernel computes `checkGather tys a b = true`, then `EquivGather a b`.
+`checkGatherGen_sound` is the same for generated cells: `checkGatherGen` gives `EquivGatherGen`.
 
 The whole argument is the **gather lemma**, `unnestRows_gather`: unnest over the gathered arrays
 yields exactly the `VALUES` rows, row for row and cell for cell. After that the two statements feed
@@ -145,5 +146,86 @@ theorem checkGather_sound (tys : List Nat) (a b : Insert) (h : checkGather tys a
   intro V R run β
   simp only
   rw [unnestRows_gather β tys (r :: rs) (x :: xs) hargs hrows (by simp), ht, hc, htail]
+
+/-! ### Generated cells
+
+The same argument, with each row and cell carrying its position so that a generated cell reads its
+value from `g`. `pinSeq` and `hasGen` are modelling preconditions; the proof does not use them. -/
+
+theorem rowOkG_length : ∀ (tys : List Nat) (r : List Cell),
+    rowOkG tys r = true → r.length = tys.length
+  | [], [], _ => rfl
+  | _ :: ts, _ :: cs, h => by
+    simp only [rowOkG, Bool.and_eq_true] at h
+    simp [rowOkG_length ts cs h.2]
+  | [], _ :: _, h => by simp [rowOkG] at h
+  | _ :: _, [], h => by simp [rowOkG] at h
+
+theorem rowsOkG_length (tys : List Nat) : ∀ (rows : List (List Cell)),
+    rowsOkG tys rows = true → ∀ r ∈ rows, r.length = tys.length
+  | [], _ => by simp
+  | r :: rs, h => by
+    simp only [rowsOkG, Bool.and_eq_true] at h
+    intro r' hr'
+    rcases List.mem_cons.mp hr' with rfl | hr'
+    · exact rowOkG_length tys r' h.1
+    · exact rowsOkG_length tys rs h.2 r' hr'
+
+/-- The gather lemma with generated cells: unnest over the gathered arrays yields exactly the rows
+`VALUES` produces when its generated cells evaluate to `g`. -/
+theorem unnestRows_gatherG (β : Scalars V) (g : Generated V) (tys : List Nat)
+    (rows : List (List Cell)) (args : List Arg) (hargs : argsOk 1 tys args = true)
+    (hrows : rowsOkG tys rows = true) (hne : args ≠ []) :
+    unnestRows (gatherG rows β g) args = valuesRowsG β g rows := by
+  obtain ⟨hlen, hidx⟩ := argsOk_spec 1 tys args hargs
+  have hwidth := rowsOkG_length tys rows hrows
+  have hmax : maxLen (args.map fun a => gatherG rows β g a.param) = rows.length := by
+    apply maxLen_const
+    · simpa using hne
+    · intro x hx
+      obtain ⟨a, _, rfl⟩ := List.mem_map.mp hx
+      simp [gatherG]
+  unfold unnestRows zipPad valuesRowsG
+  rw [hmax]
+  apply List.ext_getElem
+  · simp
+  · intro i h1 h2
+    have hi : i < rows.length := by simpa using h1
+    have hri : rows[i].length = args.length := by rw [hlen]; exact hwidth _ (List.getElem_mem hi)
+    simp only [List.getElem_map, List.getElem_range, List.getElem_mapIdx]
+    apply List.ext_getElem
+    · simp [hri]
+    · intro j hj1 hj2
+      have hj : j < args.length := by simpa using hj1
+      simp only [List.getElem_map, List.getElem_mapIdx]
+      rw [getD_of_lt _ _ _ (by simp [gatherG]; exact hi)]
+      simp only [gatherG, List.getElem_mapIdx, hidx j hj]
+      have hj' : 1 + j - 1 = j := by omega
+      simp only [hj']
+      rw [getD_of_lt _ _ _ (by rw [hri]; exact hj)]
+
+theorem checkGatherGen_sound (tys : List Nat) (a b : Insert) (h : checkGatherGen tys a b = true) :
+    EquivGatherGen a b := by
+  cases a with
+  | mk ta ac asrc atail =>
+  cases b with
+  | mk bt bc bsrc btail =>
+  cases asrc with
+  | unnest _ => simp [checkGatherGen] at h
+  | values rows =>
+  cases bsrc with
+  | values _ => cases rows <;> simp [checkGatherGen] at h
+  | unnest args =>
+  cases rows with
+  | nil => simp [checkGatherGen] at h
+  | cons r rs =>
+  cases args with
+  | nil => simp [checkGatherGen] at h
+  | cons x xs =>
+  simp only [checkGatherGen, Bool.and_eq_true, beq_iff_eq] at h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨ht, hc⟩, htail⟩, _⟩, _⟩, hargs⟩, hrows⟩, _⟩, _⟩ := h
+  intro V R run β g
+  simp only
+  rw [unnestRows_gatherG β g tys (r :: rs) (x :: xs) hargs hrows (by simp), ht, hc, htail]
 
 end Sqleq
