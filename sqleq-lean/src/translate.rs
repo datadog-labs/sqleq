@@ -323,6 +323,30 @@ fn pin_seq(rows: &[Vec<Cell>]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Every parameter from `$1` to the highest is used. Slot pinning allows a gap (`($1, $2), ($5,
+/// $6)`), but a parameter no cell uses has nothing to take its type from, so Postgres cannot
+/// prepare the statement and the `VALUES` side never runs. Checked here only: it is about what
+/// Postgres will prepare, which the kernel's model does not see. (`pin_seq` rules gaps out for a
+/// pair with generated cells.)
+fn no_gaps(rows: &[Vec<Cell>]) -> Result<(), Refusal> {
+    let mut used: Vec<u32> = rows
+        .iter()
+        .flatten()
+        .filter_map(|c| match c {
+            Cell::Param(n, _) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    match used.iter().zip(1..).find(|(n, i)| **n != *i) {
+        Some((_, missing)) => Err(unsupported(format!(
+            "${missing} is never used, so Postgres cannot infer its type and the VALUES side does not prepare"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Every word of a tail, lower-cased, split on anything that cannot be part of an identifier.
 fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(str::to_lowercase)
@@ -613,6 +637,9 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
         }
         la_rows.push(out);
     }
+    if !has_gen {
+        no_gaps(rows)?;
+    }
     let generated = if has_gen { Some(generated_preconditions(a, rows, table)?) } else { None };
 
     let tail_a = tokens(&a.tail, &mut interner);
@@ -703,6 +730,10 @@ mod tests {
         assert!(refused("INSERT INTO t (b, a) VALUES ($1, $2)", B).reason().contains("column lists differ"));
         // A parameter reused across columns.
         assert!(refused("INSERT INTO t (a, b) VALUES ($1, $1)", B).reason().contains("pinned"));
+        // A gap: pinned to their columns, but nothing uses $3 and $4.
+        assert!(refused("INSERT INTO t (a, b) VALUES ($1, $2), ($5, $6)", B).reason().contains("$3 is never used"));
+        // NULL cells leave gaps only if no other row fills them.
+        assert!(pair("INSERT INTO t (a, b) VALUES ($1, NULL), ($3, $4), (NULL, $2)", B).is_ok());
         // A cast with a type modifier truncates; the same modifier on the column alone does not.
         assert!(refused("INSERT INTO t (a, c) VALUES ($1, $2)", "INSERT INTO t (a, c) SELECT * FROM unnest($1::int[], $2::varchar(10)[])").reason().contains("truncates"));
         assert!(pair("INSERT INTO t (a, c) VALUES ($1, $2)", "INSERT INTO t (a, c) SELECT * FROM unnest($1::int[], $2::varchar[])").is_ok());
