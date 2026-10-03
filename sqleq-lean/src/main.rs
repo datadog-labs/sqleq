@@ -24,6 +24,8 @@ options:
   --replay-plan <file>  also write, for each proved or no-witness pair, what
                     tools/lean_replay.py needs to re-run it on Postgres
   --full-names      key a pair file's record by its path, not its file name
+  --translate-only  run no Lean: report each pair's refusal, or the claim it
+                    would be checked under
 
 environment: LAKE (default `lake` on PATH), SQLEQ_LEAN_DIR (default the repository's lean/)";
 
@@ -44,7 +46,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (mut json, mut csv, mut names, mut keep, mut plan) = (None, None, None, None, None);
     let (mut batch, mut jobs, mut timeout) = (50usize, 4usize, 600u64);
-    let mut full_names = false;
+    let (mut full_names, mut translate_only) = (false, false);
     let mut paths = Vec::new();
     while let Some(a) = args.next() {
         let mut val = |flag: &str| args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
                 "--jobs" => jobs = val("--jobs")?.parse().map_err(|e| format!("--jobs: {e}"))?,
                 "--timeout" => timeout = val("--timeout")?.parse().map_err(|e| format!("--timeout: {e}"))?,
                 "--full-names" => full_names = true,
+                "--translate-only" => translate_only = true,
                 "-h" | "--help" => return Err(String::new()),
                 s if s.starts_with('-') => return Err(format!("unknown option {s}")),
                 _ => paths.push(PathBuf::from(&a)),
@@ -128,12 +131,16 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let lean = Lean::from_env(Duration::from_secs(timeout));
-    let records = match check(&cases, &lean, batch, jobs, keep.as_deref(), plan.is_some()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("sqleq-lean: {e}");
-            return ExitCode::from(1);
+    let records = if translate_only {
+        sqleq_lean::translate_only(&cases)
+    } else {
+        let lean = Lean::from_env(Duration::from_secs(timeout));
+        match check(&cases, &lean, batch, jobs, keep.as_deref(), plan.is_some()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("sqleq-lean: {e}");
+                return ExitCode::from(1);
+            }
         }
     };
     let mut plans = serde_json::Map::new();

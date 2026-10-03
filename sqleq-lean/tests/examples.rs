@@ -128,3 +128,77 @@ fn the_audit_accepts_emitted_batches_and_refuses_tampered_ones() {
     }
     assert!(audit(&format!("{src}\n#eval 1\n")).is_err(), "a trailing command");
 }
+
+/// A pair with generated cells (`DEFAULT` on a serial key), and one without.
+const GENERATED: &str = "CREATE TABLE g (id serial PRIMARY KEY, name text);
+INSERT INTO g (id, name) VALUES (DEFAULT, $1), (DEFAULT, $2);
+INSERT INTO g (id, name) SELECT * FROM unnest($1::int[], $2::text[]);";
+const PLAIN: &str = "CREATE TABLE g (id serial PRIMARY KEY, name text);
+INSERT INTO g (id, name) VALUES ($1, $2), ($3, $4);
+INSERT INTO g (id, name) SELECT * FROM unnest($1::int[], $2::text[]);";
+
+fn lean_pair(text: &str) -> sqleq_lean::translate::LeanPair {
+    let case = Case::from_file("pair".into(), text);
+    let (a, b) = case.pair.as_ref().unwrap();
+    translate(a, b, &case.schema).unwrap()
+}
+
+/// Lean's output on `src`, written to a file of its own.
+fn kernel(src: &str, tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("sqleq-lean-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("batch.lean");
+    std::fs::write(&file, src).unwrap();
+    let lean = Lean::from_env(Duration::from_secs(600));
+    lean.build().unwrap();
+    let out = lean.check(&file).unwrap().expect("no timeout");
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn a_generated_pair_is_proved_under_its_own_claim() {
+    let lean = Lean::from_env(Duration::from_secs(600));
+    let got = check(&[Case::from_file("g".into(), GENERATED)], &lean, 50, 1, None, false).unwrap();
+    let rec = &got[0].1;
+    assert_eq!(rec["verdict"], sqleq_lean::PROVED_GENERATED, "{rec}");
+    assert_eq!(rec["generated"]["sequence"], true, "{rec}");
+}
+
+/// Which claim a pair is proved under is the kernel's to check, not the translator's: a pair with
+/// generated cells emitted under `checkGather`, and one without emitted under `checkGatherGen`,
+/// are both well-formed batches that the kernel must refuse.
+#[test]
+fn the_kernel_checks_which_claim_a_pair_is_proved_under() {
+    for (text, generated) in [(GENERATED, true), (PLAIN, false)] {
+        let mut p = lean_pair(text);
+        assert_eq!(p.generated.is_some(), generated);
+        p.generated = if generated { None } else { Some(Default::default()) };
+        let (src, entries) = sqleq_lean::emit::batch(&[&p]);
+        let out = kernel(&src, "claim");
+        sqleq_lean::run::audit(&src).expect("the forgery is a well-formed batch");
+        let o = sqleq_lean::run::outcomes(&src, &out, &[entries[0].proof.clone()]);
+        assert!(matches!(&o[0], sqleq_lean::run::Outcome::Failed(_)), "forged claim was proved: {out}");
+    }
+}
+
+/// The audit reports each entry's claim, in order, and refuses a batch whose two claim lines
+/// disagree or whose data names a constructor the package does not have.
+#[test]
+fn the_audit_reads_each_entrys_claim() {
+    use sqleq_lean::run::{audit, Claim};
+    let (g, p) = (lean_pair(GENERATED), lean_pair(PLAIN));
+    let (src, _) = sqleq_lean::emit::batch(&[&p, &g, &p]);
+    assert_eq!(audit(&src).unwrap(), [Claim::Gather, Claim::GatherGenerated, Claim::Gather]);
+    let tamper = [
+        (
+            "theorem equiv : EquivGatherGen A B := checkGatherGen_sound tys A B ok",
+            "theorem equiv : EquivGather A B := checkGather_sound tys A B ok",
+        ),
+        ("Sqleq.GenKind.dflt", "Sqleq.GenKind.other"),
+    ];
+    for (from, to) in tamper {
+        assert!(src.contains(from), "{from:?} not in the emitted batch");
+        assert!(audit(&src.replacen(from, to, 1)).is_err(), "the audit passed a batch with {to:?}");
+    }
+}

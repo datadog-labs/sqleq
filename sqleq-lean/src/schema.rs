@@ -142,6 +142,60 @@ pub fn default_kind(e: &Expr) -> DefaultKind {
     }
 }
 
+/// What a column's default is, at the precision a `DEFAULT` cell needs: whether its value is fixed
+/// by the schema, drawn from a sequence, or made by a generator the checker knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultSource {
+    /// No default, or a constant: a literal, possibly cast, or `NULL`.
+    Constant,
+    /// `nextval('s')`, a serial or an identity, by the sequence's name.
+    Sequence(String),
+    /// One of the recognised generators, such as `now()` or `gen_random_uuid()`.
+    Generator,
+    /// Anything else: an unrecognised function, or an expression around one.
+    Other,
+}
+
+/// Classify a `DEFAULT` expression for a `DEFAULT` cell.
+pub fn default_source(e: &Expr) -> DefaultSource {
+    match e {
+        Expr::Nested(inner) => default_source(inner),
+        Expr::Value(_) | Expr::TypedString(_) => DefaultSource::Constant,
+        Expr::UnaryOp { expr, .. } if matches!(expr.as_ref(), Expr::Value(_)) => DefaultSource::Constant,
+        Expr::Cast { expr, .. } => default_source(expr),
+        Expr::Function(f) => match crate::recognize::generator(f) {
+            Ok(g) => match g.seq {
+                Some(s) => DefaultSource::Sequence(s),
+                None => DefaultSource::Generator,
+            },
+            Err(_) => DefaultSource::Other,
+        },
+        _ => DefaultSource::Other,
+    }
+}
+
+/// What `e` does to sequences: the sequences whose `nextval` it calls (by string literal), and
+/// whether it reads or sets sequence state any other way (`currval`, `lastval`, `setval`, or
+/// `nextval` of something that is not a literal).
+pub fn sequence_use(e: &Expr) -> (Vec<String>, bool) {
+    let mut seqs = Vec::new();
+    let mut state = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if let Expr::Function(f) = x {
+            match last_name(&f.name).as_deref() {
+                Some("nextval") => match crate::recognize::generator(f) {
+                    Ok(g) => seqs.extend(g.seq),
+                    Err(_) => state = true,
+                },
+                Some("currval" | "lastval" | "setval") => state = true,
+                _ => {}
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    (seqs, state)
+}
+
 #[derive(Clone, Debug)]
 pub struct Column {
     pub name: String,
@@ -154,6 +208,12 @@ pub struct Column {
     pub default: DefaultKind,
     /// `GENERATED ALWAYS` (an identity or a computed column): an explicit value is an error.
     pub always: bool,
+    /// The default, as a `DEFAULT` cell sees it.
+    pub source: DefaultSource,
+    /// The sequences the default draws from. A serial or identity draws from `<table>_<column>_seq`.
+    pub seqs: Vec<String>,
+    /// The default reads or sets sequence state another way: `currval`, `lastval`, `setval`.
+    pub seq_state: bool,
 }
 
 /// A uniqueness constraint or unique index.
@@ -303,14 +363,21 @@ impl Schema {
                     let raw = format!("{}", c.data_type).to_lowercase();
                     matches!(raw.as_str(), "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial")
                 };
+                let col_name = if retried { c.name.value.to_lowercase() } else { fold(&c.name) };
+                // The sequence a serial or identity column creates, as Postgres names it (names
+                // over 63 bytes, which Postgres truncates, are not reproduced).
+                let implicit_seq = format!("{name}_{col_name}_seq");
                 let mut col = Column {
-                    name: if retried { c.name.value.to_lowercase() } else { fold(&c.name) },
+                    name: col_name,
                     raw_type: format!("{}", c.data_type),
                     default_text: None,
                     ty,
                     nullable: !serial,
                     default: if serial { DefaultKind::Fresh } else { DefaultKind::Null },
                     always: false,
+                    source: if serial { DefaultSource::Sequence(implicit_seq.clone()) } else { DefaultSource::Constant },
+                    seqs: if serial { vec![implicit_seq.clone()] } else { Vec::new() },
+                    seq_state: false,
                 };
                 let idx = t.columns.len();
                 for o in &c.options {
@@ -319,6 +386,8 @@ impl Schema {
                         O::Default(e) => {
                             col.default = default_kind(e);
                             col.default_text = Some(e.to_string());
+                            col.source = default_source(e);
+                            (col.seqs, col.seq_state) = sequence_use(e);
                         }
                         O::PrimaryKey(pk) => {
                             col.nullable = false;
@@ -338,13 +407,20 @@ impl Schema {
                             if generation_expr.is_some() {
                                 col.always = true;
                                 col.default = DefaultKind::Same;
+                                col.source = DefaultSource::Other;
                             } else {
                                 col.default = DefaultKind::Fresh;
                                 col.nullable = false;
                                 col.always = matches!(generated_as, GeneratedAs::Always);
+                                col.source = DefaultSource::Sequence(implicit_seq.clone());
+                                col.seqs = vec![implicit_seq.clone()];
                             }
                         }
-                        O::Identity(_) => col.default = DefaultKind::Fresh,
+                        O::Identity(_) => {
+                            col.default = DefaultKind::Fresh;
+                            col.source = DefaultSource::Sequence(implicit_seq.clone());
+                            col.seqs = vec![implicit_seq.clone()];
+                        }
                         _ => {}
                     }
                 }
@@ -546,6 +622,32 @@ mod tests {
         assert_eq!(k("i").default, DefaultKind::Null);
         assert!(k("j").always, "a computed column takes no explicit value");
         assert_eq!((k("k").default, k("k").nullable), (DefaultKind::Same, false), "an unknown function is Same");
+    }
+
+    #[test]
+    fn defaults_are_classified_for_a_default_cell() {
+        let s = Schema::from_ddl(
+            "CREATE TABLE t (
+               a serial, b bigint GENERATED ALWAYS AS IDENTITY, d timestamptz DEFAULT now(),
+               f text DEFAULT NULL, g text DEFAULT 'x'::text, m int DEFAULT -1,
+               h int DEFAULT nextval('public.\"S\"'::regclass), i int, j int GENERATED ALWAYS AS (i + 1) STORED,
+               k text DEFAULT lower('X'), l bigint DEFAULT currval('t_a_seq'),
+               n text DEFAULT 'p' || nextval('s2'));",
+        );
+        let t = s.table("t").unwrap();
+        let k = |n: &str| t.columns[t.column(n).unwrap()].clone();
+        let seq = |s: &str| DefaultSource::Sequence(s.to_string());
+        assert_eq!((k("a").source, k("a").seqs), (seq("t_a_seq"), vec!["t_a_seq".to_string()]));
+        assert_eq!(k("b").source, seq("t_b_seq"), "an identity draws from its own sequence");
+        assert_eq!(k("d").source, DefaultSource::Generator);
+        for c in ["f", "g", "m", "i"] {
+            assert_eq!(k(c).source, DefaultSource::Constant, "{c}");
+        }
+        assert_eq!(k("h").source, seq("S"), "a quoted, qualified sequence name");
+        assert_eq!(k("j").source, DefaultSource::Other);
+        assert_eq!(k("k").source, DefaultSource::Other, "an unknown function");
+        assert_eq!((k("l").source.clone(), k("l").seq_state), (DefaultSource::Other, true));
+        assert_eq!((k("n").source.clone(), k("n").seqs, k("n").seq_state), (DefaultSource::Other, vec!["s2".to_string()], false));
     }
 
     #[test]

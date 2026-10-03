@@ -114,12 +114,37 @@ pub enum Outcome {
 /// The only names a definition in a batch may mention: the Lean package's constructors. With
 /// these, numerals and booleans, a definition is pure data. It cannot refer to a theorem, an axiom
 /// or another definition.
-const CONSTRUCTORS: [&str; 20] = [
+const CONSTRUCTORS: [&str; 24] = [
     "Sqleq.Insert.mk", "Sqleq.Source.values", "Sqleq.Source.unnest", "Sqleq.Arg.mk",
-    "Sqleq.Cell.p", "Sqleq.Cell.pc", "Sqleq.Cell.null", "Sqleq.Tok.word", "Sqleq.Tok.param",
+    "Sqleq.Cell.p", "Sqleq.Cell.pc", "Sqleq.Cell.null", "Sqleq.Cell.gen", "Sqleq.GenKind.dflt",
+    "Sqleq.GenKind.fresh", "Sqleq.GenKind.once", "Sqleq.Tok.word", "Sqleq.Tok.param",
     "Sqleq.Spec.mk", "Sqleq.Col.mk", "Sqleq.Dflt.null", "Sqleq.Dflt.same", "Sqleq.Dflt.fresh",
     "Sqleq.Uniq.mk", "Sqleq.Conflict.none", "Sqleq.Conflict.nothing", "Sqleq.Conflict.nothingOn",
     "Sqleq.Conflict.update", "Sqleq.Conflict.noArbiter",
+];
+
+/// Which theorem an entry of a batch proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// `EquivGather A B`, by `checkGather_sound`.
+    Gather,
+    /// `EquivGatherGen A B`, by `checkGatherGen_sound`: the weaker claim, for generated cells.
+    GatherGenerated,
+}
+
+/// The two forms an entry's proof may take, written out here rather than taken from `emit`, so that
+/// the audit is a second statement of the format.
+const CLAIMS: [(Claim, &str, &str); 2] = [
+    (
+        Claim::Gather,
+        "theorem ok : checkGather tys A B = true := by decide +kernel",
+        "theorem equiv : EquivGather A B := checkGather_sound tys A B ok",
+    ),
+    (
+        Claim::GatherGenerated,
+        "theorem ok : checkGatherGen tys A B = true := by decide +kernel",
+        "theorem equiv : EquivGatherGen A B := checkGatherGen_sound tys A B ok",
+    ),
 ];
 
 fn is_data(term: &str) -> bool {
@@ -140,15 +165,20 @@ fn is_data(term: &str) -> bool {
 /// how it was checked: an `axiom`, a `set_option` such as `debug.skipKernelTC`, a macro or a
 /// tactic. This closes both. A batch passes only if every line is one `emit::batch` writes, in
 /// order:
-/// - each proof is literally `theorem equiv : EquivGather A B := checkGather_sound tys A B ok`
-///   inside `namespace Q<i>`, so it is about that namespace's own `A` and `B`;
+/// - each proof is literally `theorem equiv : EquivGather A B := checkGather_sound tys A B ok`, or
+///   the same with `EquivGatherGen` and `checkGatherGen_sound`, inside `namespace Q<i>`, so it is
+///   about that namespace's own `A` and `B`;
 /// - each witness is literally `(witness Q<i>.spec Q<i>.A).isOk = true` in `namespace W<i>`;
-/// - every definition is data, built only from [`CONSTRUCTORS`], numerals and booleans;
+/// - every definition is data, built only from `CONSTRUCTORS`, numerals and booleans;
 /// - nothing else appears.
+///
+/// Returns which of the two claims each entry proves, in order. The verdict is taken from this,
+/// so a pair is called `proved-gather-generated` because the kernel checked that statement, not
+/// because the translator said so.
 ///
 /// It is written separately from `emit` on purpose: it is a second statement of the format, so an
 /// emitter change that alters what is proved fails here instead of passing silently.
-pub fn audit(src: &str) -> Result<(), String> {
+pub fn audit(src: &str) -> Result<Vec<Claim>, String> {
     let mut lines = src.lines().enumerate().filter(|(_, l)| !l.is_empty()).peekable();
     let fail = |at: Option<(usize, &str)>, want: &str| -> String {
         match at {
@@ -164,6 +194,7 @@ pub fn audit(src: &str) -> Result<(), String> {
     };
     exact("import Sqleq")?;
     exact("open Sqleq")?;
+    let mut claims = Vec::new();
     let mut i = 0usize;
     while let Some(&(n, l)) = lines.peek() {
         if l != format!("namespace Q{i}") {
@@ -188,14 +219,24 @@ pub fn audit(src: &str) -> Result<(), String> {
         def("noncomputable def A : Insert := ", true)?;
         def("noncomputable def B : Insert := ", true)?;
         let spec = def("noncomputable def spec : Spec := ", false)?;
+        // The `ok` line picks the claim; the `equiv` line must then be that claim's.
+        let claim = match lines.next() {
+            Some((_, l)) => match CLAIMS.iter().find(|(_, ok, _)| l == *ok) {
+                Some(&(c, _, equiv)) => match lines.next() {
+                    Some((_, l)) if l == equiv => c,
+                    other => return Err(fail(other, &format!("`{equiv}`"))),
+                },
+                None => return Err(fail(Some((n, l)), "a `theorem ok` line")),
+            },
+            None => return Err(fail(None, "a `theorem ok` line")),
+        };
+        claims.push(claim);
         let mut exact = |want: String| -> Result<(), String> {
             match lines.next() {
                 Some((_, l)) if l == want => Ok(()),
                 other => Err(fail(other, &format!("`{want}`"))),
             }
         };
-        exact("theorem ok : checkGather tys A B = true := by decide +kernel".into())?;
-        exact("theorem equiv : EquivGather A B := checkGather_sound tys A B ok".into())?;
         exact(format!("end Q{i}"))?;
         exact(format!("#print axioms Q{i}.equiv"))?;
         if lines.peek().is_some_and(|&(_, l)| l == format!("namespace W{i}")) {
@@ -215,7 +256,7 @@ pub fn audit(src: &str) -> Result<(), String> {
         }
         i += 1;
     }
-    Ok(())
+    Ok(claims)
 }
 
 /// Read Lean's output for the batch whose source is `src`. Each entry is the 0-based line range it
@@ -223,7 +264,7 @@ pub fn audit(src: &str) -> Result<(), String> {
 /// counts as proved.
 pub fn outcomes(src: &str, output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcome> {
     match audit(src) {
-        Ok(()) => read_outcomes(output, entries),
+        Ok(_) => read_outcomes(output, entries),
         Err(e) => entries.iter().map(|_| Outcome::Failed(format!("audit: {e}"))).collect(),
     }
 }

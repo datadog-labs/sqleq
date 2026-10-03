@@ -7,11 +7,11 @@
 //!
 //! The Lean side lives in the repository's `lean/` package. This crate parses a pair with the
 //! frontend's own parser ([`sqleq_frontend::internals::parse_pair`]), recognises the shapes the
-//! Lean checker decides ([`recognize`], [`translate`]), emits one `.lean` file per batch of pairs
-//! ([`emit`]), and runs `lake env lean` on it ([`run`]).
+//! Lean checker decides ([`recognize`], [`translate`](mod@translate)), emits one `.lean` file per
+//! batch of pairs ([`emit`]), and runs `lake env lean` on it ([`run`]).
 //!
-//! What a proof here means is stated in `lean/Sqleq/Check.lean` (`EquivGather`) and in
-//! `docs/LEAN.md`.
+//! What a proof here means is stated in `lean/Sqleq/Check.lean` (`EquivGather`, and
+//! `EquivGatherGen` for pairs with generated cells) and in `docs/LEAN.md`.
 
 pub mod emit;
 pub mod recognize;
@@ -38,6 +38,24 @@ pub const PROVED: &str = "proved-gather";
 /// The kernel proved `EquivGather`, but no witness shows the `VALUES` side can succeed, so the proof
 /// may be vacuous (both sides always error). Not credited.
 pub const NO_WITNESS: &str = "no-witness";
+
+/// The kernel proved `EquivGatherGen`, the weaker claim for a `VALUES` side with generated cells
+/// (B reproduces A given A's generated values), and the canonical run succeeds.
+pub const PROVED_GENERATED: &str = "proved-gather-generated";
+
+/// The kernel proved `EquivGatherGen`, but no witness shows the `VALUES` side can succeed.
+pub const NO_WITNESS_GENERATED: &str = "no-witness-generated";
+
+/// The `generated` field of a record: what the pair's generated cells are.
+fn generated_json(g: &translate::GenSummary) -> Value {
+    json!({
+        "funcs": g.funcs,
+        "columns": g.columns,
+        "mixed": g.mixed,
+        "sequence": g.sequence,
+        "constant_default": g.constant_default,
+    })
+}
 
 /// One pair's input, already parsed, and as the original text for the Postgres replay.
 pub struct Case {
@@ -113,6 +131,11 @@ pub fn replay_plan(case: &Case, p: &LeanPair) -> Value {
                     .map(|c| match c {
                         translate::LCell::P(n) | translate::LCell::Pc(n, _) => json!(n),
                         translate::LCell::Null => Value::Null,
+                        translate::LCell::Gen(k) => json!({"gen": match k {
+                            recognize::GenKind::Default => "default",
+                            recognize::GenKind::Fresh => "fresh",
+                            recognize::GenKind::Once => "once",
+                        }}),
                     })
                     .collect()
             })
@@ -121,7 +144,7 @@ pub fn replay_plan(case: &Case, p: &LeanPair) -> Value {
     };
     let (values_sql, unnest_sql) =
         if p.flipped { (&case.sql.1, &case.sql.0) } else { (&case.sql.0, &case.sql.1) };
-    json!({
+    let mut plan = json!({
         "ddl": case.ddl,
         "values_sql": values_sql,
         "unnest_sql": unnest_sql,
@@ -131,7 +154,40 @@ pub fn replay_plan(case: &Case, p: &LeanPair) -> Value {
         "columns": p.replay.columns.iter().map(|(n, t, d, listed)| json!({
             "name": n, "type": t, "default": d, "listed": listed,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(g) = &p.generated {
+        plan["values_clause"] = json!(p.replay.values_text);
+        plan["generated"] = generated_json(g);
+    }
+    plan
+}
+
+/// Translate every case without running Lean: each record is the refusal, or `translated` with the
+/// claim the pair would be checked under. For sizing what the translator admits and refuses.
+pub fn translate_only(cases: &[Case]) -> Vec<(String, Value)> {
+    cases
+        .iter()
+        .map(|c| {
+            let rec = match c.pair.as_ref().map_err(Clone::clone).and_then(|(a, b)| translate(a, b, &c.schema)) {
+                Err(r) => json!({"verdict": r.verdict(), "reason": r.reason()}),
+                Ok(p) => {
+                    let mut v = json!({
+                        "verdict": "translated",
+                        "claim": if p.generated.is_some() { "gather-generated" } else { "gather" },
+                        "shape": p.shape.name(),
+                    });
+                    if let Some(g) = &p.generated {
+                        v["generated"] = generated_json(g);
+                    }
+                    if let translate::Witness::Skip(r) = &p.witness {
+                        v["witness_skipped"] = json!(r);
+                    }
+                    v
+                }
+            };
+            (c.name.clone(), rec)
+        })
+        .collect()
 }
 
 /// Pairs with more `VALUES` rows than this are checked one per file.
@@ -212,7 +268,13 @@ pub fn check(
 
     let dir = match keep {
         Some(d) => d.to_path_buf(),
-        None => std::env::temp_dir().join(format!("sqleq-lean-{}", std::process::id())),
+        // One directory per call, not per process: two calls in one process (two tests, say) would
+        // otherwise overwrite each other's batch files, and the audit would read the other's.
+        None => {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            let n = CALLS.fetch_add(1, Ordering::SeqCst);
+            std::env::temp_dir().join(format!("sqleq-lean-{}-{n}", std::process::id()))
+        }
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if !todo.is_empty() {
@@ -234,23 +296,26 @@ pub fn check(
     let outputs = run_files(lean, &files, jobs)?;
     // Approximate Lean CPU time per pair: wall time times workers, spread over the pairs.
     let ms = start.elapsed().as_millis() as u64 * jobs.max(1) as u64 / todo.len().max(1) as u64;
-    // (proof outcome, witness outcome) per case; `None` when the batch timed out.
-    let mut got: Vec<Option<(run::Outcome, Option<run::Outcome>)>> = vec![None; cases.len()];
+    // (proof outcome, witness outcome, the claim the audit read) per case; `None` when the batch
+    // timed out.
+    type Got = (run::Outcome, Option<run::Outcome>, Option<run::Claim>);
+    let mut got: Vec<Option<Got>> = vec![None; cases.len()];
     for (((members, entries), out), file) in batches.iter().zip(&layouts).zip(&outputs).zip(&files) {
         let Some(text) = out else { continue };
         // The audit reads the file Lean read, not the string that was written to it.
         let proofs: Vec<_> = entries.iter().map(|e| e.proof.clone()).collect();
         let src = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let po = run::outcomes(&src, text, &proofs);
-        for ((&i, e), p) in members.iter().zip(entries).zip(po) {
+        let claims = run::audit(&src).unwrap_or_default();
+        for (k, ((&i, e), p)) in members.iter().zip(entries).zip(po).enumerate() {
             let w = e.witness.as_ref().map(|w| run::outcomes(&src, text, std::slice::from_ref(w)).remove(0));
-            got[i] = Some((p, w));
+            got[i] = Some((p, w, claims.get(k).copied()));
         }
     }
 
     // Pass 2: why each failed witness failed.
     let failed: Vec<usize> = (0..cases.len())
-        .filter(|&i| matches!(&got[i], Some((run::Outcome::Proved, Some(run::Outcome::Failed(_))))))
+        .filter(|&i| matches!(&got[i], Some((run::Outcome::Proved, Some(run::Outcome::Failed(_)), _))))
         .collect();
     let mut why: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let chunks: Vec<&[usize]> = failed.chunks(batch.max(1)).collect();
@@ -293,19 +358,26 @@ pub fn check(
                 (Ok(p), g) => {
                     let (verdict, reason) = match g {
                         None => ("timeout".to_string(), None),
-                        Some((run::Outcome::Failed(m), _)) => ("error".to_string(), Some(m.clone())),
-                        Some((run::Outcome::Proved, w)) => match (&p.witness, w) {
-                            (translate::Witness::Skip(r), _) => (NO_WITNESS.to_string(), Some(r.clone())),
-                            (_, Some(run::Outcome::Proved)) => (PROVED.to_string(), None),
-                            (_, _) => (
-                                NO_WITNESS.to_string(),
-                                Some(match why.get(&i) {
-                                    Some(w) if !w.starts_with("ok") => explain(p, w),
-                                    Some(w) => format!("witness: the kernel refused a run the model evaluates to `{w}`"),
-                                    None => "the VALUES side's canonical run fails".to_string(),
-                                }),
-                            ),
-                        },
+                        Some((run::Outcome::Failed(m), _, _)) => ("error".to_string(), Some(m.clone())),
+                        Some((run::Outcome::Proved, w, claim)) => {
+                            // The words follow the statement the audit read and the kernel proved.
+                            let (proved, no_witness) = match claim {
+                                Some(run::Claim::GatherGenerated) => (PROVED_GENERATED, NO_WITNESS_GENERATED),
+                                _ => (PROVED, NO_WITNESS),
+                            };
+                            match (&p.witness, w) {
+                                (translate::Witness::Skip(r), _) => (no_witness.to_string(), Some(r.clone())),
+                                (_, Some(run::Outcome::Proved)) => (proved.to_string(), None),
+                                (_, _) => (
+                                    no_witness.to_string(),
+                                    Some(match why.get(&i) {
+                                        Some(w) if !w.starts_with("ok") => explain(p, w),
+                                        Some(w) => format!("witness: the kernel refused a run the model evaluates to `{w}`"),
+                                        None => "the VALUES side's canonical run fails".to_string(),
+                                    }),
+                                ),
+                            }
+                        }
                     };
                     let mut v = json!({
                         "verdict": verdict, "shape": p.shape.name(), "flipped": p.flipped, "ms": ms
@@ -313,10 +385,14 @@ pub fn check(
                     if let Some(r) = reason {
                         v["reason"] = json!(r);
                     }
+                    if let Some(g) = &p.generated {
+                        v["generated"] = generated_json(g);
+                    }
                     if !p.unmodelled.is_empty() {
                         v["unmodelled"] = json!(p.unmodelled);
                     }
-                    if with_plan && (verdict == PROVED || verdict == NO_WITNESS) {
+                    let checked = [PROVED, NO_WITNESS, PROVED_GENERATED, NO_WITNESS_GENERATED];
+                    if with_plan && checked.contains(&verdict.as_str()) {
                         v["replay"] = replay_plan(c, p);
                     }
                     v
