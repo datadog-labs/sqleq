@@ -143,7 +143,7 @@ fn is_data(term: &str) -> bool {
 /// - each proof is literally `theorem equiv : EquivGather A B := checkGather_sound tys A B ok`
 ///   inside `namespace Q<i>`, so it is about that namespace's own `A` and `B`;
 /// - each witness is literally `(witness Q<i>.spec Q<i>.A).isOk = true` in `namespace W<i>`;
-/// - every definition is data, built only from [`CONSTRUCTORS`], numerals and booleans;
+/// - every definition is data, built only from `CONSTRUCTORS`, numerals and booleans;
 /// - nothing else appears.
 ///
 /// It is written separately from `emit` on purpose: it is a second statement of the format, so an

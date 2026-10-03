@@ -37,7 +37,9 @@ permissions:
 
 # `-D warnings` lives on the clippy invocations, not in `RUSTFLAGS`: a global `RUSTFLAGS`
 # reaches dependency crates too, so an upstream release that adds one warning would break
-# this repo's CI. Clippy runs rustc's own lints, so nothing is lost by scoping it.
+# this repo's CI. Clippy runs rustc's own lints, so nothing is lost by scoping it. The doc steps
+# set `RUSTDOCFLAGS` instead, which is safe for the same reason: with `--no-deps`, rustdoc runs on
+# this workspace's crates only.
 env:
   CARGO_TERM_COLOR: always
 
@@ -89,6 +91,18 @@ jobs:
       # Without this step it would rot silently until the benchmark harness that depends on it
       # failed to build against a new frontend.
       - run: cargo clippy --features internals --all-targets -- -D warnings
+
+      # Intra-doc links are resolved only when the docs are built, which nothing above does, so a
+      # link to a private or renamed item would otherwise land unnoticed. A public build is the only
+      # one that reports a public item's doc linking to a private one, and `internals` makes more
+      # of the crate public; the private build is the only one that renders private modules' docs.
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --features internals
+          cargo doc --no-deps --features internals --document-private-items
 
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
 
@@ -331,3 +345,10 @@ jobs:
       # the verdict its header declares; it fails, rather than skips, without `lake` on PATH.
       - run: cargo test -p sqleq-lean
       - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings
+      # As in the frontend job: intra-doc links are checked only when the docs are built.
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p sqleq-lean
+          cargo doc --no-deps -p sqleq-lean --document-private-items
