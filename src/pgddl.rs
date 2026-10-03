@@ -345,10 +345,10 @@ pub fn parse_provided_schema(raw: &str) -> Catalog {
 /// Raw Postgres DDL, parsed one statement at a time, plus one report per statement that would not
 /// parse even after the retry.
 ///
-/// The `bool` is `true` for a statement that only parsed after [`simplify_for_retry`]. A caller that
-/// reads more than the catalog does must know which those are: the retry replaces every default in
-/// the table with `qed_unparsed_default()`, and it quotes every column name, so an unquoted `MyCol`
-/// (which Postgres folds to `mycol`) comes back looking case-sensitive.
+/// The `bool` is `true` for a statement that only parsed after the retry (`simplify_for_retry`). A
+/// caller that reads more than the catalog does must know which those are: the retry replaces every
+/// default in the table with `qed_unparsed_default()`, and it quotes every column name, so an
+/// unquoted `MyCol` (which Postgres folds to `mycol`) comes back looking case-sensitive.
 pub fn parse_statements_reporting(raw: &str) -> (Vec<(Statement, bool)>, Vec<Rejected>) {
     let sql = unescape(raw);
     let mut errors = Vec::new();

@@ -58,7 +58,9 @@ lines of each:
 ## Lints
 
 `cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per
-crate.
+crate. So must `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps`, which is the only thing that checks
+intra-doc links: CI builds the frontend's docs as published, with `--features internals`, and with
+`--document-private-items`, and `sqleq-lean`'s as published and with private items.
 
 **`cargo fmt` is not used and must not be added to CI.** There is no `rustfmt.toml`, over a
 thousand source lines already run past 100 columns, and `src/dml.rs` has never been formatted — a

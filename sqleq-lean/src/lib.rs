@@ -7,8 +7,8 @@
 //!
 //! The Lean side lives in the repository's `lean/` package. This crate parses a pair with the
 //! frontend's own parser ([`sqleq_frontend::internals::parse_pair`]), recognises the shapes the
-//! Lean checker decides ([`recognize`], [`translate`]), emits one `.lean` file per batch of pairs
-//! ([`emit`]), and runs `lake env lean` on it ([`run`]).
+//! Lean checker decides ([`recognize`], [`translate`](mod@translate)), emits one `.lean` file per
+//! batch of pairs ([`emit`]), and runs `lake env lean` on it ([`run`]).
 //!
 //! What a proof here means is stated in `lean/Sqleq/Check.lean` (`EquivGather`) and in
 //! `docs/LEAN.md`.
