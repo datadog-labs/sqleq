@@ -499,7 +499,8 @@ def probe(plan: dict, scalars: list[str], psql: list[str], timeout: int) -> list
     """What the generated cells evaluate to on each of two runs, as `g[run][row][column]`."""
     res = parse(run(psql, probe_script(plan, scalars, 2), timeout), 2)
     if res["prepared"] is not True or len(res["runs"]) != 2 or not all(r["ok"] for r in res["runs"]):
-        raise NoValue("the probe for the generated values failed")
+        raise NoValue("the probe for the generated values failed"
+                      + (" (some DDL was rejected)" if res["ddl_failed"] else ""))
     out = []
     for r in res["runs"]:
         rows = [fields(x) for x in r["returning"]]
