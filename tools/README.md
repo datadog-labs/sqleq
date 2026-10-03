@@ -94,7 +94,7 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check. Same jobs, same result rows, same buckets. Not with `--sqleq-solver`. |
 | `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
 | `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. |
-| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
+| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
 

@@ -101,6 +101,19 @@ class Lint(unittest.TestCase):
             ("needs `expect lean: proved-gather` or an `argument:`",
              ("-- truth: equivalent", "-- binding: gather", "-- origin: x",
               "-- expect lean: no-witness")),
+            # Under `gather` a generated proof claims less than the truth, so it is no evidence...
+            ("needs `expect lean: proved-gather` or an `argument:`",
+             ("-- truth: equivalent", "-- binding: gather", "-- origin: x",
+              "-- expect lean: proved-gather-generated")),
+            # ...under `gather-generated` it is, but its possibly vacuous form is not...
+            ("needs `expect lean: proved-gather-generated` or an `argument:`",
+             ("-- truth: equivalent", "-- binding: gather-generated", "-- origin: x",
+              "-- expect lean: no-witness-generated")),
+            # ...and either form contradicts a non-equivalent truth.
+            ("contradicts `truth: not-equivalent`",
+             NEQ_OK + ("-- binding: gather-generated", "-- expect lean: no-witness-generated")),
+            ("contradicts `truth: not-equivalent`",
+             NEQ_OK + ("-- binding: gather-generated", "-- expect lean: proved-gather")),
         ]
         for needle, directives in rows:
             with self.subTest(needle=needle, directives=directives):
@@ -113,6 +126,8 @@ class Lint(unittest.TestCase):
                                      "-- expect qed: proved"), [])
         self.assertEqual(self.errors("-- truth: equivalent", "-- binding: gather", "-- origin: x",
                                      "-- expect lean: proved-gather"), [])
+        self.assertEqual(self.errors("-- truth: equivalent", "-- binding: gather-generated",
+                                     "-- origin: x", "-- expect lean: proved-gather-generated"), [])
 
     def test_an_axis_under_the_other_binding_contradicts_nothing(self):
         # The other axes refuse a gather pair, and Lean has nothing to say about an index one.
@@ -182,6 +197,12 @@ class Judge(unittest.TestCase):
              s.UNPINNED),
             ("fuzz on a gather pair", eq + ("-- binding: gather",),
              {"fuzz": ("counterexample", "")}, s.UNPINNED),
+            ("lean generated false proof", neq + ("-- binding: gather-generated",),
+             {"lean": ("proved-gather-generated", "")}, s.INVARIANT),
+            ("lean generated proof of a gather truth", neq + ("-- binding: gather",),
+             {"lean": ("proved-gather-generated", "")}, s.UNPINNED),
+            ("prover on a gather-generated pair", neq + ("-- binding: gather-generated",),
+             {"qed": ("proved", "")}, s.UNPINNED),
         ]
         for label, directives, observed, want in rows:
             with self.subTest(label):

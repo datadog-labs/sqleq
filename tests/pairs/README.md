@@ -58,11 +58,11 @@ an error, not a comment, because a pin nobody reads looks exactly like one that 
 |---|---|---|
 | `truth:` | a person; `--bless` never writes it | `equivalent` or `not-equivalent` |
 | `expect <axis>:` | `--bless` | what that axis said, as one word from the table below |
-| `binding:` | a person | `index` (the default) or `gather`: how the truth binds `$N` across the two sides ([below](#the-gather-rule)) |
+| `binding:` | a person | `index` (the default), `gather` or `gather-generated`: how the truth binds `$N` across the two sides ([below](#the-gather-rule)) |
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
 | `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` (not under `binding: gather`). |
-| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, or, under `binding: gather`, Lean's is `proved-gather`. |
+| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
 
 ## What each axis may say
 
@@ -75,7 +75,7 @@ nothing and changing what is refused moves a pin.
 | `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
 | `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend refused), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
-| `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
+| `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `proved-gather-generated`, `no-witness-generated` (the same, under the weaker claim for generated cells), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
 
 `sqleq-solver` is the Rust rewrite of SQLSolver in this repository, and `sqlsolver-jvm` the original,
 kept as its cross-check; a `!known-unsound` pin on `sqlsolver-jvm` is one of that fork's known false
@@ -117,10 +117,18 @@ the `unnest` side's array `$j` is column `j` of the `VALUES` rows ([LEAN.md](../
 A pair headed `-- binding: gather` states its truth under that rule, and its `witness:` or
 `argument:` binds the parameters the same way.
 
+A pair whose `VALUES` side has generated cells (`DEFAULT`, `nextval('s')`, `now()`) is headed
+`-- binding: gather-generated` instead. Its `unnest` side's arrays also carry what those cells
+evaluated to, so its truth is stated in the weaker relation Lean's `proved-gather-generated`
+claims: the `unnest` side reproduces the `VALUES` side when given the generated values. A
+`witness:` for such a pair gives the `unnest` side the values the `VALUES` side generated.
+
 Only an axis answering under a pair's binding can contradict its truth or stand as evidence for it.
-Under `binding: gather` that is Lean alone; the other axes refuse to compare a scalar with an array
-at the same `$N`, and their pins record exactly that. Under the default binding, Lean's answers are
-ordinary pins.
+Under either gather binding that is Lean alone; the other axes refuse to compare a scalar with an
+array at the same `$N`, and their pins record exactly that. Under `gather` a generated answer
+claims less than the truth, so it is neither evidence nor a contradiction there; under
+`gather-generated` a plain gather proof claims more, so it is both. Under the default binding,
+Lean's answers are ordinary pins.
 
 ## `!known-unsound`
 
