@@ -6,9 +6,10 @@
 
 """Re-run sqleq-lean's INSERT pairs on a real Postgres, as an independent check of the Lean axis.
 
-`sqleq-lean --replay-plan plan.json` writes, for every pair it proved (`proved-gather`) or proved
-without a witness (`no-witness`), the DDL, both statements, the VALUES rows and the target table's
-column types and defaults. This script replays each pair on Postgres and asks two questions.
+`sqleq-lean --replay-plan plan.json` writes, for every pair it proved (`proved-gather`,
+`proved-gather-generated`) or proved without a witness (`no-witness`, `no-witness-generated`), the
+DDL, both statements, the VALUES rows and the target table's column types and defaults. This script
+replays each pair on Postgres and asks two questions.
 
 1. **Does the witness hold?** The Lean witness model says whether the VALUES side's canonical run
    (every parameter a distinct non-NULL value, on an empty table) succeeds. Postgres runs the same
@@ -22,9 +23,18 @@ column types and defaults. This script replays each pair on Postgres and asks tw
    the first run's rows and exercises the conflict clause against existing rows.
 
 Every run is its own transaction, with the DDL applied inside it and rolled back afterwards, so
-sequences start fresh each time. Columns the INSERT omits whose default is neither a sequence nor a
-literal (`now()`, `gen_random_uuid()`, …) differ between any two runs, so they are left out of the
-table comparison.
+sequences start fresh each time. That is only true because every sequence a run uses is created
+inside it, by the DDL or by this script: sequences are not transactional, so run this against a
+database where none of them already exists. Clocks are fixed and random generators drawn from
+sequences of their own (see `determinise`). Columns the INSERT omits whose default this does not
+recognise as deterministic are left out of the table comparison.
+
+**Generated cells.** For a `proved-gather-generated` or `no-witness-generated` pair, the unnest side
+needs the values the VALUES side's generated cells evaluate to, which the claim takes as given. A
+probe learns them first (see `probe_script`), and the unnest side is then run under the gather of
+the canonical binding with those values filled in, one set per execution. Sequences the VALUES side
+advances and the unnest side does not are outside the claim, and the table comparison does not
+look at them.
 
 It needs `psql` and a server it can reach. Nothing is written to the database outside the rolled
 back transactions.
@@ -40,7 +50,9 @@ Statuses, per pair:
 - `ALARM-sides-differ` — the two sides end differently. The one outcome the Lean axis must never
   produce. Investigate before reporting anything.
 - `inconclusive: <why>` — the replay could not be set up (DDL Postgres rejects, a type this script
-  cannot generate values for, …).
+  cannot generate values for, a probe that failed, …). `inconclusive: probe disagrees with the
+  VALUES side` is a pair whose two sides differ, but whose VALUES side inserted other generated
+  values than the probe found, so the replay, not the theorem, is what is wrong.
 """
 from __future__ import annotations
 
@@ -158,30 +170,56 @@ def array_literal(items: list[str | None]) -> str:
 # ---------------------------------------------------------------------------------------------------
 # One pair.
 
-def bindings(plan: dict) -> tuple[list[str], list[str]]:
-    """The VALUES side's canonical binding and the unnest side's gather binding, as literals."""
+def is_param(cell) -> bool:
+    """A plan cell is a parameter number, `None` for `NULL`, or `{"gen": kind}` for a generated cell."""
+    return isinstance(cell, int) and not isinstance(cell, bool)
+
+
+# A parameter in a column that also holds generated cells is offset by this much, so that its
+# canonical value cannot equal a value a sequence there generates (which starts at 1). The witness
+# model takes the two to be distinct; without the offset Postgres could see them collide.
+GEN_OFFSET = 20000
+
+
+def bindings(plan: dict) -> list[str]:
+    """The VALUES side's canonical binding, as literals."""
     types = {c["name"]: c["type"] for c in plan["columns"]}
     enums = enums_in(plan["ddl"])
     insert = plan["insert"]
     rows = plan["rows"]
-    k = len(insert)
     col_of: dict[int, int] = {}
+    gen_cols = {j for r in rows for j, cell in enumerate(r) if isinstance(cell, dict)}
     for r in rows:
         for j, cell in enumerate(r):
-            if cell is not None:
+            if is_param(cell):
                 col_of.setdefault(cell, j)
     if not col_of:
-        scalars: list[str] = []
-    else:
-        top = max(col_of)
-        missing = [n for n in range(1, top + 1) if n not in col_of]
-        if missing:
-            raise NoValue(f"parameter ${missing[0]} is not used, so Postgres cannot type it")
-        scalars = [value_for(types[insert[col_of[n]]], n, enums) for n in range(1, top + 1)]
+        return []
+    top = max(col_of)
+    missing = [n for n in range(1, top + 1) if n not in col_of]
+    if missing:
+        raise NoValue(f"parameter ${missing[0]} is not used, so Postgres cannot type it")
+    return [value_for(types[insert[col_of[n]]], n + (GEN_OFFSET if col_of[n] in gen_cols else 0), enums)
+            for n in range(1, top + 1)]
+
+
+def gather(plan: dict, scalars: list[str], g: list[list[str | None]] | None = None) -> list[str]:
+    """The unnest side's gather binding, as literals: array `$j` is column `j` of the rows the VALUES
+    side produced. A generated cell's entry is what it evaluated to, row `i`, column `j` of `g`."""
+    rows = plan["rows"]
     arrays = []
-    for j in range(k):
-        arrays.append(array_literal([None if r[j] is None else scalars[r[j] - 1] for r in rows]))
-    return scalars, arrays
+    for j in range(len(plan["insert"])):
+        col = []
+        for i, r in enumerate(rows):
+            cell = r[j]
+            if cell is None:
+                col.append(None)
+            elif is_param(cell):
+                col.append(scalars[cell - 1])
+            else:
+                col.append(g[i][j])
+        arrays.append(array_literal(col))
+    return arrays
 
 
 def compared_columns(plan: dict) -> list[str]:
@@ -240,50 +278,177 @@ def unqualify(text: str, schemas: list[str]) -> str:
 # under the *same* generator stream, so the replay gives both runs one: a clock is fixed (it is one
 # value per statement anyway), and a random value is drawn from a sequence that lives, and is rolled
 # back, with the run.
+#
+# Streams are split so that a draw on one side only cannot shift the other side's draws. With one
+# shared stream, a generated cell that draws on the VALUES side but is supplied by the unnest side
+# would shift every later draw on the VALUES side, and the two sides' other columns would differ
+# for no reason the theorem is about. So each default in the DDL and each generator in a statement's
+# tail draws from a sequence of its own, and every generator inside the VALUES clause from one
+# shared sequence, in the order Postgres evaluates them, which the probe repeats. The stream's number
+# is part of each value, so two streams never produce the same value. (Real random generators share
+# no state, and never repeat.)
 _CLOCK = re.compile(r"\b(?:now|statement_timestamp|transaction_timestamp)\s*\(\s*\)|\bcurrent_timestamp\b(?:\s*\(\s*\d*\s*\))?"
                     r"|\blocaltimestamp\b(?:\s*\(\s*\d*\s*\))?|\bclock_timestamp\s*\(\s*\)", re.I)
 _DATE = re.compile(r"\bcurrent_date\b", re.I)
-_UUID = re.compile(r"\b(?:public\.)?(?:gen_random_uuid|uuid_generate_v4|uuid_generate_v1|uuid_generate_v1mc|uuidv4|uuidv7)\s*\(\s*\)", re.I)
+_UUID = re.compile(r"\b(?:public\.|pg_catalog\.)?(?:gen_random_uuid|uuid_generate_v4|uuid_generate_v7|uuid_generate_v1|uuid_generate_v1mc|uuidv4|uuidv7)\s*\(\s*\)", re.I)
 _RANDOM = re.compile(r"\brandom\s*\(\s*\)", re.I)
 FIXED_CLOCK = "'2020-06-01 12:00:00+00'::timestamptz"
-SEQ_UUID = "(('00000000-0000-4000-8000-' || lpad(nextval('sqleq_replay_gen')::text, 12, '0'))::uuid)"
-SEQ_RANDOM = "(nextval('sqleq_replay_gen')::double precision / 1e12)"
+# The variant nibble 9 sets these apart from the canonical parameter uuids (8, see `value_for`),
+# and the next three hex digits are the stream's number.
+SEQ_UUID = "(('00000000-0000-4000-9{n:03x}-' || lpad(nextval('{seq}')::text, 12, '0'))::uuid)"
+SEQ_RANDOM = "(({n} * 1000000 + nextval('{seq}'))::double precision / 1e12)"
 
 
-def determinise(ddl: str) -> str:
-    ddl = _CLOCK.sub(FIXED_CLOCK, ddl)
-    ddl = _DATE.sub("'2020-06-01'::date", ddl)
-    ddl = _UUID.sub(SEQ_UUID, ddl)
-    return _RANDOM.sub(SEQ_RANDOM, ddl)
+class Streams:
+    """The generator sequences of one run, numbered from 1. `site(tag)` gives the stream for one
+    place a generator is written; `shared(tag)` one stream for every generator under the tag."""
+
+    def __init__(self):
+        self.names: dict[str, int] = {}
+
+    def _get(self, key: str) -> tuple[str, int]:
+        n = self.names.setdefault(key, len(self.names) + 1)
+        return f"sqleq_replay_{n}", n
+
+    def site(self, tag: str):
+        count = iter(range(1 << 30))
+        return lambda: self._get(f"{tag}{next(count)}")
+
+    def shared(self, tag: str):
+        return lambda: self._get(tag)
+
+
+def determinise(text: str, stream) -> str:
+    text = _CLOCK.sub(FIXED_CLOCK, text)
+    text = _DATE.sub("'2020-06-01'::date", text)
+
+    def uuid(_):
+        seq, n = stream()
+        return SEQ_UUID.format(seq=seq, n=n)
+
+    def rand(_):
+        seq, n = stream()
+        return SEQ_RANDOM.format(seq=seq, n=n)
+
+    text = _UUID.sub(uuid, text)
+    return _RANDOM.sub(rand, text)
+
+
+def split_values(sql: str) -> tuple[str, str, str]:
+    """`sql` as (before, `VALUES (…), (…)`, after), splitting at the top-level `VALUES` clause and
+    respecting quotes and parentheses. `("", "", sql)` if there is none."""
+    i, depth, n = 0, 0, len(sql)
+    start = None
+    while i < n:
+        c = sql[i]
+        if c in "'\"":
+            j = i + 1
+            while j < n and not (sql[j] == c and (j + 1 >= n or sql[j + 1] != c)):
+                j += 2 if sql[j] == c else 1
+            i = j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if start is not None and depth == 0:
+                k = i + 1
+                while k < n and sql[k].isspace():
+                    k += 1
+                if k >= n or sql[k] != ",":
+                    return sql[:start], sql[start:i + 1], sql[i + 1:]
+        elif start is None and depth == 0 and sql[i:i + 6].lower() == "values" \
+                and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")) \
+                and (i + 6 >= n or not (sql[i + 6].isalnum() or sql[i + 6] == "_")):
+            start = i
+            i += 6
+            continue
+        i += 1
+    return "", "", sql
 
 
 def localise(plan: dict) -> dict:
     """The plan with every schema qualifier stripped (see `unqualify`) and every nondeterministic
-    default made deterministic (see `determinise`)."""
+    generator made deterministic (see `determinise`), in the DDL and in the statements alike.
+
+    A default in the DDL and a generator in a statement's tail get a stream per site: the two sides'
+    tails are the same text, so their sites line up. Every generator in the VALUES clause, on the
+    VALUES side and in the probe's copy of it, draws from one stream."""
     schemas = schemas_in(plan["ddl"] + [plan["values_sql"], plan["unnest_sql"], plan["target"]])
     schemas += [x for x in ("public",) if x not in schemas]
     u = lambda t: unqualify(t, schemas)
-    return {**plan, "ddl": [determinise(u(d)) for d in plan["ddl"]], "values_sql": u(plan["values_sql"]),
-            "unnest_sql": u(plan["unnest_sql"]), "target": u(plan["target"])}
+    st = Streams()
+    ddl = st.site("d")
+    ddl_out = [determinise(u(d), ddl) for d in plan["ddl"]]
+
+    def statement(sql: str) -> str:
+        before, values, after = split_values(u(sql))
+        tail = st.site("t")
+        return determinise(before, tail) + determinise(values, st.shared("v")) + determinise(after, tail)
+
+    out = {**plan, "ddl": ddl_out, "values_sql": statement(plan["values_sql"]),
+           "unnest_sql": statement(plan["unnest_sql"]), "target": u(plan["target"])}
+    if plan.get("values_clause") is not None:
+        out["values_clause"] = determinise(u(plan["values_clause"]), st.shared("v"))
+    out["sequences"] = [f"sqleq_replay_{n}" for n in sorted(st.names.values())]
+    return out
 
 
-def script(plan: dict, sql: str, args: list[str], times: int, cols: list[str]) -> str:
-    """One run: DDL, PREPARE, EXECUTE `times` times, dump the table, roll back."""
+def preamble(plan: dict) -> list[str]:
+    """Open the run's transaction, create its generator sequences, and apply the DDL."""
     out = ["\\set ON_ERROR_STOP off", "\\set QUIET on", "\\pset format unaligned", "\\pset tuples_only on",
-           "\\pset fieldsep '\\x1f'", "\\pset recordsep '\\x1d'", "\\pset null '\\x1e'", "BEGIN;",
-           "CREATE SEQUENCE sqleq_replay_gen;"]
+           "\\pset fieldsep '\\x1f'", "\\pset recordsep '\\x1d'", "\\pset null '\\x1e'", "BEGIN;"]
+    out += [f"CREATE SEQUENCE {s};" for s in plan.get("sequences", [])]
     for i, d in enumerate(plan["ddl"]):
         # The terminator goes on its own line: a statement can end in a `--` comment.
         out += [f"SAVEPOINT d{i};", d.rstrip().rstrip(";") + "\n;",
                 "\\if :ERROR", f"ROLLBACK TO SAVEPOINT d{i};", f"\\echo @@ddlfail {i} :LAST_ERROR_SQLSTATE",
                 "\\else", f"RELEASE SAVEPOINT d{i};", "\\endif"]
+    return out
+
+
+def ident(c: str) -> str:
+    return '"' + c.replace('"', '""') + '"'
+
+
+def script(plan: dict, sql: str, args: list[list[str]], cols: list[str]) -> str:
+    """One run: DDL, PREPARE, one EXECUTE per argument list, dump the table, roll back."""
+    out = preamble(plan)
     out += ["\\echo @@prepare", f"PREPARE s AS {sql}\n;", "\\echo @@prepared :ERROR :LAST_ERROR_SQLSTATE"]
-    call = f"EXECUTE s({', '.join(sql_str(a) for a in args)});" if args else "EXECUTE s;"
-    for t in range(times):
+    for t, a in enumerate(args):
+        call = f"EXECUTE s({', '.join(sql_str(x) for x in a)});" if a else "EXECUTE s;"
         out += [f"\\echo @@exec {t}", call, f"\\echo @@done {t} :ERROR :SQLSTATE :ROW_COUNT"]
-    sel = ", ".join('"' + c.replace('"', '""') + '"' for c in cols) or "1"
+    sel = ", ".join(ident(c) for c in cols) or "1"
     out += ["\\echo @@table", f"SELECT {sel} FROM {plan['target']};", "\\echo @@end", "ROLLBACK;"]
     return "\n".join(out) + "\n"
+
+
+def probe_script(plan: dict, scalars: list[str], times: int) -> str:
+    """Learn what the VALUES side's generated cells evaluate to: run its VALUES clause, `times`
+    times, into a copy of the target with the target's defaults and identities, and read the rows
+    back. The copy has no constraint but the NOT NULL of an identity, so the probe succeeds even
+    where the VALUES side itself fails, and Postgres does the `DEFAULT` substitution, the coercion
+    and the evaluation order itself. Rolled back, so the sequences it advances start afresh in the
+    runs that follow."""
+    cols = ", ".join(ident(c) for c in plan["insert"])
+    out = preamble(plan)
+    out += [f"CREATE TEMP TABLE sqleq_probe (LIKE {plan['target']} INCLUDING DEFAULTS INCLUDING IDENTITY);",
+            "DO $$ DECLARE c text; BEGIN FOR c IN SELECT attname FROM pg_attribute "
+            "WHERE attrelid = 'sqleq_probe'::regclass AND attnum > 0 AND attnotnull AND attidentity = '' "
+            "LOOP EXECUTE format('ALTER TABLE sqleq_probe ALTER COLUMN %I DROP NOT NULL', c); END LOOP; END $$;",
+            "\\echo @@prepare",
+            f"PREPARE p AS INSERT INTO sqleq_probe ({cols}) {plan['values_clause']} RETURNING {cols}\n;",
+            "\\echo @@prepared :ERROR :LAST_ERROR_SQLSTATE"]
+    call = f"EXECUTE p({', '.join(sql_str(x) for x in scalars)});" if scalars else "EXECUTE p;"
+    for t in range(times):
+        out += [f"\\echo @@exec {t}", call, f"\\echo @@done {t} :ERROR :SQLSTATE :ROW_COUNT"]
+    out += ["\\echo @@end", "ROLLBACK;"]
+    return "\n".join(out) + "\n"
+
+
+def fields(record: str) -> list[str | None]:
+    """One output record's values; `\\x1e` is NULL."""
+    return [None if v == "\x1e" else v for v in record.split("\x1f")]
 
 
 def run(psql: list[str], text: str, timeout: int) -> str:
@@ -327,19 +492,70 @@ def outcome(r: dict) -> tuple:
     return runs + ((tuple(r["table"] or ()),) if ok else ())
 
 
+CREDITED = ("proved-gather", "proved-gather-generated")
+
+
+def probe(plan: dict, scalars: list[str], psql: list[str], timeout: int) -> list[list[list[str | None]]]:
+    """What the generated cells evaluate to on each of two runs, as `g[run][row][column]`."""
+    res = parse(run(psql, probe_script(plan, scalars, 2), timeout), 2)
+    if res["prepared"] is not True or len(res["runs"]) != 2 or not all(r["ok"] for r in res["runs"]):
+        raise NoValue("the probe for the generated values failed")
+    out = []
+    for r in res["runs"]:
+        rows = [fields(x) for x in r["returning"]]
+        if len(rows) != len(plan["rows"]) or any(len(x) != len(plan["insert"]) for x in rows):
+            raise NoValue("the probe returned a different shape than the VALUES side")
+        out.append(rows)
+    return out
+
+
+def probe_disagrees(plan: dict, cols: list[str], values_run: dict, g: list[list[list[str | None]]],
+                    times: int) -> bool:
+    """Triage for a pair with generated cells and no conflict clause: whether the VALUES side's own
+    rows hold other generated values than the probe found. If so the probe, not the theorem, is what
+    failed. Only a VALUES side that succeeded every time has rows to compare; anything else stays an
+    alarm."""
+    table = values_run["table"]
+    if (table is None or not values_run["runs"] or not all(r["ok"] for r in values_run["runs"])
+            or "on conflict" in plan["values_sql"].lower()):
+        return False
+    gen = sorted({j for r in plan["rows"] for j, c in enumerate(r) if isinstance(c, dict)})
+    pos = [cols.index(plan["insert"][j]) if plan["insert"][j] in cols else None for j in gen]
+    if None in pos:
+        return False
+    got = sorted(tuple(fields(rec)[p] for p in pos) for rec in table)
+    want = sorted(tuple(g[t][i][j] for j in gen) for t in range(times) for i in range(len(plan["rows"])))
+    return got != want
+
+
 def replay(name: str, plan: dict, psql: list[str], timeout: int) -> dict:
     try:
-        scalars, arrays = bindings(plan)
+        scalars = bindings(plan)
     except NoValue as e:
         return {"status": f"inconclusive: {e}"}
     cols = compared_columns(plan)
     rec: dict = {"lean": plan["verdict"]}
     plan = localise(plan)
+    generated = plan.get("values_clause") is not None
+    g = None
+    if generated:
+        try:
+            g = probe(plan, scalars, psql, timeout)
+        except NoValue as e:
+            return {**rec, "status": f"inconclusive: {e}"}
+        except subprocess.TimeoutExpired:
+            return {**rec, "status": "inconclusive: psql timed out"}
     runs = {}
-    for side, sql, args in (("values", plan["values_sql"], scalars), ("unnest", plan["unnest_sql"], arrays)):
+    for side, sql in (("values", plan["values_sql"]), ("unnest", plan["unnest_sql"])):
         for times in (1, 2):
+            # The VALUES side runs under the same binding each time. The unnest side gathers that
+            # binding, with each run's generated values: those values are different on the second run.
+            if side == "values":
+                args = [scalars] * times
+            else:
+                args = [gather(plan, scalars, g[t] if g else None) for t in range(times)]
             try:
-                out = run(psql, script(plan, sql, args, times, cols), timeout)
+                out = run(psql, script(plan, sql, args, cols), timeout)
             except subprocess.TimeoutExpired:
                 return {**rec, "status": "inconclusive: psql timed out"}
             runs[(side, times)] = parse(out, times)
@@ -358,8 +574,10 @@ def replay(name: str, plan: dict, psql: list[str], timeout: int) -> dict:
             rec["differs_on"] = "empty table" if times == 1 else "second run"
             rec["values_run"] = runs[("values", times)]["runs"]
             rec["unnest_run"] = runs[("unnest", times)]["runs"]
+            if generated and probe_disagrees(plan, cols, runs[("values", times)], g, times):
+                return {**rec, "status": "inconclusive: probe disagrees with the VALUES side"}
             return {**rec, "status": "ALARM-sides-differ"}
-    model_ok = plan["verdict"] == "proved-gather"
+    model_ok = plan["verdict"] in CREDITED
     if model_ok != pg_ok:
         # If Postgres rejected DDL, it may be missing a constraint the model used, and then the
         # disagreement says nothing about the model.
