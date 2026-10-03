@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: unsupported
+-- expect sqleq-solver: unsupported
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: DISTINCT inside an IN subquery was stripped even under LIMIT, where it decides which rows the LIMIT keeps

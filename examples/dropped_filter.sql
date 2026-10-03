@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: the README's quick start: a rewrite that drops a predicate

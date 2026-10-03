@@ -7,7 +7,7 @@
 -- expect frontend: refuse:parameter-misaligned
 -- expect fuzz: error
 -- expect qed: no-plan
--- expect sqlsolver-rust: no-plan
+-- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: proved-gather
 -- binding: gather

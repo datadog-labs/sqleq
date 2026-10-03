@@ -30,13 +30,13 @@ capability, and in practice they are often the large majority, so the summary
 prints `capability` — proved among the pairs that actually differ — directly
 beneath the raw `proved` count.
 
-`--sqlsolver` adds a **second opinion** on the same cases: SQLSolver, run over
-the very `Input` JSON this harness hands the QED prover, through the bridge in
-`tools/sqlsolver/` or, with `--sqlsolver-impl=rust`, through this repo's Rust
-port of it. It is off by default and it never changes the exit code —
-the qed axis decides the policy — because it answers a different question. Two
-things
-must be read off it carefully, and the summary says both:
+`--sqleq-solver` adds a **second opinion** on the same cases, run over the very
+`Input` JSON this harness hands the QED prover: `sqleq-solver`, this repo's
+Rust rewrite of SQLSolver's proof engine, or with `--sqlsolver-jvm` instead the
+original SQLSolver through the bridge in `tools/sqlsolver/`, kept as a backup
+cross-check of `sqleq-solver`. It is off by default and it never changes the
+exit code — the qed axis decides the policy — because it answers a different
+question. Two things must be read off it carefully, and the summary says both:
 
 * **That prover never disproves.** Its `NEQ` means "no proof found", exactly
   like its `UNKNOWN`; only its `EQ` is a claim. A case we prove and it calls
@@ -365,9 +365,10 @@ class Case:
     trivial_basis: str = ""          # "ir" | "text" — how `trivial` was decided
     stats: dict = field(default_factory=dict)  # full prover Stats from .result
     message: str = ""    # error detail when not provable/unprovable
-    # The second opinion, only when --sqlsolver is on. `s_verdict` is SQLSolver's
-    # raw label, kept beside the bucket purely for audit: nothing may branch on
-    # it, because `NEQ` is not a refutation.
+    # The second opinion, only when one was asked for (--sqleq-solver or
+    # --sqlsolver-jvm). `s_verdict` is that prover's raw label, kept beside the
+    # bucket purely for audit: nothing may branch on it, because `NEQ` is not a
+    # refutation.
     s_bucket: Optional[str] = None
     s_verdict: Optional[str] = None
     s_ms: Optional[int] = None
@@ -509,7 +510,7 @@ def run_case(
         # the two axes cannot drift apart between here and `IrDriver`. Built
         # before the prover runs, so a prover timeout does not also cost us the
         # second opinion; its own cost is discounted from `case.wall` below so a
-        # `--sqlsolver` run's timings stay comparable to one without it.
+        # second-opinion run's timings stay comparable to one without it.
         if ss_dir is not None:
             job = ss_dir / f"{ss_slug(name)}.job.jsonl"
             pack = run_cmd([frontend, "--sqlsolver", "--ir", json_path.name,
@@ -583,11 +584,12 @@ def run_case(
 # ---------------------------------------------------------------------------
 #
 # SQLSolver is a second equivalence prover, an independent implementation rather
-# than a variant of this one. It used to be reachable only through its own
-# MySQL-dialect parser, which is where most of its answers were lost; the bridge
-# in `tools/sqlsolver/` hands it our lowered `Input` instead, so the question it
-# is asked here is literally the one the QED prover is asked. `docs/SQLSOLVER.md`
-# has the measurements.
+# than a variant of this one. `sqleq-solver` rewrites its proof engine in Rust and
+# reads our lowered `Input` directly; the original used to be reachable only
+# through its own MySQL-dialect parser, which is where most of its answers were
+# lost, until the bridge in `tools/sqlsolver/` handed it the `Input` too. Either
+# way the question asked here is literally the one the QED prover is asked.
+# `docs/SQLSOLVER.md` has the measurements.
 #
 # Three properties of that prover shape the code below, and together they are why
 # this is one batched pass at the end rather than a call inside `run_case`:
@@ -658,32 +660,33 @@ class SsDriver:
     where: str
 
 
-def discover_sqlsolver_rust(override: Optional[str]) -> SsDriver:
-    """Resolve the Rust port's driver: explicit override -> $SQLEQ_SOLVER_BIN -> PATH ->
+def discover_sqleq_solver(override: Optional[str]) -> SsDriver:
+    """Resolve `sqleq-solver`: explicit override -> $SQLEQ_SOLVER_BIN -> PATH ->
     this repo's own build (release preferred over debug).
 
-    No JDK, no fork tree and no library path: Z3 is linked at build time and its
-    location baked into the binary (`sqleq-solver/build.rs`)."""
+    No JDK, no fork tree and no library path: the build compiles Z3 from source and
+    links it in statically."""
     for c in (override, os.environ.get("SQLEQ_SOLVER_BIN")):
         if c:
             if os.path.isfile(c) and os.access(c, os.X_OK):
                 c = os.path.abspath(c)
-                return SsDriver("rust", [c], REPO, dict(os.environ), c)
+                return SsDriver("sqleq-solver", [c], REPO, dict(os.environ), c)
             sys.exit(f"error: sqleq-solver not found or not executable at: {c}")
     found = shutil.which("sqleq-solver") or _newest(
         [str(REPO / "target" / p / "sqleq-solver") for p in ("release", "debug")])
     if found:
         found = os.path.abspath(found)
-        return SsDriver("rust", [found], REPO, dict(os.environ), found)
+        return SsDriver("sqleq-solver", [found], REPO, dict(os.environ), found)
     sys.exit(
         "error: could not find 'sqleq-solver'. Build it with "
-        "`cargo build --release -p sqleq-solver` (it links Z3; see "
-        "sqleq-solver/build.rs), put it on PATH, or pass "
-        "--sqlsolver-bin/$SQLEQ_SOLVER_BIN.")
+        "`cargo build --release -p sqleq-solver` (its first build compiles Z3, "
+        "which needs cmake and a C++20 compiler), put it on PATH, or pass "
+        "--sqleq-solver-bin/$SQLEQ_SOLVER_BIN.")
 
 
 def discover_sqlsolver_jvm(override: Optional[str]) -> SsDriver:
-    """The JVM driver (`tools/sqlsolver/IrDriver.java`) over the de-Calcited fork."""
+    """The JVM driver (`tools/sqlsolver/IrDriver.java`) over the de-Calcited fork: the
+    original SQLSolver, kept as a cross-check of `sqleq-solver`."""
     cp, tree = discover_sqlsolver(override)
     return SsDriver(
         "jvm",
@@ -710,7 +713,7 @@ def discover_sqlsolver(override: Optional[str]) -> tuple[str, Path]:
     """
     root = override or os.environ.get("SQLEQ_SQLSOLVER")
     if not root:
-        sys.exit("error: --sqlsolver needs the fork's location: pass "
+        sys.exit("error: --sqlsolver-jvm needs the fork's location: pass "
                  "--sqlsolver-tree DIR or set $SQLEQ_SQLSOLVER.")
     tree = Path(root)
     classes = tree / "build" / "classes-javac"
@@ -727,7 +730,7 @@ def discover_sqlsolver(override: Optional[str]) -> tuple[str, Path]:
         sys.exit(f"error: no dependency directory at {deps}; "
                  f"set $SQLEQ_SQLSOLVER_DEPS to the exploded jar.")
     if not shutil.which("javac") or not shutil.which("java"):
-        sys.exit("error: --sqlsolver needs a JDK on PATH (javac and java).")
+        sys.exit("error: --sqlsolver-jvm needs a JDK on PATH (javac and java).")
     driver = _compile_driver(f"{deps}:{classes}")
     return f"{deps}:{classes}:{driver}", tree
 
@@ -756,7 +759,7 @@ def _ss_answered(path: Path) -> dict:
 
 def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
                        timeout_ms: int) -> dict:
-    """Ask SQLSolver about every case that produced a job, and attach the answers.
+    """Ask the second prover about every case that produced a job, and attach the answers.
 
     Mutates the cases in place, because the answer belongs beside the case rather
     than in a parallel table that a later sort could desynchronise.
@@ -795,7 +798,7 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
             driver.cmd + [str(todo_path), str(out_path), f"--timeout-ms={timeout_ms}"],
             cwd=str(driver.cwd), env=driver.env, capture_output=True, text=True)
         # Exit 3 is the driver taking its own process down because a row would not
-        # stop (the JVM's interrupt missed; the Rust driver's grace period ran out).
+        # stop (the JVM's interrupt missed; sqleq-solver's grace period ran out).
         # It writes the row first, so resuming always advances.
         if proc.returncode == 3:
             halts += 1
@@ -846,7 +849,7 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
 # `sqleq-lean` decides one class the frontend refuses outright, `INSERT … VALUES`
 # against `INSERT … SELECT * FROM unnest(…)`, under the gather rule (see
 # docs/LEAN.md). It parses the pair file itself, so it runs over every `.sql`
-# case regardless of what the frontend made of it, and like `--sqlsolver` it is
+# case regardless of what the frontend made of it, and like `--sqleq-solver` it is
 # a second opinion that never moves the exit code.
 
 LEAN_ORDER = ["proved-gather", "no-witness", "unsupported", "invalid-sql",
@@ -1029,7 +1032,7 @@ def observe(case: Case, axes: list) -> dict:
             if word == "proved" and case.trivial:
                 word = "proved-literal"
             out["qed"] = (word, case.message)
-    for axis in ("sqlsolver-rust", "sqlsolver-jvm"):
+    for axis in ("sqleq-solver", "sqlsolver-jvm"):
         if axis in axes:
             out[axis] = (("no-plan", "") if no_plan
                          else (case.s_bucket or SQLSOLVER_MISSING, case.s_note))
@@ -1291,8 +1294,15 @@ def print_summary(c: Color, cases: list[Case], wall: float, qed: bool = True):
               f"{c.dim('slowest')} {slowest.name} ({slowest.wall:.2f}s)")
 
 
-def print_second_opinion(c: Color, cases: list[Case], stats: dict):
-    """The second opinion, and the two warnings that have to travel with it."""
+def ss_name(impl: str) -> str:
+    """How the output names the second prover, from its `SsDriver.impl`."""
+    return "sqleq-solver" if impl == "sqleq-solver" else "the JVM SQLSolver"
+
+
+def print_second_opinion(c: Color, cases: list[Case], stats: dict, impl: str = "sqleq-solver"):
+    """The second opinion, and the two warnings that have to travel with it. `impl` is the
+    driver's `SsDriver.impl`, which names the prover in the table."""
+    who = ss_name(impl)
     scored = [x for x in cases if x.s_bucket is not None]
     if not scored:
         return
@@ -1300,7 +1310,7 @@ def print_second_opinion(c: Color, cases: list[Case], stats: dict):
     for x in scored:
         counts[x.s_bucket] = counts.get(x.s_bucket, 0) + 1
     print()
-    print(c.bold("  Second opinion") + c.dim("  — SQLSolver, over the same lowered IR"))
+    print(c.bold("  Second opinion") + c.dim(f"  — {who}, over the same lowered IR"))
     print(c.dim("  " + "─" * 40))
     for b in SQLSOLVER_ORDER:
         if counts.get(b):
@@ -1319,7 +1329,7 @@ def print_second_opinion(c: Color, cases: list[Case], stats: dict):
     print(f"  {'of pairs that differ':<22} {len(diff):>5}")
     print(f"  {'both provers':<22} {len(both):>5}")
     print(f"  {'only the QED prover':<22} {len(only_p):>5}")
-    print(f"  {'only SQLSolver':<22} {c.bold(f'{len(only_s):>5}')}   "
+    print(f"  {'only ' + who:<22} {c.bold(f'{len(only_s):>5}')}   "
           f"{c.dim('what the second opinion adds')}")
     for name in sorted(only_s)[:10]:
         print(c.dim(f"  {'':<22}       {name}"))
@@ -1329,7 +1339,7 @@ def print_second_opinion(c: Color, cases: list[Case], stats: dict):
     if stats.get("wall_s") is not None:
         detail = f"{stats['wall_s']:.2f}s over {stats.get('answered', 0)} row(s)"
         if stats.get("halts"):
-            detail += (f", {stats['halts']} JVM self-halt(s) in "
+            detail += (f", {stats['halts']} driver self-halt(s) in "
                        f"{stats.get('passes', 0)} pass(es)")
         print(c.dim(f"  {'wall time':<22} {detail}"))
     if stats.get("stalled"):
@@ -1367,6 +1377,24 @@ def write_csv(path: str, cases: list[Case]):
 # ---------------------------------------------------------------------------
 
 
+def _sqlsolver_impl(name: str) -> str:
+    """The old `--sqlsolver-impl`'s value, with `rust` read as the old name of `sqleq-solver`."""
+    return "sqleq-solver" if name == "rust" else name
+
+
+def second_opinion(args: argparse.Namespace) -> Optional[str]:
+    """Which prover gives the second opinion: `"sqleq-solver"`, `"jvm"` for the JVM fork, or `None`.
+
+    `--sqleq-solver` and `--sqlsolver-jvm` are the two switches. The spellings from before
+    sqleq-solver was the default still work -- `--sqlsolver` for `--sqleq-solver`, and with it
+    `--sqlsolver-impl=jvm` for the fork -- so a script written against them keeps running."""
+    if args.sqleq_solver and args.sqlsolver_jvm:
+        sys.exit("error: --sqleq-solver and --sqlsolver-jvm ask two different provers; pick one")
+    if args.sqlsolver_jvm or (args.sqleq_solver and args.sqlsolver_impl == "jvm"):
+        return "jvm"
+    return "sqleq-solver" if args.sqleq_solver else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sqleq-check",
@@ -1401,9 +1429,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "'pinned': every case's header pins each axis's answer, and "
                         "any movement fails (tests/pairs/README.md).")
     p.add_argument("--axes", metavar="LIST",
-                   help="Comma-separated axes to run: frontend, fuzz, qed, sqlsolver-rust, "
+                   help="Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, "
                         "sqlsolver-jvm, lean (default: frontend,qed). A prover axis brings in "
-                        "frontend; at most one SQLSolver per run.")
+                        "frontend; at most one SQLSolver per run. sqlsolver-rust is the old "
+                        "name of sqleq-solver.")
     p.add_argument("--bless", action="store_true",
                    help="With --expect pinned: rewrite each case's `expect` lines for the "
                         "axes that ran. Never pins an answer that contradicts the case's "
@@ -1429,26 +1458,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frontend", help="Path to sqleq-frontend (else $SQLEQ_FRONTEND / "
                                       "PATH / this repo's target/{release,debug}).")
     p.add_argument("--prover", help="Path to qed-prover (else PATH / $QED_PROVER).")
-    p.add_argument("--sqlsolver", action="store_true",
-                   help="Also ask SQLSolver about every case that lowered, over "
-                        "the same Input JSON the QED prover gets. Informational "
-                        "only: it never changes the exit code, and its NEQ is not "
-                        "a refutation. Needs a JDK and the de-Calcited fork; see "
-                        "docs/SQLSOLVER.md.")
-    p.add_argument("--sqlsolver-impl", choices=("jvm", "rust"), default="jvm",
-                   help="Which SQLSolver to ask: the JVM fork through "
-                        "tools/sqlsolver/IrDriver (default), or this repo's Rust "
-                        "port, sqleq-solver. Same jobs, same result rows, same "
-                        "buckets; the Rust port needs no JDK.")
+    p.add_argument("--sqleq-solver", action="store_true",
+                   help="Also ask sqleq-solver (a Rust rewrite of SQLSolver) about "
+                        "every case that lowered, over the same Input JSON the QED "
+                        "prover gets. Informational only: it never changes the exit "
+                        "code, and its NEQ is not a refutation. See docs/SQLSOLVER.md.")
+    p.add_argument("--sqleq-solver-bin", metavar="PATH",
+                   help="With --sqleq-solver: the binary (else $SQLEQ_SOLVER_BIN / "
+                        "PATH / this repo's target/{release,debug}).")
+    p.add_argument("--sqlsolver-jvm", action="store_true",
+                   help="Ask the original SQLSolver instead, as a JVM fork through "
+                        "tools/sqlsolver/IrDriver: sqleq-solver's backup cross-check. "
+                        "Same jobs, same result rows, same buckets; needs a JDK and "
+                        "the fork tree. Not with --sqleq-solver.")
     p.add_argument("--sqlsolver-tree", metavar="DIR",
-                   help="With --sqlsolver-impl=jvm: the SQLSolver fork to run (else "
+                   help="With --sqlsolver-jvm: the SQLSolver fork to run (else "
                         "$SQLEQ_SQLSOLVER; one of the two is required). Its "
                         "exploded dependency directory comes from "
                         "$SQLEQ_SQLSOLVER_DEPS.")
-    p.add_argument("--sqlsolver-bin", metavar="PATH",
-                   help="With --sqlsolver-impl=rust: the sqleq-solver binary (else "
-                        "$SQLEQ_SOLVER_BIN / PATH / this repo's "
-                        "target/{release,debug}).")
     p.add_argument("--lean", action="store_true",
                    help="Also run the Lean axis (sqleq-lean) over the .sql cases: "
                         "INSERT ... VALUES vs INSERT ... SELECT * FROM unnest(..) "
@@ -1456,31 +1483,43 @@ def build_parser() -> argparse.ArgumentParser:
                         "--axes; outside --expect pinned it never changes the exit code.")
     p.add_argument("--lean-bin", metavar="PATH",
                    help="Path to sqleq-lean (else $SQLEQ_LEAN / target/{release,debug}).")
-    p.add_argument("--sqlsolver-timeout", type=int, default=None, metavar="MS",
-                   help="Per-row cap for the second opinion, in ms "
+    p.add_argument("--sqleq-solver-timeout", type=int, default=None, metavar="MS",
+                   help="Per-row cap for the second opinion (sqleq-solver, or the "
+                        "fork with --sqlsolver-jvm), in ms "
                         "(default: --timeout). Its rows run sequentially, so this "
                         "is a per-row budget, not a share of one.")
+    # The spellings from before sqleq-solver was the default, so scripts written against them still
+    # run. Hidden from --help; `second_opinion` reads them.
+    p.add_argument("--sqlsolver", dest="sqleq_solver", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--sqlsolver-impl", type=_sqlsolver_impl, choices=("sqleq-solver", "jvm"),
+                   default=None, help=argparse.SUPPRESS)
+    p.add_argument("--sqlsolver-bin", dest="sqleq_solver_bin", help=argparse.SUPPRESS)
+    p.add_argument("--sqlsolver-timeout", dest="sqleq_solver_timeout", type=int,
+                   help=argparse.SUPPRESS)
     return p
 
 
 def resolve_axes(args) -> list:
-    """The axes this run asks, in canonical order. The legacy flags still work: `--sqlsolver`
-    adds the SQLSolver axis its `--sqlsolver-impl` names, so an old invocation runs what it
-    always ran. A prover is handed the frontend's plan, so asking one asks the frontend."""
+    """The axes this run asks, in canonical order. `--sqleq-solver` and `--sqlsolver-jvm` add the
+    SQLSolver axis they name (see `second_opinion`), and `sqlsolver-rust`, sqleq-solver's axis
+    before it was renamed, still names it. A prover is handed the frontend's plan, so asking one
+    asks the frontend."""
     if args.axes is None:
         axes = {"frontend", "qed"}
     else:
-        axes = {a.strip() for a in args.axes.split(",") if a.strip()}
+        axes = {suite.canonical_axis(a.strip()) for a in args.axes.split(",") if a.strip()}
         unknown = sorted(axes - set(suite.AXES))
         if unknown:
             sys.exit(f"error: unknown axis {', '.join(unknown)} (one of {', '.join(suite.AXES)})")
-    if args.sqlsolver:
-        axes.add(f"sqlsolver-{args.sqlsolver_impl}")
+    second = second_opinion(args)
+    if second:
+        axes.add("sqleq-solver" if second == "sqleq-solver" else "sqlsolver-jvm")
     if args.lean:
         axes.add("lean")
     if axes & set(suite.PROVERS):
         axes.add("frontend")
-    if {"sqlsolver-rust", "sqlsolver-jvm"} <= axes:
+    if {"sqleq-solver", "sqlsolver-jvm"} <= axes:
         sys.exit("error: one SQLSolver per run; --bless only touches the axes that ran, so "
                  "two runs combine.")
     if not axes:
@@ -1504,8 +1543,8 @@ def setup(args) -> dict:
     # Resolved before a single case runs — including the driver rebuild — so a
     # fork that is missing or will not compile costs a second, not a full pass.
     env["ss"] = None
-    if "sqlsolver-rust" in axes:
-        env["ss"] = discover_sqlsolver_rust(args.sqlsolver_bin)
+    if "sqleq-solver" in axes:
+        env["ss"] = discover_sqleq_solver(args.sqleq_solver_bin)
     elif "sqlsolver-jvm" in axes:
         env["ss"] = discover_sqlsolver_jvm(args.sqlsolver_tree)
     env["fuzz"] = discover_fuzz(args.fuzz_bin) if "fuzz" in axes else None
@@ -1522,7 +1561,7 @@ def setup(args) -> dict:
     env["files"] = files
 
     bins = [env["frontend"], env["fuzz"], env["lean"]]
-    if env["ss"] is not None and env["ss"].impl == "rust":
+    if env["ss"] is not None and env["ss"].impl == "sqleq-solver":
         bins.append(env["ss"].where)
     for b in bins:
         why = b and stale_build(b)
@@ -1555,7 +1594,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         rel = os.path.relpath(str(f.resolve()), str(root))
         return f.name if rel in (".", "") else rel
 
-    ss_timeout_ms = args.sqlsolver_timeout or int(args.timeout * 1000)
+    ss_timeout_ms = args.sqleq_solver_timeout or int(args.timeout * 1000)
 
     keep_dir = Path(args.keep) if args.keep else None
     if keep_dir:
@@ -1584,7 +1623,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if prover_bin:
             print(c.dim(f"qed-prover:   {prover_bin}"))
         if ss_driver:
-            print(c.dim(f"sqlsolver:    {ss_driver.where} ({ss_driver.impl})"))
+            label = "sqleq-solver:" if ss_driver.impl == "sqleq-solver" else "JVM fork:"
+            print(c.dim(f"{label:<14}{ss_driver.where}"))
         if fuzz_bin:
             print(c.dim(f"sqleq-fuzz:   {fuzz_bin}"))
         print(c.bold(f"Checking {len(files)} case(s) on {', '.join(axes)} "
@@ -1652,7 +1692,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if live:
                 print(" " * 30, end="\r")
             n = sum(1 for x in cases if x.s_bucket is None)
-            print(c.dim(f"  asking SQLSolver about {n} case(s), "
+            print(c.dim(f"  asking {ss_name(ss_driver.impl)} about {n} case(s), "
                         f"sequentially, {ss_timeout_ms}ms/row…"))
         t1 = time.monotonic()
         ss_stats = run_second_opinion(cases, ss_dir, ss_driver, ss_timeout_ms)
@@ -1704,7 +1744,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         if frontend_bin is not None:
             print_summary(c, cases, wall, qed="qed" in axes)
-        print_second_opinion(c, cases, ss_stats)
+        print_second_opinion(c, cases, ss_stats,
+                             ss_driver.impl if ss_driver else "sqleq-solver")
         print_fuzz(c, cases, fuzz_stats)
         print_lean(c, cases, lean_stats)
 

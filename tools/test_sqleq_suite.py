@@ -132,6 +132,20 @@ class Lint(unittest.TestCase):
                 self.assertEqual(self.errors(*directives), [])
 
 
+class AxisNames(unittest.TestCase):
+    def test_the_old_name_of_sqleq_solvers_axis_is_read_as_the_new_one(self):
+        h = s.parse_header(pair(*NEQ_OK, "-- expect sqlsolver-rust: no-proof"))
+        self.assertEqual(h.errors, [])
+        self.assertIn("sqleq-solver", h.expect)
+        self.assertEqual(s.canonical_axis("sqlsolver-rust"), "sqleq-solver")
+
+    def test_both_spellings_in_one_header_are_one_axis_twice(self):
+        h = s.parse_header(pair(*NEQ_OK, "-- expect sqleq-solver: no-proof",
+                                "-- expect sqlsolver-rust: no-proof"))
+        self.assertTrue(any("second `expect` line for `sqleq-solver`" in e for e in h.errors),
+                        h.errors)
+
+
 class Judge(unittest.TestCase):
     def judge(self, observed, *directives):
         h = s.parse_header(pair(*directives))
@@ -195,9 +209,9 @@ class Bless(unittest.TestCase):
 
     def test_missing_lines_go_in_canonical_order_whatever_ran_first(self):
         observed = {"frontend": ("emit", ""), "fuzz": ("counterexample", ""),
-                    "qed": ("no-proof", ""), "sqlsolver-rust": ("no-proof", "")}
+                    "qed": ("no-proof", ""), "sqleq-solver": ("no-proof", "")}
         want = None
-        for order in (["sqlsolver-rust", "qed"], ["qed", "fuzz", "frontend", "sqlsolver-rust"],
+        for order in (["sqleq-solver", "qed"], ["qed", "fuzz", "frontend", "sqleq-solver"],
                       ["frontend"]):
             text = pair(*NEQ_OK)
             for axis in order + list(observed):
@@ -207,7 +221,7 @@ class Bless(unittest.TestCase):
                 self.assertEqual(text, want)
         axes = [ln.split(":")[0] for ln in want.splitlines() if ln.startswith("-- expect ")]
         self.assertEqual(axes, ["-- expect frontend", "-- expect fuzz", "-- expect qed",
-                                "-- expect sqlsolver-rust"])
+                                "-- expect sqleq-solver"])
         self.assertLess(want.index("-- truth:"), want.index("-- expect frontend"))
 
     def test_a_second_bless_is_a_no_op(self):
@@ -299,9 +313,9 @@ class ThroughMain(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_main(self, *extra, axes="frontend,sqlsolver-rust", paths=None):
+    def run_main(self, *extra, axes="frontend,sqleq-solver", paths=None):
         argv = ["--expect", "pinned", "--axes", axes, "--frontend", self.frontend,
-                "--sqlsolver-bin", self.solver, "--fuzz-bin", self.fuzz, "-j", "1",
+                "--sqleq-solver-bin", self.solver, "--fuzz-bin", self.fuzz, "-j", "1",
                 *extra, *(paths or [str(self.case)])]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -320,15 +334,30 @@ class ThroughMain(unittest.TestCase):
 
         # A person marks it known: the run passes while the bug reproduces …
         self.case.write_text(pair(*NEQ_OK, "-- expect frontend: emit",
-                                  "-- expect sqlsolver-rust: proved !known-unsound"))
+                                  "-- expect sqleq-solver: proved !known-unsound"))
         self.assertEqual(self.run_main(), 0)
         # … and fails the run that fixes it, until bless drops the marker.
         os.environ["FAKE_SS"] = "NEQ"
         self.assertEqual(self.run_main(), 1)
         self.assertIn("no longer reproduces", self.out)
         self.assertEqual(self.run_main("--bless"), 0)
-        self.assertIn("-- expect sqlsolver-rust: no-proof\n", self.case.read_text())
+        self.assertIn("-- expect sqleq-solver: no-proof\n", self.case.read_text())
         self.assertNotIn("!known-unsound", self.case.read_text())
+
+    def test_the_old_axis_name_is_read_and_a_rewritten_pin_gets_the_new_one(self):
+        # `sqlsolver-rust` was sqleq-solver's axis before the rename: a pin under it still holds ...
+        self.case.write_text(pair(*NEQ_OK, "-- expect frontend: emit",
+                                  "-- expect sqlsolver-rust: no-proof"))
+        self.assertEqual(self.run_main(axes="frontend,sqlsolver-rust"), 0)
+        self.assertEqual(self.run_main(), 0)
+        # ... and once it moves, `--bless` writes it back under the new name.
+        os.environ["FAKE_SS"] = "UNKNOWN"
+        self.case.write_text(pair(*NEQ_OK, "-- expect frontend: emit",
+                                  "-- expect sqlsolver-rust: unsupported"))
+        self.assertEqual(self.run_main(), 1)
+        self.assertEqual(self.run_main("--bless"), 0)
+        self.assertIn("-- expect sqleq-solver: no-proof\n", self.case.read_text())
+        self.assertNotIn("sqlsolver-rust", self.case.read_text())
 
     def test_a_false_refutation_fails(self):
         os.environ["FAKE_FUZZ"] = "NOT-EQUIVALENT"
@@ -338,21 +367,21 @@ class ThroughMain(unittest.TestCase):
 
     def test_bless_round_trip(self):
         self.case.write_text(pair(*NEQ_OK))
-        self.assertEqual(self.run_main(axes="frontend,fuzz,sqlsolver-rust"), 1)  # unpinned
-        self.assertEqual(self.run_main("--bless", axes="frontend,fuzz,sqlsolver-rust"), 0)
+        self.assertEqual(self.run_main(axes="frontend,fuzz,sqleq-solver"), 1)  # unpinned
+        self.assertEqual(self.run_main("--bless", axes="frontend,fuzz,sqleq-solver"), 0)
         blessed = self.case.read_text()
         for line in ("-- expect frontend: emit\n", "-- expect fuzz: no-counterexample\n",
-                     "-- expect sqlsolver-rust: no-proof\n"):
+                     "-- expect sqleq-solver: no-proof\n"):
             self.assertIn(line, blessed)
-        self.assertEqual(self.run_main(axes="frontend,fuzz,sqlsolver-rust"), 0)
-        self.assertEqual(self.run_main("--bless", axes="frontend,fuzz,sqlsolver-rust"), 0)
+        self.assertEqual(self.run_main(axes="frontend,fuzz,sqleq-solver"), 0)
+        self.assertEqual(self.run_main("--bless", axes="frontend,fuzz,sqleq-solver"), 0)
         self.assertEqual(self.case.read_text(), blessed)
         self.assertIn("blessed 0 file(s)", self.out)
 
     def test_an_improvement_fails_until_blessed(self):
         os.environ["FAKE_SS"] = "EQ"
         self.case.write_text(pair(*EQ_OK, "-- expect frontend: emit",
-                                  "-- expect sqlsolver-rust: no-proof"))
+                                  "-- expect sqleq-solver: no-proof"))
         self.assertEqual(self.run_main(), 1)
         self.assertIn("no-proof→proved", self.out)
 
@@ -367,12 +396,12 @@ class ThroughMain(unittest.TestCase):
         name nothing there. CI passes `target/debug/...`, which is how this was found."""
         self.case.write_text(pair(*NEQ_OK, "-- expect frontend: emit",
                                   "-- expect fuzz: no-counterexample",
-                                  "-- expect sqlsolver-rust: no-proof"))
+                                  "-- expect sqleq-solver: no-proof"))
         cwd = os.getcwd()
         os.chdir(self.tmp)
         try:
             self.frontend, self.solver, self.fuzz = "fe", "ss", "fz"
-            self.assertEqual(self.run_main(axes="frontend,fuzz,sqlsolver-rust",
+            self.assertEqual(self.run_main(axes="frontend,fuzz,sqleq-solver",
                                            paths=["case.sql"]), 0, self.out + self.err)
         finally:
             os.chdir(cwd)
@@ -396,7 +425,7 @@ class ThroughMain(unittest.TestCase):
             (["--expect", "pinned", "--axes", "fuzz", "--fuzz-bin", str(self.tmp / "nope")],
              self.case),
             (["--expect", "pinned", "--axes", "frontend,qd"], self.case),
-            (["--expect", "pinned", "--axes", "sqlsolver-rust,sqlsolver-jvm"], self.case),
+            (["--expect", "pinned", "--axes", "sqleq-solver,sqlsolver-jvm"], self.case),
             (["--expect", "equivalent", "--axes", "frontend"], self.case),
             (["--expect", "report-only", "--bless"], self.case),
             (["--expect", "pinned", "--axes", "frontend"], plan),

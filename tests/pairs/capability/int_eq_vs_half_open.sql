@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: integer reasoning across a half-open range, which is sound over integers and not

@@ -19,6 +19,8 @@ Standard library only, like the harness itself.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -27,8 +29,9 @@ import unittest
 from pathlib import Path
 
 from sqleq_check import (REPO, SQLSOLVER_NO_PROOF, SQLSOLVER_PROVED, SQLSOLVER_PROVED_LITERAL,
-                         SQLSOLVER_UNSUPPORTED, Case, SsDriver, _statements, run_second_opinion,
-                         ss_slug, triviality_from_ir, triviality_from_text)
+                         SQLSOLVER_UNSUPPORTED, Case, SsDriver, _statements, build_parser,
+                         resolve_axes, run_second_opinion, second_opinion, ss_slug,
+                         triviality_from_ir, triviality_from_text)
 
 
 class StatementSplitting(unittest.TestCase):
@@ -123,18 +126,18 @@ class TrivialityFromIR(unittest.TestCase):
         self.assertIsNone(triviality_from_ir({"queries": "not a list"}))
 
 
-def _rust_driver():
+def _sqleq_solver_driver():
     """This repo's build of sqleq-solver, if there is one (it needs Z3 to build)."""
     for profile in ("release", "debug"):
         b = REPO / "target" / profile / "sqleq-solver"
         if b.is_file() and os.access(b, os.X_OK):
-            return SsDriver("rust", [str(b)], REPO, dict(os.environ), str(b))
+            return SsDriver("sqleq-solver", [str(b)], REPO, dict(os.environ), str(b))
     return None
 
 
-@unittest.skipIf(_rust_driver() is None, "sqleq-solver is not built")
-class SecondOpinionThroughTheRustDriver(unittest.TestCase):
-    """`run_second_opinion` end to end against the Rust port: the driver reads the jobs,
+@unittest.skipIf(_sqleq_solver_driver() is None, "sqleq-solver is not built")
+class SecondOpinionThroughSqleqSolver(unittest.TestCase):
+    """`run_second_opinion` end to end against sqleq-solver: the driver reads the jobs,
     writes IrDriver-shaped rows, and the harness buckets them exactly as it buckets the
     JVM's."""
 
@@ -169,7 +172,7 @@ class SecondOpinionThroughTheRustDriver(unittest.TestCase):
             self.job("refused", None, refusal="unknown table t"),
             Case(name="no-job", path="no-job"),
         ]
-        stats = run_second_opinion(cases, self.dir, _rust_driver(), 10_000)
+        stats = run_second_opinion(cases, self.dir, _sqleq_solver_driver(), 10_000)
         got = {c.name: c.s_bucket for c in cases}
         self.assertEqual(got, {
             "same": SQLSOLVER_PROVED_LITERAL,
@@ -180,6 +183,46 @@ class SecondOpinionThroughTheRustDriver(unittest.TestCase):
         })
         self.assertEqual((stats["rows"], stats["answered"], stats["halts"]), (4, 4, 0))
         self.assertEqual({c.name: c.s_note for c in cases}["refused"], "unknown table t")
+
+
+class SecondOpinionOptions(unittest.TestCase):
+    """`--sqleq-solver` asks sqleq-solver, `--sqlsolver-jvm` the JVM fork, and the spellings from
+    before sqleq-solver was the default still mean what they meant."""
+
+    def asks(self, *argv):
+        return second_opinion(build_parser().parse_args(["x.sql", *argv]))
+
+    def refused(self, *argv):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.asks(*argv)
+
+    def test_nothing_is_asked_by_default(self):
+        self.assertIsNone(self.asks())
+
+    def test_each_switch_asks_its_prover(self):
+        self.assertEqual(self.asks("--sqleq-solver"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver-jvm"), "jvm")
+
+    def test_the_two_switches_together_are_refused(self):
+        self.refused("--sqleq-solver", "--sqlsolver-jvm")
+
+    def test_the_old_spellings_still_work(self):
+        self.assertEqual(self.asks("--sqlsolver"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver", "--sqlsolver-impl", "rust"), "sqleq-solver")
+        self.assertEqual(self.asks("--sqlsolver", "--sqlsolver-impl", "jvm"), "jvm")
+        args = build_parser().parse_args(["x.sql", "--sqlsolver-bin", "b", "--sqlsolver-timeout", "5"])
+        self.assertEqual((args.sqleq_solver_bin, args.sqleq_solver_timeout), ("b", 5))
+
+    def test_an_unknown_implementation_is_refused(self):
+        self.refused("--sqlsolver", "--sqlsolver-impl", "java")
+
+    def test_the_switches_and_the_old_axis_name_choose_the_axis(self):
+        axes = lambda *argv: resolve_axes(build_parser().parse_args(["x.sql", *argv]))
+        self.assertEqual(axes("--sqleq-solver"), ["frontend", "qed", "sqleq-solver"])
+        self.assertEqual(axes("--sqlsolver-jvm"), ["frontend", "qed", "sqlsolver-jvm"])
+        self.assertEqual(axes("--axes", "sqlsolver-rust"), ["frontend", "sqleq-solver"])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            axes("--axes", "sqleq-solver", "--sqlsolver-jvm")
 
 
 class LeanAxis(unittest.TestCase):

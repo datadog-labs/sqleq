@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved !known-unsound
 -- expect lean: unsupported
 -- catalog: inferred-seeded
@@ -18,7 +18,7 @@
 -- harmless (booleans/null_guard_in_where.sql); in the SELECT list it is a value.
 --
 -- The JVM SQLSolver still proves this pair: it reads the projected boolean two-valued.
--- The Rust port keeps NULL apart from false and does not.
+-- sqleq-solver keeps NULL apart from false and does not.
 create table "t" ("id" INTEGER, "x" INTEGER, unique ("id"));
 SELECT "x" IS NOT NULL AND "x" <= 5 FROM "t" WHERE "id" = $1;
 SELECT "x" <= 5 FROM "t" WHERE "id" = $1;

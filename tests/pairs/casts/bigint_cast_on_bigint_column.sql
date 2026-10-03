@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: sqleq-fuzz compared result cells by DuckDB type, so an identity cast changed the cell (#6)

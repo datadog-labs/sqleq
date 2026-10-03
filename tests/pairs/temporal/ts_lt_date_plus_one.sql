@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: dates and timestamps both lowered as integers, so `d + 1` read as one microsecond (742935f)

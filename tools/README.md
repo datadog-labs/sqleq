@@ -6,7 +6,7 @@
 | `sqleq_suite.py` | the pinned-pair header grammar, its judgement and `--bless`, used by `sqleq_check.py --expect pinned` — see [`../tests/pairs/README.md`](../tests/pairs/README.md) |
 | `linkcheck.py` | every relative link in every tracked Markdown file resolves |
 | `update_license_3rdparty.sh` | regenerates `LICENSE-3rdparty.csv`; `--check` is the CI gate — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
-| `sqlsolver/` | our side of the IR bridge to the second prover — see [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) |
+| `sqlsolver/` | our side of the IR bridge to the JVM SQLSolver, the cross-check of `sqleq-solver` — see [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) |
 | `lean_replay.py` | re-runs the Lean axis's INSERT pairs on a real Postgres, as an independent check — see [`../docs/LEAN.md`](../docs/LEAN.md) |
 
 Standard library only, Python 3.8+. `test_sqleq_check.py` covers `sqleq_check.py` and
@@ -57,7 +57,7 @@ them in bulk from a CSV corpus, use the frontend's own `--csv` mode.
 
 An already-lowered `.json` plan is also a first-class case: the harness skips
 the lowering stage and hands it straight to the prover. That is how an archived
-`Input` is re-checked, and it is also the path `--sqlsolver` was built around.
+`Input` is re-checked, and it is also the path `--sqleq-solver` was built around.
 
 ### Usage
 
@@ -83,20 +83,24 @@ python3 tools/sqleq_check.py --keep ./work rewrites/
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable`. |
 | `--expect report-only` | Always exit 0; just report. |
 | `--expect pinned` | Each case's header pins every axis's answer; exit non-zero on any movement. See [Pinned pairs](#pinned-pairs). |
-| `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqlsolver-rust`, `sqlsolver-jvm`, `lean` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. |
+| `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqleq-solver`, `sqlsolver-jvm`, `lean` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. |
 | `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. |
 | `--fuzz-bin PATH` | The `sqleq-fuzz` binary (else `$SQLEQ_FUZZ`, `PATH`, or this repo's `target/{release,debug}`). |
 | `--json` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs. |
 | `--no-retry` | Don't re-run transient failures serially at the end. |
-| `--sqlsolver` | Ask SQLSolver about the same cases too — see [Second opinion](#second-opinion-sqlsolver). Never changes the exit code. |
-| `--sqlsolver-impl {jvm,rust}` | Which SQLSolver to ask: the JVM fork through `tools/sqlsolver/IrDriver` (default), or this repo's Rust port, `sqleq-solver`. Same jobs, same result rows, same buckets. |
-| `--sqlsolver-tree DIR` | With `jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
-| `--sqlsolver-bin PATH` | With `rust`: the `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
-| `--sqlsolver-timeout MS` | Per-row cap for that prover (default: `-t` in ms). Its own, because the two provers are not comparably fast. |
+| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Never changes the exit code. |
+| `--sqleq-solver-bin PATH` | The `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
+| `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check. Same jobs, same result rows, same buckets. Not with `--sqleq-solver`. |
+| `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
+| `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. |
 | `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule. It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
+
+The spellings from before `sqleq-solver` was the default still work and are not listed by `--help`:
+`--sqlsolver` (now `--sqleq-solver`), `--sqlsolver-impl {sqleq-solver,rust,jvm}` with it,
+`--sqlsolver-bin` and `--sqlsolver-timeout`.
 
 ### Status taxonomy
 
@@ -148,17 +152,19 @@ statements in the source text after whitespace normalization
 (`trivial_basis: "text"`), which is weaker; `trivial` is `null` when neither
 test applies.
 
-### Second opinion: SQLSolver
+### Second opinion: sqleq-solver
 
-`--sqlsolver` runs a second prover over **the same lowered plan** and prints a
-second table. It is off by default, and it cannot change the exit code.
+`--sqleq-solver` runs a second prover over **the same lowered plan** and prints
+a second table: `sqleq-solver`, this repo's Rust rewrite of SQLSolver. With
+`--sqlsolver-jvm` instead, the original SQLSolver answers, kept as a cross-check. It is off
+by default, and it cannot change the exit code.
 
 ```sh
-python3 tools/sqleq_check.py --expect report-only --sqlsolver -j 8 -t 30 corpus/
+python3 tools/sqleq_check.py --expect report-only --sqleq-solver -j 8 -t 30 corpus/
 ```
 
 ```
-  Second opinion  — SQLSolver, over the same lowered IR
+  Second opinion  — sqleq-solver, over the same lowered IR
   ────────────────────────────────────────
   s-proved                  27
   s-no-proof                 2
@@ -166,14 +172,14 @@ python3 tools/sqleq_check.py --expect report-only --sqlsolver -j 8 -t 30 corpus/
   ────────────────────────────────────────
   of pairs that differ      30
   both provers              25
-  only qed-prover            2
-  only SQLSolver             2   what the second opinion adds
+  only the QED prover        2
+  only sqleq-solver          2   what the second opinion adds
   neither                    1
 ```
 
 The cells below the rule use **the same denominator as `capability`** — pairs
 whose two queries actually differ — so the two tables can be read against each
-other. `only SQLSolver` is the whole reason the flag exists.
+other. `only sqleq-solver` is the whole reason the flag exists.
 
 | bucket | meaning |
 |---|---|
@@ -183,14 +189,14 @@ other. `only SQLSolver` is the whole reason the flag exists.
 | `s-unsupported` | **Ours, not theirs.** Either the frontend refused the row, or the bridge could not express the plan. The `s_note` column says which. |
 | `s-timeout` | The cap ran out. Kept out of `s-no-proof` deliberately: that prover answers `UNKNOWN` when interrupted, so `killed` is the only thing separating "we stopped asking" from "they declined". |
 | `s-error` | It threw. |
-| `s-missing` | It never answered — the JVM died before reaching the row. |
+| `s-missing` | It never answered — the driver died before reaching the row. |
 
 Two things about the numbers, both printed under the table on every run:
 
 * **`s-no-proof` is not a refutation.** That prover's `NEQ` means "no proof
   found", exactly like its `UNKNOWN`; only `EQ` is a claim. `sqleq-fuzz` is the
   only disprover in this project.
-* **The two opinions share a frontend.** The bridge hands SQLSolver the very
+* **The two opinions share a frontend.** The bridge hands the second prover the very
   `Input` JSON the QED prover reads — no SQL is emitted and nothing re-parses
   the case — which is what makes the comparison exact, and also what makes it
   *correlated*: a lowering bug yields the same wrong plan on both axes, so
@@ -198,27 +204,28 @@ Two things about the numbers, both printed under the table on every run:
 
 Mechanics worth knowing before reading a slow run:
 
-- The rows go to one JVM **at the end, sequentially**, not per case. Startup
-  would otherwise swamp the cases, and the per-row cap is load-sensitive — a
-  second opinion that changes under `-j` is not one.
-- That prover can hang past an interrupt, so the driver writes the row and then
-  halts the JVM; the harness notices the missing answers and resumes. The wall
-  line reports `N JVM self-halt(s) in M pass(es)` when that happened.
-- Setup is checked **before any case runs**, and a missing classpath or
+- The rows go to one driver process **at the end, sequentially**, not per case.
+  A JVM's startup would otherwise swamp the cases, and the per-row cap is
+  load-sensitive — a second opinion that changes under `-j` is not one.
+- A row can outlive its cap, so the driver writes what it has and then halts
+  itself; the harness notices the missing answers and resumes. The wall line
+  reports `N driver self-halt(s) in M pass(es)` when that happened.
+- Setup is checked **before any case runs**: a missing binary, classpath or
   `javac` exits 2 with the fix rather than reporting `s-missing` for every row.
-  With `--sqlsolver-impl=jvm` (the default) it requires the fork tree (its
-  `lib/` holds the Z3 natives), a JDK, and `$SQLEQ_SQLSOLVER_DEPS` pointing at
-  the exploded dependency directory the fork was compiled against. The driver
-  compiles itself on first use and recompiles when `tools/sqlsolver/IrDriver.java`
-  or `IrToRel.java` is newer than the class.
-- With `--sqlsolver-impl=rust` it needs only the `sqleq-solver` binary:
-  `cargo build --release -p sqleq-solver`, which compiles Z3 from source and
-  links it in, so nothing is needed at run time (the first build needs cmake and
-  a C++20 compiler). It takes the same arguments and writes the same rows,
-  including the exit-3 self-halt when a row outlives its cap and grace period.
+- `sqleq-solver` (the default) needs only its binary: `cargo build --release
+  -p sqleq-solver`, which compiles Z3 from source and links it in, so nothing is
+  needed at run time (the first build needs cmake and a C++20 compiler).
+- With `--sqlsolver-jvm` it requires the fork tree (its `lib/` holds the Z3
+  natives), a JDK, and `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded
+  dependency directory the fork was compiled against. The driver compiles itself
+  on first use and recompiles when `tools/sqlsolver/IrDriver.java` or
+  `IrToRel.java` is newer than the class. Both drivers take the same arguments
+  and write the same rows, including the exit-3 self-halt.
 
-See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for the bridge, the
-Calcite-ectomy behind it, and what each bucket was measured to be worth.
+See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for what `sqleq-solver`
+rewrites and where it differs from the original, the bridge to the JVM fork and
+the Calcite-ectomy behind it, and the false proofs that keep the fork a
+cross-check.
 
 ### Pinned pairs
 
@@ -229,9 +236,9 @@ regression — and on any answer that contradicts the case's truth, which `--ble
 
 ```sh
 # What CI checks, one axis per job:
-python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
+python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 # After a change that moves answers: rewrite the pins, then review the diff.
-python3 tools/sqleq_check.py --expect pinned --bless --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
+python3 tools/sqleq_check.py --expect pinned --bless --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
 Two things differ from the other policies:

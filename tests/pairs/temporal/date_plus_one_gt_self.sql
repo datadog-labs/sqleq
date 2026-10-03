@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: date arithmetic was integer arithmetic, which is wrong at infinity (64af5bf)

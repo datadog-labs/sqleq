@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: sqleq-fuzz compared only table state after an UPDATE, not what RETURNING returned

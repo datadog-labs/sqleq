@@ -7,7 +7,7 @@
 -- expect frontend: refuse:unsupported
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
--- expect sqlsolver-rust: no-plan
+-- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
 -- origin: a row-locking clause was dropped, so the two sides lowered alike (#16)

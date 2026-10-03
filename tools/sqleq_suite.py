@@ -11,7 +11,7 @@ comment block says what the pair *is* and what each axis said about it:
     -- truth: not-equivalent
     -- expect frontend: emit
     -- expect fuzz: counterexample
-    -- expect sqlsolver-rust: no-proof
+    -- expect sqleq-solver: no-proof
     -- expect qed: proved !known-unsound
     -- origin: why this pair is here
     -- witness: the instance on which the two sides differ
@@ -52,8 +52,17 @@ NOT_EQUIVALENT = "not-equivalent"
 TRUTHS = (EQUIVALENT, NOT_EQUIVALENT)
 
 # Canonical order: the order `--bless` inserts missing lines in, and the table's column order.
-AXES = ("frontend", "fuzz", "qed", "sqlsolver-rust", "sqlsolver-jvm", "lean")
-PROVERS = ("qed", "sqlsolver-rust", "sqlsolver-jvm")
+AXES = ("frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "lean")
+PROVERS = ("qed", "sqleq-solver", "sqlsolver-jvm")
+# Old axis names, still read wherever an axis is named -- `--axes` and `expect` lines -- so a pin or
+# a script written before the rename keeps working. A pin `--bless` rewrites gets the new name.
+AXIS_ALIASES = {"sqlsolver-rust": "sqleq-solver"}
+
+
+def canonical_axis(name: str) -> str:
+    """An axis name as `AXES` spells it."""
+    return AXIS_ALIASES.get(name, name)
+
 
 INDEX = "index"
 GATHER = "gather"
@@ -71,7 +80,7 @@ WORDS = {
     "fuzz": ("counterexample", "no-counterexample", "param-misaligned", "not-comparable",
              "nondet-skip", "no-schema", "no-tables", "error"),
     "qed": PROVED_WORDS + ("no-proof", "no-plan", "panic", "error"),
-    "sqlsolver-rust": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
+    "sqleq-solver": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
     "sqlsolver-jvm": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
     # `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of equivalence.
     "lean": ("proved-gather", "no-witness", "unsupported", "invalid-sql", "error"),
@@ -144,7 +153,10 @@ def parse_header(text: str) -> Header:
             continue
         h.lines[key] = i
         if key.startswith("expect "):
-            axis = key.split(" ", 1)[1]
+            axis = canonical_axis(key.split(" ", 1)[1])
+            if axis in h.expect:
+                h.errors.append(f"line {i + 1}: a second `expect` line for `{axis}`")
+                continue
             if axis not in AXES:
                 h.errors.append(f"line {i + 1}: unknown axis `{axis}` (one of {', '.join(AXES)})")
                 continue

@@ -7,7 +7,7 @@
 -- expect frontend: emit-reflexive
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
--- expect sqlsolver-rust: proved-literal
+-- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
 -- expect lean: unsupported
 -- origin: sqlparser 0.62 parsed the right operand of IS DISTINCT FROM at precedence 0 (docs/sqlparser-is-distinct-from.md)

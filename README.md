@@ -6,7 +6,7 @@ Turns query rewrites, optimizer changes, and migrations into something you verif
 
 ```
                    ┌─▶ sqleq-frontend ──▶ Input JSON ─┬─▶ qed-prover ──▶ provable?
-SQL pair + DDL ────┤   (parse·resolve·type·lower)     └─▶ SQLSolver ───▶ proved?
+SQL pair + DDL ────┤   (parse·resolve·type·lower)     └─▶ sqleq-solver ─▶ proved?
                    └─▶ sqleq-fuzz ──▶ DuckDB tables ─────────────────────▶ counterexample?
 ```
 
@@ -14,10 +14,13 @@ A proof and a counterexample are different claims, reached by different machiner
 independent — which is what lets them check each other. Any pair a prover calls equivalent *and*
 `sqleq-fuzz` refutes is a bug in one of them; see [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
-The SQLSolver leg is a **research axis** and the one part of that picture you cannot run from this
-repository: it needs a separate Java checkout, and the plan-level bridge needs a fork of it that is
-not published. It never changes a verdict or an exit code. See
-[`docs/SQLSOLVER.md`](docs/SQLSOLVER.md), *Reproducing this*.
+The second prover is **`sqleq-solver`**, a Rust rewrite of
+[SQLSolver](https://github.com/SQLSolver/SQLSolver)'s proof engine that reads the same Input JSON
+and builds from this repository alone, Z3 included. It is a second opinion:
+`tools/sqleq_check.py --sqleq-solver` reports its answer beside the prover's, and it never changes a
+verdict or an exit code. The original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a
+backup cross-check, but that needs a fork of it that is not published. See
+[`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
 
 The **Lean axis** (`sqleq-lean`) is narrower still. It decides one class of `INSERT` pair the other
 axes cannot even state: `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a
@@ -172,6 +175,11 @@ on `sqlparser`, `serde_json` and `csv`.
 Build it with `cargo build --release -p sqleq-fuzz`. To link a libduckdb you already have instead,
 set `DUCKDB_LIB_DIR`; the build script checks it before it considers downloading anything.
 
+`sqleq-solver` is outside `default-members` too: its first build compiles Z3 from source, which
+takes minutes and needs cmake and a C++20 compiler. Build it with
+`cargo build --release -p sqleq-solver`; Z3 is linked in statically, so the binary needs nothing at
+run time.
+
 The prover binary is external (from the upstream `qed-solver` project) and is not vendored here. It
 needs the native `z3` and `cvc5` solvers, and its Nix flake bundles them, so Nix is the most
 reliable way to get a working prover without installing solvers yourself:
@@ -192,7 +200,7 @@ default. Every `qed-prover` command above assumes it is on `PATH` this way.
 | [`docs/SOUNDNESS.md`](docs/SOUNDNESS.md) | what a verdict rests on: what is refused, and the one assumption |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | how the tool is validated, and the defects that has caught |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | why the frontend is built this way |
-| [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | the second proving backend, on the same IR |
+| [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | `sqleq-solver`, the second prover on the same IR, and the Java SQLSolver that cross-checks it |
 | [`docs/INTERNALS.md`](docs/INTERNALS.md) | module map, for reading or changing the code |
 | [`tools/README.md`](tools/README.md) | the batch harness |
 | [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |

@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
 -- expect lean: unsupported
 -- origin: issue #22: both SQLSolver bridges numbered a join's right input from after its left, so

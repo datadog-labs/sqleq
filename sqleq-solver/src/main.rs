@@ -3,8 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! `sqleq-solver`: the Rust port behind `IrDriver`'s command line and I/O contract, so a
-//! harness swaps one command for the other and changes nothing else.
+//! `sqleq-solver`: this crate behind `IrDriver`'s command line and I/O contract, so a harness runs
+//! it or the JVM driver the same way and changes nothing else.
 //!
 //! ```text
 //! sqleq-solver <ir.jobs.jsonl> <results.jsonl> [--timeout-ms=N] [--grace-ms=N] [--dry-run]

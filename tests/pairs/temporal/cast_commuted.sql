@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqlsolver-rust: proved
+-- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: the equivalent shape beside the two temporal casts above, which must still lower and prove

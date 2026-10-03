@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqlsolver-rust: unsupported
+-- expect sqleq-solver: unsupported
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: DuckDB binds ->> looser than AND, so sqleq-fuzz once ran a different predicate than Postgres

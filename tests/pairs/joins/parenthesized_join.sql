@@ -7,7 +7,7 @@
 -- expect frontend: emit-reflexive
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
--- expect sqlsolver-rust: proved-literal
+-- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
 -- expect lean: unsupported
 -- origin: issue #23: a parenthesized join in FROM was refused as an unsupported FROM factor (#31)

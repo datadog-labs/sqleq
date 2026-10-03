@@ -7,7 +7,7 @@
 -- expect frontend: refuse:unsupported
 -- expect fuzz: counterexample
 -- expect qed: no-plan
--- expect sqlsolver-rust: no-plan
+-- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
 -- origin: a USING after a RIGHT join compared the first binding of the name, not the column the

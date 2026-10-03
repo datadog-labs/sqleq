@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqlsolver-rust: proved
+-- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: the control beside joins/derived_table_right_numbered_from_base.sql (#29)

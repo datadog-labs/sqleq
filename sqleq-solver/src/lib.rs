@@ -3,9 +3,10 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Rust port of SQLSolver's equivalence-checking proof engine, a native alternative to the JVM
-//! driver the `sqlsolver` axis runs through (`tools/sqlsolver/`). The binary, `sqleq-solver`,
-//! speaks `IrDriver`'s command line and job/result JSONL, so a harness can swap one for the other.
+//! A Rust rewrite of SQLSolver's equivalence-checking proof engine, and what the `sqlsolver` axis
+//! asks; the original, driven as a JVM fork through `tools/sqlsolver/`, is kept as its cross-check.
+//! The binary, `sqleq-solver`, speaks `IrDriver`'s command line and job/result JSONL, so a harness
+//! drives either one the same way.
 //!
 //! Deliberately excluded: SQLSolver's superoptimizer/rule-mining subsystem and all SQL-text
 //! parsing -- neither is reachable from the `Verification.verify(RelNode, RelNode, Schema)` entry

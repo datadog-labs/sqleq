@@ -7,7 +7,7 @@
 -- expect frontend: refuse:unsupported
 -- expect fuzz: error
 -- expect qed: no-plan
--- expect sqlsolver-rust: no-plan
+-- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
 -- origin: a WITH binding named like the DML target was read as the target (4df30d8)

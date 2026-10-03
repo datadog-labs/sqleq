@@ -54,3 +54,11 @@ csv = { workspace = true }
 # Profiles are workspace-wide and may only be set at the root (moved here from sqleq-fuzz).
 [profile.release]
 opt-level = 3
+
+# z3-sys's build script compiles Z3 through the `cmake` crate, which takes the CMake build type from
+# this package's profile, and opt-level 0 means `Debug`: an unoptimised Z3 with its internal
+# assertions and tracing compiled in, which creates `.z3-trace` in the working directory of every
+# run. Dev builds, `cargo test` and CI included, get the same `Release` Z3 as a release build.
+[profile.dev.package.z3-sys]
+opt-level = 3
+debug = false

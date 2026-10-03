@@ -18,7 +18,7 @@ The Lean axis's pairs are under `insert_unnest/`, and are stated under the gathe
 
 ```sh
 # The axes CI runs, one job each:
-python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqlsolver-rust tests/pairs examples/*.sql
+python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 # The two it never installs (one SQLSolver per run):
 python3 tools/sqleq_check.py --expect pinned --axes qed --prover "$QED_PROVER" tests/pairs examples/*.sql
 python3 tools/sqleq_check.py --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
@@ -39,7 +39,7 @@ The output is one row per pair and one column per axis that ran. Exit code 0 mea
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqlsolver-rust: no-proof
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved !known-unsound
 -- catalog: inferred-seeded
 -- origin: a boolean in the SELECT list was read two-valued, as if NULL were false
@@ -74,8 +74,13 @@ nothing and changing what is refused moves a pin.
 | `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
 | `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
 | `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend refused), `panic`, `error` |
-| `sqlsolver-rust`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
+| `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
 | `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
+
+`sqleq-solver` is the Rust rewrite of SQLSolver in this repository, and `sqlsolver-jvm` the original,
+kept as its cross-check; a `!known-unsound` pin on `sqlsolver-jvm` is one of that fork's known false
+proofs. `sqlsolver-rust`, `sqleq-solver`'s axis before it was renamed, is still read in an `expect`
+line and in `--axes`, and a pin `--bless` rewrites gets the new name.
 
 `timeout` and `missing` are never pinnable: they say the run got no answer, not what the answer was.
 
@@ -150,7 +155,7 @@ drift between reviews. The last time all five axes were blessed together:
   `aggregates/scalar_agg_empty_group.sql`, and the run fails there, as it should.
 * **sqlsolver-jvm** — the unpublished fork described in [SQLSOLVER.md](../../docs/SQLSOLVER.md),
   at its revision `8c5548b`.
-* **sqlsolver-rust**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
+* **sqleq-solver**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
   the toolchain `lean/lean-toolchain` names, as in CI.
 
 The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared

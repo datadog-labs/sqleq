@@ -7,7 +7,7 @@
 -- expect frontend: refuse:unsupported
 -- expect fuzz: counterexample
 -- expect qed: no-plan
--- expect sqlsolver-rust: no-plan
+-- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
 -- origin: a bare `*` over JOIN ... USING lowered as the ON form, which has one more column (#31)

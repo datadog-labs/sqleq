@@ -8,7 +8,7 @@ name = "sqleq-solver"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Rust port of SQLSolver's equivalence-checking proof engine"
+description = "A Rust rewrite of SQLSolver's equivalence-checking proof engine"
 license = "Apache-2.0"
 publish = false
 
@@ -16,7 +16,7 @@ publish = false
 name = "sqleq_solver"
 path = "src/lib.rs"
 
-# IrDriver's command line and JSONL contract over the Rust port; see src/main.rs.
+# IrDriver's command line and JSONL contract, so a harness drives either one; see src/main.rs.
 [[bin]]
 name = "sqleq-solver"
 path = "src/main.rs"
@@ -29,5 +29,6 @@ serde_json = { workspace = true, features = ["unbounded_depth"] }
 
 # "vendored": Z3 itself is compiled from the source crate `z3-src` (checksum-pinned in Cargo.lock)
 # and linked statically, so there is no Z3 to install and nothing to find at run time. The first
-# build compiles Z3 and needs cmake and a C++20 compiler.
+# build compiles Z3 and needs cmake and a C++20 compiler. The root manifest builds it optimised in
+# every profile (`[profile.dev.package.z3-sys]`).
 z3 = { version = "0.21.1", features = ["vendored"] }
