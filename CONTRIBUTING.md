@@ -9,7 +9,7 @@ conventions are not the ones you would guess from the code — this file is the 
 cargo test                 # the frontend: 206 + 10 + 7 + 190 + 18 + 11 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (compiles Z3, see below)
-cargo test -p sqleq-lean   # the Lean axis: 25 + 3 (needs Lean, see below)
+cargo test -p sqleq-lean   # the Lean axis: 34 + 6 (needs Lean, see below)
 python3 -m unittest discover -s tools -p 'test_*.py'
 python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
 python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql

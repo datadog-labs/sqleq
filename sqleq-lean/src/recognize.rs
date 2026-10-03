@@ -6,7 +6,8 @@
 //! Read one `INSERT` into the parts the Lean checker models, or say why not.
 //!
 //! The fragment is `INSERT INTO t [AS a] (c₁, …, cₖ) <source> [ON CONFLICT …] [RETURNING …]` where
-//! the source is either `VALUES` rows of parameters and `NULL`s, or
+//! the source is either `VALUES` rows of parameters, `NULL`s and generated cells (`DEFAULT`, or a
+//! generator such as `now()`), or
 //! `SELECT * FROM unnest($1::T₁[], …, $k::Tₖ[])`. Everything after the source is kept as rendered
 //! text, the *tail*: the checker never interprets it, it only requires the two sides' tails to be
 //! identical and parameter-free.
@@ -53,11 +54,73 @@ fn unsupported(r: impl Into<String>) -> Refusal {
     Refusal::Unsupported(r.into())
 }
 
-/// A `VALUES` cell: `$n`, optionally cast (by `CAST` or `::`) to a type, or `NULL`.
+/// A `VALUES` cell: `$n`, optionally cast (by `CAST` or `::`) to a type, `NULL`, or a cell the
+/// database fills in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cell {
     Param(u32, Option<DataType>),
     Null,
+    Gen(Generated),
+}
+
+/// What fills a generated cell, as the witness models it (`Sqleq.GenKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GenKind {
+    /// `DEFAULT`: the column's own default.
+    Default,
+    /// A new value per row: a sequence, a random uuid.
+    Fresh,
+    /// A value not known to differ between rows: a clock.
+    Once,
+}
+
+/// A cell the database fills in: `DEFAULT`, or a call to one of [`GENERATORS`] or `nextval`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Generated {
+    pub kind: GenKind,
+    /// `default`, or the generator's name.
+    pub func: String,
+    /// The sequence `nextval` draws from, as [`seq_name`] reads its argument.
+    pub seq: Option<String>,
+}
+
+const UUID: &[&str] = &["uuid"];
+const CLOCK: &[&str] = &["timestamptz", "timestamp", "date"];
+/// The column types `nextval`'s `bigint` may be assigned to.
+pub const SEQUENCE_TYPES: &[&str] = &["int8", "int4", "int2", "numeric"];
+
+/// The generator calls a `VALUES` cell may be, besides `nextval('s')`: called with no argument and
+/// nothing else, each with the kind of value it gives and the column base types that value may be
+/// assigned to. Kept short on purpose. The claim holds for any value a cell could take, so this list
+/// is not what makes a proof true; it is what keeps "generated" meaning a cell the database fills in,
+/// and what the witness can model.
+pub const GENERATORS: &[(&str, GenKind, &[&str])] = &[
+    ("gen_random_uuid", GenKind::Fresh, UUID),
+    ("uuid_generate_v1", GenKind::Fresh, UUID),
+    ("uuid_generate_v1mc", GenKind::Fresh, UUID),
+    ("uuid_generate_v4", GenKind::Fresh, UUID),
+    ("uuid_generate_v7", GenKind::Fresh, UUID),
+    ("uuidv4", GenKind::Fresh, UUID),
+    ("uuidv7", GenKind::Fresh, UUID),
+    ("now", GenKind::Once, CLOCK),
+    ("current_timestamp", GenKind::Once, CLOCK),
+    ("localtimestamp", GenKind::Once, CLOCK),
+    ("statement_timestamp", GenKind::Once, CLOCK),
+    ("transaction_timestamp", GenKind::Once, CLOCK),
+    // Differs between rows, but can repeat, so the witness treats it as one value.
+    ("clock_timestamp", GenKind::Once, CLOCK),
+    ("current_date", GenKind::Once, CLOCK),
+];
+
+/// The sequence a `nextval('…')` string names, as Postgres resolves the regclass text: the last
+/// dot-separated part, folded to lower case unless double-quoted. Schema qualifiers are dropped, as
+/// everywhere else in sqleq.
+pub fn seq_name(text: &str) -> String {
+    let last = text.rsplit('.').next().unwrap_or(text).trim();
+    match last.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(q) => q.to_string(),
+        None => last.to_lowercase(),
+    }
 }
 
 /// An `unnest` argument `$param::elem[]`.
@@ -153,9 +216,76 @@ fn cell(e: &Expr) -> Result<Cell, Refusal> {
             Ok(Cell::Param(n, Some(data_type.clone())))
         }
         Expr::Identifier(id) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") => {
-            Err(unsupported("DEFAULT in a VALUES row"))
+            Ok(Cell::Gen(Generated { kind: GenKind::Default, func: "default".into(), seq: None }))
         }
-        _ => Err(unsupported("VALUES cell is not a parameter, a cast parameter or NULL")),
+        Expr::Function(f) => generator(f).map(Cell::Gen),
+        _ => Err(unsupported("VALUES cell is not a parameter, a cast parameter, NULL or a generator")),
+    }
+}
+
+/// A placeholder anywhere inside `e`.
+fn has_placeholder(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if placeholder(x).is_some() {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+/// A generator call: an unqualified (or `pg_catalog.`) name from [`GENERATORS`] with no argument, or
+/// `nextval` of one string literal, optionally cast to `regclass`; and no `FILTER`, `OVER`,
+/// `DISTINCT` or other clause.
+pub(crate) fn generator(f: &sqlparser::ast::Function) -> Result<Generated, Refusal> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let not_one = || unsupported(format!("VALUES cell calls {}, which is not a generator the checker models", f.name));
+    // A function in any schema but `pg_catalog` is a user's, whatever its name.
+    match f.name.0.as_slice() {
+        [_] => {}
+        [schema, _] if schema.as_ident().is_some_and(|s| fold(s) == "pg_catalog") => {}
+        _ => return Err(not_one()),
+    }
+    let Some(name) = last_name(&f.name) else { return Err(not_one()) };
+    if name != "nextval" && !GENERATORS.iter().any(|(g, _, _)| *g == name) {
+        return Err(not_one());
+    }
+    if has_placeholder(&Expr::Function(f.clone())) {
+        return Err(unsupported(format!("VALUES cell calls {name} with a parameter")));
+    }
+    let plain = !f.uses_odbc_syntax
+        && matches!(f.parameters, FunctionArguments::None)
+        && f.filter.is_none()
+        && f.null_treatment.is_none()
+        && f.over.is_none()
+        && f.within_group.is_empty();
+    if !plain {
+        return Err(not_one());
+    }
+    let args: &[FunctionArg] = match &f.args {
+        FunctionArguments::None => &[],
+        FunctionArguments::List(l) if l.duplicate_treatment.is_none() && l.clauses.is_empty() => &l.args,
+        _ => return Err(not_one()),
+    };
+    if name == "nextval" {
+        let [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))] = args else { return Err(not_one()) };
+        let lit = match strip(e) {
+            Expr::Cast { kind, expr, data_type, format: None, .. }
+                if postgres_cast(kind) && data_type.to_string().eq_ignore_ascii_case("regclass") =>
+            {
+                strip(expr)
+            }
+            other => other,
+        };
+        let Expr::Value(v) = lit else { return Err(not_one()) };
+        let Value::SingleQuotedString(s) = &v.value else { return Err(not_one()) };
+        return Ok(Generated { kind: GenKind::Fresh, func: name, seq: Some(seq_name(s)) });
+    }
+    match GENERATORS.iter().find(|(g, _, _)| *g == name) {
+        Some(&(_, kind, _)) if args.is_empty() => Ok(Generated { kind, func: name, seq: None }),
+        _ => Err(not_one()),
     }
 }
 
@@ -247,14 +377,24 @@ impl Parts {
         self.target_obj.to_string()
     }
 
-    /// The statement these parts describe, as SQL text.
-    fn render(&self) -> String {
-        let src = match &self.src {
+    /// The `VALUES` clause as the statement writes it, cell for cell. For the Postgres replay's
+    /// probe, which runs this clause into a copy of the table to learn what its generated cells
+    /// evaluate to.
+    pub fn values_text(&self) -> Option<String> {
+        match &self.src {
             Source::Values(_) => {
                 let rows: Vec<String> =
                     self.src_text.iter().map(|r| format!("({})", r.join(", "))).collect();
-                format!("VALUES {}", rows.join(", "))
+                Some(format!("VALUES {}", rows.join(", ")))
             }
+            Source::Unnest { .. } => None,
+        }
+    }
+
+    /// The statement these parts describe, as SQL text.
+    fn render(&self) -> String {
+        let src = match &self.src {
+            Source::Values(_) => self.values_text().unwrap_or_default(),
             Source::Unnest { func, alias, .. } => {
                 let args: Vec<String> = self.src_text.first().cloned().unwrap_or_default();
                 // sqlparser's rendering of the alias carries its own `AS` when one was written.
@@ -444,9 +584,8 @@ mod tests {
             "INSERT INTO t (a) SELECT * FROM unnest($1::int[]) LIMIT 1",
             "INSERT INTO t (a) VALUES ($1) LIMIT 1",
             "INSERT INTO t (a) WITH w AS (SELECT 1) SELECT * FROM unnest($1::int[])",
-            "INSERT INTO t (a) VALUES (DEFAULT)",
             "INSERT INTO t (a) VALUES (1)",
-            "INSERT INTO t (a) VALUES (now())",
+            "INSERT INTO t (a) VALUES (lower($1))",
             "INSERT INTO t (a) SELECT * FROM unnest($1)",
             "INSERT INTO t (a) SELECT * FROM unnest(CAST($1 AS INT ARRAY))",
             "INSERT INTO t VALUES ($1)",
@@ -454,6 +593,62 @@ mod tests {
         ] {
             assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
         }
+    }
+
+    fn first_cell(sql: &str) -> Result<Cell, Refusal> {
+        let p = rec(sql)?;
+        let Source::Values(rows) = p.src else { panic!("{sql}: not VALUES") };
+        Ok(rows[0][0].clone())
+    }
+
+    #[test]
+    fn generated_cells_are_read_with_their_kind() {
+        for (sql, kind, func, seq) in [
+            ("INSERT INTO t (a) VALUES (DEFAULT)", GenKind::Default, "default", None),
+            ("INSERT INTO t (a) VALUES (default)", GenKind::Default, "default", None),
+            ("INSERT INTO t (a) VALUES (now())", GenKind::Once, "now", None),
+            ("INSERT INTO t (a) VALUES (CURRENT_TIMESTAMP)", GenKind::Once, "current_timestamp", None),
+            ("INSERT INTO t (a) VALUES (current_date)", GenKind::Once, "current_date", None),
+            ("INSERT INTO t (a) VALUES (pg_catalog.now())", GenKind::Once, "now", None),
+            ("INSERT INTO t (a) VALUES (gen_random_uuid())", GenKind::Fresh, "gen_random_uuid", None),
+            ("INSERT INTO t (a) VALUES (nextval('s'))", GenKind::Fresh, "nextval", Some("s")),
+            ("INSERT INTO t (a) VALUES (nextval('public.\"S\"'::regclass))", GenKind::Fresh, "nextval", Some("S")),
+            ("INSERT INTO t (a) VALUES (nextval('My_Seq'))", GenKind::Fresh, "nextval", Some("my_seq")),
+        ] {
+            let got = first_cell(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(
+                got,
+                Cell::Gen(Generated { kind, func: func.into(), seq: seq.map(String::from) }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_that_are_not_plain_generators_are_refused() {
+        for sql in [
+            // A parameter inside, as the sequence name.
+            "INSERT INTO t (a) VALUES (nextval($1))",
+            // An argument where the generator takes none, or a sequence that is not a literal.
+            "INSERT INTO t (a) VALUES (now(1))",
+            "INSERT INTO t (a) VALUES (nextval(x))",
+            // A function in a user's schema, a cast over a generator, and a quoted `DEFAULT`, which
+            // is a column reference.
+            "INSERT INTO t (a) VALUES (app.now())",
+            "INSERT INTO t (a) VALUES (now()::date)",
+            "INSERT INTO t (a) VALUES (\"default\")",
+            // Clauses on the call.
+            "INSERT INTO t (a) VALUES (now() OVER ())",
+            "INSERT INTO t (a) VALUES (current_timestamp(3))",
+        ] {
+            assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
+        }
+    }
+
+    #[test]
+    fn the_values_clause_is_kept_as_written() {
+        let p = rec("INSERT INTO t (a, b) VALUES (DEFAULT, $1), (now(), (($2)))").unwrap();
+        assert_eq!(p.values_text().as_deref(), Some("VALUES (DEFAULT, $1), (now(), (($2)))"));
     }
 
     #[test]

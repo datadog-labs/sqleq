@@ -852,8 +852,9 @@ def run_second_opinion(cases: list[Case], ss_dir: Path, driver: SsDriver,
 # case regardless of what the frontend made of it, and like `--sqleq-solver` it is
 # a second opinion that never moves the exit code.
 
-LEAN_ORDER = ["proved-gather", "no-witness", "unsupported", "invalid-sql",
-              "error", "timeout", "missing"]
+LEAN_ORDER = ["proved-gather", "no-witness", "proved-gather-generated", "no-witness-generated",
+              "unsupported", "invalid-sql", "error", "timeout", "missing"]
+LEAN_PROVED = ("proved-gather", "proved-gather-generated")
 
 
 def discover_lean(override: Optional[str]) -> str:
@@ -915,13 +916,15 @@ def print_lean(c: Color, cases: list[Case], stats: dict):
             print(f"  {v:<22} {counts[v]:>5}")
     print(c.dim("  " + "─" * 40))
     for x in scored:
-        if x.l_verdict == "proved-gather":
-            print(c.dim(f"  {'proved-gather':<22}       {x.name}"))
+        if x.l_verdict in LEAN_PROVED:
+            print(c.dim(f"  {x.l_verdict:<22}       {x.name}"))
     if stats.get("wall_s") is not None:
         print(c.dim(f"  {'wall time':<22} {stats['wall_s']:.2f}s"))
     print(c.dim("  note  `proved-gather` is proved under the gather rule: the unnest\n"
                 "        side's array $j is column j of the VALUES rows. It is not the\n"
-                "        same-$N claim `provable` makes. See docs/LEAN.md."))
+                "        same-$N claim `provable` makes. `proved-gather-generated` is\n"
+                "        weaker still: the arrays also carry the values the VALUES side's\n"
+                "        generated cells (DEFAULT, now()) evaluated to. See docs/LEAN.md."))
 
 
 # ---------------------------------------------------------------------------

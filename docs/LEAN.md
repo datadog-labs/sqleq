@@ -29,10 +29,36 @@ NULL, unique, CHECK and foreign-key constraints, sequences, clocks or triggers b
 compared as row *sequences*, never as bags, because serial ids, which duplicate `DO NOTHING` keeps,
 and `RETURNING` order all depend on row order.
 
+### Generated cells
+
+A `VALUES` cell can be one the database fills in: `DEFAULT`, `nextval('s')`, or a generator such as
+`now()` or `gen_random_uuid()`. Often the `unnest` side supplies that column's array itself:
+
+```sql
+INSERT INTO t (id, name) VALUES (DEFAULT, $1), (DEFAULT, $2);
+INSERT INTO t (id, name) SELECT * FROM unnest($1::int[], $2::text[]);
+```
+
+There is no parameter to gather for such a cell, so such a pair is proved under a weaker claim
+with its own verdict, `proved-gather-generated`. The theorem (`EquivGatherGen`) adds one more
+quantifier: for every value `g i j` that the generated cell in row `i`, column `j` could evaluate
+to, the `unnest` side, run under the gather binding with those cells' entries taken from `g`, gives
+the same result as the `VALUES` side whose generated cells evaluate to `g`.
+
+So the `unnest` side reproduces the `VALUES` side **when given the values the `VALUES` side's
+generated cells produced**. Nothing in the claim says where it would get them. For a serial or an
+identity column, it means the caller supplies the ids, which leaves the sequence behind them, so a
+later `DEFAULT` can collide with an id the `unnest` side inserted. As a rewrite that is not safe,
+though the claim holds. A record whose generated cells draw from a sequence says so
+(`generated.sequence`).
+
 ## What a proof assumes
 
 Only this: an `INSERT`'s effect is determined by its target, its column list, its tail, and the
-sequence of typed rows its source yields.
+sequence of typed rows its source yields. For `proved-gather-generated`, one more: a generated cell
+contributes only its value. What a generator does besides produce its value (a sequence it
+advances) is not compared, and the claim speaks of runs in which every generated cell evaluates
+without error.
 
 The checker enforces the conditions that make "typed rows" the same on both sides, and refuses
 everything else:
@@ -49,16 +75,38 @@ everything else:
     the frontend refuses that spelling.
   - With a mismatched type the two sides apply different coercions. `text[]` into a `uuid` column
     always errors, and `int4[]` into `bigint` differs on overflow.
+  - A generated cell is `DEFAULT`, `nextval('s')`, or one of a short list of generators called with
+    no argument: the clocks (`now()`, `current_timestamp`, `localtimestamp`, `clock_timestamp()`,
+    …) and the uuid generators. A generator with a parameter, a cast over one, and any other
+    function are refused.
 - **Parameter placement.** Each `VALUES` parameter is pinned to one column: `$n` sits in column
   `(n − 1) mod k`. A parameter spread over columns of different types fails Postgres's type
-  inference, and the model cannot see that failure.
+  inference, and the model cannot see that failure. Nor may a parameter number go unused, which
+  would leave it with no type at all. With generated cells, which take a column but no number,
+  the parameters must instead be `$1, $2, …` in reading order, each once.
 - **The tail.** The two tails are identical and mention no parameter. On one side `$k+1` may be a
   `VALUES` cell, while on the other the same `$k+1` is the `DO UPDATE` value.
 - **The `unnest` arguments.** They are `$1..$k` in order, one per column, with no `WITH
   ORDINALITY`, `WHERE`, `ORDER BY`, `LIMIT` or `DISTINCT`.
 
-Every condition is checked twice: once in Rust, to give a refusal its reason, and once by the kernel,
-from each side's own text.
+A pair with generated cells is also refused when its schema says a generated cell is not just its
+value:
+- a generated cell in a `GENERATED ALWAYS` column, which accepts `DEFAULT` but rejects the `unnest`
+  side's explicit value;
+- a target table whose DDL was not read in full (a statement naming it could not be read, it is
+  `ALTER`ed, or it only parsed after the frontend's simplifying retry), since such a column, or a
+  rule that evaluates the generators again, could be missing;
+- a generated cell drawing from a sequence while something else in the statement reads that
+  sequence's state: the tail (`nextval`, `currval`, `DEFAULT` in `DO UPDATE SET`), an omitted
+  column's default, or a trigger. The `VALUES` side advances the sequence row by row and the
+  `unnest` side does not;
+- `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
+- a generator whose value the column's type cannot take, or two generators in one column.
+
+Every condition above that concerns the two statements is checked twice: once in Rust, to give a
+refusal its reason, and once by the kernel, from each side's own text. The ones that need the
+schema (the list just above), and the unused-parameter check, which is about what Postgres will
+prepare, are checked in Rust only, because the kernel never sees the schema.
 
 ## Non-vacuity
 
@@ -75,7 +123,11 @@ parameters fails.
 
 The model covers:
 - defaults: none (so NULL), one value per statement (a constant, a clock, or anything
-  unrecognised), or a fresh value per row (a sequence, an identity, `gen_random_uuid()`);
+  unrecognised), or a fresh value per row (a sequence, an identity, `gen_random_uuid()`),
+  including a domain's default for a column of that domain;
+- generated cells: `DEFAULT` filled as an omitted column would be, a per-row generator as a fresh
+  value, and any other generator as the column's once-per-statement value, which maximises
+  collisions;
 - NOT NULL;
 - unique constraints and unique indexes, including `NULLS NOT DISTINCT`;
 - conflict-target inference, `DO NOTHING`, and `DO UPDATE`, which cannot touch a row the same
@@ -90,7 +142,9 @@ following tables get none:
 - a table with an `EXCLUDE` constraint;
 - a table the DDL also `ALTER`s, since constraints added that way are not read;
 - a table named by any DDL statement that could not be read;
-- a table whose DDL only parsed after the frontend's simplifying retry, which can drop a `NOT NULL`.
+- a table whose DDL only parsed after the frontend's simplifying retry, which can drop a `NOT NULL`;
+- a table with a column of a domain whose DDL could not be read (sqlparser has no domain-level
+  `NOT NULL`), since such a statement constrains the column but never names the table.
 
 pg_dump's `CREATE UNIQUE INDEX … ON ONLY t` is read as the same index without `ONLY`.
 
@@ -103,6 +157,8 @@ credit or withhold credit wrongly.
 |---|---|
 | `proved-gather` | The kernel proved `EquivGather` and checked a witness. The credited verdict. |
 | `no-witness` | The kernel proved `EquivGather`, but the `VALUES` side fails every run with non-NULL parameters, or its table's DDL could not be read reliably enough to tell. The proof may be vacuous. Not credited. |
+| `proved-gather-generated` | The kernel proved `EquivGatherGen`, the weaker claim for generated cells, and checked a witness. Credited under its own name, beside `proved-gather`. |
+| `no-witness-generated` | The kernel proved `EquivGatherGen`, but no witness shows the `VALUES` side can succeed. Not credited. |
 | `unsupported` | Outside the fragment above. Not a claim about the pair. |
 | `invalid-sql` | Postgres rejects the pair as written, e.g. a `VALUES` row narrower than the column list. |
 | `error`, `timeout` | Lean did not accept the proof, or did not finish. |
@@ -112,7 +168,9 @@ A proof counts only if both of these checks pass:
 - **What was proved.** Before any proof in a generated Lean file is believed, the file must pass an
   audit (`run::audit`), a second definition of the file format written apart from the emitter:
   - every line must be one the emitter writes;
-  - each proof must state exactly `EquivGather A B` of its own pair's `A` and `B`;
+  - each proof must state exactly `EquivGather A B`, or `EquivGatherGen A B`, of its own pair's `A`
+    and `B`. The verdict follows which, so a pair is `proved-gather-generated` because the kernel
+    checked that statement, and the kernel checks that its `VALUES` side has a generated cell;
   - every definition must be pure data, built only from the package's constructors, numerals and
     booleans;
   - nothing else may appear, so no `axiom`, no `set_option` (such as `debug.skipKernelTC`), and no
@@ -141,8 +199,17 @@ witness model must agree with Postgres on whether the `VALUES` side succeeds.
 
 Every run is a transaction that applies the DDL and is rolled back. Inside it, generators are made
 deterministic so that both runs see the *same* stream, which is what the theorem claims. A clock
-default is fixed, and a random uuid is drawn from a sequence created within the run. Schema
-qualifiers are dropped, which is how sqleq resolves a name.
+is fixed, and a random value is drawn from a sequence created within the run: one per default in
+the DDL and per generator in a tail, and one shared by the generators in the `VALUES` clause, so a
+draw on one side only shifts nothing on the other. Schema qualifiers are dropped, which is how
+sqleq resolves a name.
+
+For a pair with generated cells, a probe first runs the `VALUES` clause into a copy of the table
+that has the target's defaults and identities but no constraints, and reads back what the generated
+cells evaluated to. Postgres does the `DEFAULT` substitution, the coercion and the evaluation order
+itself. The `unnest` side is then run with those values gathered into its arrays, a fresh set for
+each execution. A difference between the sides that the probe explains (the `VALUES` side inserted
+other generated values than it found) is reported as inconclusive rather than as an alarm.
 
     python3 tools/lean_replay.py --setup --plan plan.json --json replay.json --host <socket dir>
 
@@ -161,9 +228,11 @@ cargo build -p sqleq-lean
 ```
 
 `$LAKE` overrides the `lake` found on `PATH`, and `$SQLEQ_LEAN_DIR` the Lean package. The checker's
-own positive and negative controls are `lake build SqleqTest` in `lean/`.
+own positive and negative controls are `lake build SqleqTest` in `lean/`. `--translate-only` runs no
+Lean and reports, for each pair, its refusal or the claim it would be checked under.
 
 The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/README.md), headed
-`-- binding: gather` because their truth is stated under the gather rule. `cargo test -p
+`-- binding: gather` because their truth is stated under the gather rule, or `-- binding:
+gather-generated` for a pair with generated cells. `cargo test -p
 sqleq-lean` checks every `-- expect lean:` pin under `tests/pairs/` against real Lean, and
 `tools/sqleq_check.py --expect pinned --axes lean` does the same with the suite's other rules.

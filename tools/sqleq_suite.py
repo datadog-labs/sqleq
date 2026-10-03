@@ -30,9 +30,12 @@ the bug.
 every axis but Lean answers under: `$N` on one side is `$N` on the other. A pair
 headed `-- binding: gather` states its truth under the gather rule instead (the
 `unnest` side's array `$j` is column `j` of the `VALUES` rows; docs/LEAN.md),
-which only the Lean axis answers under. An answer can contradict a truth only
-when the axis and the pair use the same binding; under the other one it is an
-ordinary pin.
+which only the Lean axis answers under. `-- binding: gather-generated` is the
+same rule for a `VALUES` side with generated cells (`DEFAULT`, `now()`), whose
+entries in the unnest side's arrays are the values those cells evaluated to: a
+weaker relation, which Lean's `*-generated` answers claim. An answer can
+contradict a truth only when the axis answers under the pair's binding; under
+another one it is an ordinary pin.
 
 This is the logic only; `sqleq_check.py` runs the axes and calls it. Standard
 library only, like the harness.
@@ -66,10 +69,12 @@ def canonical_axis(name: str) -> str:
 
 INDEX = "index"
 GATHER = "gather"
-BINDINGS = (INDEX, GATHER)
-# The binding each axis answers under. Only Lean reads a scalar and an array at the same `$N` as
+GATHER_GENERATED = "gather-generated"
+BINDINGS = (INDEX, GATHER, GATHER_GENERATED)
+GATHERS = (GATHER, GATHER_GENERATED)
+# The bindings each axis answers under. Only Lean reads a scalar and an array at the same `$N` as
 # the gather rule relates them; every other axis refuses such a pair.
-AXIS_BINDING = {a: GATHER if a == "lean" else INDEX for a in AXES}
+AXIS_BINDINGS = {a: GATHERS if a == "lean" else (INDEX,) for a in AXES}
 
 PROVED_WORDS = ("proved", "proved-literal")
 # What may be pinned, per axis. Only the stable *kind* of an answer is pinned, never its message,
@@ -83,13 +88,30 @@ WORDS = {
     "sqleq-solver": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
     "sqlsolver-jvm": PROVED_WORDS + ("no-proof", "unsupported", "no-plan", "error"),
     # `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of equivalence.
-    "lean": ("proved-gather", "no-witness", "unsupported", "invalid-sql", "error"),
+    "lean": ("proved-gather", "no-witness", "proved-gather-generated", "no-witness-generated",
+             "unsupported", "invalid-sql", "error"),
 }
 # The answers that claim equivalence, per axis, and the one that claims the opposite.
 CLAIMS_EQUIVALENT = {**{a: PROVED_WORDS for a in PROVERS}, "lean": ("proved-gather", "no-witness")}
 REFUTES = {"fuzz": ("counterexample",)}
 # Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is.
 EVIDENCE_EQUIVALENT = {**CLAIMS_EQUIVALENT, "lean": ("proved-gather",)}
+# Under `gather-generated`, Lean's `*-generated` answers claim the relation the truth is stated in.
+# A plain gather proof claims more than that, so it counts too. Under `gather` a generated answer
+# claims less than the truth, so it does not.
+CLAIMS_EQUIVALENT_GENERATED = {"lean": ("proved-gather-generated", "no-witness-generated",
+                                        "proved-gather", "no-witness")}
+EVIDENCE_EQUIVALENT_GENERATED = {"lean": ("proved-gather-generated", "proved-gather")}
+
+
+def claims_equivalent(axis: str, binding: str) -> tuple:
+    table = CLAIMS_EQUIVALENT_GENERATED if binding == GATHER_GENERATED else CLAIMS_EQUIVALENT
+    return table.get(axis, ())
+
+
+def evidence_equivalent(axis: str, binding: str) -> tuple:
+    table = EVIDENCE_EQUIVALENT_GENERATED if binding == GATHER_GENERATED else EVIDENCE_EQUIVALENT
+    return table.get(axis, ())
 # Never pinnable: each says the run did not get an answer, not what the answer was.
 UNPINNABLE = ("timeout", "missing")
 
@@ -191,10 +213,10 @@ def contradicts(truth: Optional[str], axis: str, word: str, binding: str = INDEX
     """Whether an answer is impossible for a pair of this truth — a soundness failure of that axis
     (or of the frontend feeding it), as opposed to a capability move. An axis answering under
     another binding than the one the truth is stated under contradicts nothing."""
-    if AXIS_BINDING.get(axis) != binding:
+    if binding not in AXIS_BINDINGS.get(axis, ()):
         return False
     if truth == NOT_EQUIVALENT:
-        return (word in CLAIMS_EQUIVALENT.get(axis, ())
+        return (word in claims_equivalent(axis, binding)
                 or (axis == "frontend" and word == "emit-reflexive"))
     if truth == EQUIVALENT:
         return word in REFUTES.get(axis, ())
@@ -226,15 +248,17 @@ def lint(h: Header) -> list:
             errs.append(f"`expect {axis}: {pin.word}` contradicts `truth: {h.truth}`; mark it "
                         f"{MARKER} if that is a known bug")
     # Evidence for the truth counts only from an axis answering under the pair's binding.
-    def says(table):
-        return any(p.word in table.get(a, ()) and not p.marker
-                   and AXIS_BINDING[a] == h.binding for a, p in h.expect.items())
-    gather = h.binding == GATHER
-    if h.truth == NOT_EQUIVALENT and not says(REFUTES) and not h.text.get("witness"):
+    def says(words):
+        return any(p.word in words(a) and not p.marker
+                   and h.binding in AXIS_BINDINGS[a] for a, p in h.expect.items())
+    gather = h.binding in GATHERS
+    if h.truth == NOT_EQUIVALENT and not says(lambda a: REFUTES.get(a, ())) and not h.text.get("witness"):
         errs.append("a non-equivalent pair needs a `witness:`" if gather else
                     "a non-equivalent pair needs `expect fuzz: counterexample` or a `witness:`")
-    if h.truth == EQUIVALENT and not says(EVIDENCE_EQUIVALENT) and not h.text.get("argument"):
-        errs.append("an equivalent pair needs `expect lean: proved-gather` or an `argument:`"
+    if (h.truth == EQUIVALENT and not says(lambda a: evidence_equivalent(a, h.binding))
+            and not h.text.get("argument")):
+        proved = "proved-gather-generated" if h.binding == GATHER_GENERATED else "proved-gather"
+        errs.append(f"an equivalent pair needs `expect lean: {proved}` or an `argument:`"
                     if gather else "an equivalent pair needs a prover's `proved` pin or an "
                     "`argument:`")
     return errs

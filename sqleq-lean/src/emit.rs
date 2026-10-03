@@ -20,6 +20,7 @@
 use std::fmt::{self, Display, Write};
 use std::ops::Range;
 
+use crate::recognize::GenKind;
 use crate::schema::DefaultKind;
 use crate::translate::{LCell, LConflict, LInsert, LSource, LSpec, LTok, LeanPair, Witness};
 
@@ -48,7 +49,32 @@ impl Display for LCell {
             LCell::P(n) => write!(f, "Sqleq.Cell.p {n}"),
             LCell::Pc(n, t) => write!(f, "Sqleq.Cell.pc {n} {t}"),
             LCell::Null => f.write_str("Sqleq.Cell.null"),
+            LCell::Gen(k) => {
+                let k = match k {
+                    GenKind::Default => "dflt",
+                    GenKind::Fresh => "fresh",
+                    GenKind::Once => "once",
+                };
+                write!(f, "Sqleq.Cell.gen Sqleq.GenKind.{k}")
+            }
         }
+    }
+}
+
+/// The checker, its soundness theorem and the claim a pair is proved under: `checkGather` for a
+/// pair whose `VALUES` side has only parameters and `NULL`s, `checkGatherGen` for one with generated
+/// cells.
+pub fn claim_lines(generated: bool) -> [&'static str; 2] {
+    if generated {
+        [
+            "theorem ok : checkGatherGen tys A B = true := by decide +kernel",
+            "theorem equiv : EquivGatherGen A B := checkGatherGen_sound tys A B ok",
+        ]
+    } else {
+        [
+            "theorem ok : checkGather tys A B = true := by decide +kernel",
+            "theorem equiv : EquivGather A B := checkGather_sound tys A B ok",
+        ]
     }
 }
 
@@ -171,15 +197,8 @@ pub fn batch(pairs: &[&LeanPair]) -> (String, Vec<Entry>) {
     for (i, p) in pairs.iter().enumerate() {
         let ns = namespace(i);
         let start = out.lines().count();
-        let _ = write!(
-            out,
-            "namespace {ns}\n{}\
-             theorem ok : checkGather tys A B = true := by decide +kernel\n\
-             theorem equiv : EquivGather A B := checkGather_sound tys A B ok\n\
-             end {ns}\n\
-             #print axioms {ns}.equiv\n",
-            defs(p)
-        );
+        let [ok, equiv] = claim_lines(p.generated.is_some());
+        let _ = write!(out, "namespace {ns}\n{}{ok}\n{equiv}\nend {ns}\n#print axioms {ns}.equiv\n", defs(p));
         let proof = (start..out.lines().count(), format!("{ns}.equiv"));
         let witness = matches!(p.witness, Witness::Spec(_)).then(|| {
             let wns = witness_namespace(i);
@@ -227,6 +246,13 @@ mod tests {
             a.to_string(),
             "Sqleq.Insert.mk 7 [1, 2] (Sqleq.Source.values [[Sqleq.Cell.p 1, Sqleq.Cell.pc 2 3], \
              [Sqleq.Cell.null, Sqleq.Cell.p 4]]) [Sqleq.Tok.word 5, Sqleq.Tok.param 6]"
+        );
+        assert_eq!(
+            [LCell::Gen(GenKind::Default), LCell::Gen(GenKind::Fresh), LCell::Gen(GenKind::Once)]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>(),
+            ["Sqleq.Cell.gen Sqleq.GenKind.dflt", "Sqleq.Cell.gen Sqleq.GenKind.fresh", "Sqleq.Cell.gen Sqleq.GenKind.once"]
         );
         assert_eq!(LSource::Unnest(vec![(1, 3), (2, 4)]).to_string(), "Sqleq.Source.unnest [Sqleq.Arg.mk 1 3, Sqleq.Arg.mk 2 4]");
         assert_eq!(LSource::Values(vec![]).to_string(), "Sqleq.Source.values []");

@@ -32,6 +32,9 @@ parameters fails, and none of them is a witness.
     `now()`, and any default the translator does not recognise, the choice that maximises
     collisions;
   - `fresh`: a new value per row, as a sequence or `gen_random_uuid()` gives.
+- **Generated cells**: a `DEFAULT` cell is filled exactly as an omitted column would be. A
+  generator call with a new value per row (`nextval('s')`, `gen_random_uuid()`) is `fresh`, and any
+  other (`now()`, `clock_timestamp()`) shares the column's once-per-statement value.
 - **NOT NULL** is checked before the conflict clause, as Postgres does.
 - **Unique constraints**: two rows collide when every key column is non-NULL and equal, or, under
   `NULLS NOT DISTINCT`, equal treating NULLs as equal.
@@ -48,7 +51,7 @@ the Postgres replay is what checks them.
 
 This model is only ever used for non-vacuity. A bug in it can wrongly credit an always-failing
 pair, which the replay exists to catch, or wrongly withhold credit. It cannot make
-`EquivGather` false.
+`EquivGather` or `EquivGatherGen` false.
 -/
 
 namespace Sqleq
@@ -125,31 +128,35 @@ def pos : List Nat → Nat → Nat → Option Nat
   | [], _, _ => none
   | x :: xs, i, p => if x == i then some p else pos xs i (p + 1)
 
-def cellW : Cell → Option WVal
-  | .p n => some (.param n)
-  | .pc n _ => some (.param n)
-  | .null => none
+/-- Table column `i`'s default, with `fr` the next fresh value: the value, and the next fresh
+value. An omitted column and a `DEFAULT` cell are filled the same way. -/
+def dfltW (c : Col) (i fr : Nat) : Option WVal × Nat :=
+  match c.dflt with
+  | .null => (none, fr)
+  | .same => (some (.same i), fr)
+  | .fresh => (some (.fresh fr), fr + 1)
+
+/-- A listed cell's value in table column `i`, and the next fresh value. A generator not known to
+differ between rows shares the column's once-per-statement value, which maximises collisions. -/
+def cellW (c : Col) (i fr : Nat) : Cell → Option WVal × Nat
+  | .p n => (some (.param n), fr)
+  | .pc n _ => (some (.param n), fr)
+  | .null => (none, fr)
+  | .gen .dflt => dfltW c i fr
+  | .gen .fresh => (some (.fresh fr), fr + 1)
+  | .gen .once => (some (.same i), fr)
 
 /-- The full table row for one `VALUES` row, starting at table column `i`, with `fr` the next
 fresh value. Returns the row and the next fresh value. -/
 def fullRow (ins : List Nat) (row : List Cell) : Nat → List Col → Nat → Row × Nat
   | _, [], fr => ([], fr)
   | i, c :: cs, fr =>
-    match pos ins i 0 with
-    | some p =>
-      let rest := fullRow ins row (i + 1) cs fr
-      (cellW (row.getD p .null) :: rest.1, rest.2)
-    | none =>
-      match c.dflt with
-      | .null =>
-        let rest := fullRow ins row (i + 1) cs fr
-        (none :: rest.1, rest.2)
-      | .same =>
-        let rest := fullRow ins row (i + 1) cs fr
-        (some (.same i) :: rest.1, rest.2)
-      | .fresh =>
-        let rest := fullRow ins row (i + 1) cs (fr + 1)
-        (some (.fresh fr) :: rest.1, rest.2)
+    let here :=
+      match pos ins i 0 with
+      | some p => cellW c i fr (row.getD p .null)
+      | none => dfltW c i fr
+    let rest := fullRow ins row (i + 1) cs here.2
+    (here.1 :: rest.1, rest.2)
 
 /-- The first NOT NULL column holding NULL. -/
 def notNullAt : Nat → List Col → Row → Option Nat

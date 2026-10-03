@@ -71,4 +71,32 @@ def composite : Spec := ⟨[serial, plain, plain], [⟨[1, 2], false⟩], [1, 2]
 example : witness composite (two [[.p 1, .p 2], [.p 1, .p 4]]) = .ok 2 := by decide +kernel
 example : witness composite (two dup) = .unique 0 := by decide +kernel
 
+/-! ### Generated cells -/
+
+/-- The insert lists all three columns of `(id, name, n)`. -/
+def three (rows : List (List Cell)) : Insert := ⟨0, [0, 1, 2], .values rows, []⟩
+def dfltRows (k : GenKind) : List (List Cell) := [[.gen k, .p 1, .p 2], [.gen k, .p 3, .p 4]]
+/-- Unique on column 0, whose column is `c`. -/
+def keyedBy (c : Col) : Spec := ⟨[c, plain, plain], [⟨[0], false⟩], [0, 1, 2], .none⟩
+
+-- `DEFAULT` on a serial key gives each row its own id...
+example : witness (keyedBy serial) (three (dfltRows .dflt)) = .ok 2 := by decide +kernel
+-- ...on a once-per-statement default, the two rows collide...
+example : witness (keyedBy ⟨false, .same, false⟩) (three (dfltRows .dflt)) = .unique 0 := by
+  decide +kernel
+-- ...and on a NOT NULL column with no default, it is NULL.
+example : witness (keyedBy notNull) (three (dfltRows .dflt)) = .notNull 0 := by decide +kernel
+-- A generator with a new value per row does not collide; one that may repeat does.
+example : witness (keyedBy plain) (three (dfltRows .fresh)) = .ok 2 := by decide +kernel
+example : witness (keyedBy plain) (three (dfltRows .once)) = .unique 0 := by decide +kernel
+-- `DEFAULT` in a `GENERATED ALWAYS` column is legal in Postgres, but the column is still listed;
+-- the model keeps refusing it, as a backstop behind the translator's own refusal.
+example : witness (keyedBy ⟨false, .fresh, true⟩) (three (dfltRows .dflt)) = .generated 0 := by
+  decide +kernel
+
+/-- A fresh generated cell and an omitted serial draw distinct values from the same counter. -/
+def freshPair : Spec := ⟨[serial, plain, plain], [⟨[0], false⟩, ⟨[1], false⟩], [1, 2], .none⟩
+example : witness freshPair (two [[.gen .fresh, .p 1], [.gen .fresh, .p 2]]) = .ok 2 := by
+  decide +kernel
+
 end Sqleq.WitnessControls
