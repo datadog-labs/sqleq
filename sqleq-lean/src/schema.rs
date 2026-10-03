@@ -323,6 +323,18 @@ impl Schema {
     /// regardless of quoting, as the frontend's own catalog does.
     pub fn from_statements<'a>(statements: impl IntoIterator<Item = (&'a Statement, bool)>) -> Schema {
         use sqlparser::ast::{ColumnOption as O, GeneratedAs, NullsDistinctOption, TableConstraint as C};
+        let statements: Vec<(&Statement, bool)> = statements.into_iter().collect();
+        // Domains first, whatever the order of the DDL: a column of a domain type takes the
+        // domain's default unless it declares its own, and the domain's CHECK applies to it.
+        let mut domains: HashMap<String, (Option<&Expr>, bool)> = HashMap::new();
+        for (st, _) in &statements {
+            if let Statement::CreateDomain(d) = st {
+                if let Some(name) = last_name(&d.name) {
+                    let check = d.constraints.iter().any(|c| matches!(c, C::Check(_)));
+                    domains.insert(name, (d.default.as_ref(), check));
+                }
+            }
+        }
         let mut s = Schema::default();
         let mut indexes = Vec::new();
         let mut altered = Vec::new();
@@ -379,6 +391,15 @@ impl Schema {
                     seqs: if serial { vec![implicit_seq.clone()] } else { Vec::new() },
                     seq_state: false,
                 };
+                if let Some(&(default, check)) = domains.get(unqualified(&col.ty.name)).filter(|_| !col.ty.array) {
+                    if let Some(e) = default {
+                        col.default = default_kind(e);
+                        col.default_text = Some(e.to_string());
+                        col.source = default_source(e);
+                        (col.seqs, col.seq_state) = sequence_use(e);
+                    }
+                    t.has_check |= check;
+                }
                 let idx = t.columns.len();
                 for o in &c.options {
                     match &o.option {
@@ -520,11 +541,34 @@ impl Schema {
             }
         }
         let mut s = Schema::from_statements(statements.iter().map(|(s, r)| (s, *r)));
+        // A domain sqlparser cannot read (it has no domain-level `NOT NULL`, for one) constrains
+        // every column of its type, and those statements never name a table.
+        let domains: Vec<String> = unread.iter().filter_map(|u| unread_domain(u)).collect();
         for t in s.tables.values_mut().flatten() {
-            t.unread = unread.iter().any(|u| mentions(u, &t.name));
+            t.unread = unread.iter().any(|u| mentions(u, &t.name))
+                || t.columns.iter().any(|c| domains.iter().any(|d| d == unqualified(&c.ty.name)));
         }
         s
     }
+}
+
+/// A type name without its schema: domains are keyed by their bare name, as tables are.
+fn unqualified(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The domain an unreadable `CREATE DOMAIN name …` declares, folded as `type_key` folds a type name.
+fn unread_domain(stmt: &str) -> Option<String> {
+    let mut words = stmt.split_whitespace();
+    let (Some(c), Some(d), Some(name)) = (words.next(), words.next(), words.next()) else { return None };
+    if !(c.eq_ignore_ascii_case("create") && d.eq_ignore_ascii_case("domain")) {
+        return None;
+    }
+    let last = name.rsplit('.').next().unwrap_or(name);
+    Some(match last.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(q) => q.to_string(),
+        None => last.to_lowercase(),
+    })
 }
 
 /// `CREATE [UNIQUE] INDEX … ON ONLY t …`, parsed as the same statement without `ONLY`.
@@ -622,6 +666,37 @@ mod tests {
         assert_eq!(k("i").default, DefaultKind::Null);
         assert!(k("j").always, "a computed column takes no explicit value");
         assert_eq!((k("k").default, k("k").nullable), (DefaultKind::Same, false), "an unknown function is Same");
+    }
+
+    #[test]
+    fn a_domain_gives_its_columns_its_default_and_check() {
+        let s = Schema::from_ddl(
+            "CREATE TABLE t (a email, b email DEFAULT 'own', c public.email, d int, e email[]);
+             CREATE DOMAIN email AS text DEFAULT 'nobody' CHECK (VALUE <> '');
+             CREATE TABLE plain (a int);",
+        );
+        let t = s.table("t").unwrap();
+        let k = |n: &str| t.columns[t.column(n).unwrap()].clone();
+        assert_eq!(k("a").default_text.as_deref(), Some("'nobody'"), "the domain's default, declared after the table");
+        assert_eq!((k("a").default, k("a").source), (DefaultKind::Same, DefaultSource::Constant));
+        assert_eq!(k("b").default_text.as_deref(), Some("'own'"), "a column's own default wins");
+        assert_eq!(k("c").default_text.as_deref(), Some("'nobody'"), "a qualified domain name");
+        assert_eq!(k("e").default_text, None, "an array of the domain is not the domain");
+        assert!(t.has_check, "the domain's CHECK applies to the table");
+        assert!(!s.table("plain").unwrap().has_check);
+    }
+
+    #[test]
+    fn an_unreadable_domain_marks_the_tables_that_use_it() {
+        // sqlparser has no domain-level NOT NULL, so this domain is not read, and the NOT NULL
+        // it puts on `t.a` would be missed.
+        let s = Schema::from_ddl(
+            "CREATE DOMAIN pos AS int NOT NULL;
+             CREATE TABLE t (a pos, b text);
+             CREATE TABLE u (a int);",
+        );
+        assert!(s.table("t").unwrap().unread);
+        assert!(!s.table("u").unwrap().unread);
     }
 
     #[test]
