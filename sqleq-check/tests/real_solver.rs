@@ -11,6 +11,7 @@
 
 use serde_json::{json, Value};
 use sqleq_check::axes::solver::{self, run_second_opinion};
+use sqleq_check::portfolio;
 use sqleq_check::case::{ss_slug, Case};
 use sqleq_check::discover::{repo, SsDriver};
 use sqleq_check::util::{is_exe, TempDir};
@@ -75,4 +76,44 @@ fn rows_are_bucketed_like_the_jvm_drivers() {
     );
     assert_eq!((stats.rows, stats.answered, stats.halts), (4, Some(4), 0));
     assert_eq!(cases[3].s_note, "unknown table t");
+}
+
+/// A portfolio asks sqleq-solver one job at a time, inside the case's deadline, with its own cap and
+/// grace period; its answers must bucket exactly as the batched pass buckets them.
+#[test]
+fn a_portfolio_asks_it_per_case() {
+    let Some(driver) = sqleq_solver() else {
+        eprintln!("skipped: sqleq-solver is not built (set $SQLEQ_SOLVER_BIN to require it)");
+        return;
+    };
+    let frontend = ["debug", "release"].iter().map(|p| repo().join("target").join(p).join("sqleq-frontend")).find(|b| is_exe(b));
+    let required = std::env::var_os("SQLEQ_SOLVER_BIN").is_some();
+    let Some(frontend) = frontend else {
+        assert!(!required, "the portfolio test needs sqleq-frontend built beside sqleq-solver");
+        eprintln!("skipped: sqleq-frontend is not built");
+        return;
+    };
+    let frontend = frontend.to_string_lossy().into_owned();
+    let axes = ["frontend", "sqleq-solver"];
+    let ctx = portfolio::Ctx {
+        axes: &axes,
+        frontend: Some(&frontend),
+        prover: None,
+        ss: Some(&driver),
+        ss_cap_ms: None,
+        fuzz: None,
+        lean: None,
+        timeout: 30.0,
+        smt_timeout_ms: None,
+        keep_dir: None,
+    };
+    for (example, bucket, verdict) in [
+        ("in_vs_or.sql", solver::PROVED_LITERAL, portfolio::EQUIVALENT),
+        ("dropped_filter.sql", solver::NO_PROOF, portfolio::UNDECIDED),
+    ] {
+        let case = portfolio::run_case(&repo().join("examples").join(example), example, &ctx);
+        let o = case.portfolio.as_ref().unwrap();
+        assert_eq!((case.s_bucket.as_deref(), o.verdict.as_str()), (Some(bucket), verdict), "{example}: {}", case.s_note);
+        assert!(o.done.contains_key("sqleq-solver") && o.pending.is_empty(), "{example}: {o:?}");
+    }
 }

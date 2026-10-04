@@ -265,10 +265,12 @@ jobs:
       - run: cargo test -p sqleq-solver
       - run: cargo clippy -p sqleq-solver --all-targets -- -D warnings
 
-      # The frontend job runs the harness tests too, but without this binary the one that drives
-      # the second opinion through it skips. Here it must run: `$SQLEQ_SOLVER_BIN` makes a missing
-      # binary a failure instead of a skip, and the test is named.
+      # The frontend job runs the harness tests too, but without this binary the ones that drive the
+      # second opinion through it skip. Here they must run: `$SQLEQ_SOLVER_BIN` makes a missing
+      # binary a failure instead of a skip, and the tests are named. The portfolio's test lowers its
+      # pairs, so the frontend is built first.
       - run: cargo build -p sqleq-solver --bin sqleq-solver
+      - run: cargo build --bin sqleq-frontend --bin sqleq-check
       - name: second opinion through sqleq-solver
         env:
           SQLEQ_SOLVER_BIN: target/debug/sqleq-solver
@@ -276,7 +278,6 @@ jobs:
 
       # The pinned pairs on sqleq-solver. It proves from the frontend's IR, so this job builds the
       # frontend binary too; the frontend's own pins are checked again on the way, at no extra cost.
-      - run: cargo build --bin sqleq-frontend --bin sqleq-check
       - name: pinned pairs (sqleq-solver)
         run: |
           target/debug/sqleq-check --expect pinned --axes sqleq-solver \

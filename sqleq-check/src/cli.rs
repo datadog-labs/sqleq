@@ -52,9 +52,18 @@ pub struct Args {
     #[arg(short = 'j', long, default_value_t = default_jobs())]
     pub jobs: usize,
 
-    /// Per-case wall-clock timeout in seconds.
+    /// Per-case wall-clock timeout in seconds. Under --portfolio, the one deadline every backend
+    /// on the case shares.
     #[arg(short = 't', long, default_value_t = 60.0)]
     pub timeout: f64,
+
+    /// Run every asked backend on each case at once, within the one --timeout, and report one
+    /// combined verdict per case: equivalent, not-equivalent, alarm (a proof and a counterexample),
+    /// timeout or undecided. Asks frontend, qed, sqleq-solver and fuzz unless --axes says
+    /// otherwise; --lean adds Lean. The verdict decides the exit code, and an alarm always fails
+    /// the run. Not with --expect pinned or --sqlsolver-jvm.
+    #[arg(long)]
+    pub portfolio: bool,
 
     /// QED_SMT_TIMEOUT for each SMT request, in ms (default: prover's own default of 10000).
     #[arg(long, value_name = "MS")]
@@ -172,6 +181,7 @@ pub fn second_opinion(args: &Args) -> Option<&'static str> {
 /// names it. A prover is handed the frontend's plan, so asking one asks the frontend.
 pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
     let mut axes: Vec<String> = match &args.axes {
+        None if args.portfolio => ["frontend", "qed", "sqleq-solver", "fuzz"].map(String::from).to_vec(),
         None => vec!["frontend".into(), "qed".into()],
         Some(list) => {
             let named: Vec<String> = list
@@ -252,6 +262,14 @@ mod tests {
         assert!(axes(&["--axes", "sqleq-solver", "--sqlsolver-jvm"]).is_err());
         assert!(axes(&["--axes", "frontend,qd"]).unwrap_err().contains("unknown axis qd"));
         assert_eq!(axes(&["--axes", "fuzz", "--lean"]).unwrap(), ["fuzz", "lean"]);
+    }
+
+    #[test]
+    fn a_portfolio_asks_every_light_backend_by_default() {
+        let axes = |argv: &[&str]| resolve_axes(&parse(argv).unwrap()).unwrap();
+        assert_eq!(axes(&["--portfolio"]), ["frontend", "fuzz", "qed", "sqleq-solver"]);
+        assert_eq!(axes(&["--portfolio", "--lean"]), ["frontend", "fuzz", "qed", "sqleq-solver", "lean"]);
+        assert_eq!(axes(&["--portfolio", "--axes", "qed,fuzz"]), ["frontend", "fuzz", "qed"]);
     }
 
     #[test]

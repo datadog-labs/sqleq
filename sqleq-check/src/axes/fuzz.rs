@@ -71,7 +71,9 @@ pub fn fuzz_one(fuzz_bin: &str, path: &str, timeout_s: f64) -> (String, String, 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub rows: usize,
-    pub wall_s: f64,
+    /// The pass's own wall time; a portfolio has no separate pass to time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall_s: Option<f64>,
 }
 
 /// Run sqleq-fuzz over every `.sql` case and attach its verdicts in place.
@@ -98,5 +100,5 @@ pub fn run_fuzz(cases: &mut [Case], fuzz_bin: &str, jobs: usize, timeout_s: f64)
             (c.f_verdict, c.f_note, c.f_ms) = (Some(w), n, Some(ms));
         }
     }
-    Stats { rows: todo.len(), wall_s: crate::util::round(t0.elapsed().as_secs_f64(), 3) }
+    Stats { rows: todo.len(), wall_s: Some(crate::util::round(t0.elapsed().as_secs_f64(), 3)) }
 }

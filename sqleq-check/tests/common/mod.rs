@@ -74,21 +74,45 @@ set -- $pos
 printf '{"schemas": [], "queries": [{"scan": 0}, {"scan": 1}]}' > "$2"
 "#;
 
-/// Answers `$FAKE_SS` for every job.
-pub const FAKE_SOLVER: &str = r#"while IFS= read -r line || [ -n "$line" ]; do
+/// Answers `$FAKE_SS` for every job, after `$FAKE_SS_SLEEP` seconds when that is set.
+pub const FAKE_SOLVER: &str = r#"[ -n "$FAKE_SS_SLEEP" ] && sleep "$FAKE_SS_SLEEP"
+while IFS= read -r line || [ -n "$line" ]; do
     name=$(printf '%s' "$line" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
     printf '{"name": "%s", "verdict": "%s", "ms": 1}\n' "$name" "$FAKE_SS" >> "$2"
 done < "$1"
 "#;
 
-/// Prints `$FAKE_FUZZ`.
-pub const FAKE_FUZZ: &str = "echo \"$FAKE_FUZZ\"\n";
+/// Prints `$FAKE_FUZZ`, after `$FAKE_FUZZ_SLEEP` seconds when that is set.
+pub const FAKE_FUZZ: &str = "[ -n \"$FAKE_FUZZ_SLEEP\" ] && sleep \"$FAKE_FUZZ_SLEEP\"\necho \"$FAKE_FUZZ\"\n";
+
+/// Writes `<stem>.result` saying `provable` when `$FAKE_QED` is `proved`. Appends its pid to
+/// `$FAKE_PIDS`, sleeps `$FAKE_QED_SLEEP` seconds when that is set, and 30 seconds the first time
+/// it runs when `$FAKE_QED_ONCE` names a file that does not exist yet.
+pub const FAKE_PROVER: &str = r#"for a in "$@"; do json=$a; done
+[ -n "$FAKE_PIDS" ] && echo $$ >> "$FAKE_PIDS"
+if [ -n "$FAKE_QED_ONCE" ] && [ ! -e "$FAKE_QED_ONCE" ]; then : > "$FAKE_QED_ONCE"; sleep 30; fi
+[ -n "$FAKE_QED_SLEEP" ] && sleep "$FAKE_QED_SLEEP"
+case "$FAKE_QED" in proved) p=true ;; *) p=false ;; esac
+printf '{"provable": %s, "panicked": false}' "$p" > "${json%.json}.result"
+"#;
+
+/// Answers `$FAKE_LEAN` for every pair file it is given.
+pub const FAKE_LEAN: &str = r#"out=""; prev=""; body=""; sep=""
+for a in "$@"; do
+    [ "$prev" = "--json" ] && out=$a
+    case "$a" in *.sql) body="$body$sep\"$a\": {\"verdict\": \"$FAKE_LEAN\", \"ms\": 1}"; sep=", " ;; esac
+    prev=$a
+done
+printf '{%s}' "$body" > "$out"
+"#;
 
 pub struct Fakes {
     pub dir: sqleq_check::util::TempDir,
     pub frontend: PathBuf,
     pub solver: PathBuf,
     pub fuzz: PathBuf,
+    pub prover: PathBuf,
+    pub lean: PathBuf,
     pub argv_log: PathBuf,
     pub case: PathBuf,
 }
@@ -101,6 +125,8 @@ impl Fakes {
             frontend: exe(&d.join("fe"), FAKE_FRONTEND),
             solver: exe(&d.join("ss"), FAKE_SOLVER),
             fuzz: exe(&d.join("fz"), FAKE_FUZZ),
+            prover: exe(&d.join("qed"), FAKE_PROVER),
+            lean: exe(&d.join("ln"), FAKE_LEAN),
             argv_log: d.join("argv.log"),
             case: d.join("case.sql"),
             dir,
