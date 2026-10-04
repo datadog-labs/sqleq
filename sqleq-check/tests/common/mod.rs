@@ -10,6 +10,19 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::RwLock;
+
+/// Writing a script and running one exclude each other within this test process. A process forked
+/// by another test thread while a script is open for writing holds that file open until it execs,
+/// and running the script in that window fails with `ETXTBSY` ("Text file busy"). Writers take it
+/// exclusively, spawners shared.
+static EXEC: RwLock<()> = RwLock::new(());
+
+/// Run `f`, which starts subprocesses, while no stand-in is being written.
+pub fn spawning<T>(f: impl FnOnce() -> T) -> T {
+    let _shared = EXEC.read().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 pub const LICENCE: &str = "-- Unless explicitly stated otherwise all files in this repository are licensed under the
 -- Apache License Version 2.0.
@@ -35,6 +48,7 @@ pub fn pair(base: &[&str], more: &[&str]) -> String {
 
 /// Write an executable `/bin/sh` script.
 pub fn exe(path: &Path, body: &str) -> PathBuf {
+    let _exclusive = EXEC.write().unwrap_or_else(|e| e.into_inner());
     std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
     let mut perm = std::fs::metadata(path).unwrap().permissions();
     perm.set_mode(0o755);
@@ -111,7 +125,7 @@ pub fn run(cwd: &Path, argv: &[String], env: &[(&str, &str)]) -> Ran {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let Output { status, stdout, stderr } = cmd.output().unwrap();
+    let Output { status, stdout, stderr } = spawning(|| cmd.output().unwrap());
     Ran {
         code: status.code().unwrap_or(-1),
         out: String::from_utf8_lossy(&stdout).into_owned(),
