@@ -152,7 +152,7 @@ final class IrToRel {
     // and then any `{"scan": i}` refuses as `scan-out-of-range` -- loud, and in the right place.
     for (JsonNode s : ir.path("schemas")) {
       // `name` is an additive field: plans lowered before it existed carry none, and
-      // `sqleq_check.py` takes an archived or hand-written `Input` as a first-class case. The
+      // `sqleq-check` takes an archived or hand-written `Input` as a first-class case. The
       // fallback is the very spelling `sqlsolver::ddl_from_ir` emits for a nameless schema, so a
       // `{"scan": i}` still addresses the table that entry describes -- which is the invariant the
       // bridge rests on.

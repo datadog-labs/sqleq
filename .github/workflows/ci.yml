@@ -83,7 +83,11 @@ jobs:
           key: frontend-lines-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: frontend-lines-${{ runner.os }}-
 
-      # `default-members = ["."]`, so these two cover the frontend crate and nothing else.
+      # `default-members` is the frontend and sqleq-check, so these two cover both crates and nothing
+      # else. sqleq-check's tests include the hygiene gate over every committed pair (it lints, it
+      # carries the licence, it names no corpus row or machine), and the frontend's include
+      # `tests/doc_links.rs`: every relative link in every Markdown file resolves -- see that file
+      # for why it is a gate and not a habit.
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -104,20 +108,14 @@ jobs:
           cargo doc --no-deps --features internals
           cargo doc --no-deps --features internals --document-private-items
 
-      - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
-
       # The pinned pairs on the frontend axis. A non-equivalent pair that lowers to the same IR on
       # both sides fails here, with no prover anywhere in the job.
-      - run: cargo build --bin sqleq-frontend
+      - run: cargo build --bin sqleq-frontend --bin sqleq-check
       - name: pinned pairs (frontend)
         run: |
           test -x target/debug/sqleq-frontend
-          python3 tools/sqleq_check.py --expect pinned --axes frontend \
+          target/debug/sqleq-check --expect pinned --axes frontend \
             --frontend target/debug/sqleq-frontend tests/pairs examples/*.sql
-
-      # Every relative link in every tracked Markdown file resolves. See tools/linkcheck.py for
-      # why this is a gate and not a habit.
-      - run: python3 tools/linkcheck.py
 
       # No path from the machine something was developed on survives into the tree. On a GitHub
       # runner such a path cannot exist, which is exactly what makes the check worth running here.
@@ -170,7 +168,10 @@ jobs:
       - name: fetch libduckdb (digest-pinned)
         run: |
           set -euo pipefail
-          ver=$(python3 -c 'import re;s=open("Cargo.lock").read();e=int(re.search(r"libduckdb-sys.\nversion = .1\.(\d+)\.",s).group(1));print(f"{e//10000}.{e//100%100}.{e%100}")')
+          # libduckdb-sys 1.MMmmpp.0 bundles DuckDB MM.mm.pp: 1.10505.0 is 1.5.5.
+          ver=$(awk '/^name = "libduckdb-sys"$/ { getline; split($3, v, "."); e = v[2]
+            printf "%d.%d.%d", int(e / 10000), int(e / 100) % 100, e % 100 }' Cargo.lock)
+          test -n "$ver"
           dir="target/duckdb-download/x86_64-unknown-linux-gnu/$ver"
           mkdir -p "$dir"
           curl -fsSL --retry 3 -o "$dir/libduckdb-linux-amd64.zip" \
@@ -184,10 +185,11 @@ jobs:
       # The pinned pairs on the only axis that refutes. It reads each pair file itself, so it needs
       # no frontend.
       - run: cargo build -p sqleq-fuzz --bin sqleq-fuzz
+      - run: cargo build -p sqleq-check --bin sqleq-check
       - name: pinned pairs (fuzz)
         run: |
           test -x target/debug/sqleq-fuzz
-          python3 tools/sqleq_check.py --expect pinned --axes fuzz \
+          target/debug/sqleq-check --expect pinned --axes fuzz \
             --fuzz-bin target/debug/sqleq-fuzz tests/pairs examples/*.sql
 
   licenses:
@@ -264,20 +266,20 @@ jobs:
       - run: cargo clippy -p sqleq-solver --all-targets -- -D warnings
 
       # The frontend job runs the harness tests too, but without this binary the one that drives
-      # the second opinion through it skips. Here it must run, so the binary's presence is asserted
-      # first and the test is named.
+      # the second opinion through it skips. Here it must run: `$SQLEQ_SOLVER_BIN` makes a missing
+      # binary a failure instead of a skip, and the test is named.
       - run: cargo build -p sqleq-solver --bin sqleq-solver
       - name: second opinion through sqleq-solver
-        run: |
-          test -x target/debug/sqleq-solver
-          cd tools && python3 -m unittest -v test_sqleq_check.SecondOpinionThroughSqleqSolver
+        env:
+          SQLEQ_SOLVER_BIN: target/debug/sqleq-solver
+        run: cargo test -p sqleq-check --test real_solver -- --nocapture
 
       # The pinned pairs on sqleq-solver. It proves from the frontend's IR, so this job builds the
       # frontend binary too; the frontend's own pins are checked again on the way, at no extra cost.
-      - run: cargo build --bin sqleq-frontend
+      - run: cargo build --bin sqleq-frontend --bin sqleq-check
       - name: pinned pairs (sqleq-solver)
         run: |
-          python3 tools/sqleq_check.py --expect pinned --axes sqleq-solver \
+          target/debug/sqleq-check --expect pinned --axes sqleq-solver \
             --frontend target/debug/sqleq-frontend --sqleq-solver-bin target/debug/sqleq-solver \
             tests/pairs examples/*.sql
 

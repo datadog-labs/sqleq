@@ -235,4 +235,4 @@ The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/REA
 `-- binding: gather` because their truth is stated under the gather rule, or `-- binding:
 gather-generated` for a pair with generated cells. `cargo test -p
 sqleq-lean` checks every `-- expect lean:` pin under `tests/pairs/` against real Lean, and
-`tools/sqleq_check.py --expect pinned --axes lean` does the same with the suite's other rules.
+`sqleq-check --expect pinned --axes lean` does the same with the suite's other rules.

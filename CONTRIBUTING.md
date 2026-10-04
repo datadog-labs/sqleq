@@ -6,23 +6,25 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 206 + 10 + 7 + 190 + 18 + 11 + 11
+cargo test                 # the frontend: 206 + 10 + 7 + 2 + 190 + 18 + 11 + 11; sqleq-check: 53 + 5 + 1 + 12
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 34 + 6 (needs Lean, see below)
-python3 -m unittest discover -s tools -p 'test_*.py'
-python3 tools/linkcheck.py # every relative link in every tracked Markdown file resolves
-python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
+target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
-The last line runs the [pinned pairs](tests/pairs/README.md) on three of the axes CI has; it needs
-the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries built. Their Lean pins are checked by
+`cargo test` covers the frontend and `sqleq-check`, the batch harness. Among the frontend's suites
+is `tests/doc_links.rs`, which fails on any relative link in a Markdown file that resolves to
+nothing; among the harness's is the hygiene gate over every committed pair. The last line runs the
+[pinned pairs](tests/pairs/README.md) on three of the axes CI has; it needs the `sqleq-frontend`,
+`sqleq-fuzz` and `sqleq-solver` binaries built. Their Lean pins are checked by
 `cargo test -p sqleq-lean`.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
 `sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and the first build
 of `sqleq-solver` compiles Z3 from source, which takes minutes and needs cmake and a C++20
-compiler — so the root manifest sets `default-members = ["."]` and both are opt-in. `sqleq-lean`
+compiler — so the root manifest sets `default-members = [".", "sqleq-check"]` and both are
+opt-in. `sqleq-lean`
 is opt-in too: it runs the Lean 4 toolchain that `lean/lean-toolchain` names, with `lake` on `PATH`
 (elan installs it, or put a release's `bin` there yourself), and its integration test fails rather
 than skips without it. `cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks
@@ -133,8 +135,7 @@ that lowered alike — comes with that pair under [`tests/pairs/`](tests/pairs/R
 
 1. Minimize it on an invented schema. Nothing in it may come from a corpus that is not public.
 2. Write its `truth`, its `origin`, and a `witness` (not equivalent) or an `argument` (equivalent).
-3. Rebuild every binary, then run `tools/sqleq_check.py --expect pinned --bless` with every axis
-   you have.
+3. Rebuild every binary, then run `sqleq-check --expect pinned --bless` with every axis you have.
 4. Read the diff against `truth`, and show the pair fails on a build from before the fix.
 5. In the pull request, say why every pin that moved, moved.
 
