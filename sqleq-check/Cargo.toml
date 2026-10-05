@@ -1,0 +1,32 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+[package]
+name = "sqleq-check"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Batch harness: run SQL equivalence pairs past every axis and judge the answers"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sqleq_check"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqleq-check"
+path = "src/main.rs"
+
+# Light on purpose: every backend is run as a subprocess, so none of them -- DuckDB, Z3, Lean -- is
+# built to build this. A hard per-case deadline needs a process to kill anyway: a Z3 call cannot be
+# interrupted from outside, and sqleq-fuzz has no timeout of its own.
+[dependencies]
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+csv = { workspace = true }
+# Process groups: `killpg` at a deadline, and on Ctrl-C, takes a backend's own children with it.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }

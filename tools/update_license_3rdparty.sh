@@ -8,9 +8,9 @@
 #
 # Crate rows come from dd-rust-license-tool, run once per workspace member: the root manifest is
 # both the workspace and the sqleq-frontend package, so a single run walks only the frontend's
-# dependencies and silently leaves out everything sqleq-fuzz and sqleq-solver pull in; a new
-# workspace member needs its own line below. The tool also has no way to list a component that is
-# not a crate, so those rows live in tools/license-3rdparty-extra.csv and are appended as-is.
+# dependencies and silently leaves out everything the other members pull in; a new workspace
+# member needs its own line below. The tool also has no way to list a component that is not a
+# crate, so those rows live in tools/license-3rdparty-extra.csv and are appended as-is.
 set -eu
 
 usage="usage: sh tools/update_license_3rdparty.sh [--check]"
@@ -34,14 +34,15 @@ trap 'rm -rf "$tmp"' EXIT
 # One file per manifest rather than a pipeline, so a failing run stops the script instead of
 # vanishing into `sort`.
 dd-rust-license-tool --manifest-path Cargo.toml dump >"$tmp/frontend.csv"
+dd-rust-license-tool --manifest-path sqleq-check/Cargo.toml dump >"$tmp/check.csv"
 dd-rust-license-tool --manifest-path sqleq-fuzz/Cargo.toml dump >"$tmp/fuzz.csv"
 dd-rust-license-tool --manifest-path sqleq-lean/Cargo.toml dump >"$tmp/lean.csv"
 dd-rust-license-tool --manifest-path sqleq-solver/Cargo.toml dump >"$tmp/solver.csv"
 
 {
     echo "Component,Origin,License,Copyright"
-    { tail -n +2 "$tmp/frontend.csv"; tail -n +2 "$tmp/fuzz.csv"; tail -n +2 "$tmp/lean.csv"
-      tail -n +2 "$tmp/solver.csv"; } \
+    { tail -n +2 "$tmp/frontend.csv"; tail -n +2 "$tmp/check.csv"; tail -n +2 "$tmp/fuzz.csv"
+      tail -n +2 "$tmp/lean.csv"; tail -n +2 "$tmp/solver.csv"; } \
         | LC_ALL=C sort -u
     tail -n +2 tools/license-3rdparty-extra.csv
 } >"$tmp/new.csv"

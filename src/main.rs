@@ -28,7 +28,7 @@
 //! `--sqlsolver --ir <input.json>` is the single-case form of that destination, and the only mode
 //! whose input is an `Input` rather than SQL: it packages an *already lowered* plan as one bridge
 //! job, deriving the DDL from the plan's own `schemas`. It lowers nothing — deliberately, so that
-//! `tools/sqleq_check.py` can hand the second prover the very bytes it handed the first, with no
+//! `sqleq-check` can hand the second prover the very bytes it handed the first, with no
 //! second lowering between the two axes. See [`sqleq_frontend::sqlsolver::ir_job_from_input`].
 
 use std::path::{Path, PathBuf};

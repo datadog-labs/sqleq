@@ -1,10 +1,10 @@
 # Pinned pairs
 
 Each `.sql` file here is a pair whose truth is known — equivalent or not in Postgres — together with
-what every axis said about it when it was last reviewed. `tools/sqleq_check.py --expect pinned`
-asks the axes again and fails on any movement. Most of these pairs are a defect that was found
-once, kept as the smallest pair that shows it, so that from then on it is checked on every axis and
-not only on the one that found it: a false proof found in one prover is a pin on all of them.
+what every axis said about it when it was last reviewed. `sqleq-check --expect pinned` asks the
+axes again and fails on any movement. Most of these pairs are a defect that was found once, kept as
+the smallest pair that shows it, so that from then on it is checked on every axis and not only on
+the one that found it: a false proof found in one prover is a pin on all of them.
 
 They are a **regression pin, not a control.** A pinned pair can only fail in a way someone has
 already seen, so passing them says nothing about whether a change that grows the provable set is
@@ -17,13 +17,13 @@ The Lean axis's pairs are under `insert_unnest/`, and are stated under the gathe
 ## Running them
 
 ```sh
-# The axes CI runs, one job each:
-python3 tools/sqleq_check.py --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
+# The axes CI runs, one job each (`cargo build --release` builds sqleq-check):
+sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 # The two it never installs (one SQLSolver per run):
-python3 tools/sqleq_check.py --expect pinned --axes qed --prover "$QED_PROVER" tests/pairs examples/*.sql
-python3 tools/sqleq_check.py --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
+sqleq-check --expect pinned --axes qed --prover "$QED_PROVER" tests/pairs examples/*.sql
+sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
 # The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
-python3 tools/sqleq_check.py --expect pinned --axes lean tests/pairs examples/*.sql
+sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
 ```
 
 The output is one row per pair and one column per axis that ran. Exit code 0 means every pin held,

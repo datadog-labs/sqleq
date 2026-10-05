@@ -308,7 +308,7 @@ pub fn ir_job(row: &Row, source: CatalogSource) -> IrJob {
 /// Package an already-lowered `Input` as a bridge job: the same bytes, plus the DDL they imply.
 ///
 /// Split out of [`ir_job`] for the single-case path (`--sqlsolver --ir <input.json>`), which
-/// `tools/sqleq_check.py` drives. That harness has already lowered the case and handed the JSON to
+/// `sqleq-check` drives. That harness has already lowered the case and handed the JSON to
 /// the prover, so re-lowering the SQL here would put a *second* lowering between the two axes --
 /// reintroducing precisely the drift [`ddl_from_ir`] exists to rule out, one level up. Instead the
 /// same JSON goes to both provers and the DDL is derived from it.

@@ -20,9 +20,6 @@
 *.swp
 .DS_Store
 
-# Python bytecode from tools/
-tools/__pycache__/
-
 # javac output for the SQLSolver IR bridge (tools/sqlsolver/*.java)
 tools/sqlsolver/out/
 tools/sqlsolver/out-fork/

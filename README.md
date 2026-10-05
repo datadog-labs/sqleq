@@ -17,8 +17,8 @@ independent — which is what lets them check each other. Any pair a prover call
 The second prover is **`sqleq-solver`**, a Rust rewrite of
 [SQLSolver](https://github.com/SQLSolver/SQLSolver)'s proof engine that reads the same Input JSON
 and builds from this repository alone, Z3 included. It is a second opinion:
-`tools/sqleq_check.py --sqleq-solver` reports its answer beside the prover's, and it never changes a
-verdict or an exit code. The original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a
+`sqleq-check --sqleq-solver` reports its answer beside the prover's, and it never changes a verdict
+or an exit code. The original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a
 backup cross-check, but that needs a fork of it that is not published. See
 [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
 
@@ -26,8 +26,8 @@ The **Lean axis** (`sqleq-lean`) is narrower still. It decides one class of `INS
 axes cannot even state: `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a
 parameter is a scalar on one side and an array on the other. It proves such a pair under an explicit
 rule for how the two sides' parameters correspond, and has the Lean kernel check the proof. It
-needs a Lean toolchain, and `tools/sqleq_check.py --lean` runs it as a second opinion that never
-changes an exit code. See [`docs/LEAN.md`](docs/LEAN.md).
+needs a Lean toolchain, and `sqleq-check --lean` runs it as a second opinion that never changes an
+exit code. See [`docs/LEAN.md`](docs/LEAN.md).
 
 ## Quick start
 
@@ -142,12 +142,12 @@ know. It detects and reports what it can (`parameter-misaligned`) and assumes th
 ./target/release/sqleq-frontend --csv corpus.csv -o out/ --report report.json --infer-seeded
 
 # A corpus of .sql pairs → verdicts + a CI exit code:
-python3 tools/sqleq_check.py --expect report-only -j 8 corpus/
+./target/release/sqleq-check --expect report-only -j 8 corpus/
 ```
 
 `--infer-seeded` reads columns from the DDL but *infers* parameter types, which is what lets `$N`
-placeholders lower at all. The batch harness has its own manual:
-[`tools/README.md`](tools/README.md).
+placeholders lower at all. The batch harness, `sqleq-check`, has its own manual:
+[`sqleq-check/README.md`](sqleq-check/README.md).
 
 As a library:
 

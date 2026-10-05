@@ -20,7 +20,7 @@ should.
 | [DESIGN.md](DESIGN.md) | Why the frontend is a single Rust binary that refuses what it cannot lower, and the premise and four decisions behind it. History, kept for the arguments. |
 | [INTERNALS.md](INTERNALS.md) | The module map: which file does what, for reading or changing the code. |
 | [SQLSOLVER.md](SQLSOLVER.md) | `sqleq-solver`, the second proving backend (a Rust rewrite of SQLSolver) on the same IR, and the JVM SQLSolver kept as its cross-check — what each does, and the defects that shaped them. |
-| [../tools/README.md](../tools/README.md) | The batch harness: running a directory of pairs, and the CI exit code. |
+| [../sqleq-check/README.md](../sqleq-check/README.md) | `sqleq-check`, the batch harness: running a directory of pairs, the pinned-pair suite, and the CI exit code. |
 | [../sqleq-fuzz/README.md](../sqleq-fuzz/README.md) | The refuting axis: how a counterexample is produced, and the rules that keep one honest. |
 | [LEAN.md](LEAN.md) | The Lean axis: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` under the gather rule — what a proof claims, what it assumes, and what the kernel checks. |
 | [logo/](logo/) | The `⊢≡` mark, its variants, and the script that renders them. |

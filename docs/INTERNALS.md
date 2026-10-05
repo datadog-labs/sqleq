@@ -24,7 +24,8 @@ for a counterexample. See [DESIGN.md](DESIGN.md) for why it is arranged that way
 | `src/sqlsolver.rs` | the `sqlsolver` axis's job files, which `sqleq-solver` and the JVM SQLSolver both read ([SQLSOLVER.md](SQLSOLVER.md)) |
 | `tests/lower.rs` | integration tests (parse/lower shape + soundness refusals) |
 | `tests/reflexive.rs` | integration tests for the reflexivity check — that it reaches past a lowering refusal, and never widens one into a proof |
-| `tests/pairs/` | pinned pairs: known truth, each axis's last answer, run by `sqleq_check.py --expect pinned` ([README](../tests/pairs/README.md)) |
+| `tests/pairs/` | pinned pairs: known truth, each axis's last answer, run by `sqleq-check --expect pinned` ([README](../tests/pairs/README.md)) |
+| `tests/doc_links.rs` | every relative link in every Markdown file resolves |
 
 ## The second proving axis (`sqleq-solver/`)
 
@@ -39,16 +40,15 @@ A separate crate, opt-in because its first build downloads DuckDB: `cargo build 
 generates instances, runs both queries, and reports the first divergence. Its own soundness rules —
 what it must never call a counterexample — are in [`sqleq-fuzz/README.md`](../sqleq-fuzz/README.md).
 
-## The batch harnesses (`tools/`)
+## The batch harness (`sqleq-check/`)
 
 | path | what |
 |---|---|
-| `tools/sqleq_check.py` | a corpus of `.sql` pairs → verdicts + CI exit code, via frontend + prover ([manual](../tools/README.md)) |
-| `tools/sqleq_suite.py` | the pinned-pair grammar, judgement and `--bless` behind `sqleq_check.py --expect pinned` |
-| `tools/linkcheck.py` | every relative link in every tracked Markdown file resolves |
+| `sqleq-check/` | a corpus of `.sql` pairs → verdicts + CI exit code, via frontend + prover and any other axis asked for; every backend runs as a subprocess, so it builds none of them ([manual](../sqleq-check/README.md)) |
+| `sqleq-check/src/suite.rs` | the pinned-pair grammar, judgement and `--bless` behind `sqleq-check --expect pinned` |
 | `tools/sqlsolver/` | our side of the IR bridge to the JVM SQLSolver, `sqleq-solver`'s cross-check: `IrToRel.java` builds the plan pair, `IrDriver.java` runs it ([SQLSOLVER.md](SQLSOLVER.md)) |
 
 Running all three axes over one corpus and cross-tabulating them is what produces the table
 [VALIDATION.md](VALIDATION.md) describes, including the cell that is a soundness alarm. The driver
 that does it is not in this repository — it exists to run corpora that are not public — but
-`sqleq_check.py --sqleq-solver` and `sqleq-fuzz` between them reach every axis it reaches.
+`sqleq-check --sqleq-solver` and `sqleq-fuzz` between them reach every axis it reaches.
