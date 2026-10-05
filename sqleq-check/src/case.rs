@@ -100,6 +100,10 @@ pub struct Case {
     /// apart by.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub q_tail: String,
+    /// The prover's exit code when it crashed or panicked, minus the signal when a signal ended it:
+    /// `-11` is the z3 null dereference, which only the code tells apart from other crashes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_rc: Option<i32>,
     /// The corpus row this case is, when it is one.
     #[serde(skip)]
     pub row: Option<CorpusRow>,
@@ -140,6 +144,7 @@ impl Case {
             s_raw: None,
             l_raw: None,
             q_tail: String::new(),
+            q_rc: None,
             row: None,
         }
     }
@@ -559,7 +564,7 @@ pub fn read_result(case: &mut Case, result_path: &Path, qr: &crate::proc::Run) {
         if flag("panicked") {
             case.status = s(PANIC);
             case.message = s("prover panicked");
-            case.q_tail = crash_tail(qr);
+            (case.q_tail, case.q_rc) = (crash_tail(qr), Some(qr.rc));
         } else if flag("provable") {
             case.status = s(PROVABLE);
         } else {
@@ -572,7 +577,7 @@ pub fn read_result(case: &mut Case, result_path: &Path, qr: &crate::proc::Run) {
         case.status = s(UNPROVABLE);
     } else if qr.rc != 0 {
         case.status = s(PANIC);
-        case.q_tail = crash_tail(qr);
+        (case.q_tail, case.q_rc) = (crash_tail(qr), Some(qr.rc));
         let text = if qr.err.is_empty() { &qr.out } else { &qr.err };
         let msg: String = text.trim().chars().take(400).collect();
         case.message = if msg.is_empty() { format!("prover exit {}", qr.rc) } else { msg };

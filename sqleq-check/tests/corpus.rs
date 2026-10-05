@@ -277,6 +277,20 @@ fn the_prover_runs_under_its_memory_cap() {
 }
 
 #[test]
+fn a_crashed_prover_leaves_its_exit_code() {
+    let f = Fakes::new();
+    let mut r = Run::new(&f);
+    r.set("FAKE_QED_SIGNAL", "SEGV");
+    let (_, cases) = r.cases(&["--axes", "frontend,qed", "--no-retry"]);
+    let c = &cases[0];
+    assert_eq!((c["status"].as_str(), c["q_rc"].as_i64()), (Some("panic"), Some(-11)), "{c}");
+    assert!(c["q_tail"].as_str().is_some_and(|t| t.contains("--- stderr ---")));
+    r.set("FAKE_QED_SIGNAL", "");
+    let (_, cases) = r.cases(&["--axes", "frontend,qed"]);
+    assert!(cases[0].get("q_rc").is_none(), "only a crash carries one");
+}
+
+#[test]
 fn what_a_corpus_cannot_be_combined_with_is_a_setup_error() {
     let f = Fakes::new();
     let r = Run::new(&f);

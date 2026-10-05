@@ -316,7 +316,8 @@ What a long run needs:
   cannot mix binaries from two trees.
 - **The raw records.** Each case keeps every backend's own record beside the bucket: `f_raw` (the
   fuzz label, and `ok_trials` / `trial_error` when only some trials compared both sides), `s_raw`
-  (the solver's row), `l_raw` (the Lean record), and `q_tail` (the end of a crashed prover's output).
+  (the solver's row), `l_raw` (the Lean record), and for a crashed prover `q_tail` (the end of its
+  output) and `q_rc` (its exit code, or minus the signal that ended it).
 
 `--expect pinned` does not combine with `--corpus`: a pin lives in a pair file's header.
 
