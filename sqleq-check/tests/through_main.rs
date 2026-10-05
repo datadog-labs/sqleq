@@ -14,6 +14,7 @@ mod common;
 use std::path::Path;
 
 use common::*;
+use sqleq_check::axes::fuzz::Pair;
 use sqleq_check::case::Case;
 
 struct Run<'a> {
@@ -238,9 +239,9 @@ fn fuzz_labels_map_to_their_kind() {
     ];
     for (i, (body, (word, note))) in rows.iter().enumerate() {
         let fake = exe(&f.path().join(format!("fz{i}")), &format!("{body}\n"));
-        let (w, n, _) =
-            spawning(|| sqleq_check::axes::fuzz::fuzz_one(&fake.to_string_lossy(), &case.to_string_lossy(), 10.0));
-        assert_eq!((w.as_str(), n.as_str()), (*word, *note), "{body}");
+        let path = case.to_string_lossy();
+        let a = spawning(|| sqleq_check::axes::fuzz::fuzz_one(&fake.to_string_lossy(), Pair::File(&path), 10.0));
+        assert_eq!((a.word.as_str(), a.note.as_str()), (*word, *note), "{body}");
     }
 }
 
@@ -263,7 +264,7 @@ printf '{%s}' "$body" > "$out"
     );
     let at = |rel: &str| f.path().join(rel).to_string_lossy().into_owned();
     let mut cases = vec![Case::new("dir1/a.sql", &at("dir1/a.sql")), Case::new("dir2/b.sql", &at("dir2/b.sql")), Case::new("p.json", &at("p.json"))];
-    let stats = spawning(|| sqleq_check::axes::lean::run_lean(&mut cases, &fake.to_string_lossy(), 2, 10.0, None));
+    let stats = spawning(|| sqleq_check::axes::lean::run_lean(&mut cases, &fake.to_string_lossy(), 2, 10.0, None, None));
     assert_eq!(stats.rows, 2);
     let a = &cases[0];
     assert_eq!(

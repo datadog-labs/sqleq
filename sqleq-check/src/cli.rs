@@ -17,6 +17,28 @@ Exit codes:
   1  policy not satisfied (some case failed expectation)
   2  usage / setup error (a missing tool, a bad flag)";
 
+/// The catalog a case is lowered against when its own header names none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Catalog {
+    /// The DDL's tables and columns only; a bare `$N` is refused.
+    Declared,
+    /// Everything inferred from the queries.
+    Inferred,
+    /// Tables and columns from the DDL, parameter types inferred.
+    InferredSeeded,
+}
+
+impl Catalog {
+    /// The name a `-- catalog:` header gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Catalog::Declared => "declared",
+            Catalog::Inferred => "inferred",
+            Catalog::InferredSeeded => "inferred-seeded",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Expect {
     /// Nonzero exit unless every case is provable -- for validating known-equivalent rewrite pairs
@@ -44,8 +66,73 @@ pub struct Args {
     /// One or more .sql / .json files or directories (recursed). .json inputs are treated as
     /// pre-parsed plans and skip the frontend stage. A .sql and its sibling .json are
     /// de-duplicated.
-    #[arg(value_name = "PATH", required = true)]
+    #[arg(value_name = "PATH", required_unless_present = "corpus", conflicts_with = "corpus")]
     pub paths: Vec<String>,
+
+    /// A corpus CSV instead of PATHs: rows of `query A, query B, DDL`, no header line. Row N is case
+    /// `pairNNNN`, named and read exactly as the frontend's, sqleq-fuzz's and sqleq-lean's corpus
+    /// modes name and read it, and each row reaches every backend through that backend's own corpus
+    /// code -- its DDL included, which the corpus reader takes leniently, statement by statement.
+    #[arg(long, value_name = "FILE")]
+    pub corpus: Option<String>,
+
+    /// Run only the cases named in FILE, one name per line (corpus rows by `pairNNNN`, files by
+    /// their display name). Applied after naming, so names never renumber.
+    #[arg(long, value_name = "FILE")]
+    pub only: Option<String>,
+
+    /// The catalog every case is lowered against unless its own `-- catalog:` header names one
+    /// (default: declared).
+    #[arg(long, value_enum)]
+    pub catalog: Option<Catalog>,
+
+    /// Append each case to FILE as one JSON line the moment its last asked axis has answered: the
+    /// same object `--json` holds, written as the run goes, so an interrupted run keeps what it had.
+    #[arg(long, value_name = "FILE")]
+    pub jsonl: Option<String>,
+
+    /// With --jsonl: skip every case already in FILE, and append the rest.
+    #[arg(long, requires = "jsonl")]
+    pub resume: bool,
+
+    /// Cap the QED prover's address space -- its z3 and cvc5 included -- at GIB, as `ulimit -v` does.
+    #[arg(long, value_name = "GIB")]
+    pub qed_mem_gib: Option<f64>,
+
+    /// Cap each sqleq-solver driver's address space at GIB. A row it dies on is recorded as an
+    /// error and the rest go on.
+    #[arg(long, value_name = "GIB")]
+    pub sqleq_solver_mem_gib: Option<f64>,
+
+    /// The retry pass's own wall-clock budget per case, in seconds (default: --timeout): a second,
+    /// longer tier for the cases the first one ran out of time or crashed on.
+    #[arg(long, value_name = "S")]
+    pub retry_timeout: Option<f64>,
+
+    /// The retry pass's QED_SMT_TIMEOUT, in ms (default: --smt-timeout).
+    #[arg(long, value_name = "MS")]
+    pub retry_smt_timeout: Option<u64>,
+
+    /// Cases the retry pass runs at once (default: 1, serially, so a case starved under -j gets the
+    /// machine to itself).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub retry_jobs: usize,
+
+    /// sqleq-solver drivers to run side by side, each over its share of the rows (default: 1). More
+    /// is faster, but the per-row cap is load-sensitive: a row near it can decide differently with
+    /// other drivers running, so one is the reproducible choice.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub sqleq_solver_jobs: usize,
+
+    /// Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR -- every one of them,
+    /// unless a flag names it -- instead of looking them up one by one.
+    #[arg(long, value_name = "DIR")]
+    pub bin_dir: Option<String>,
+
+    /// With the Lean axis: have sqleq-lean also write FILE, what `tools/lean_replay.py` needs to
+    /// re-run its proved pairs on Postgres.
+    #[arg(long, value_name = "FILE")]
+    pub lean_replay_plan: Option<String>,
 
     /// Parallel cases (default: min(8, ncpu)). Each case itself runs z3+cvc5, so avoid heavy
     /// oversubscription.

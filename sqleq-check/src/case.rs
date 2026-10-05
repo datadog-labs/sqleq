@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::inputs::{suffix, triviality_from_ir, triviality_from_text};
+use crate::inputs::{first_row_name, suffix, triviality_from_ir, triviality_from_text, CorpusRow, Item};
 use crate::proc::run_cmd;
 use crate::util::{tail, truthy};
 
@@ -84,6 +84,25 @@ pub struct Case {
     /// The combined verdict, only under `--portfolio`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<crate::portfolio::Outcome>,
+    /// A refused corpus row whose two sides normalize to the same text, as the frontend's corpus
+    /// report calls it: settled by reflexivity without being lowered.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reflexive: bool,
+    /// Each backend's own record, unbucketed: the fuzz label with its partial-trial count, the
+    /// solver's row, the Lean record. Kept for a consumer that needs more than the bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub f_raw: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_raw: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l_raw: Option<Value>,
+    /// The end of the prover's stdout and stderr when it crashed: the signature a crash is told
+    /// apart by.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub q_tail: String,
+    /// The corpus row this case is, when it is one.
+    #[serde(skip)]
+    pub row: Option<CorpusRow>,
 }
 
 impl Case {
@@ -116,11 +135,29 @@ impl Case {
             f_note: String::new(),
             f_ms: None,
             portfolio: None,
+            reflexive: false,
+            f_raw: None,
+            s_raw: None,
+            l_raw: None,
+            q_tail: String::new(),
+            row: None,
         }
+    }
+
+    pub fn of(item: &Item) -> Case {
+        let mut c = Case::new(&item.name, &item.path.to_string_lossy());
+        c.row = item.row.clone();
+        c
     }
 
     pub fn is_sql(&self) -> bool {
         self.path.ends_with(".sql")
+    }
+
+    /// Whether there is a pair for the axes that read it themselves -- fuzz and Lean: a `.sql`
+    /// file, or a corpus row. A pre-lowered `.json` plan has none.
+    pub fn has_pair(&self) -> bool {
+        self.row.is_some() || self.is_sql()
     }
 }
 
@@ -151,15 +188,25 @@ pub fn classify_refusal(err: &str) -> (String, String) {
 /// A pair whose queries use `$N` needs an inferred catalog: under the default, declared one the
 /// frontend refuses a bare placeholder. An unknown value is an error, rather than silently lowering
 /// against a catalog the case did not ask for.
-pub fn catalog_flags(src: &Path) -> Result<Vec<String>, String> {
+///
+/// `default` is `--catalog`'s choice, for a case whose header names none: a header always wins,
+/// because it states what that one pair needs.
+pub fn catalog_flags(src: &Path, default: Option<&str>) -> Result<Vec<String>, String> {
+    let named = |c: &str| {
+        crate::suite::catalog_flags(c)
+            .map(|f| f.iter().map(|s| s.to_string()).collect())
+            .ok_or_else(|| format!("unknown `catalog: {c}`"))
+    };
     if suffix(src) != ".sql" {
-        return Ok(Vec::new());
+        return named(default.unwrap_or("declared"));
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let h = crate::suite::parse_header(&text);
-    crate::suite::catalog_flags(&h.catalog)
-        .map(|f| f.iter().map(|s| s.to_string()).collect())
-        .ok_or_else(|| format!("unknown `catalog: {}`", h.catalog))
+    if h.lines.contains_key("catalog") {
+        named(&h.catalog)
+    } else {
+        named(default.unwrap_or("declared"))
+    }
 }
 
 /// Record whether this case is `x` against `x`. Prefers the IR test and falls back to the source
@@ -241,6 +288,10 @@ pub struct Stage {
     pub smt_timeout_ms: Option<u64>,
     pub keep_dir: Option<PathBuf>,
     pub ss_dir: Option<PathBuf>,
+    /// `--catalog`: the catalog a case is lowered against when its header names none.
+    pub catalog: Option<String>,
+    /// `--qed-mem-gib`, in bytes.
+    pub qed_mem: Option<u64>,
 }
 
 fn s(v: &str) -> String {
@@ -248,8 +299,9 @@ fn s(v: &str) -> String {
 }
 
 /// The frontend, then the prover, on one case.
-pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
-    let mut case = Case::new(name, &src.to_string_lossy());
+pub fn run_case(item: &Item, st: &Stage) -> Case {
+    let mut case = Case::of(item);
+    let (src, name) = (item.path.as_path(), item.name.as_str());
     let mut t0 = Instant::now();
     let wd = match Workdir::new(st.keep_dir.as_deref(), name) {
         Ok(w) => w,
@@ -258,7 +310,7 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
             return case;
         }
     };
-    let Some(json_name) = lower(&mut case, src, &wd.path, &st.frontend, st.timeout) else {
+    let Some(json_name) = lower(&mut case, src, &wd.path, &st.frontend, st.catalog.as_deref(), st.timeout) else {
         case.wall = t0.elapsed().as_secs_f64();
         return case;
     };
@@ -278,7 +330,7 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
         return case;
     };
     let remaining = (st.timeout - case.lower_wall).max(1.0);
-    prove(&mut case, &wd.path, &json_name, prover, remaining, st.smt_timeout_ms);
+    prove(&mut case, &wd.path, &json_name, prover, remaining, st.smt_timeout_ms, st.qed_mem);
     case.wall = t0.elapsed().as_secs_f64();
     case
 }
@@ -286,7 +338,17 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
 /// The first stage: lower SQL -> JSON in `workdir`, or take a pre-parsed plan as it is. Returns the
 /// plan's file name when there is one to prove, and `None` when the case is already decided
 /// (refused, timed out, or an error), with its status set.
-pub fn lower(case: &mut Case, src: &Path, workdir: &Path, frontend: &str, timeout: f64) -> Option<String> {
+pub fn lower(
+    case: &mut Case,
+    src: &Path,
+    workdir: &Path,
+    frontend: &str,
+    catalog: Option<&str>,
+    timeout: f64,
+) -> Option<String> {
+    if let Some(row) = case.row.clone() {
+        return lower_row(case, &row, workdir, frontend, catalog, timeout);
+    }
     let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let json_name = format!("{stem}.json");
     let json_path = workdir.join(&json_name);
@@ -303,7 +365,7 @@ pub fn lower(case: &mut Case, src: &Path, workdir: &Path, frontend: &str, timeou
             case.message = format!("cannot copy {}: {e}", src.display());
             return None;
         }
-        let flags = match catalog_flags(src) {
+        let flags = match catalog_flags(src, catalog) {
             Ok(f) => f,
             Err(e) => {
                 case.message = e;
@@ -336,6 +398,93 @@ pub fn lower(case: &mut Case, src: &Path, workdir: &Path, frontend: &str, timeou
     Some(json_name)
 }
 
+/// Lower a corpus row through the frontend's own corpus mode, handed the row as a one-row CSV, so it
+/// is read, lowered and reported exactly as that row of the whole file would be -- its DDL through
+/// the corpus mode's lenient reader, not the stricter one a `.sql` file's goes through. The report
+/// says `emit`, `refuse` or `reflexive` (refused, but settled by reflexivity), with the refusal's
+/// kind and reason.
+fn lower_row(
+    case: &mut Case,
+    row: &CorpusRow,
+    workdir: &Path,
+    frontend: &str,
+    catalog: Option<&str>,
+    timeout: f64,
+) -> Option<String> {
+    let flags = match crate::suite::catalog_flags(catalog.unwrap_or("declared")) {
+        Some(f) => f.iter().map(|s| s.to_string()),
+        None => {
+            case.message = format!("unknown catalog `{}`", catalog.unwrap_or_default());
+            return None;
+        }
+    };
+    let csv = match row.write_csv(workdir) {
+        Ok(p) => p,
+        Err(e) => {
+            case.message = format!("cannot write the row: {e}");
+            return None;
+        }
+    };
+    let mut argv = vec![frontend.to_string()];
+    argv.extend(flags);
+    argv.extend([
+        "--csv".to_string(),
+        csv.to_string_lossy().into_owned(),
+        "-o".into(),
+        "lowered".into(),
+        "--report".into(),
+        "report.json".into(),
+    ]);
+    let fr = run_cmd(&argv, workdir, timeout, &[]);
+    case.lower_wall = fr.wall;
+    let text_trivial = |case: &mut Case| {
+        let (a, b) = (&row.0.a, &row.0.b);
+        if let Some(v) = triviality_from_text(&format!("{a};\n{b};")) {
+            (case.trivial, case.trivial_basis) = (Some(v), "text".into());
+        }
+    };
+    if fr.timed_out {
+        case.status = s(TIMEOUT);
+        case.message = s("frontend timed out");
+        text_trivial(case);
+        return None;
+    }
+    let report: Option<Value> =
+        std::fs::read_to_string(workdir.join("report.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let Some(detail) = report.as_ref().and_then(|r| r.pointer("/detail/0")) else {
+        // No report is a frontend that died, not a refusal: there is no reason to give.
+        case.message = {
+            let why = tail(&fr.err);
+            if why.is_empty() { format!("frontend exit {} with no report", fr.rc) } else { why }
+        };
+        text_trivial(case);
+        return None;
+    };
+    let field = |k: &str| detail.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match field("status").as_str() {
+        "emit" => {
+            let json_name = format!("{}.json", case.name);
+            let json_path = workdir.join(&json_name);
+            let lowered = workdir.join("lowered").join(format!("{}.json", first_row_name()));
+            if let Err(e) = std::fs::rename(lowered, &json_path) {
+                case.message = format!("the frontend reported a plan it did not write: {e}");
+                return None;
+            }
+            case.lowered = true;
+            set_triviality(case, Some(&json_path), Path::new(""));
+            Some(json_name)
+        }
+        status => {
+            case.status = s(REFUSED);
+            case.refuse_kind = field("kind");
+            case.message = field("reason");
+            case.reflexive = status == "reflexive";
+            text_trivial(case);
+            None
+        }
+    }
+}
+
 /// Package the lowered plan as the second opinion's job at `job`: `{name, ir, schema}` built from
 /// *this* JSON -- the same bytes the prover reads -- so nothing re-lowers the case and the two axes
 /// cannot drift apart. A plan the bridge cannot express is `unsupported` on the case. Returns the
@@ -361,11 +510,20 @@ pub fn package(case: &mut Case, frontend: &str, workdir: &Path, json_name: &str,
 }
 
 /// The second stage: prove equivalence of the plan `json_name` in `workdir`, within `timeout`
-/// seconds.
-pub fn prove(case: &mut Case, workdir: &Path, json_name: &str, prover: &str, timeout: f64, smt_timeout_ms: Option<u64>) {
+/// seconds, and within `mem_bytes` of address space when that is set.
+pub fn prove(
+    case: &mut Case,
+    workdir: &Path,
+    json_name: &str,
+    prover: &str,
+    timeout: f64,
+    smt_timeout_ms: Option<u64>,
+    mem_bytes: Option<u64>,
+) {
     let env: Vec<(String, String)> =
         smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
-    let qr = run_cmd(&[prover.to_string(), json_name.to_string()], workdir, timeout, &env);
+    let argv = [prover.to_string(), json_name.to_string()];
+    let qr = crate::proc::run_limited(&argv, Some(workdir), &env, Some(timeout), mem_bytes);
     case.prove_wall = qr.wall;
     if qr.timed_out {
         case.status = s(TIMEOUT);
@@ -374,6 +532,16 @@ pub fn prove(case: &mut Case, workdir: &Path, json_name: &str, prover: &str, tim
     }
     let stem = json_name.strip_suffix(".json").unwrap_or(json_name);
     read_result(case, &workdir.join(format!("{stem}.result")), &qr);
+}
+
+/// The last 600 characters of the prover's stdout and of its stderr: what tells one crash from
+/// another (docs/INTERNALS.md has the taxonomy).
+fn crash_tail(qr: &crate::proc::Run) -> String {
+    let last = |t: &str| {
+        let n = t.chars().count();
+        t.chars().skip(n.saturating_sub(600)).collect::<String>()
+    };
+    format!("{}\n--- stderr ---\n{}", last(qr.out.trim_end()), last(qr.err.trim_end()))
 }
 
 /// The prover's verdict: its `.result` file when it wrote one, else what it printed.
@@ -391,6 +559,7 @@ pub fn read_result(case: &mut Case, result_path: &Path, qr: &crate::proc::Run) {
         if flag("panicked") {
             case.status = s(PANIC);
             case.message = s("prover panicked");
+            case.q_tail = crash_tail(qr);
         } else if flag("provable") {
             case.status = s(PROVABLE);
         } else {
@@ -403,6 +572,7 @@ pub fn read_result(case: &mut Case, result_path: &Path, qr: &crate::proc::Run) {
         case.status = s(UNPROVABLE);
     } else if qr.rc != 0 {
         case.status = s(PANIC);
+        case.q_tail = crash_tail(qr);
         let text = if qr.err.is_empty() { &qr.out } else { &qr.err };
         let msg: String = text.trim().chars().take(400).collect();
         case.message = if msg.is_empty() { format!("prover exit {}", qr.rc) } else { msg };

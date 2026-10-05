@@ -5,17 +5,18 @@
 
 //! Setup, the passes, and the exit-code policy.
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 use crate::axes::{fuzz, lean, solver};
 use crate::case::{run_case, status_rank, Case, Stage, ERROR, LOWERED, PANIC, PROVABLE, TIMEOUT};
 use crate::cli::{resolve_axes, Args, Expect};
 use crate::discover::{self, SsDriver};
-use crate::inputs::{collect_inputs, common_root, display_name, suffix};
+use crate::inputs::{collect_inputs, common_root, corpus_items, display_name, read_names, suffix, Item};
 use crate::pinned;
 use crate::portfolio;
 use crate::report::{self, Color, Finding, FuzzMeta, LeanMeta, Meta, PinnedMeta, PortfolioMeta, SsMeta};
@@ -29,7 +30,7 @@ pub struct Env {
     pub ss: Option<SsDriver>,
     pub fuzz: Option<String>,
     pub lean: Option<String>,
-    pub files: Vec<PathBuf>,
+    pub items: Vec<Item>,
 }
 
 /// Every check that can fail before a case runs. An error here is exit code 2: a missing tool is
@@ -57,36 +58,66 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     if args.bless && !pinned {
         return Err("error: --bless needs --expect pinned".into());
     }
+    if pinned && args.corpus.is_some() {
+        return Err("error: --expect pinned reads each case's header, and a corpus row has none; pin pair files".into());
+    }
     if args.expect == Expect::Equivalent && !args.portfolio && !axes.contains(&"qed") {
         return Err("error: --expect equivalent is a policy on the qed axis, which --axes leaves out; use \
                     --expect pinned or report-only"
             .into());
     }
     let has = |a: &str| axes.contains(&a);
-    let frontend = if has("frontend") { Some(discover::discover_frontend(args.frontend.as_deref())?) } else { None };
+    let bin_dir = args.bin_dir.as_deref();
+    let frontend =
+        if has("frontend") { Some(discover::discover_frontend(args.frontend.as_deref(), bin_dir)?) } else { None };
     let prover = if has("qed") { Some(discover::discover_prover(args.prover.as_deref())?) } else { None };
     // Resolved before a single case runs -- including the driver rebuild -- so a fork that is
     // missing or will not compile costs a second, not a full pass.
     let ss = if has("sqleq-solver") {
-        Some(discover::discover_sqleq_solver(args.sqleq_solver_bin.as_deref())?)
+        Some(discover::discover_sqleq_solver(args.sqleq_solver_bin.as_deref(), bin_dir)?)
     } else if has("sqlsolver-jvm") {
         Some(discover::discover_sqlsolver_jvm(args.sqlsolver_tree.as_deref())?)
     } else {
         None
     };
-    let fuzz = if has("fuzz") { Some(discover::discover_fuzz(args.fuzz_bin.as_deref())?) } else { None };
-    let lean = if has("lean") { Some(discover::discover_lean(args.lean_bin.as_deref())?) } else { None };
+    let fuzz = if has("fuzz") { Some(discover::discover_fuzz(args.fuzz_bin.as_deref(), bin_dir)?) } else { None };
+    let lean = if has("lean") { Some(discover::discover_lean(args.lean_bin.as_deref(), bin_dir)?) } else { None };
 
-    let (files, warnings) = collect_inputs(&args.paths);
-    for w in warnings {
-        eprintln!("{w}");
-    }
-    if files.is_empty() {
-        return Err("error: no .sql or .json inputs found.".into());
-    }
+    let only = match &args.only {
+        Some(p) => Some(read_names(Path::new(p)).map_err(|e| format!("error: --only {e}"))?),
+        None => None,
+    };
+    let items: Vec<Item> = match &args.corpus {
+        Some(c) => {
+            let items = corpus_items(Path::new(c), only.as_ref()).map_err(|e| format!("error: {e}"))?;
+            if items.is_empty() {
+                return Err(format!("error: no rows of {c} to run"));
+            }
+            items
+        }
+        None => {
+            let (files, warnings) = collect_inputs(&args.paths);
+            for w in warnings {
+                eprintln!("{w}");
+            }
+            if files.is_empty() {
+                return Err("error: no .sql or .json inputs found.".into());
+            }
+            let root = common_root(&files);
+            files
+                .iter()
+                .map(|f| Item { path: f.clone(), name: display_name(f, &root), row: None })
+                .filter(|i| only.as_ref().is_none_or(|o| o.contains(&i.name)))
+                .collect()
+        }
+    };
     if pinned {
-        let plans: Vec<String> =
-            files.iter().filter(|f| suffix(f) == ".json").take(3).map(|f| f.to_string_lossy().into_owned()).collect();
+        let plans: Vec<String> = items
+            .iter()
+            .filter(|i| suffix(&i.path) == ".json")
+            .take(3)
+            .map(|i| i.path.to_string_lossy().into_owned())
+            .collect();
         if !plans.is_empty() {
             return Err(format!(
                 "error: --expect pinned reads each case's header, and a .json plan has none: {}",
@@ -109,7 +140,51 @@ pub fn setup(args: &Args) -> Result<Env, String> {
             eprintln!("warning: {why}; its answers may not be this tree's");
         }
     }
-    Ok(Env { axes, frontend, prover, ss, fuzz, lean, files })
+    Ok(Env { axes, frontend, prover, ss, fuzz, lean, items })
+}
+
+/// GiB as bytes, for an address-space cap.
+fn gib(g: Option<f64>) -> Option<u64> {
+    g.filter(|g| *g > 0.0).map(|g| (g * 1024.0 * 1024.0 * 1024.0) as u64)
+}
+
+/// The names already in a `--jsonl` file, for `--resume`. A torn last line -- the run that wrote it
+/// was killed mid-write -- is not a case, and is run again.
+fn names_in_jsonl(path: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return HashSet::new() };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// `--jsonl`: each case as one line, written when its last asked axis has answered.
+struct Stream(Option<Mutex<std::fs::File>>);
+
+impl Stream {
+    fn emit(&self, case: &Case) {
+        let Some(f) = &self.0 else { return };
+        if let Ok(line) = serde_json::to_string(case) {
+            let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    }
+}
+
+/// A case back as the item it was run from, for the retry pass.
+fn item_of(case: &Case) -> Item {
+    Item { path: PathBuf::from(&case.path), name: case.name.clone(), row: case.row.clone() }
+}
+
+/// How the retry pass runs, for its progress line.
+fn retry_how(args: &Args) -> String {
+    let budget = args.retry_timeout.map(|t| format!(", {}s each", report::fmt_secs(t))).unwrap_or_default();
+    if args.retry_jobs > 1 {
+        format!("{} at a time{budget}", args.retry_jobs)
+    } else {
+        format!("serially{budget}")
+    }
 }
 
 /// The backends a run asks: every axis but the frontend, which only feeds two of them.
@@ -128,22 +203,17 @@ fn progress(text: &str) {
 }
 
 /// Run every case through `run` on `jobs` workers, calling `done` on each as it finishes.
-fn run_all(
-    files: &[(PathBuf, String)],
-    run: &(dyn Fn(&Path, &str) -> Case + Sync),
-    jobs: usize,
-    mut done: impl FnMut(Case),
-) {
+fn run_all(items: &[Item], run: &(dyn Fn(&Item) -> Case + Sync), jobs: usize, mut done: impl FnMut(Case)) {
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|s| {
-        for _ in 0..jobs.max(1).min(files.len().max(1)) {
+        for _ in 0..jobs.max(1).min(items.len().max(1)) {
             let tx = tx.clone();
             let next = &next;
             s.spawn(move || loop {
                 let k = next.fetch_add(1, Ordering::Relaxed);
-                let Some((f, name)) = files.get(k) else { break };
-                if tx.send(run(f, name)).is_err() {
+                let Some(item) = items.get(k) else { break };
+                if tx.send(run(item)).is_err() {
                     break;
                 }
             });
@@ -166,8 +236,38 @@ pub fn main(args: Args) -> i32 {
     };
     let axes = env.axes.clone();
     let pinned_mode = args.expect == Expect::Pinned;
-    let root = common_root(&env.files);
-    let files: Vec<(PathBuf, String)> = env.files.iter().map(|f| (f.clone(), display_name(f, &root))).collect();
+    let mut files: Vec<Item> = env.items;
+
+    // `--jsonl`, and with `--resume` only what it does not hold yet.
+    let stream = match &args.jsonl {
+        None => Stream(None),
+        Some(p) => {
+            if args.resume {
+                let done = names_in_jsonl(Path::new(p));
+                let before = files.len();
+                files.retain(|i| !done.contains(&i.name));
+                if !args.quiet {
+                    println!("{}", c.dim(&format!("resuming {p}: {} of {before} case(s) left", files.len())));
+                }
+            }
+            let f = std::fs::OpenOptions::new().create(true).append(args.resume).write(true).truncate(!args.resume).open(p);
+            // A killed run can leave a torn last line with no newline; the first case appended must
+            // not be glued onto it, or it is lost along with the torn one.
+            let torn = args.resume && std::fs::read(p).is_ok_and(|b| b.last().is_some_and(|c| *c != b'\n'));
+            match f {
+                Ok(mut f) => {
+                    if torn {
+                        let _ = writeln!(f);
+                    }
+                    Stream(Some(Mutex::new(f)))
+                }
+                Err(e) => {
+                    eprintln!("error: {p}: {e}");
+                    return 2;
+                }
+            }
+        }
+    };
     let ss_timeout_ms = args.sqleq_solver_timeout.filter(|t| *t > 0).unwrap_or((args.timeout * 1000.0) as u64);
 
     let keep_dir = args.keep.as_ref().map(PathBuf::from);
@@ -251,7 +351,7 @@ pub fn main(args: Args) -> i32 {
         println!();
     }
 
-    let name_w = files.iter().map(|(_, n)| n.chars().count()).max().unwrap_or(10).min(60);
+    let name_w = files.iter().map(|i| i.name.chars().count()).max().unwrap_or(10).min(60);
     let live = isatty_stdout();
     let mut cases: Vec<Case> = Vec::new();
     let t0 = Instant::now();
@@ -262,6 +362,26 @@ pub fn main(args: Args) -> i32 {
         smt_timeout_ms: args.smt_timeout,
         keep_dir: keep_dir.clone(),
         ss_dir: ss_dir.clone(),
+        catalog: args.catalog.map(|c| c.name().to_string()),
+        qed_mem: gib(args.qed_mem_gib),
+    };
+    // The retry pass's own tier: a longer budget, when one was given, for what the first ran out of.
+    let retry_stage = Stage {
+        timeout: args.retry_timeout.unwrap_or(args.timeout),
+        smt_timeout_ms: args.retry_smt_timeout.or(args.smt_timeout),
+        ..stage.clone()
+    };
+    // The pass after which a case says nothing more, and is written to `--jsonl`.
+    let last_pass = if args.portfolio {
+        "main"
+    } else if env.lean.is_some() {
+        "lean"
+    } else if env.fuzz.is_some() {
+        "fuzz"
+    } else if env.ss.is_some() {
+        "solver"
+    } else {
+        "main"
     };
     let pctx = portfolio::Ctx {
         axes: &axes,
@@ -274,18 +394,35 @@ pub fn main(args: Args) -> i32 {
         timeout: args.timeout,
         smt_timeout_ms: args.smt_timeout,
         keep_dir: keep_dir.as_deref(),
+        catalog: args.catalog.map(|c| c.name()),
+        qed_mem: gib(args.qed_mem_gib),
+        ss_mem: gib(args.sqleq_solver_mem_gib),
     };
-    let run_one = |f: &Path, name: &str| {
+    let retry_pctx = portfolio::Ctx {
+        timeout: args.retry_timeout.unwrap_or(args.timeout),
+        smt_timeout_ms: args.retry_smt_timeout.or(args.smt_timeout),
+        ..pctx
+    };
+    let run_one = |item: &Item| {
         if args.portfolio {
-            portfolio::run_case(f, name, &pctx)
+            portfolio::run_case(item, &pctx)
         } else {
-            run_case(f, name, &stage)
+            run_case(item, &stage)
         }
     };
+    // Whether the retry pass will take a case: until it has, the case is not final.
+    let will_retry = |case: &Case| {
+        !args.no_retry
+            && if args.portfolio {
+                portfolio::worth_retrying(case)
+            } else {
+                [PANIC, TIMEOUT, ERROR].contains(&case.status.as_str()) && env.frontend.is_some()
+            }
+    };
     if env.frontend.is_none() && !args.portfolio {
-        // Only axes that read the pair file themselves: nothing to lower.
-        for (f, name) in &files {
-            let mut x = Case::new(name, &f.to_string_lossy());
+        // Only axes that read the pair themselves: nothing to lower.
+        for item in &files {
+            let mut x = Case::of(item);
             x.status = LOWERED.into();
             cases.push(x);
         }
@@ -300,6 +437,9 @@ pub fn main(args: Args) -> i32 {
                 report::print_line(c, &case, name_w);
             } else if !args.quiet && live {
                 progress(&c.dim(&format!("  [{}/{total}] ", cases.len() + 1)));
+            }
+            if last_pass == "main" && !will_retry(&case) {
+                stream.emit(&case);
             }
             cases.push(case);
         });
@@ -319,11 +459,15 @@ pub fn main(args: Args) -> i32 {
                 progress(&" ".repeat(30));
             }
             if !args.quiet {
-                println!("{}", c.dim(&format!("  re-running {} undecided case(s) serially…", retry.len())));
+                println!("{}", c.dim(&format!("  re-running {} undecided case(s), {}…", retry.len(), retry_how(&args))));
             }
-            for i in retry {
-                retried += 1;
-                let mut new = portfolio::run_case(Path::new(&cases[i].path), &cases[i].name.clone(), &pctx);
+            retried = retry.len();
+            let items: Vec<Item> = retry.iter().map(|&i| item_of(&cases[i])).collect();
+            let at: std::collections::HashMap<String, usize> = retry.iter().map(|&i| (cases[i].name.clone(), i)).collect();
+            let mut fresh = Vec::new();
+            run_all(&items, &|item: &Item| portfolio::run_case(item, &retry_pctx), args.retry_jobs, |new| fresh.push(new));
+            for mut new in fresh {
+                let i = at[&new.name];
                 if let Some(o) = new.portfolio.as_mut() {
                     o.retried = true;
                 }
@@ -333,6 +477,7 @@ pub fn main(args: Args) -> i32 {
                     }
                     cases[i] = new;
                 }
+                stream.emit(&cases[i]);
             }
         }
     } else if !args.no_retry && env.frontend.is_some() {
@@ -342,17 +487,24 @@ pub fn main(args: Args) -> i32 {
                 progress(&" ".repeat(30));
             }
             if !args.quiet {
-                println!("{}", c.dim(&format!("  re-running {} transient failure(s) serially…", retry.len())));
+                println!("{}", c.dim(&format!("  re-running {} transient failure(s) {}…", retry.len(), retry_how(&args))));
             }
-            for i in retry {
+            let items: Vec<Item> = retry.iter().map(|&i| item_of(&cases[i])).collect();
+            let at: std::collections::HashMap<String, usize> = retry.iter().map(|&i| (cases[i].name.clone(), i)).collect();
+            let mut fresh = Vec::new();
+            run_all(&items, &|item: &Item| run_case(item, &retry_stage), args.retry_jobs, |new| fresh.push(new));
+            for new in fresh {
+                let i = at[&new.name];
                 let old = &cases[i];
-                let new = run_case(Path::new(&old.path), &old.name.clone(), &stage);
                 let better = !transient(&new.status) || status_rank(&new.status) < status_rank(&old.status);
                 if better {
                     if !args.quiet && !pinned_mode {
                         report::print_case_line(c, &new, name_w);
                     }
                     cases[i] = new;
+                }
+                if last_pass == "main" {
+                    stream.emit(&cases[i]);
                 }
             }
         }
@@ -373,23 +525,29 @@ pub fn main(args: Args) -> i32 {
                 progress(&" ".repeat(30));
             }
             let n = cases.iter().filter(|x| x.s_bucket.is_none()).count();
+            let how = if args.sqleq_solver_jobs > 1 {
+                format!("{} drivers side by side", args.sqleq_solver_jobs)
+            } else {
+                "sequentially".to_string()
+            };
             println!(
                 "{}",
-                c.dim(&format!(
-                    "  asking {} about {n} case(s), sequentially, {ss_timeout_ms}ms/row…",
-                    solver::name(&driver.imp)
-                ))
+                c.dim(&format!("  asking {} about {n} case(s), {how}, {ss_timeout_ms}ms/row…", solver::name(&driver.imp)))
             );
         }
         let t1 = Instant::now();
-        ss_stats = solver::run_second_opinion(&mut cases, dir, driver, ss_timeout_ms);
+        let mem = gib(args.sqleq_solver_mem_gib);
+        ss_stats = solver::run_second_opinion(&mut cases, dir, driver, ss_timeout_ms, args.sqleq_solver_jobs, mem);
         ss_stats.wall_s = Some(round(t1.elapsed().as_secs_f64(), 3));
+        if last_pass == "solver" {
+            cases.iter().for_each(|x| stream.emit(x));
+        }
     }
 
     // The fuzz axis reads the pair files itself, so it is independent of the passes above --
     // though not of the pair, which is the point.
     let mut fuzz_stats = None;
-    let sql_cases = cases.iter().filter(|x| x.is_sql()).count();
+    let sql_cases = cases.iter().filter(|x| x.has_pair()).count();
     if args.portfolio {
         fuzz_stats = env.fuzz.as_ref().map(|_| fuzz::Stats { rows: sql_cases, wall_s: None });
     } else if let Some(fz) = &env.fuzz {
@@ -397,10 +555,14 @@ pub fn main(args: Args) -> i32 {
             if live {
                 progress(&" ".repeat(30));
             }
-            let n = cases.iter().filter(|x| x.is_sql()).count();
-            println!("{}", c.dim(&format!("  asking sqleq-fuzz about {n} .sql case(s)…")));
+            println!("{}", c.dim(&format!("  asking sqleq-fuzz about {sql_cases} case(s)…")));
         }
-        fuzz_stats = Some(fuzz::run_fuzz(&mut cases, fz, args.jobs, args.timeout));
+        let done = |x: &Case| {
+            if last_pass == "fuzz" {
+                stream.emit(x);
+            }
+        };
+        fuzz_stats = Some(fuzz::run_fuzz(&mut cases, fz, args.jobs, args.timeout, &done));
     }
 
     // The Lean axis, likewise apart from both: it reads the pair files itself.
@@ -412,10 +574,11 @@ pub fn main(args: Args) -> i32 {
             if live {
                 progress(&" ".repeat(30));
             }
-            let n = cases.iter().filter(|x| x.is_sql()).count();
-            println!("{}", c.dim(&format!("  asking sqleq-lean about {n} .sql case(s)…")));
+            println!("{}", c.dim(&format!("  asking sqleq-lean about {sql_cases} case(s)…")));
         }
-        lean_stats = Some(lean::run_lean(&mut cases, lb, args.jobs, args.timeout, keep_dir.as_deref()));
+        let plan = args.lean_replay_plan.as_deref().map(Path::new);
+        lean_stats = Some(lean::run_lean(&mut cases, lb, args.jobs, args.timeout, keep_dir.as_deref(), plan));
+        cases.iter().for_each(|x| stream.emit(x));
     }
 
     if pinned_mode {

@@ -81,6 +81,7 @@ pub fn answered(path: &Path) -> HashMap<String, Value> {
 
 /// One answered row, bucketed onto its case.
 pub fn attach(case: &mut Case, rec: &Value) {
+    case.s_raw = Some(rec.clone());
     case.s_verdict = rec.get("verdict").and_then(Value::as_str).map(str::to_string);
     case.s_ms = rec.get("ms").cloned();
     let mut bucket = bucket_of(case.s_verdict.as_deref().unwrap_or(""));
@@ -130,7 +131,19 @@ pub struct Stats {
 ///
 /// Mutates the cases in place, because the answer belongs beside the case rather than in a
 /// parallel table that a later sort could desynchronise.
-pub fn run_second_opinion(cases: &mut [Case], ss_dir: &Path, driver: &SsDriver, timeout_ms: u64) -> Stats {
+///
+/// `slots` drivers run side by side, each over its own share of the jobs and its own results file.
+/// One is the default and the reproducible choice: the per-row cap is load-sensitive, so a row near
+/// it can decide differently with other drivers running. `mem_bytes` caps each driver's address
+/// space.
+pub fn run_second_opinion(
+    cases: &mut [Case],
+    ss_dir: &Path,
+    driver: &SsDriver,
+    timeout_ms: u64,
+    slots: usize,
+    mem_bytes: Option<u64>,
+) -> Stats {
     let mut jobs: Vec<(String, String)> = Vec::new(); // (name, the job's line)
     for case in cases.iter_mut() {
         let job = ss_dir.join(format!("{}.job.jsonl", ss_slug(&case.name)));
@@ -166,42 +179,36 @@ pub fn run_second_opinion(cases: &mut [Case], ss_dir: &Path, driver: &SsDriver, 
         return Stats::default();
     }
 
-    let todo_path = ss_dir.join("todo.jsonl");
-    let out_path = ss_dir.join("results.jsonl");
-    let (mut passes, mut halts, mut stall) = (0, 0, None);
-    loop {
-        let have = answered(&out_path);
-        let todo: Vec<&(String, String)> = jobs.iter().filter(|(n, _)| !have.contains_key(n)).collect();
-        if todo.is_empty() {
-            break;
+    let slots = slots.max(1).min(jobs.len());
+    // One slot keeps the file names a `--keep` user has always found here.
+    let file = |stem: &str, k: usize| {
+        if slots == 1 {
+            ss_dir.join(format!("{stem}.jsonl"))
+        } else {
+            ss_dir.join(format!("{stem}.{k}.jsonl"))
         }
-        let body: String = todo.iter().map(|(_, l)| format!("{l}\n")).collect();
-        if let Err(e) = std::fs::write(&todo_path, body) {
-            stall = Some(Stalled { exit: -1, reason: format!("{}: {e}", todo_path.display()) });
-            break;
-        }
-        passes += 1;
-        let mut argv = driver.cmd.clone();
-        argv.push(todo_path.to_string_lossy().into_owned());
-        argv.push(out_path.to_string_lossy().into_owned());
-        argv.push(format!("--timeout-ms={timeout_ms}"));
-        let r = crate::proc::run(&argv, Some(&driver.cwd), &driver.env, None);
-        // Exit 3 is the driver taking its own process down because a row would not stop (the JVM's
-        // interrupt missed; sqleq-solver's grace period ran out). It writes the row first, so
-        // resuming always advances.
-        if r.rc == 3 {
-            halts += 1;
-            continue;
-        }
-        if answered(&out_path).len() <= have.len() {
-            // No row was answered and the process is gone: a classpath or native library problem,
-            // not a hard case. Report it rather than spinning.
-            stall = Some(Stalled { exit: r.rc, reason: tail(&r.err) });
-            break;
-        }
-    }
+    };
+    let shares: Vec<Vec<&(String, String)>> =
+        (0..slots).map(|k| jobs.iter().skip(k).step_by(slots).collect()).collect();
+    let runs: Vec<Slot> = std::thread::scope(|s| {
+        let handles: Vec<_> = shares
+            .iter()
+            .enumerate()
+            .map(|(k, share)| {
+                let (todo, out) = (file("todo", k), file("results", k));
+                s.spawn(move || run_slot(share, &todo, &out, driver, timeout_ms, mem_bytes))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+    let passes = runs.iter().map(|r| r.passes).sum();
+    let halts = runs.iter().map(|r| r.halts).sum();
+    let stall = runs.into_iter().find_map(|r| r.stall);
 
-    let got = answered(&out_path);
+    let mut got = HashMap::new();
+    for k in 0..slots {
+        got.extend(answered(&file("results", k)));
+    }
     for case in cases.iter_mut() {
         match got.get(&case.name) {
             Some(rec) => attach(case, rec),
@@ -215,6 +222,74 @@ pub fn run_second_opinion(cases: &mut [Case], ss_dir: &Path, driver: &SsDriver, 
         }
     }
     Stats { rows: jobs.len(), passes, halts, answered: Some(got.len()), stalled: stall, wall_s: None }
+}
+
+#[derive(Default)]
+struct Slot {
+    passes: usize,
+    halts: usize,
+    stall: Option<Stalled>,
+}
+
+/// One driver's share of the jobs, run to the end: resumed after every self-halt, and past a row
+/// the driver died on.
+fn run_slot(
+    jobs: &[&(String, String)],
+    todo_path: &Path,
+    out_path: &Path,
+    driver: &SsDriver,
+    timeout_ms: u64,
+    mem_bytes: Option<u64>,
+) -> Slot {
+    let mut slot = Slot::default();
+    loop {
+        let have = answered(out_path);
+        let todo: Vec<&&(String, String)> = jobs.iter().filter(|(n, _)| !have.contains_key(n)).collect();
+        let Some(first) = todo.first() else { break };
+        let body: String = todo.iter().map(|(_, l)| format!("{l}\n")).collect();
+        if let Err(e) = std::fs::write(todo_path, body) {
+            slot.stall = Some(Stalled { exit: -1, reason: format!("{}: {e}", todo_path.display()) });
+            break;
+        }
+        slot.passes += 1;
+        let mut argv = driver.cmd.clone();
+        argv.push(todo_path.to_string_lossy().into_owned());
+        argv.push(out_path.to_string_lossy().into_owned());
+        argv.push(format!("--timeout-ms={timeout_ms}"));
+        let r = crate::proc::run_limited(&argv, Some(&driver.cwd), &driver.env, None, mem_bytes);
+        // Exit 3 is the driver taking its own process down because a row would not stop (the JVM's
+        // interrupt missed; sqleq-solver's grace period ran out). It writes the row first, so
+        // resuming always advances.
+        if r.rc == 3 {
+            slot.halts += 1;
+            continue;
+        }
+        if answered(out_path).len() > have.len() {
+            continue;
+        }
+        if r.rc < 0 {
+            // Killed by a signal before answering the row it was on: out of memory under a cap, or
+            // a crash. That is this row's answer, not a reason to give up on the rest -- record it
+            // and resume past it. The row is the first unanswered one, which is the one it was on.
+            let died = serde_json::json!({
+                "name": first.0, "verdict": "ERROR", "killed": false, "died": true,
+                "error": format!("sqleq-solver died on this row (signal {})", -r.rc),
+            });
+            let append = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(out_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{died}\n").as_bytes()));
+            if append.is_ok() {
+                continue;
+            }
+        }
+        // No row was answered and the process exited on its own: a classpath or native library
+        // problem, not a hard case. Report it rather than spinning.
+        slot.stall = Some(Stalled { exit: r.rc, reason: tail(&r.err) });
+        break;
+    }
+    slot
 }
 
 /// How the output names the second prover, from its driver's `imp`.

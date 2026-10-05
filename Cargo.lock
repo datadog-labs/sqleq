@@ -1225,6 +1225,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sqleq-frontend",
 ]
 
 [[package]]

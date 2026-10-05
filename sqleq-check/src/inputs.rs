@@ -13,8 +13,72 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
+use sqleq_frontend::corpus::Row;
+
+/// A corpus row, shared rather than copied: every axis that reads the pair itself needs it.
+#[derive(Clone)]
+pub struct CorpusRow(pub Arc<Row>);
+
+impl std::fmt::Debug for CorpusRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CorpusRow({})", self.0.name())
+    }
+}
+
+impl CorpusRow {
+    /// The row as a one-row corpus CSV: `a,b,ddl`, quoted as the corpus readers expect. Handed to
+    /// a backend's own corpus mode, it is lowered, fuzzed or checked exactly as a row of the whole
+    /// file would be, by the same code.
+    pub fn csv(&self) -> String {
+        let mut w = csv::WriterBuilder::new().has_headers(false).from_writer(Vec::new());
+        let r = &self.0;
+        let _ = w.write_record([r.a.as_str(), r.b.as_str(), r.ddl.as_deref().unwrap_or("")]);
+        String::from_utf8(w.into_inner().unwrap_or_default()).unwrap_or_default()
+    }
+
+    /// Write [`CorpusRow::csv`] to `dir/row.csv` and return its path.
+    pub fn write_csv(&self, dir: &Path) -> std::io::Result<PathBuf> {
+        let p = dir.join("row.csv");
+        std::fs::write(&p, self.csv())?;
+        Ok(p)
+    }
+}
+
+/// The name a backend's corpus mode gives row 0 -- the only row of a one-row corpus -- from the
+/// frontend's own naming, so this file never spells it.
+pub fn first_row_name() -> String {
+    Row { index: 0, a: String::new(), b: String::new(), ddl: None }.name()
+}
+
+/// One case to run: a pair file, or a row of a corpus.
+#[derive(Clone, Debug)]
+pub struct Item {
+    /// The pair file, or the corpus a row came from.
+    pub path: PathBuf,
+    pub name: String,
+    pub row: Option<CorpusRow>,
+}
+
+/// The rows of a corpus CSV as cases, named `pair{index:04}` by the frontend's own reader -- so a
+/// name here is the name every other tool gives the same row. `only`, when given, keeps the named
+/// rows; it filters after naming, so names never renumber.
+pub fn corpus_items(corpus: &Path, only: Option<&HashSet<String>>) -> Result<Vec<Item>, String> {
+    let rows = sqleq_frontend::corpus::read(corpus)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Item { path: corpus.to_path_buf(), name: r.name(), row: Some(CorpusRow(Arc::new(r))) })
+        .filter(|i| only.is_none_or(|o| o.contains(&i.name)))
+        .collect())
+}
+
+/// A names file: one name per line, blank lines ignored.
+pub fn read_names(path: &Path) -> Result<HashSet<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+}
 
 /// Split on top-level `;`, dropping declarations. Quote- and comment-aware, because a `;` inside a
 /// string literal or a `--` comment does not end a statement and mis-splitting would silently

@@ -1,0 +1,7 @@
+"SELECT a FROM t WHERE a IN (1, 2)",SELECT a FROM t WHERE a = 1 OR a = 2,CREATE TABLE t (a INTEGER);
+SELECT row_number() OVER (ORDER BY a) FROM t,SELECT 1 FROM t,CREATE TABLE t (a INTEGER);
+SELECT a FROM t ORDER BY a LIMIT 1,select a from t order by a limit 1,CREATE TABLE t (a INTEGER);
+a row with one field
+SELECT $1::int,SELECT $1::int
+SELECT b FROM u,SELECT b FROM u WHERE b = b,"CREATE TABLE u (b INTEGER NOT NULL);
+CREATE INDEX i ON u (b) INCLUDE (b);"

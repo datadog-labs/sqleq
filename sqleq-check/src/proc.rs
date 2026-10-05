@@ -122,6 +122,19 @@ enum Event {
 /// Run `argv` to completion, or until `timeout` seconds have passed, when its whole process group
 /// is killed. `env` is laid over the harness's own environment; `cwd` defaults to its own.
 pub fn run(argv: &[String], cwd: Option<&Path>, env: &[(String, String)], timeout: Option<f64>) -> Run {
+    run_limited(argv, cwd, env, timeout, None)
+}
+
+/// [`run`], with the address space of the process -- and of every child it starts, which inherit
+/// the limit -- capped at `mem_bytes`, as `ulimit -v` caps it. An allocation past the cap fails, so
+/// a backend that runs away dies on its own instead of taking the machine with it.
+pub fn run_limited(
+    argv: &[String],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    timeout: Option<f64>,
+    mem_bytes: Option<u64>,
+) -> Run {
     let t0 = Instant::now();
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -134,6 +147,19 @@ pub fn run(argv: &[String], cwd: Option<&Path>, env: &[(String, String)], timeou
     }
     for (k, v) in env {
         cmd.env(k, v);
+    }
+    if let Some(bytes) = mem_bytes {
+        // SAFETY: setrlimit(2) is async-signal-safe, the only kind of call allowed between fork and
+        // exec, and the closure touches nothing but its own copy of `bytes`.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit { rlim_cur: bytes as libc::rlim_t, rlim_max: bytes as libc::rlim_t };
+                if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -267,6 +293,14 @@ mod tests {
     fn env_is_laid_over_ours() {
         let r = run(&sh("echo $SQLEQ_PROC_TEST"), None, &[("SQLEQ_PROC_TEST".into(), "x".into())], None);
         assert_eq!(r.out, "x\n");
+    }
+
+    #[test]
+    fn a_memory_limit_reaches_the_process() {
+        let r = run_limited(&sh("ulimit -v"), None, &[], Some(10.0), Some(512 * 1024 * 1024));
+        assert_eq!(r.out.trim(), "524288", "ulimit -v reports KiB");
+        let free = run(&sh("ulimit -v"), None, &[], Some(10.0));
+        assert_eq!(free.out.trim(), "unlimited");
     }
 
     #[test]

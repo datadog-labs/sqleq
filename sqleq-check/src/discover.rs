@@ -41,10 +41,33 @@ fn explicit(name: &str, flag: Option<&str>, var: &str) -> Result<Option<String>,
     }
 }
 
-/// sqleq-frontend: explicit override -> `$SQLEQ_FRONTEND` -> PATH -> this repo's own build (the
-/// newest of release and debug).
-pub fn discover_frontend(flag: Option<&str>) -> Result<String, String> {
-    if let Some(p) = explicit("sqleq-frontend", flag, "SQLEQ_FRONTEND")? {
+/// `--bin-dir`: this binary out of one directory, or an error -- never a fallback to another one,
+/// since a run pointed at a directory means every binary in it and no other.
+fn in_bin_dir(bin_dir: Option<&str>, name: &str) -> Result<Option<String>, String> {
+    let Some(d) = bin_dir else { return Ok(None) };
+    let p = Path::new(d).join(name);
+    if is_exe(&p) {
+        Ok(Some(path_str(&abspath(&p))))
+    } else {
+        Err(format!("error: no executable {name} in --bin-dir {d}"))
+    }
+}
+
+/// The flag, then `--bin-dir`, then the variable: the choices a person made, in that order.
+fn chosen(name: &str, flag: Option<&str>, bin_dir: Option<&str>, var: &str) -> Result<Option<String>, String> {
+    if let Some(p) = explicit(name, flag, "")? {
+        return Ok(Some(p));
+    }
+    if let Some(p) = in_bin_dir(bin_dir, name)? {
+        return Ok(Some(p));
+    }
+    explicit(name, None, var)
+}
+
+/// sqleq-frontend: explicit override -> `--bin-dir` -> `$SQLEQ_FRONTEND` -> PATH -> this repo's own
+/// build (the newest of release and debug).
+pub fn discover_frontend(flag: Option<&str>, bin_dir: Option<&str>) -> Result<String, String> {
+    if let Some(p) = chosen("sqleq-frontend", flag, bin_dir, "SQLEQ_FRONTEND")? {
         return Ok(p);
     }
     if let Some(p) = which("sqleq-frontend") {
@@ -80,9 +103,9 @@ pub fn discover_prover(flag: Option<&str>) -> Result<String, String> {
     Err("error: could not find 'qed-prover'. Enter the QED Nix shell, or pass --prover/$QED_PROVER.".to_string())
 }
 
-/// sqleq-fuzz: explicit override -> `$SQLEQ_FUZZ` -> PATH -> this repo's own build.
-pub fn discover_fuzz(flag: Option<&str>) -> Result<String, String> {
-    if let Some(p) = explicit("sqleq-fuzz", flag, "SQLEQ_FUZZ")? {
+/// sqleq-fuzz: explicit override -> `--bin-dir` -> `$SQLEQ_FUZZ` -> PATH -> this repo's own build.
+pub fn discover_fuzz(flag: Option<&str>, bin_dir: Option<&str>) -> Result<String, String> {
+    if let Some(p) = chosen("sqleq-fuzz", flag, bin_dir, "SQLEQ_FUZZ")? {
         return Ok(p);
     }
     if let Some(p) = which("sqleq-fuzz").or_else(|| newest(&target_builds("sqleq-fuzz"))) {
@@ -93,9 +116,14 @@ pub fn discover_fuzz(flag: Option<&str>) -> Result<String, String> {
         .to_string())
 }
 
-/// sqleq-lean: explicit override -> `$SQLEQ_LEAN` -> this repo's release, then debug, build. The
-/// first that exists wins, resolved through symlinks.
-pub fn discover_lean(flag: Option<&str>) -> Result<String, String> {
+/// sqleq-lean: explicit override -> `--bin-dir` -> `$SQLEQ_LEAN` -> this repo's release, then debug,
+/// build. The first that exists wins, resolved through symlinks.
+pub fn discover_lean(flag: Option<&str>, bin_dir: Option<&str>) -> Result<String, String> {
+    if flag.is_none_or(str::is_empty) {
+        if let Some(p) = in_bin_dir(bin_dir, "sqleq-lean")? {
+            return Ok(p);
+        }
+    }
     let env = std::env::var("SQLEQ_LEAN").ok();
     let builds = target_builds("sqleq-lean");
     let cands = [flag.map(str::to_string), env, Some(path_str(&builds[0])), Some(path_str(&builds[1]))];
@@ -128,8 +156,8 @@ pub struct SsDriver {
 /// sqleq-solver: explicit override -> `$SQLEQ_SOLVER_BIN` -> PATH -> this repo's own build. No
 /// JDK, no fork tree and no library path: the build compiles Z3 from source and links it in
 /// statically.
-pub fn discover_sqleq_solver(flag: Option<&str>) -> Result<SsDriver, String> {
-    let found = match explicit("sqleq-solver", flag, "SQLEQ_SOLVER_BIN")? {
+pub fn discover_sqleq_solver(flag: Option<&str>, bin_dir: Option<&str>) -> Result<SsDriver, String> {
+    let found = match chosen("sqleq-solver", flag, bin_dir, "SQLEQ_SOLVER_BIN")? {
         Some(p) => p,
         None => match which("sqleq-solver").or_else(|| newest(&target_builds("sqleq-solver"))) {
             Some(p) => path_str(&abspath(&p)),

@@ -39,6 +39,7 @@ pub fn attach(x: &mut Case, rec: &Value) {
     x.l_reason = text("reason");
     x.l_shape = text("shape");
     x.l_ms = rec.get("ms").cloned();
+    x.l_raw = Some(rec.clone());
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -50,14 +51,44 @@ pub struct Stats {
     pub failed: Option<String>,
 }
 
-/// Run sqleq-lean over every `.sql` case and attach its verdicts in place.
-pub fn run_lean(cases: &mut [Case], lean_bin: &str, jobs: usize, timeout_s: f64, keep_dir: Option<&Path>) -> Stats {
-    let todo: Vec<usize> = (0..cases.len()).filter(|&i| cases[i].is_sql()).collect();
-    if todo.is_empty() {
-        return Stats::default();
+/// Run sqleq-lean over every case with a pair and attach its verdicts in place. Pair files are
+/// handed over by path; corpus rows as the corpus and their names, which sqleq-lean reads with the
+/// same reader and keys its records by.
+pub fn run_lean(
+    cases: &mut [Case],
+    lean_bin: &str,
+    jobs: usize,
+    timeout_s: f64,
+    keep_dir: Option<&Path>,
+    replay_plan: Option<&Path>,
+) -> Stats {
+    let files: Vec<usize> = (0..cases.len()).filter(|&i| cases[i].row.is_none() && cases[i].is_sql()).collect();
+    let rows: Vec<usize> = (0..cases.len()).filter(|&i| cases[i].row.is_some()).collect();
+    let mut stats = Stats::default();
+    for group in [files, rows] {
+        if group.is_empty() {
+            continue;
+        }
+        let s = run_group(cases, &group, lean_bin, jobs, timeout_s, keep_dir, replay_plan);
+        stats.rows += s.rows;
+        stats.wall_s = Some(stats.wall_s.unwrap_or(0.0) + s.wall_s.unwrap_or(0.0));
+        stats.failed = stats.failed.or(s.failed);
     }
+    stats
+}
+
+fn run_group(
+    cases: &mut [Case],
+    todo: &[usize],
+    lean_bin: &str,
+    jobs: usize,
+    timeout_s: f64,
+    keep_dir: Option<&Path>,
+    replay_plan: Option<&Path>,
+) -> Stats {
+    let rows = cases[todo[0]].row.is_some();
     let Ok(tmp) = crate::util::TempDir::new("sqleq-lean-") else {
-        for &i in &todo {
+        for &i in todo {
             (cases[i].l_verdict, cases[i].l_reason) = (Some("missing".into()), "no temporary directory".into());
         }
         return Stats { rows: todo.len(), ..Stats::default() };
@@ -77,21 +108,42 @@ pub fn run_lean(cases: &mut [Case], lean_bin: &str, jobs: usize, timeout_s: f64,
         let k = k.canonicalize().unwrap_or_else(|_| crate::util::abspath(k)).join("lean");
         argv.extend(["--keep".into(), k.to_string_lossy().into_owned()]);
     }
-    argv.extend(todo.iter().map(|&i| cases[i].path.clone()));
+    if let Some(p) = replay_plan {
+        argv.extend(["--replay-plan".into(), p.to_string_lossy().into_owned()]);
+    }
+    if rows {
+        let names = tmp.path().join("names.txt");
+        let list: String = todo.iter().map(|&i| format!("{}\n", cases[i].name)).collect();
+        if let Err(e) = std::fs::write(&names, list) {
+            for &i in todo {
+                (cases[i].l_verdict, cases[i].l_reason) = (Some("missing".into()), format!("cannot write names: {e}"));
+            }
+            return Stats { rows: todo.len(), ..Stats::default() };
+        }
+        argv.extend([
+            "--csv".into(),
+            cases[todo[0]].path.clone(),
+            "--names".into(),
+            names.to_string_lossy().into_owned(),
+        ]);
+    } else {
+        argv.extend(todo.iter().map(|&i| cases[i].path.clone()));
+    }
     let t0 = Instant::now();
     let r = crate::proc::run(&argv, None, &[], None);
     let wall = t0.elapsed().as_secs_f64();
     let got = std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
     let Some(got) = got else {
         let why = tail(&r.err);
-        for &i in &todo {
+        for &i in todo {
             cases[i].l_verdict = Some("missing".into());
             cases[i].l_reason = if why.is_empty() { "no output".into() } else { why.clone() };
         }
         return Stats { rows: todo.len(), wall_s: Some(wall), failed: Some(why) };
     };
-    for &i in &todo {
-        match got.get(&cases[i].path) {
+    for &i in todo {
+        let key = if rows { cases[i].name.clone() } else { cases[i].path.clone() };
+        match got.get(&key) {
             Some(rec) => attach(&mut cases[i], rec),
             None => (cases[i].l_verdict, cases[i].l_reason) = (Some("missing".into()), "no record".into()),
         }
