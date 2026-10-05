@@ -39,6 +39,10 @@
 //! and reports one combined verdict -- `equivalent`, `not-equivalent`, `alarm` when a proof meets a
 //! counterexample, `timeout` or `undecided` -- which then decides the exit code; see [`portfolio`].
 //!
+//! `--corpus` runs the rows of a corpus CSV instead of pair files, each through every backend's own
+//! corpus code, with what a long run needs beside it: one JSON line per case as it finishes and
+//! `--resume`, memory caps, a second retry tier, and parallel solver drivers.
+//!
 //! `--expect pinned` is the other policy: every case carries its own expected answer per axis in
 //! its header (`tests/pairs/README.md`), `--axes` picks which axes run -- sqleq-fuzz among them --
 //! and any movement fails. The grammar and the judgement live in [`suite`].

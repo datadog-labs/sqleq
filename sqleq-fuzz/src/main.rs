@@ -313,6 +313,12 @@ fn report(v: &Verdict) {
     if let Verdict::NotEquivalent(ce) = v {
         println!("counterexample: {ce}");
     }
+    // The same fact `csv` mode records as `ok_trials` / `trial_error`: the label is the finding,
+    // and this says how thin the coverage behind it was. A line of its own, so a reader of the
+    // first line sees what it always saw.
+    if let Some((ok, err)) = v.partial() {
+        println!("partial: {ok} trials compared both sides; last error: {err}");
+    }
 }
 
 #[cfg(test)]

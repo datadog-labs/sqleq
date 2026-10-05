@@ -14,6 +14,7 @@ use sqleq_check::axes::solver::{self, run_second_opinion};
 use sqleq_check::portfolio;
 use sqleq_check::case::{ss_slug, Case};
 use sqleq_check::discover::{repo, SsDriver};
+use sqleq_check::inputs::Item;
 use sqleq_check::util::{is_exe, TempDir};
 
 fn sqleq_solver() -> Option<SsDriver> {
@@ -61,7 +62,7 @@ fn rows_are_bucketed_like_the_jvm_drivers() {
         job(d, "refused", Value::Null, Some("unknown table t")),
         Case::new("no-job", "no-job"),
     ];
-    let stats = run_second_opinion(&mut cases, d, &driver, 10_000);
+    let stats = run_second_opinion(&mut cases, d, &driver, 10_000, 1, None);
     let got: Vec<(&str, &str)> =
         cases.iter().map(|c| (c.name.as_str(), c.s_bucket.as_deref().unwrap_or("-"))).collect();
     assert_eq!(
@@ -106,12 +107,16 @@ fn a_portfolio_asks_it_per_case() {
         timeout: 30.0,
         smt_timeout_ms: None,
         keep_dir: None,
+        catalog: None,
+        qed_mem: None,
+        ss_mem: None,
     };
     for (example, bucket, verdict) in [
         ("in_vs_or.sql", solver::PROVED_LITERAL, portfolio::EQUIVALENT),
         ("dropped_filter.sql", solver::NO_PROOF, portfolio::UNDECIDED),
     ] {
-        let case = portfolio::run_case(&repo().join("examples").join(example), example, &ctx);
+        let item = Item { path: repo().join("examples").join(example), name: example.to_string(), row: None };
+        let case = portfolio::run_case(&item, &ctx);
         let o = case.portfolio.as_ref().unwrap();
         assert_eq!((case.s_bucket.as_deref(), o.verdict.as_str()), (Some(bucket), verdict), "{example}: {}", case.s_note);
         assert!(o.done.contains_key("sqleq-solver") && o.pending.is_empty(), "{example}: {o:?}");

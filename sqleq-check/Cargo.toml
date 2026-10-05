@@ -24,6 +24,8 @@ path = "src/main.rs"
 # built to build this. A hard per-case deadline needs a process to kill anyway: a Z3 call cannot be
 # interrupted from outside, and sqleq-fuzz has no timeout of its own.
 [dependencies]
+# Only its corpus reader, so a corpus row is named and split exactly as every other tool reads it.
+sqleq-frontend = { path = ".." }
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 csv = { workspace = true }
 # Process groups: `killpg` at a deadline, and on Ctrl-C, takes a backend's own children with it.

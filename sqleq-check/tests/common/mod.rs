@@ -68,41 +68,73 @@ case " $* " in *" --sqlsolver "*)
     printf '{"name": "%s", "ir": {"queries": [1, 2]}, "schema": ""}\n' "$name" > "$out"
     exit 0 ;;
 esac
+case " $* " in *" --csv "*)
+    out=""; rep=""; r0="pair$(printf '%04d' 0)"
+    while [ $# -gt 0 ]; do
+        case "$1" in -o) out=$2; shift ;; --report) rep=$2; shift ;; esac
+        shift
+    done
+    mkdir -p "$out"
+    case "${FAKE_FE_STATUS:-emit}" in
+    emit)
+        printf '{"schemas": [], "queries": [{"scan": 0}, {"scan": 1}]}' > "$out/$r0.json"
+        printf '{"detail": [{"row": 0, "name": "%s", "status": "emit"}]}' "$r0" > "$rep" ;;
+    *)
+        printf '{"detail": [{"row": 0, "name": "%s", "status": "%s", "kind": "unsupported", "reason": "unsupported: LIMIT"}]}' "$r0" "$FAKE_FE_STATUS" > "$rep" ;;
+    esac
+    exit 0 ;;
+esac
 pos=""
 for a in "$@"; do case "$a" in --*) ;; *) pos="$pos $a" ;; esac; done
 set -- $pos
 printf '{"schemas": [], "queries": [{"scan": 0}, {"scan": 1}]}' > "$2"
 "#;
 
-/// Answers `$FAKE_SS` for every job, after `$FAKE_SS_SLEEP` seconds when that is set.
+/// Answers `$FAKE_SS` for every job, after `$FAKE_SS_SLEEP` seconds when that is set; kills itself
+/// on reaching the job named `$FAKE_SS_DIE_ON`, as a driver out of memory would die.
 pub const FAKE_SOLVER: &str = r#"[ -n "$FAKE_SS_SLEEP" ] && sleep "$FAKE_SS_SLEEP"
 while IFS= read -r line || [ -n "$line" ]; do
     name=$(printf '%s' "$line" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+    [ -n "$FAKE_SS_DIE_ON" ] && [ "$name" = "$FAKE_SS_DIE_ON" ] && kill -9 $$
     printf '{"name": "%s", "verdict": "%s", "ms": 1}\n' "$name" "$FAKE_SS" >> "$2"
 done < "$1"
 "#;
 
-/// Prints `$FAKE_FUZZ`, after `$FAKE_FUZZ_SLEEP` seconds when that is set.
-pub const FAKE_FUZZ: &str = "[ -n \"$FAKE_FUZZ_SLEEP\" ] && sleep \"$FAKE_FUZZ_SLEEP\"\necho \"$FAKE_FUZZ\"\n";
+/// Prints `$FAKE_FUZZ`, after `$FAKE_FUZZ_SLEEP` seconds when that is set, then `partial:
+/// $FAKE_FUZZ_PARTIAL` when that is set; appends its arguments to `$FAKE_FUZZ_ARGV`.
+pub const FAKE_FUZZ: &str = r#"[ -n "$FAKE_FUZZ_ARGV" ] && printf '%s\n' "$*" >> "$FAKE_FUZZ_ARGV"
+[ -n "$FAKE_FUZZ_SLEEP" ] && sleep "$FAKE_FUZZ_SLEEP"
+echo "$FAKE_FUZZ"
+[ -n "$FAKE_FUZZ_PARTIAL" ] && echo "partial: $FAKE_FUZZ_PARTIAL"
+exit 0
+"#;
 
 /// Writes `<stem>.result` saying `provable` when `$FAKE_QED` is `proved`. Appends its pid to
 /// `$FAKE_PIDS`, sleeps `$FAKE_QED_SLEEP` seconds when that is set, and 30 seconds the first time
 /// it runs when `$FAKE_QED_ONCE` names a file that does not exist yet.
 pub const FAKE_PROVER: &str = r#"for a in "$@"; do json=$a; done
 [ -n "$FAKE_PIDS" ] && echo $$ >> "$FAKE_PIDS"
+[ -n "$FAKE_ULIMIT" ] && ulimit -v >> "$FAKE_ULIMIT"
 if [ -n "$FAKE_QED_ONCE" ] && [ ! -e "$FAKE_QED_ONCE" ]; then : > "$FAKE_QED_ONCE"; sleep 30; fi
 [ -n "$FAKE_QED_SLEEP" ] && sleep "$FAKE_QED_SLEEP"
 case "$FAKE_QED" in proved) p=true ;; *) p=false ;; esac
 printf '{"provable": %s, "panicked": false}' "$p" > "${json%.json}.result"
 "#;
 
-/// Answers `$FAKE_LEAN` for every pair file it is given.
-pub const FAKE_LEAN: &str = r#"out=""; prev=""; body=""; sep=""
+/// Answers `$FAKE_LEAN` for every pair file it is given, or under `--csv` for every name in
+/// `--names` (row 0's name without one).
+pub const FAKE_LEAN: &str = r#"out=""; prev=""; body=""; sep=""; csv=""; names=""
 for a in "$@"; do
     [ "$prev" = "--json" ] && out=$a
+    [ "$prev" = "--csv" ] && csv=$a
+    [ "$prev" = "--names" ] && names=$a
     case "$a" in *.sql) body="$body$sep\"$a\": {\"verdict\": \"$FAKE_LEAN\", \"ms\": 1}"; sep=", " ;; esac
     prev=$a
 done
+if [ -n "$csv" ]; then
+    if [ -n "$names" ]; then list=$(cat "$names"); else list="pair$(printf '%04d' 0)"; fi
+    for n in $list; do body="$body$sep\"$n\": {\"verdict\": \"$FAKE_LEAN\", \"ms\": 1, \"generated\": true}"; sep=", "; done
+fi
 printf '{%s}' "$body" > "$out"
 "#;
 

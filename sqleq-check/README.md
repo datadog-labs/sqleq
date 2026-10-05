@@ -83,6 +83,15 @@ sqleq-check --keep ./work rewrites/
 | `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
 | `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
+| `--corpus FILE` | Run the rows of a corpus CSV instead of PATHs — see [Corpus runs](#corpus-runs). |
+| `--only FILE` | Run only the cases named in FILE, one per line. |
+| `--catalog C` | `declared` (default), `inferred` or `inferred-seeded`: the catalog every case is lowered against unless its own `-- catalog:` header names one. |
+| `--jsonl FILE` / `--resume` | Append each case to FILE as one JSON line once its last axis has answered; with `--resume`, skip the cases FILE already holds. |
+| `--qed-mem-gib G` / `--sqleq-solver-mem-gib G` | Cap the QED prover's (z3 and cvc5 included) or each sqleq-solver driver's address space, as `ulimit -v` does. |
+| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism: a second, longer tier. |
+| `--sqleq-solver-jobs N` | sqleq-solver drivers side by side (default 1, the reproducible choice). |
+| `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR, unless a flag names one. |
+| `--lean-replay-plan FILE` | Have sqleq-lean also write what `tools/lean_replay.py` needs. |
 
 ## Status taxonomy
 
@@ -264,6 +273,53 @@ Three things to know before reading one:
   `undecided` after a prover crash or a sqleq-solver error — unless `--no-retry`. The re-run is kept
   only if it decides the case, and the case is marked `retried`.
 
+## Corpus runs
+
+```sh
+# Every row of a corpus, lowered against the DDL with parameter types inferred, one JSON line per row:
+sqleq-check --corpus corpus.csv --catalog inferred-seeded --expect report-only -j 14 --jsonl run.jsonl
+# Interrupted? The same command with --resume picks up where it stopped.
+sqleq-check --corpus corpus.csv --catalog inferred-seeded --expect report-only -j 14 --jsonl run.jsonl --resume
+```
+
+A corpus is a CSV with no header line, one pair per row: query A, query B, and the Postgres DDL
+both were run against. The DDL is optional. Row *N* is case `pairNNNN`, and a row with fewer than two
+fields is no pair but still uses up its number, so a name means the same row in every tool's report.
+`--only` keeps the rows it names without renumbering the rest.
+
+Each row reaches every backend through that backend's own corpus code, handed the row as a
+one-row corpus:
+
+- the frontend lowers it with `--csv`, exactly as it lowers that row of the whole file — its DDL
+  read leniently, statement by statement, where a `.sql` file's goes through a stricter reader;
+- its report says whether the row was emitted, refused, or refused but settled by reflexivity
+  (`reflexive`), with the refusal's kind and reason;
+- sqleq-fuzz tests it with `row`, the code its `csv` mode runs on every row;
+- sqleq-lean is asked about all of them at once with `--csv` and `--names`.
+
+So a corpus run's answers are the corpus modes' answers, row for row. Each row also runs in its own
+process with its own timeout, so one row that hangs or crashes costs that row and nothing else.
+
+What a long run needs:
+
+- **`--jsonl` and `--resume`.** `--json` is written at the end; `--jsonl` gets each case the moment
+  its last asked axis has answered, as the same object. `--resume` skips every case the file already
+  holds, so a run that was stopped is finished by running it again.
+- **Memory caps.** `--qed-mem-gib` and `--sqleq-solver-mem-gib` cap a backend's address space. A
+  sqleq-solver driver that dies on a row — out of memory under its cap, or a crash — has that row
+  recorded as `error` (with `died` in `s_raw`) and goes on with the rest.
+- **A second tier.** `--retry-timeout`, `--retry-smt-timeout` and `--retry-jobs` give the retry pass
+  its own budget and parallelism, for the cases the first pass ran out of time or crashed on.
+- **Parallel solver drivers.** `--sqleq-solver-jobs N` splits the rows across N drivers. One stays
+  the default, because the per-row cap is load-sensitive.
+- **One directory of binaries.** `--bin-dir` takes every sibling binary from one build, so a run
+  cannot mix binaries from two trees.
+- **The raw records.** Each case keeps every backend's own record beside the bucket: `f_raw` (the
+  fuzz label, and `ok_trials` / `trial_error` when only some trials compared both sides), `s_raw`
+  (the solver's row), `l_raw` (the Lean record), and `q_tail` (the end of a crashed prover's output).
+
+`--expect pinned` does not combine with `--corpus`: a pin lives in a pair file's header.
+
 ## Pinned pairs
 
 `--expect pinned` is the policy for [`../tests/pairs/`](../tests/pairs/README.md): every case says
@@ -317,6 +373,8 @@ Under `--portfolio` the combined verdict decides `0` or `1`, and an `alarm` is a
 ## Tests
 
 `cargo test -p sqleq-check` runs the unit tests, the binary end to end over stand-in backends (shell
-scripts, so no backend needs building), and the hygiene gate over every committed pair. The test
+scripts, so no backend needs building), and the hygiene gate over every committed pair. When
+`sqleq-frontend` is built, it also checks that a corpus run lowers every row of
+`tests/data/corpus.csv` exactly as the frontend's own `--csv` run of the whole file does. The test
 that drives the real `sqleq-solver` skips unless a build of it exists; with `$SQLEQ_SOLVER_BIN` set
 (relative to the repository root, as CI sets it) a missing binary fails it instead.

@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::axes::{fuzz, lean, solver};
 use crate::case::{self, Case, Workdir, ERROR, LOWERED, PANIC, TIMEOUT as CASE_TIMEOUT};
 use crate::discover::SsDriver;
+use crate::inputs::{first_row_name, CorpusRow, Item};
 use crate::suite::{self, AXES, BINDINGS, GATHER, GATHER_GENERATED, INDEX};
 use crate::util::tail;
 
@@ -117,6 +118,11 @@ pub struct Ctx<'a> {
     pub timeout: f64,
     pub smt_timeout_ms: Option<u64>,
     pub keep_dir: Option<&'a Path>,
+    /// `--catalog`.
+    pub catalog: Option<&'a str>,
+    /// `--qed-mem-gib` and `--sqleq-solver-mem-gib`, in bytes.
+    pub qed_mem: Option<u64>,
+    pub ss_mem: Option<u64>,
 }
 
 /// Seconds left before `deadline`.
@@ -133,7 +139,15 @@ enum SsAnswer {
 /// sqleq-solver on one packaged job, within what is left of the deadline. Its own cap is set a
 /// margin short of the deadline, so it can write a `killed` row itself; the process-group kill at
 /// the deadline is the backstop for a row that will not stop.
-fn ss_one(driver: &SsDriver, name: &str, job: &Path, out: &Path, cap_ms: Option<u64>, deadline: Instant) -> SsAnswer {
+fn ss_one(
+    driver: &SsDriver,
+    name: &str,
+    job: &Path,
+    out: &Path,
+    cap_ms: Option<u64>,
+    mem: Option<u64>,
+    deadline: Instant,
+) -> SsAnswer {
     let remaining = left(deadline);
     let remaining_ms = (remaining * 1000.0) as u64;
     if remaining_ms == 0 {
@@ -148,7 +162,7 @@ fn ss_one(driver: &SsDriver, name: &str, job: &Path, out: &Path, cap_ms: Option<
         format!("--timeout-ms={cap}"),
         format!("--grace-ms={margin}"),
     ]);
-    let r = crate::proc::run(&argv, Some(&driver.cwd), &driver.env, Some(remaining));
+    let r = crate::proc::run_limited(&argv, Some(&driver.cwd), &driver.env, Some(remaining), mem);
     if let Some(row) = solver::answered(out).remove(name) {
         return SsAnswer::Row(row);
     }
@@ -165,15 +179,16 @@ enum LeanAnswer {
     Missing(String),
 }
 
-/// sqleq-lean on one pair file, within what is left of the deadline. Its temporary directory is
-/// put in the case's own, so a killed run leaves nothing behind.
-fn lean_one(bin: &str, path: &str, workdir: &Path, deadline: Instant) -> LeanAnswer {
+/// sqleq-lean on one pair, within what is left of the deadline: a pair file by its path, a corpus
+/// row as a one-row CSV, whose record its corpus mode keys by the name of row 0. Its temporary
+/// directory is put in the case's own, so a killed run leaves nothing behind.
+fn lean_one(bin: &str, path: &str, row: Option<&CorpusRow>, workdir: &Path, deadline: Instant) -> LeanAnswer {
     let remaining = left(deadline);
     if remaining <= 0.0 {
         return LeanAnswer::CutOff;
     }
     let out = workdir.join("lean.json");
-    let argv = vec![
+    let mut argv = vec![
         bin.to_string(),
         "--full-names".into(),
         "--json".into(),
@@ -182,15 +197,27 @@ fn lean_one(bin: &str, path: &str, workdir: &Path, deadline: Instant) -> LeanAns
         "1".into(),
         "--timeout".into(),
         (remaining.ceil() as u64).max(1).to_string(),
-        path.to_string(),
     ];
+    let key = match row {
+        None => {
+            argv.push(path.to_string());
+            path.to_string()
+        }
+        Some(r) => match r.write_csv(workdir) {
+            Ok(csv) => {
+                argv.extend(["--csv".into(), csv.to_string_lossy().into_owned()]);
+                first_row_name()
+            }
+            Err(e) => return LeanAnswer::Missing(format!("cannot write the row: {e}")),
+        },
+    };
     let env = [("TMPDIR".to_string(), workdir.to_string_lossy().into_owned())];
     let r = crate::proc::run(&argv, None, &env, Some(remaining));
     if r.timed_out {
         return LeanAnswer::CutOff;
     }
     let got = std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-    match got.as_ref().and_then(|g| g.get(path)) {
+    match got.as_ref().and_then(|g| g.get(&key)) {
         Some(rec) => LeanAnswer::Record(rec.clone()),
         None if got.is_some() => LeanAnswer::Missing("no record".into()),
         None => {
@@ -201,10 +228,11 @@ fn lean_one(bin: &str, path: &str, workdir: &Path, deadline: Instant) -> LeanAns
 }
 
 /// One case through every backend in `ctx` at once.
-pub fn run_case(src: &Path, name: &str, ctx: &Ctx) -> Case {
+pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
     let t0 = Instant::now();
     let deadline = t0 + std::time::Duration::from_secs_f64(ctx.timeout.max(0.0));
-    let mut case = Case::new(name, &src.to_string_lossy());
+    let mut case = Case::of(item);
+    let (src, name) = (item.path.as_path(), item.name.as_str());
     let wd = match Workdir::new(ctx.keep_dir, name) {
         Ok(w) => w,
         Err(e) => {
@@ -215,34 +243,39 @@ pub fn run_case(src: &Path, name: &str, ctx: &Ctx) -> Case {
     };
     let workdir: PathBuf = wd.path.clone();
     let path = case.path.clone();
-    let is_sql = case.is_sql();
+    let row = case.row.clone();
+    let is_sql = case.has_pair();
     let mut done: BTreeMap<String, f64> = BTreeMap::new();
     let since = |t0: Instant| t0.elapsed().as_secs_f64();
 
     let (fz, ln) = std::thread::scope(|s| {
         // The two axes that read the pair file themselves start at once, beside the frontend.
         let fz = ctx.fuzz.filter(|_| is_sql).map(|bin| {
-            let path = &path;
+            let (path, row) = (&path, &row);
             s.spawn(move || {
                 let remaining = left(deadline);
+                let pair = match row {
+                    Some(r) => fuzz::Pair::Row(r),
+                    None => fuzz::Pair::File(path),
+                };
                 let r = if remaining > 0.0 {
-                    fuzz::fuzz_one(bin, path, remaining)
+                    fuzz::fuzz_one(bin, pair, remaining)
                 } else {
-                    ("timeout".to_string(), String::new(), 0)
+                    fuzz::Answer { word: "timeout".into(), note: String::new(), ms: 0, raw: None }
                 };
                 (r, since(t0))
             })
         });
         let ln = ctx.lean.filter(|_| is_sql).map(|bin| {
-            let (path, workdir) = (&path, &workdir);
-            s.spawn(move || (lean_one(bin, path, workdir, deadline), since(t0)))
+            let (path, row, workdir) = (&path, &row, &workdir);
+            s.spawn(move || (lean_one(bin, path, row.as_ref(), workdir, deadline), since(t0)))
         });
 
         match ctx.frontend {
             None => case.status = LOWERED.into(),
             Some(fe) => {
                 let json = if left(deadline) > 0.0 {
-                    case::lower(&mut case, src, &workdir, fe, left(deadline))
+                    case::lower(&mut case, src, &workdir, fe, ctx.catalog, left(deadline))
                 } else {
                     case.status = CASE_TIMEOUT.into();
                     case.message = "frontend timed out".into();
@@ -262,13 +295,13 @@ pub fn run_case(src: &Path, name: &str, ctx: &Ctx) -> Case {
                         }
                         case.s_bucket.is_none().then(|| {
                             let name = name.to_string();
-                            s.spawn(move || (ss_one(d, &name, &job, &out, ctx.ss_cap_ms, deadline), since(t0)))
+                            s.spawn(move || (ss_one(d, &name, &job, &out, ctx.ss_cap_ms, ctx.ss_mem, deadline), since(t0)))
                         })
                     });
                     match ctx.prover {
                         Some(p) => {
                             if left(deadline) > 0.0 {
-                                case::prove(&mut case, &workdir, &json, p, left(deadline), ctx.smt_timeout_ms);
+                                case::prove(&mut case, &workdir, &json, p, left(deadline), ctx.smt_timeout_ms, ctx.qed_mem);
                             } else {
                                 case.status = CASE_TIMEOUT.into();
                                 case.message = "prover timed out".into();
@@ -299,8 +332,8 @@ pub fn run_case(src: &Path, name: &str, ctx: &Ctx) -> Case {
         (fz.and_then(|h| h.join().ok()), ln.and_then(|h| h.join().ok()))
     });
 
-    if let Some(((word, note, ms), t)) = fz {
-        (case.f_verdict, case.f_note, case.f_ms) = (Some(word), note, Some(ms));
+    if let Some((answer, t)) = fz {
+        answer.attach(&mut case);
         done.insert("fuzz".into(), t);
     }
     if let Some((answer, t)) = ln {
