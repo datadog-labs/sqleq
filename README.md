@@ -143,6 +143,9 @@ know. It detects and reports what it can (`parameter-misaligned`) and assumes th
 
 # A corpus of .sql pairs → verdicts + a CI exit code:
 ./target/release/sqleq-check --expect report-only -j 8 corpus/
+
+# The same, every axis at once on each pair, with one combined verdict per pair and 60s for each:
+./target/release/sqleq-check --portfolio -t 60 corpus/
 ```
 
 `--infer-seeded` reads columns from the DDL but *infers* parameter types, which is what lets `$N`

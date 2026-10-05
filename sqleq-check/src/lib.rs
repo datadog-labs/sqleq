@@ -35,6 +35,10 @@
 //! * **The two opinions share a frontend, so they are not independent.** A lowering bug yields the
 //!   same wrong plan on both axes; agreement corroborates the provers, not the frontend.
 //!
+//! `--portfolio` asks every backend at once on each case instead, within that case's one deadline,
+//! and reports one combined verdict -- `equivalent`, `not-equivalent`, `alarm` when a proof meets a
+//! counterexample, `timeout` or `undecided` -- which then decides the exit code; see [`portfolio`].
+//!
 //! `--expect pinned` is the other policy: every case carries its own expected answer per axis in
 //! its header (`tests/pairs/README.md`), `--axes` picks which axes run -- sqleq-fuzz among them --
 //! and any movement fails. The grammar and the judgement live in [`suite`].
@@ -46,6 +50,7 @@ pub mod cli;
 pub mod discover;
 pub mod inputs;
 pub mod pinned;
+pub mod portfolio;
 pub mod proc;
 pub mod report;
 pub mod suite;

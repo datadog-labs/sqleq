@@ -109,6 +109,12 @@ directory still exists — and a single sequential pass at the end asks the driv
 The packaging cost is discounted from the case wall time, so a second-opinion run's timings stay
 comparable to one without it.
 
+`sqleq-check --portfolio` is the one exception, and gives up the third constraint on purpose: it
+asks `sqleq-solver` about each case beside the other backends, inside that case's deadline, because
+one combined verdict within a time budget is what it is for. It never runs the JVM fork, which the
+first two constraints are about. Its answers near the cap can therefore vary with load; the
+sequential pass stays the one to compare the two implementations in, or to pin.
+
 ## `sqleq-solver`
 
 `sqleq-solver/` is a Rust rewrite of the part of SQLSolver that the IR bridge reaches: from the

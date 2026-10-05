@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::Serialize;
 
 use crate::axes::{fuzz, lean, solver};
+use crate::portfolio;
 use crate::case::{Case, LOWERED, PANIC, PROVABLE, REFUSED, STATUS_ORDER, TIMEOUT, UNPROVABLE};
 use crate::pinned::Pinned;
 use crate::suite::{self, Judgement};
@@ -88,6 +89,174 @@ pub fn print_case_line(c: Color, case: &Case, name_w: usize) {
         fmt_status(c, &case.status),
         case.name,
         c.dim(&format!("{:6.2}s", case.wall))
+    );
+}
+
+/// A case's line as it finishes: its portfolio verdict when it has one, else its status.
+pub fn print_line(c: Color, case: &Case, name_w: usize) {
+    match &case.portfolio {
+        Some(o) => print_portfolio_line(c, case, o, name_w),
+        None => print_case_line(c, case, name_w),
+    }
+}
+
+pub fn fmt_verdict(c: Color, v: &str) -> String {
+    let s = format!(
+        "{} {v}",
+        match v {
+            portfolio::ALARM => "‼",
+            portfolio::NOT_EQUIVALENT => "✗",
+            portfolio::TIMEOUT => "⏱",
+            portfolio::UNDECIDED => "·",
+            _ => "✓",
+        }
+    );
+    match v {
+        portfolio::ALARM => c.red(&c.bold(&s)),
+        portfolio::NOT_EQUIVALENT | portfolio::TIMEOUT => c.yellow(&s),
+        portfolio::UNDECIDED => c.dim(&s),
+        _ => c.green(&s),
+    }
+}
+
+/// The verdict, which backends it rests on and when each answered, and which were cut off.
+fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: usize) {
+    let mut tail = String::new();
+    if !o.by.is_empty() {
+        let at: Vec<String> =
+            o.by.iter().map(|a| format!("{a} {:.2}s", o.done.get(a).copied().unwrap_or(0.0))).collect();
+        tail += &format!("  {}", c.dim(&format!("by {}", at.join(", "))));
+    }
+    if !o.pending.is_empty() {
+        tail += &format!("  {}", c.yellow(&format!("⏱ {}", o.pending.join(", "))));
+    }
+    if o.verdict == portfolio::ALARM {
+        let words: Vec<String> = crate::pinned::observe(case, &crate::suite::AXES)
+            .into_iter()
+            .filter(|(a, _)| o.by.contains(a))
+            .map(|(a, (w, _))| format!("{a}: {w}"))
+            .collect();
+        tail += &format!("  {}", c.red(&format!("— {}", words.join(", "))));
+    } else if o.verdict == portfolio::NOT_EQUIVALENT && !case.f_note.is_empty() {
+        tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
+    } else if !portfolio::decisive(&o.verdict) {
+        let last = suite::splitlines(&case.message).into_iter().map(str::trim).rfind(|l| !l.is_empty());
+        if let Some(l) = last {
+            tail += &format!("  {}", c.dim(&format!("— {l}")));
+        }
+    }
+    let retried = if o.retried { format!("  {}", c.dim("(retried)")) } else { String::new() };
+    println!(
+        "  {:<34} {:<name_w$}  {}{tail}{retried}",
+        fmt_verdict(c, &o.verdict),
+        case.name,
+        c.dim(&format!("{:6.2}s", case.wall))
+    );
+}
+
+/// Seconds as the user wrote them: `60`, `0.5`.
+pub fn fmt_secs(x: f64) -> String {
+    if x.fract() == 0.0 {
+        format!("{x:.0}")
+    } else {
+        format!("{x}")
+    }
+}
+
+fn median(mut xs: Vec<f64>) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    Some(if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 })
+}
+
+/// The combined verdicts, and what they rest on.
+pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f64, retried: usize) {
+    let outcomes: Vec<(&Case, &portfolio::Outcome)> =
+        cases.iter().filter_map(|x| x.portfolio.as_ref().map(|o| (x, o))).collect();
+    if outcomes.is_empty() {
+        return;
+    }
+    let count = |v: &str| outcomes.iter().filter(|(_, o)| o.verdict == v).count();
+    println!();
+    println!(
+        "{}{}",
+        c.bold("  Portfolio"),
+        c.dim(&format!("  — {} on each case at once, {}s deadline", backends.join(", "), fmt_secs(deadline)))
+    );
+    println!("{}", rule(c));
+    for v in portfolio::ORDER {
+        let n = count(v);
+        if n > 0 {
+            println!("  {:<32} {n:>5}", fmt_verdict(c, v));
+        }
+    }
+    println!("{}", rule(c));
+    // On the same footing as the qed axis's `capability`: pairs whose two queries differ.
+    let differ: Vec<&portfolio::Outcome> =
+        outcomes.iter().filter(|(x, _)| x.trivial == Some(false)).map(|(_, o)| *o).collect();
+    if !differ.is_empty() {
+        let n = differ.iter().filter(|o| o.verdict == portfolio::EQUIVALENT).count();
+        let pct = 100.0 * n as f64 / differ.len() as f64;
+        println!(
+            "  {:<13} {n}/{}  ({pct:.1}%)   {}",
+            c.bold("capability"),
+            differ.len(),
+            c.dim("equivalent among pairs whose two queries differ")
+        );
+    }
+    let eq: Vec<&portfolio::Outcome> =
+        outcomes.iter().filter(|(_, o)| o.verdict == portfolio::EQUIVALENT).map(|(_, o)| *o).collect();
+    if !eq.is_empty() {
+        let has = |o: &portfolio::Outcome, a: &str| o.by.iter().any(|b| b == a);
+        let both = eq.iter().filter(|o| has(o, "qed") && has(o, "sqleq-solver")).count();
+        let qed = eq.iter().filter(|o| has(o, "qed") && !has(o, "sqleq-solver")).count();
+        let ss = eq.iter().filter(|o| has(o, "sqleq-solver") && !has(o, "qed")).count();
+        println!("  {:<13} qed alone {qed} · sqleq-solver alone {ss} · both {both}", c.dim("proved by"));
+    }
+    let first: Vec<f64> = outcomes.iter().filter_map(|(_, o)| o.first_s).collect();
+    let walls: Vec<f64> = outcomes.iter().map(|(x, _)| x.wall).collect();
+    if let (Some(m), Some(w)) = (median(first.clone()), median(walls.clone())) {
+        let slowest = |xs: &[f64]| xs.iter().copied().fold(0.0, f64::max);
+        println!(
+            "  {:<13} median {m:.2}s · slowest {:.2}s   {}",
+            c.dim("first answer"),
+            slowest(&first),
+            c.dim(&format!("(case wall: median {w:.2}s · slowest {:.2}s)", slowest(&walls)))
+        );
+    }
+    let cut: Vec<String> = backends
+        .iter()
+        .chain(["frontend"].iter())
+        .filter_map(|a| {
+            let n = outcomes.iter().filter(|(_, o)| o.pending.iter().any(|p| p == a)).count();
+            (n > 0).then(|| format!("{a} {n}"))
+        })
+        .collect();
+    if !cut.is_empty() {
+        println!("  {:<13} {}", c.dim("cut off"), c.yellow(&cut.join(" · ")));
+    }
+    if retried > 0 {
+        let won = outcomes.iter().filter(|(_, o)| o.retried).count();
+        println!("  {:<13} {retried} case(s) re-run serially, {won} decided by it", c.dim("retried"));
+    }
+    for (x, o) in outcomes.iter().filter(|(_, o)| o.verdict == portfolio::ALARM) {
+        let words: Vec<String> = crate::pinned::observe(x, &crate::suite::AXES)
+            .into_iter()
+            .filter(|(a, _)| o.by.contains(a))
+            .map(|(a, (w, _))| format!("{a}: {w}"))
+            .collect();
+        println!("{}", c.red(&format!("  ALARM  {}  — {}", x.name, words.join(", "))));
+    }
+    println!(
+        "{}",
+        c.dim(
+            "  note  `equivalent` is a proof under index binding, the claim `provable` makes; the\n        \
+             gather verdicts are the Lean axis's weaker claims. `timeout` and `undecided` say only\n        \
+             that no backend decided the pair in time -- neither is `not-equivalent`."
+        )
     );
 }
 
@@ -286,7 +455,9 @@ pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
     for x in scored.iter().filter(|x| x.f_verdict.as_deref() == Some("counterexample")) {
         println!("{}", c.dim(&format!("  {:<22}       {}", "counterexample", x.name)));
     }
-    println!("{}", c.dim(&format!("  {:<22} {:.2}s", "wall time", stats.wall_s)));
+    if let Some(w) = stats.wall_s {
+        println!("{}", c.dim(&format!("  {:<22} {w:.2}s", "wall time")));
+    }
     println!(
         "{}",
         c.dim(&format!(
@@ -436,6 +607,52 @@ pub struct LeanMeta {
     pub bin: String,
 }
 
+#[derive(Default, Serialize)]
+pub struct VerdictCounts {
+    pub alarm: usize,
+    #[serde(rename = "not-equivalent")]
+    pub not_equivalent: usize,
+    pub equivalent: usize,
+    #[serde(rename = "equivalent-gather")]
+    pub equivalent_gather: usize,
+    #[serde(rename = "equivalent-gather-generated")]
+    pub equivalent_gather_generated: usize,
+    pub timeout: usize,
+    pub undecided: usize,
+}
+
+#[derive(Serialize)]
+pub struct PortfolioMeta {
+    pub deadline_s: f64,
+    pub backends: Vec<String>,
+    pub counts: VerdictCounts,
+    pub alarms: Vec<String>,
+    pub retried: usize,
+}
+
+impl PortfolioMeta {
+    pub fn of(cases: &[Case], backends: &[&str], deadline_s: f64, retried: usize) -> PortfolioMeta {
+        let mut counts = VerdictCounts::default();
+        let mut alarms = Vec::new();
+        for x in cases {
+            let Some(o) = &x.portfolio else { continue };
+            match o.verdict.as_str() {
+                portfolio::ALARM => {
+                    counts.alarm += 1;
+                    alarms.push(x.name.clone());
+                }
+                portfolio::NOT_EQUIVALENT => counts.not_equivalent += 1,
+                portfolio::EQUIVALENT => counts.equivalent += 1,
+                portfolio::EQUIVALENT_GATHER => counts.equivalent_gather += 1,
+                portfolio::EQUIVALENT_GATHER_GENERATED => counts.equivalent_gather_generated += 1,
+                portfolio::TIMEOUT => counts.timeout += 1,
+                _ => counts.undecided += 1,
+            }
+        }
+        PortfolioMeta { deadline_s, backends: backends.iter().map(|b| b.to_string()).collect(), counts, alarms, retried }
+    }
+}
+
 #[derive(Serialize)]
 pub struct PinnedMeta {
     pub held: usize,
@@ -468,6 +685,8 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lean: Option<LeanMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub portfolio: Option<PortfolioMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned: Option<PinnedMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub findings: Option<Vec<Finding>>,
@@ -484,8 +703,8 @@ pub fn write_json(path: &str, cases: &[Case], meta: &Meta) -> std::io::Result<()
     std::fs::write(path, text)
 }
 
-pub fn write_csv(path: &str, cases: &[Case]) -> std::io::Result<()> {
-    let cols = [
+pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result<()> {
+    let mut cols = vec![
         "name",
         "status",
         "trivial",
@@ -510,12 +729,16 @@ pub fn write_csv(path: &str, cases: &[Case]) -> std::io::Result<()> {
         "f_note",
         "f_ms",
     ];
+    // Appended, so a reader of the batch columns finds them where they always were.
+    if portfolio {
+        cols.extend(["p_verdict", "p_by", "p_pending", "p_first_s", "p_retried"]);
+    }
     let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_path(path)?;
-    w.write_record(cols)?;
+    w.write_record(&cols)?;
     let opt = |v: &Option<String>| v.clone().unwrap_or_default();
     let num = |v: &Option<serde_json::Value>| v.as_ref().map(|v| v.to_string()).unwrap_or_default();
     for x in cases {
-        w.write_record([
+        let mut row = vec![
             x.name.clone(),
             x.status.clone(),
             x.trivial.map(|t| t.to_string()).unwrap_or_default(),
@@ -539,7 +762,18 @@ pub fn write_csv(path: &str, cases: &[Case]) -> std::io::Result<()> {
             opt(&x.f_verdict),
             x.f_note.clone(),
             x.f_ms.map(|m| m.to_string()).unwrap_or_default(),
-        ])?;
+        ];
+        if portfolio {
+            let o = x.portfolio.clone().unwrap_or_default();
+            row.extend([
+                o.verdict,
+                o.by.join(";"),
+                o.pending.join(";"),
+                o.first_s.map(|f| f.to_string()).unwrap_or_default(),
+                o.retried.to_string(),
+            ]);
+        }
+        w.write_record(&row)?;
     }
     w.flush()
 }

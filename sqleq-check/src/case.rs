@@ -81,6 +81,9 @@ pub struct Case {
     pub f_verdict: Option<String>,
     pub f_note: String,
     pub f_ms: Option<u64>,
+    /// The combined verdict, only under `--portfolio`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portfolio: Option<crate::portfolio::Outcome>,
 }
 
 impl Case {
@@ -112,6 +115,7 @@ impl Case {
             f_verdict: None,
             f_note: String::new(),
             f_ms: None,
+            portfolio: None,
         }
     }
 
@@ -254,7 +258,35 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
             return case;
         }
     };
-    let workdir = wd.path.clone();
+    let Some(json_name) = lower(&mut case, src, &wd.path, &st.frontend, st.timeout) else {
+        case.wall = t0.elapsed().as_secs_f64();
+        return case;
+    };
+
+    // 1b) Package the plan for the second opinion, while the workdir still exists. Built before the
+    // prover runs, so a prover timeout does not also cost the second opinion; its own cost is
+    // discounted from `case.wall` so a second-opinion run's timings stay comparable to one without
+    // it.
+    if let Some(ss_dir) = &st.ss_dir {
+        let job = ss_dir.join(format!("{}.job.jsonl", ss_slug(name)));
+        t0 += Duration::from_secs_f64(package(&mut case, &st.frontend, &wd.path, &json_name, &job, st.timeout));
+    }
+
+    let Some(prover) = &st.prover else {
+        case.status = s(LOWERED);
+        case.wall = t0.elapsed().as_secs_f64();
+        return case;
+    };
+    let remaining = (st.timeout - case.lower_wall).max(1.0);
+    prove(&mut case, &wd.path, &json_name, prover, remaining, st.smt_timeout_ms);
+    case.wall = t0.elapsed().as_secs_f64();
+    case
+}
+
+/// The first stage: lower SQL -> JSON in `workdir`, or take a pre-parsed plan as it is. Returns the
+/// plan's file name when there is one to prove, and `None` when the case is already decided
+/// (refused, timed out, or an error), with its status set.
+pub fn lower(case: &mut Case, src: &Path, workdir: &Path, frontend: &str, timeout: f64) -> Option<String> {
     let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let json_name = format!("{stem}.json");
     let json_path = workdir.join(&json_name);
@@ -263,36 +295,31 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
         // Pre-parsed relational plan: skip the frontend stage entirely.
         if let Err(e) = std::fs::copy(src, &json_path) {
             case.message = format!("cannot copy {}: {e}", src.display());
-            case.wall = t0.elapsed().as_secs_f64();
-            return case;
+            return None;
         }
     } else {
-        // 1) Lower SQL -> JSON.
         let sql_name = format!("{stem}.sql");
         if let Err(e) = std::fs::copy(src, workdir.join(&sql_name)) {
             case.message = format!("cannot copy {}: {e}", src.display());
-            case.wall = t0.elapsed().as_secs_f64();
-            return case;
+            return None;
         }
         let flags = match catalog_flags(src) {
             Ok(f) => f,
             Err(e) => {
                 case.message = e;
-                case.wall = t0.elapsed().as_secs_f64();
-                return case;
+                return None;
             }
         };
-        let mut argv = vec![st.frontend.clone()];
+        let mut argv = vec![frontend.to_string()];
         argv.extend(flags);
         argv.extend([sql_name, json_name.clone()]);
-        let fr = run_cmd(&argv, &workdir, st.timeout, &[]);
+        let fr = run_cmd(&argv, workdir, timeout, &[]);
         case.lower_wall = fr.wall;
         if fr.timed_out {
             case.status = s(TIMEOUT);
             case.message = s("frontend timed out");
-            set_triviality(&mut case, None, src);
-            case.wall = t0.elapsed().as_secs_f64();
-            return case;
+            set_triviality(case, None, src);
+            return None;
         }
         // The frontend's exit code is meaningful, but check the artifact too: a zero exit with no
         // JSON is still a case we cannot prove, and silently proving nothing would be worse.
@@ -300,62 +327,53 @@ pub fn run_case(src: &Path, name: &str, st: &Stage) -> Case {
         if fr.rc != 0 || empty {
             case.status = s(REFUSED);
             (case.refuse_kind, case.message) = classify_refusal(&fr.err);
-            set_triviality(&mut case, None, src);
-            case.wall = t0.elapsed().as_secs_f64();
-            return case;
+            set_triviality(case, None, src);
+            return None;
         }
     }
-
     case.lowered = true;
-    set_triviality(&mut case, Some(&json_path), src);
+    set_triviality(case, Some(&json_path), src);
+    Some(json_name)
+}
 
-    // 1b) Package the plan for the second opinion, while the workdir still exists. This is
-    // `{name, ir, schema}` built from *this* JSON -- the same bytes the prover is about to read --
-    // so nothing re-lowers the case and the two axes cannot drift apart. Built before the prover
-    // runs, so a prover timeout does not also cost the second opinion; its own cost is discounted
-    // from `case.wall` so a second-opinion run's timings stay comparable to one without it.
-    if let Some(ss_dir) = &st.ss_dir {
-        let job = ss_dir.join(format!("{}.job.jsonl", ss_slug(name)));
-        let argv = [
-            st.frontend.clone(),
-            s("--sqlsolver"),
-            s("--ir"),
-            json_name.clone(),
-            s("--name"),
-            name.to_string(),
-            s("-o"),
-            job.to_string_lossy().into_owned(),
-        ];
-        let pack = run_cmd(&argv, &workdir, st.timeout, &[]);
-        t0 += Duration::from_secs_f64(pack.wall);
-        if pack.rc != 0 || !job.exists() {
-            case.s_bucket = Some(s(crate::axes::solver::UNSUPPORTED));
-            let why = tail(&pack.err);
-            case.s_note = if why.is_empty() { format!("could not package the plan (exit {})", pack.rc) } else { why };
-        }
+/// Package the lowered plan as the second opinion's job at `job`: `{name, ir, schema}` built from
+/// *this* JSON -- the same bytes the prover reads -- so nothing re-lowers the case and the two axes
+/// cannot drift apart. A plan the bridge cannot express is `unsupported` on the case. Returns the
+/// wall time it took.
+pub fn package(case: &mut Case, frontend: &str, workdir: &Path, json_name: &str, job: &Path, timeout: f64) -> f64 {
+    let argv = [
+        frontend.to_string(),
+        s("--sqlsolver"),
+        s("--ir"),
+        json_name.to_string(),
+        s("--name"),
+        case.name.clone(),
+        s("-o"),
+        job.to_string_lossy().into_owned(),
+    ];
+    let pack = run_cmd(&argv, workdir, timeout, &[]);
+    if pack.rc != 0 || !job.exists() {
+        case.s_bucket = Some(s(crate::axes::solver::UNSUPPORTED));
+        let why = tail(&pack.err);
+        case.s_note = if why.is_empty() { format!("could not package the plan (exit {})", pack.rc) } else { why };
     }
+    pack.wall
+}
 
-    let Some(prover) = &st.prover else {
-        case.status = s(LOWERED);
-        case.wall = t0.elapsed().as_secs_f64();
-        return case;
-    };
-
-    // 2) Prove equivalence.
+/// The second stage: prove equivalence of the plan `json_name` in `workdir`, within `timeout`
+/// seconds.
+pub fn prove(case: &mut Case, workdir: &Path, json_name: &str, prover: &str, timeout: f64, smt_timeout_ms: Option<u64>) {
     let env: Vec<(String, String)> =
-        st.smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
-    let remaining = (st.timeout - case.lower_wall).max(1.0);
-    let qr = run_cmd(&[prover.clone(), json_name], &workdir, remaining, &env);
+        smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
+    let qr = run_cmd(&[prover.to_string(), json_name.to_string()], workdir, timeout, &env);
     case.prove_wall = qr.wall;
     if qr.timed_out {
         case.status = s(TIMEOUT);
         case.message = s("prover timed out");
-        case.wall = t0.elapsed().as_secs_f64();
-        return case;
+        return;
     }
-    read_result(&mut case, &workdir.join(format!("{stem}.result")), &qr);
-    case.wall = t0.elapsed().as_secs_f64();
-    case
+    let stem = json_name.strip_suffix(".json").unwrap_or(json_name);
+    read_result(case, &workdir.join(format!("{stem}.result")), &qr);
 }
 
 /// The prover's verdict: its `.result` file when it wrote one, else what it printed.

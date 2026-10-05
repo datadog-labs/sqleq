@@ -11,7 +11,8 @@ inside, classifies the outcome, and prints a summary with timings — plus machi
 and CI-friendly exit codes. It also consumes **pre-parsed `.json`** plans directly (e.g. the
 prover's bundled `tests/calcite/` corpus), skipping the lowering stage. More axes can be asked about
 the same pairs: [sqleq-solver](#second-opinion-sqleq-solver), [sqleq-fuzz](../sqleq-fuzz/README.md)
-and the [Lean axis](../docs/LEAN.md).
+and the [Lean axis](../docs/LEAN.md) — one after another, or [all at once on each
+pair](#portfolio-every-backend-at-once), for one combined verdict.
 
 Every backend runs as a subprocess, in a process group of its own, so this crate builds none of
 them: it is light enough to be a default workspace member, and a timeout or a Ctrl-C kills a
@@ -62,7 +63,8 @@ sqleq-check --keep ./work rewrites/
 | Flag | Meaning |
 |------|---------|
 | `-j, --jobs N` | Parallel cases (default `min(8, ncpu)`). Each case runs z3+cvc5, so don't oversubscribe heavily. |
-| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60). On timeout the whole process group is killed. |
+| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60). On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. |
+| `--portfolio` | Run every asked backend on each case at once, within `-t`, and report one combined verdict per case — see [Portfolio](#portfolio-every-backend-at-once). |
 | `--smt-timeout MS` | Sets `QED_SMT_TIMEOUT` per SMT request (prover default is 10000 ms). |
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable`. |
 | `--expect report-only` | Always exit 0; just report. |
@@ -177,9 +179,10 @@ Two things about the numbers, both printed under the table on every run:
 
 Mechanics worth knowing before reading a slow run:
 
-- The rows go to one driver process **at the end, sequentially**, not per case. A JVM's startup
-  would otherwise swamp the cases, and the per-row cap is load-sensitive — a second opinion that
-  changes under `-j` is not one.
+- Without `--portfolio`, the rows go to one driver process **at the end, sequentially**, not per
+  case. A JVM's startup would otherwise swamp the cases, and the per-row cap is load-sensitive — a
+  second opinion that changes under `-j` is not one. That makes this the mode to compare the two
+  implementations in, or to pin; `--portfolio` trades it for an answer within a deadline.
 - A row can outlive its cap, so the driver writes what it has and then halts itself; the harness
   notices the missing answers and resumes. The wall line reports `N driver self-halt(s) in M
   pass(es)` when that happened.
@@ -197,6 +200,69 @@ Mechanics worth knowing before reading a slow run:
 See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for what `sqleq-solver` rewrites and where it
 differs from the original, the bridge to the JVM fork and the Calcite-ectomy behind it, and the
 false proofs that keep the fork a cross-check.
+
+## Portfolio: every backend at once
+
+```sh
+# One verdict per pair, every backend at once, 60s per pair; exit 1 unless every pair is equivalent:
+sqleq-check --portfolio -t 60 rewrites/
+# The same over a corpus, with the Lean axis too, as a report:
+sqleq-check --portfolio --lean --expect report-only -t 30 --json out.json corpus/
+```
+
+`--portfolio` runs the backends side by side on each case instead of axis by axis. sqleq-fuzz and
+Lean start as soon as the case does, beside the frontend; the QED prover and sqleq-solver start the
+moment the frontend has lowered the pair and packaged its job. All of them share the case's one
+`--timeout`: each is given what is left of it, and whatever is still running when it passes is
+killed with its process group. **No backend is stopped because another answered.** A proof and a
+counterexample on the same pair mean one of the two backends is wrong, and a run that stopped at the
+first answer could not see it.
+
+It asks `frontend`, `qed`, `sqleq-solver` and `fuzz` unless `--axes` names others; `--lean` adds the
+Lean axis. Each case gets one verdict, read off the same per-axis answers `--expect pinned` judges,
+through the suite's own tables of which answer claims, evidences or refutes equivalence under which
+parameter binding:
+
+| verdict | when |
+|---|---|
+| `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair and sqleq-fuzz found a counterexample. One of them is wrong. |
+| `not-equivalent` | sqleq-fuzz found an instance on which the two sides differ. |
+| `equivalent` | The QED prover or sqleq-solver proved the pair (`proved` or `proved-literal`), under index binding: the claim `provable` makes. |
+| `equivalent-gather` | Only Lean proved it, under the gather rule. A different claim from `equivalent` — see [`../docs/LEAN.md`](../docs/LEAN.md). |
+| `equivalent-gather-generated` | Only Lean proved it, under the gather rule's weaker generated form. |
+| `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. |
+| `undecided` | Nothing decisive, and every backend finished. |
+
+Lean's `no-witness` may be vacuous, so it can raise an alarm but is not evidence of equivalence. A
+Lean proof and a fuzz counterexample are never an alarm: they are about different relations between
+the two sides' parameters. Neither `timeout` nor `undecided` says the pair is not equivalent.
+
+**The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
+case is `equivalent`, so a proof from either prover counts and a Lean proof does not. `--expect
+report-only` passes unless some case is an `alarm`, which fails every run. `--expect pinned` and
+`--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend on a time budget, and a JVM
+started per case would cost more than the case.
+
+Output: the per-axis tables as without it, then a `Portfolio` table — the verdict counts,
+`capability` (`equivalent` among the pairs whose two queries differ), which prover the proofs came
+from, the time to the first decisive answer against the case's wall time, which backends were cut
+off, and every alarm by name. Each case's line says which backends its verdict rests on and when
+each answered. `--json` adds a `portfolio` object to each case (`verdict`, `by`, `pending`, `done`,
+`first_s`, `retried`) and `meta.portfolio` (`deadline_s`, `backends`, `counts`, `alarms`,
+`retried`); `--csv` appends `p_verdict`, `p_by`, `p_pending`, `p_first_s` and `p_retried`.
+
+Three things to know before reading one:
+
+- **Its answers are bought with a time budget, under load.** A backend near its cap can decide
+  differently with other cases running beside it than it does alone, sqleq-solver included, which
+  here runs per case beside the others rather than in the sequential pass the [second
+  opinion](#second-opinion-sqleq-solver) uses. Read `timeout` as "not within this budget"; compare
+  or pin axes without `--portfolio`.
+- **`-j` still counts cases.** Each one runs up to four backends at once, and the QED prover runs z3
+  and cvc5 besides, so lower `-j` when `timeout` shows up where a lighter run decides.
+- **A case left without a verdict is re-run once, serially** — one that ended `timeout`, or
+  `undecided` after a prover crash or a sqleq-solver error — unless `--no-retry`. The re-run is kept
+  only if it decides the case, and the case is marked `retried`.
 
 ## Pinned pairs
 
@@ -230,6 +296,8 @@ replaces a file atomically, only when its bytes change.
 - `0` — policy satisfied (see `--expect`).
 - `1` — policy not satisfied (some case failed the expectation).
 - `2` — usage / setup error (no inputs, binary not found, a flag that does not combine, …).
+
+Under `--portfolio` the combined verdict decides `0` or `1`, and an `alarm` is always `1`.
 - `130` — interrupted (Ctrl-C); every backend still running is killed first.
 
 ## Implementation notes

@@ -17,7 +17,8 @@ use crate::cli::{resolve_axes, Args, Expect};
 use crate::discover::{self, SsDriver};
 use crate::inputs::{collect_inputs, common_root, display_name, suffix};
 use crate::pinned;
-use crate::report::{self, Color, Finding, FuzzMeta, LeanMeta, Meta, PinnedMeta, SsMeta};
+use crate::portfolio;
+use crate::report::{self, Color, Finding, FuzzMeta, LeanMeta, Meta, PinnedMeta, PortfolioMeta, SsMeta};
 use crate::util::round;
 
 /// Everything resolved before a single case runs.
@@ -36,10 +37,27 @@ pub struct Env {
 pub fn setup(args: &Args) -> Result<Env, String> {
     let axes = resolve_axes(args)?;
     let pinned = args.expect == Expect::Pinned;
+    if args.portfolio {
+        // A pin is an axis's answer, reproducible run to run; a portfolio answer is bought with a
+        // time budget shared under load, so pinning one would make the suite flaky.
+        if pinned || args.bless {
+            return Err("error: --portfolio answers within a time budget, and a pin must not depend on one; \
+                        run --expect pinned without --portfolio"
+                .into());
+        }
+        if axes.contains(&"sqlsolver-jvm") {
+            return Err("error: --portfolio starts each backend per case, and a JVM's startup would cost more \
+                        than the case; ask --sqleq-solver, or the JVM fork without --portfolio"
+                .into());
+        }
+        if !axes.iter().any(|a| ["qed", "sqleq-solver", "fuzz", "lean"].contains(a)) {
+            return Err("error: --portfolio needs a backend that can decide: qed, sqleq-solver, fuzz or lean".into());
+        }
+    }
     if args.bless && !pinned {
         return Err("error: --bless needs --expect pinned".into());
     }
-    if args.expect == Expect::Equivalent && !axes.contains(&"qed") {
+    if args.expect == Expect::Equivalent && !args.portfolio && !axes.contains(&"qed") {
         return Err("error: --expect equivalent is a policy on the qed axis, which --axes leaves out; use \
                     --expect pinned or report-only"
             .into());
@@ -94,6 +112,11 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     Ok(Env { axes, frontend, prover, ss, fuzz, lean, files })
 }
 
+/// The backends a run asks: every axis but the frontend, which only feeds two of them.
+fn backends(axes: &[&'static str]) -> Vec<&'static str> {
+    axes.iter().copied().filter(|a| *a != "frontend").collect()
+}
+
 fn isatty_stdout() -> bool {
     // SAFETY: isatty(2) on a descriptor this process owns.
     unsafe { libc::isatty(1) == 1 }
@@ -104,10 +127,10 @@ fn progress(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Run every case through `stage` on `jobs` workers, calling `done` on each as it finishes.
+/// Run every case through `run` on `jobs` workers, calling `done` on each as it finishes.
 fn run_all(
     files: &[(PathBuf, String)],
-    stage: &Stage,
+    run: &(dyn Fn(&Path, &str) -> Case + Sync),
     jobs: usize,
     mut done: impl FnMut(Case),
 ) {
@@ -120,7 +143,7 @@ fn run_all(
             s.spawn(move || loop {
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 let Some((f, name)) = files.get(k) else { break };
-                if tx.send(run_case(f, name, stage)).is_err() {
+                if tx.send(run(f, name)).is_err() {
                     break;
                 }
             });
@@ -160,7 +183,9 @@ pub fn main(args: Args) -> i32 {
     // surprising row can be replayed by hand.
     let mut ss_tmp: Option<crate::util::TempDir> = None;
     let ss_dir: Option<PathBuf> = match &env.ss {
+        // A portfolio packages each case's job in that case's own directory.
         None => None,
+        Some(_) if args.portfolio => None,
         Some(_) => {
             let dir = match &keep_dir {
                 // Cleared, not reused, unlike the per-case workdirs beside it: the driver resumes
@@ -205,16 +230,24 @@ pub fn main(args: Args) -> i32 {
         if let Some(f) = &env.fuzz {
             println!("{}", c.dim(&format!("sqleq-fuzz:   {f}")));
         }
-        println!(
-            "{}",
-            c.bold(&format!(
+        let line = if args.portfolio {
+            format!(
+                "Checking {} case(s) as a portfolio of {}, all at once within {}s per case, {} case(s) at a time…",
+                files.len(),
+                backends(&axes).join(", "),
+                report::fmt_secs(args.timeout),
+                args.jobs
+            )
+        } else {
+            format!(
                 "Checking {} case(s) on {} with {} worker(s), {:.0}s/case…",
                 files.len(),
                 axes.join(", "),
                 args.jobs,
                 args.timeout
-            ))
-        );
+            )
+        };
+        println!("{}", c.bold(&line));
         println!();
     }
 
@@ -230,7 +263,26 @@ pub fn main(args: Args) -> i32 {
         keep_dir: keep_dir.clone(),
         ss_dir: ss_dir.clone(),
     };
-    if env.frontend.is_none() {
+    let pctx = portfolio::Ctx {
+        axes: &axes,
+        frontend: env.frontend.as_deref(),
+        prover: env.prover.as_deref(),
+        ss: env.ss.as_ref(),
+        ss_cap_ms: args.sqleq_solver_timeout.filter(|t| *t > 0),
+        fuzz: env.fuzz.as_deref(),
+        lean: env.lean.as_deref(),
+        timeout: args.timeout,
+        smt_timeout_ms: args.smt_timeout,
+        keep_dir: keep_dir.as_deref(),
+    };
+    let run_one = |f: &Path, name: &str| {
+        if args.portfolio {
+            portfolio::run_case(f, name, &pctx)
+        } else {
+            run_case(f, name, &stage)
+        }
+    };
+    if env.frontend.is_none() && !args.portfolio {
         // Only axes that read the pair file themselves: nothing to lower.
         for (f, name) in &files {
             let mut x = Case::new(name, &f.to_string_lossy());
@@ -239,10 +291,13 @@ pub fn main(args: Args) -> i32 {
         }
     } else {
         let total = files.len();
-        run_all(&files, &stage, args.jobs, |case| {
-            let notable = case.status != PROVABLE && case.status != LOWERED;
+        run_all(&files, &run_one, args.jobs, |case| {
+            let notable = match &case.portfolio {
+                Some(o) => o.verdict != portfolio::EQUIVALENT,
+                None => case.status != PROVABLE && case.status != LOWERED,
+            };
             if !pinned_mode && (args.verbose || (!args.quiet && notable)) {
-                report::print_case_line(c, &case, name_w);
+                report::print_line(c, &case, name_w);
             } else if !args.quiet && live {
                 progress(&c.dim(&format!("  [{}/{total}] ", cases.len() + 1)));
             }
@@ -254,7 +309,33 @@ pub fn main(args: Args) -> i32 {
     // -j shouldn't be misreported as a real failure. A refusal is deterministic, so it is never
     // retried.
     let transient = |s: &str| [PANIC, TIMEOUT, ERROR].contains(&s);
-    if !args.no_retry && env.frontend.is_some() {
+    let mut retried = 0;
+    if !args.no_retry && args.portfolio {
+        // The portfolio's own criterion: a case left without a verdict by the deadline or by a
+        // failure that load can cause. The re-run is kept only when it decides the case.
+        let retry: Vec<usize> = (0..cases.len()).filter(|&i| portfolio::worth_retrying(&cases[i])).collect();
+        if !retry.is_empty() {
+            if !args.quiet && live {
+                progress(&" ".repeat(30));
+            }
+            if !args.quiet {
+                println!("{}", c.dim(&format!("  re-running {} undecided case(s) serially…", retry.len())));
+            }
+            for i in retry {
+                retried += 1;
+                let mut new = portfolio::run_case(Path::new(&cases[i].path), &cases[i].name.clone(), &pctx);
+                if let Some(o) = new.portfolio.as_mut() {
+                    o.retried = true;
+                }
+                if new.portfolio.as_ref().is_some_and(|o| portfolio::decisive(&o.verdict)) {
+                    if !args.quiet {
+                        report::print_line(c, &new, name_w);
+                    }
+                    cases[i] = new;
+                }
+            }
+        }
+    } else if !args.no_retry && env.frontend.is_some() {
         let retry: Vec<usize> = (0..cases.len()).filter(|&i| transient(&cases[i].status)).collect();
         if !retry.is_empty() {
             if !args.quiet && live {
@@ -282,7 +363,11 @@ pub fn main(args: Args) -> i32 {
     // After the prover pass and its retries, and timed apart from them: the second opinion is a
     // separate question and must not be able to move the numbers above, nor they it.
     let mut ss_stats = solver::Stats::default();
-    if let (Some(driver), Some(dir)) = (&env.ss, &ss_dir) {
+    if args.portfolio {
+        // Every axis answered inside the case already; what is left is to count.
+        ss_stats.rows = cases.iter().filter(|x| x.s_verdict.is_some() || x.s_bucket.is_some()).count();
+        ss_stats.answered = Some(cases.iter().filter(|x| x.s_verdict.is_some()).count());
+    } else if let (Some(driver), Some(dir)) = (&env.ss, &ss_dir) {
         if !args.quiet {
             if live {
                 progress(&" ".repeat(30));
@@ -304,7 +389,10 @@ pub fn main(args: Args) -> i32 {
     // The fuzz axis reads the pair files itself, so it is independent of the passes above --
     // though not of the pair, which is the point.
     let mut fuzz_stats = None;
-    if let Some(fz) = &env.fuzz {
+    let sql_cases = cases.iter().filter(|x| x.is_sql()).count();
+    if args.portfolio {
+        fuzz_stats = env.fuzz.as_ref().map(|_| fuzz::Stats { rows: sql_cases, wall_s: None });
+    } else if let Some(fz) = &env.fuzz {
         if !args.quiet {
             if live {
                 progress(&" ".repeat(30));
@@ -317,7 +405,9 @@ pub fn main(args: Args) -> i32 {
 
     // The Lean axis, likewise apart from both: it reads the pair files itself.
     let mut lean_stats = None;
-    if let Some(lb) = &env.lean {
+    if args.portfolio {
+        lean_stats = env.lean.as_ref().map(|_| lean::Stats { rows: sql_cases, ..lean::Stats::default() });
+    } else if let Some(lb) = &env.lean {
         if !args.quiet {
             if live {
                 progress(&" ".repeat(30));
@@ -330,6 +420,12 @@ pub fn main(args: Args) -> i32 {
 
     if pinned_mode {
         cases.sort_by(|a, b| a.name.cmp(&b.name));
+    } else if args.portfolio {
+        let rank = |x: &Case| {
+            let v = x.portfolio.as_ref().map_or("", |o| o.verdict.as_str());
+            portfolio::ORDER.iter().position(|o| *o == v).unwrap_or(99)
+        };
+        cases.sort_by(|a, b| (rank(a), &a.name).cmp(&(rank(b), &b.name)));
     } else {
         cases.sort_by(|a, b| (status_rank(&a.status), &a.name).cmp(&(status_rank(&b.status), &b.name)));
     }
@@ -372,6 +468,9 @@ pub fn main(args: Args) -> i32 {
         if let Some(st) = &lean_stats {
             report::print_lean(c, &cases, st);
         }
+        if args.portfolio {
+            report::print_portfolio(c, &cases, &backends(&axes), args.timeout, retried);
+        }
     }
 
     let meta = Meta {
@@ -401,6 +500,7 @@ pub fn main(args: Args) -> i32 {
             total: pinned.len(),
             blessed: blessed.clone(),
         }),
+        portfolio: args.portfolio.then(|| PortfolioMeta::of(&cases, &backends(&axes), args.timeout, retried)),
         findings: pinned_mode.then(|| {
             let mut out = Vec::new();
             for p in &pinned {
@@ -434,7 +534,7 @@ pub fn main(args: Args) -> i32 {
         }
     }
     if let Some(path) = &args.csv {
-        if let Err(e) = report::write_csv(path, &cases) {
+        if let Err(e) = report::write_csv(path, &cases, args.portfolio) {
             eprintln!("error: {path}: {e}");
             return 2;
         }
@@ -443,6 +543,18 @@ pub fn main(args: Args) -> i32 {
         }
     }
 
+    let verdict_is = |x: &Case, v: &str| x.portfolio.as_ref().is_some_and(|o| o.verdict == v);
+    if args.portfolio {
+        // The combined verdict decides, and a soundness alarm fails every policy: it says one of the
+        // backends is wrong, which no report should pass over in silence.
+        if cases.iter().any(|x| verdict_is(x, portfolio::ALARM)) {
+            return 1;
+        }
+        return match args.expect {
+            Expect::Equivalent => i32::from(!cases.iter().all(|x| verdict_is(x, portfolio::EQUIVALENT))),
+            _ => 0,
+        };
+    }
     match args.expect {
         Expect::ReportOnly => 0,
         // Blessing never clears an invariant, a timeout or a lint error, so a bless run that leaves
