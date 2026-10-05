@@ -117,6 +117,7 @@ pub const FAKE_PROVER: &str = r#"for a in "$@"; do json=$a; done
 [ -n "$FAKE_ULIMIT" ] && ulimit -v >> "$FAKE_ULIMIT"
 if [ -n "$FAKE_QED_ONCE" ] && [ ! -e "$FAKE_QED_ONCE" ]; then : > "$FAKE_QED_ONCE"; sleep 30; fi
 [ -n "$FAKE_QED_SLEEP" ] && sleep "$FAKE_QED_SLEEP"
+[ -n "$FAKE_QED_SIGNAL" ] && kill -"$FAKE_QED_SIGNAL" $$
 case "$FAKE_QED" in proved) p=true ;; *) p=false ;; esac
 printf '{"provable": %s, "panicked": false}' "$p" > "${json%.json}.result"
 "#;
