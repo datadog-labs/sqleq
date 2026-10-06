@@ -112,6 +112,10 @@ what it is or refused:
 - **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
   unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
   only in case (`"s"` and `"S"`) is refused rather than resolved to one of them.
+- **A schema qualifier is part of a table's name.** Qualifiers are dropped so that `s.t` meets the
+  DDL's `t`, but only when every reference in the pair to one bare name has the same qualifier.
+  `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides read two
+  tables, and a DDL that declares only `t` declares neither of them.
 - **The target of a `DELETE` or `UPDATE` always names the table.** A `WITH` binding of the same name
   would be inlined over it by the reduction, so `WITH t AS (…) DELETE FROM t`, which empties `t`, is
   refused rather than lowered as a filtered delete.

@@ -148,10 +148,11 @@ pub fn job(row: &Row) -> Job {
 /// actually changed is readable off the notes.
 ///
 /// **The one guard that cannot be recomputed afterwards** is [`qualifier_conflict`], which is
-/// cross-side: `normalize::strip_schema` has a per-query injectivity check but no view of the other
-/// side, so it can strip `x.t` on one side and `y.t` on the other and merge two tables into one. That
-/// check therefore runs on the raw text *before* normalizing, and a row it fires on is not normalized
-/// at all — the collapse it prevents is not reversible once rendered.
+/// cross-side: stripping `x.t` on one side and `y.t` on the other would merge two tables into one.
+/// `normalize::strip_schema` checks the same thing over the pair before it strips, but this job also
+/// strips the text by its own rules, so the check runs here too, on the raw text *before*
+/// normalizing, and a row it fires on is not normalized at all — the collapse it prevents is not
+/// reversible once rendered.
 pub fn job_normalized(row: &Row) -> Job {
     build(row, true)
 }
@@ -789,9 +790,9 @@ mod tests {
 
     #[test]
     fn an_ambiguous_qualifier_is_never_normalized() {
-        // `strip_schema`'s injectivity check is per query; `qualifier_conflict` is cross-side. Two
-        // different schemas reducing to one bare table would merge two relations, and rendering the
-        // strip makes it irreversible -- so the row keeps its qualified text instead.
+        // `qualifier_conflict` is cross-side, as `strip_schema`'s injectivity check is. Two different
+        // schemas reducing to one bare table would merge two relations, and rendering the strip makes
+        // it irreversible -- so the row keeps its qualified text instead.
         let r = row(
             "SELECT x FROM one.t;",
             "SELECT x FROM two.t;",

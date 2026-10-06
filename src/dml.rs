@@ -526,7 +526,7 @@ fn same_target(a: &TableWithJoins, b: &TableWithJoins) -> Result<()> {
 /// This is the language's rule and not a normalisation of convenience, because it decides whether
 /// two `RETURNING` lists are the same projection — folding too much is a false proof, folding too
 /// little is a refusal.
-fn fold_ident(id: &Ident) -> String {
+pub(crate) fn fold_ident(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
         None => id.value.to_lowercase(),

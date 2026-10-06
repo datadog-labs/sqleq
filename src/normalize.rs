@@ -1335,26 +1335,33 @@ const SYS_SCHEMAS: [&str; 4] = ["pg_catalog", "information_schema", "pg_temp", "
 /// no base tables at all — so this is a *naming* fix, not a semantic rewrite: it makes two spellings
 /// of the same table agree.
 ///
-/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing per query:
+/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing **for the
+/// pair**: the guards read every table reference of both queries, and either both are stripped or
+/// neither is.
 ///
 /// * **A system schema anywhere stops it.** `pg_catalog.x` is not the user's `x`, and folding one
 ///   into the other would silently answer a question about the wrong table. An unresolved reference
 ///   downstream is a refusal; a silent rename is not.
 /// * **A bare name reached through two different qualifiers stops it.** `a.orders` and `b.orders`
 ///   are two tables, and stripping would merge them into one — turning a join between two relations
-///   into a self-join, which changes the answer rather than the spelling.
+///   into a self-join, which changes the answer rather than the spelling. That holds across the
+///   pair as much as within a query: `SELECT a FROM s1.t` against `SELECT a FROM s2.t` reads two
+///   tables, and stripping each side on its own would make them one query. Qualifiers are compared
+///   under Postgres's folding, so `"S1".t` and `s1.t` are two schemas too.
 ///
 /// Column qualifiers are left as they are. A three-part `part_16.orders.id` resolves on its last
 /// two parts, so once the table is bare the column already matches it.
 pub fn strip_schema(queries: &mut [Query]) {
+    let mut names = CollectTableNames(Vec::new());
+    for q in queries.iter() {
+        // The read-only `Visit`, not `VisitMut`: the guards have to see every table reference of
+        // the pair before the first one is rewritten.
+        let _ = Visit::visit(q, &mut names);
+    }
+    if !safe_to_strip(&names.0) {
+        return;
+    }
     for q in queries {
-        let mut names = CollectTableNames(Vec::new());
-        // `&*q` so this picks the read-only `Visit`, not `VisitMut`: the guards have to see every
-        // table reference before the first one is rewritten.
-        let _ = Visit::visit(&*q, &mut names);
-        if !safe_to_strip(&names.0) {
-            continue;
-        }
         let _ = q.visit(&mut StripQualifier);
     }
 }
@@ -1383,30 +1390,36 @@ impl VisitorMut for StripQualifier {
     }
 }
 
-/// The two guards, checked over every table reference in one query before any of them is touched.
+/// The two guards, checked over every table reference of the pair before any of them is touched.
+///
+/// The bare name is keyed lower-cased, quoted or not, because that is how the catalog and lowering
+/// will look it up: `s1."T"` and `s2.t` end up at one table there, so they are one bare name here.
+/// The qualifier is compared under Postgres's folding instead, because nothing downstream sees it
+/// once it is stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
 fn safe_to_strip(names: &[ObjectName]) -> bool {
-    let part = |n: &ObjectName, i: usize| {
-        n.0.get(i).and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase())
-    };
-    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut seen: HashMap<String, Vec<String>> = HashMap::new();
     for n in names {
-        let Some(bare) = part(n, n.0.len() - 1) else { return false };
+        let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+            return false;
+        };
         if bare.starts_with("pg_") {
             return false;
         }
         let qualifier = n.0[..n.0.len() - 1]
             .iter()
-            .map(|p| p.as_ident().map(|id| id.value.to_lowercase()).unwrap_or_default())
+            .map(|p| p.as_ident().map(crate::dml::fold_ident).unwrap_or_default())
             .collect::<Vec<_>>();
-        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.as_str())) {
+        // The system schemas by their lower-cased name: `"PG_CATALOG"` is not one, but stopping on it
+        // costs only a refusal.
+        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.to_lowercase().as_str())) {
             return false;
         }
         // Two spellings of one bare name are two tables until proven otherwise.
         match seen.entry(bare) {
-            Entry::Occupied(e) if *e.get() != qualifier.join(".") => return false,
+            Entry::Occupied(e) if *e.get() != qualifier => return false,
             Entry::Occupied(_) => {}
             Entry::Vacant(e) => {
-                e.insert(qualifier.join("."));
+                e.insert(qualifier);
             }
         }
     }
@@ -2016,6 +2029,16 @@ mod tests {
     fn refuses_when_one_bare_name_has_two_qualifiers() {
         let sql = "SELECT x FROM a.orders JOIN b.orders ON a.orders.id = b.orders.id";
         assert_eq!(unschemad(sql), sql);
+    }
+
+    /// The same across the pair: `SELECT x FROM a.orders` against `SELECT x FROM b.orders` reads two
+    /// tables, so neither side is stripped, though each qualifies its one table consistently.
+    #[test]
+    fn refuses_when_the_two_queries_qualify_one_bare_name_differently() {
+        let (a, b) = ("SELECT x FROM a.orders", "SELECT x FROM b.orders");
+        let mut qs = parse_queries(a, b);
+        strip_schema(&mut qs);
+        assert_eq!((qs[0].to_string(), qs[1].to_string()), (a.to_string(), b.to_string()));
     }
 
     /// The same qualifier repeated is one table, not a collision.
