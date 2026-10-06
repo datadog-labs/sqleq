@@ -45,27 +45,66 @@ const BUILTIN_AGGS: [&str; 5] = ["COUNT", "SUM", "AVG", "MIN", "MAX"];
 /// a `declare aggregate function` line produces, without needing the line — paired with the type
 /// they return.
 ///
-/// Without this, `bool_or` matches nothing: it is not in [`BUILTIN_AGGS`] and nobody declared it, so
-/// [`is_agg_call`] says no, the query never takes the Group path, and the call is lowered as an
-/// ordinary per-row scalar. That silently turns one output row into one row per input row — a
-/// cardinality mis-lowering of the same class as [`SET_RETURNING`], reached from the other side.
+/// SOUNDNESS GUARD. An aggregate on none of the lists here matches nothing: [`is_agg_call`] says no,
+/// the query never takes the Group path, and the call is lowered as an ordinary per-row scalar. That
+/// turns the one row an aggregate without `GROUP BY` returns into one row per input row — a
+/// cardinality mis-lowering of the same class as [`SET_RETURNING`], reached from the other side — and
+/// it is a false-proof channel: `SELECT count(*) FROM (SELECT var_pop(a) FROM t) q` returns 1 on an
+/// empty `t`, and `SELECT count(*) FROM t` returns 0, yet the per-row reading made the two one query.
 ///
-/// The demonstrated effect is lost coverage: `SELECT DISTINCT bool_or(b) FROM t` against
-/// `SELECT bool_or(b) FROM t` is the same one row and now proves, where the demoted form compared a
-/// DISTINCT over N rows against N rows and could not. No false-proof witness was found for the
-/// demotion, which is why this is not filed as a soundness fix — but getting the cardinality of an
-/// aggregate wrong is not a thing to leave standing on the strength of having failed to exploit it.
+/// So every built-in Postgres aggregate is classified, and none is left to the scalar path: the
+/// prover-native five are [`BUILTIN_AGGS`]; the ones whose result the bag of input values determines
+/// are here; the ones it does not determine are [`ORDER_SENSITIVE_AGGS`] and [`UNMODELLED_AGGS`],
+/// both refused. (An aggregate a user defines and the input does not declare is still a name nobody
+/// can tell from a function's; see [`contains_agg`].)
 ///
-/// The preprocessor refuses these instead, for a reason that does not apply here: sqlglot parses them
+/// An uninterpreted aggregate symbol is a *function of the bag*, so an entry here must be one:
+/// `bool_or` and `bit_or` fold with an operation that is commutative, associative and idempotent,
+/// `range_agg` and `range_intersect_agg` with union and intersection, and the statistical ones are
+/// functions of sums over the bag. Over floating-point input the rounding of those sums can depend on
+/// the order rows arrive in, as it can for `sum` and `avg`; that is how the frontend reads floating
+/// point everywhere (a `double precision` column is the prover's exact `REAL`), not something this
+/// list adds.
+///
+/// The return types are Postgres's own where it has one: `bool_or`/`bool_and`/`every` return
+/// `boolean`, `regr_count` returns `bigint`, and `corr`, `covar_*` and the other `regr_*` return
+/// `double precision`, whatever they are given. Where the type follows the argument (`bit_and(int2)`
+/// is `int2`, `var_pop(int)` is `numeric` and `var_pop(float8)` is `float8`, `range_agg` returns the
+/// multirange of its range) the entry is [`UNDECLARED_RET`], opaque, for the reason that constant
+/// gives. Null-handling is *not* asserted: `ignoreNulls` stays `false` and `FILTER` stays refused,
+/// both of which are the incomplete-not-unsound direction.
+///
+/// The preprocessor refuses these instead, for a reason that does not apply here: sqlglot parses some
 /// into dedicated node types that render as a plain call, so its downstream had no way to say
 /// "aggregate". Nothing stops us saying it.
-///
-/// The return types are definitional rather than guessed — `bool_or`/`bool_and`/`every` return a
-/// boolean in every dialect that has them — so stating them is not the kind of assumption
-/// [`UNDECLARED_RET`] is careful about. Null-handling is *not* asserted: `ignoreNulls` stays `false`
-/// and `FILTER` stays refused, both of which are the incomplete-not-unsound direction.
-const OPAQUE_AGGS: [(&str, &str); 3] =
-    [("BOOL_OR", "BOOLEAN"), ("BOOL_AND", "BOOLEAN"), ("EVERY", "BOOLEAN")];
+const OPAQUE_AGGS: [(&str, &str); 26] = [
+    ("BOOL_OR", "BOOLEAN"),
+    ("BOOL_AND", "BOOLEAN"),
+    ("EVERY", "BOOLEAN"),
+    ("BIT_AND", UNDECLARED_RET),
+    ("BIT_OR", UNDECLARED_RET),
+    ("BIT_XOR", UNDECLARED_RET),
+    ("STDDEV", UNDECLARED_RET),
+    ("STDDEV_POP", UNDECLARED_RET),
+    ("STDDEV_SAMP", UNDECLARED_RET),
+    ("VARIANCE", UNDECLARED_RET),
+    ("VAR_POP", UNDECLARED_RET),
+    ("VAR_SAMP", UNDECLARED_RET),
+    ("CORR", "REAL"),
+    ("COVAR_POP", "REAL"),
+    ("COVAR_SAMP", "REAL"),
+    ("REGR_AVGX", "REAL"),
+    ("REGR_AVGY", "REAL"),
+    ("REGR_COUNT", "INTEGER"),
+    ("REGR_INTERCEPT", "REAL"),
+    ("REGR_R2", "REAL"),
+    ("REGR_SLOPE", "REAL"),
+    ("REGR_SXX", "REAL"),
+    ("REGR_SXY", "REAL"),
+    ("REGR_SYY", "REAL"),
+    ("RANGE_AGG", UNDECLARED_RET),
+    ("RANGE_INTERSECT_AGG", UNDECLARED_RET),
+];
 
 /// Aggregates whose result is not determined by the bag of values they fold over.
 ///
@@ -97,16 +136,51 @@ const OPAQUE_AGGS: [(&str, &str); 3] =
 ///
 /// The preprocessor demotes these to `qa_*` aggregate symbols instead, which fixes the cardinality
 /// and takes on the bag-determinism assumption. That is the trade being declined here.
-const ORDER_SENSITIVE_AGGS: [&str; 9] = [
+///
+/// The `_strict` and `_unique` variants of the `json*_agg` family are here with their base forms, and
+/// so are the SQL/JSON spellings `json_arrayagg` and `json_objectagg`.
+const ORDER_SENSITIVE_AGGS: [&str; 19] = [
     "ARRAY_AGG",
     "STRING_AGG",
     "GROUP_CONCAT",
     "LISTAGG",
     "JSON_AGG",
+    "JSON_AGG_STRICT",
     "JSONB_AGG",
+    "JSONB_AGG_STRICT",
     "JSON_OBJECT_AGG",
+    "JSON_OBJECT_AGG_STRICT",
+    "JSON_OBJECT_AGG_UNIQUE",
+    "JSON_OBJECT_AGG_UNIQUE_STRICT",
     "JSONB_OBJECT_AGG",
+    "JSONB_OBJECT_AGG_STRICT",
+    "JSONB_OBJECT_AGG_UNIQUE",
+    "JSONB_OBJECT_AGG_UNIQUE_STRICT",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
     "XMLAGG",
+];
+
+/// The other built-in aggregates that are not a function of the bag of values they fold over, or that
+/// cannot be called without a clause the lowering does not read.
+///
+/// SOUNDNESS GUARD, refused wherever a call is lowered, as [`ORDER_SENSITIVE_AGGS`] is and for the
+/// same two reasons: in aggregate position the bag would be taken to determine the result, and in
+/// scalar position, where these used to land, the cardinality is wrong outright.
+///
+/// * `any_value` returns an arbitrary one of its inputs, so two calls over one bag need not agree.
+/// * `mode`, `percentile_cont` and `percentile_disc` are ordered-set aggregates, and `rank`,
+///   `dense_rank`, `percent_rank` and `cume_dist` (without `OVER`) hypothetical-set ones: the values
+///   they fold over are in `WITHIN GROUP (ORDER BY ...)`, which [`call_parts`] refuses anyway.
+const UNMODELLED_AGGS: [&str; 8] = [
+    "ANY_VALUE",
+    "MODE",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "RANK",
+    "DENSE_RANK",
+    "PERCENT_RANK",
+    "CUME_DIST",
 ];
 
 /// Functions whose result can differ between two calls with the same arguments.
@@ -260,6 +334,15 @@ fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {
 fn reject_order_sensitive_agg(full: &str, bare: &str) -> Result<()> {
     if ORDER_SENSITIVE_AGGS.contains(&bare) {
         return Err(unsupported(format!("order-sensitive aggregate {full}")));
+    }
+    Ok(())
+}
+
+/// SOUNDNESS GUARD: see [`UNMODELLED_AGGS`]. Bare-name matched and called wherever a call is lowered,
+/// as [`reject_order_sensitive_agg`] is.
+fn reject_unmodelled_agg(full: &str, bare: &str) -> Result<()> {
+    if UNMODELLED_AGGS.contains(&bare) {
+        return Err(unsupported(format!("unmodelled aggregate {full}")));
     }
     Ok(())
 }
@@ -1682,10 +1765,15 @@ fn is_agg_call(fns: &Fns, e: &Expr) -> bool {
 /// `SELECT COALESCE(SUM(a), 0) FROM t` is an aggregate query even though the projection item is a
 /// `COALESCE`, so looking only at the top of each item would lower `SUM` as a per-row scalar and
 /// silently produce one output row per input row. Recursion deliberately stops at subqueries (an
-/// aggregate in there belongs to the subquery) and at windowed calls (not aggregates here).
+/// aggregate in there belongs to the subquery, or, when it reads only enclosing columns, is refused
+/// there by [`reads_only_enclosing_columns`]) and at windowed calls (not aggregates here).
 ///
-/// This is a *completeness* aid, not the safety net: any aggregate this misses is still caught by
-/// the refusal in [`lower_expr`]'s function arm, so a gap here costs coverage, never soundness.
+/// This is a *completeness* aid, not the safety net, for every aggregate [`is_agg_call`] recognises:
+/// one this walk misses reaches [`lower_expr`]'s function arm, which refuses it, so that gap costs
+/// coverage, never soundness. Every built-in Postgres aggregate is either recognised or refused by
+/// name there (see [`OPAQUE_AGGS`]), so the guarantee covers them all. What neither can catch is an
+/// aggregate a user defined and the input did not declare: to this frontend it is a name like any
+/// function's, and it is lowered per row.
 fn contains_agg(fns: &Fns, e: &Expr) -> bool {
     if is_agg_call(fns, e) {
         return true;
@@ -1753,6 +1841,7 @@ fn agg_of(e: &Expr) -> Result<Agg> {
     // makes [`is_agg_call`] true and sends the call straight down the Group path. A declaration is a
     // statement about the return type, not permission to assume the bag determines the value.
     reject_order_sensitive_agg(&name, bare_name(&name))?;
+    reject_unmodelled_agg(&name, bare_name(&name))?;
     // SOUNDNESS GUARD: see [`call_parts`]. An `ORDER BY` inside the parentheses, a null treatment and
     // `WITHIN GROUP` are among what it refuses; `DISTINCT`, `FILTER` and `*` are read below.
     let CallParts { args: raw_args, distinct, filter } = call_parts(f)?;
@@ -1823,9 +1912,24 @@ impl AggCtx<'_> {
             Some(p) => Some(lower_bool(self.cat, self.scope, self.fns, p)?),
             None => None,
         };
-        let mut operand: Vec<Value> = Vec::new();
+        let mut read = Vec::new();
+        if let Some(p) = &filter {
+            ir_levels(p, &mut read);
+        }
+        let mut lowered = Vec::new();
         for arg in &a.args {
-            let mut v = lower_expr(self.cat, self.scope, self.fns, arg)?;
+            let v = lower_expr(self.cat, self.scope, self.fns, arg)?;
+            ir_levels(&v, &mut read);
+            lowered.push(v);
+        }
+        if reads_only_enclosing_columns(self.scope, &read) {
+            return Err(unsupported(format!(
+                "aggregate {} over columns of an enclosing query only (it belongs to that query)",
+                a.op
+            )));
+        }
+        let mut operand: Vec<Value> = Vec::new();
+        for mut v in lowered {
             if let Some(p) = &filter {
                 // A NULL of the argument's own type, so `make_case` finds the branches already in
                 // agreement and leaves the NULL uncast -- a cast one would stop testing as null.
@@ -1937,6 +2041,7 @@ impl AggCtx<'_> {
                 reject_qualified_builtin_agg(&name, &bare)?;
                 reject_nondeterministic(&name, &bare)?;
                 reject_order_sensitive_agg(&name, &bare)?;
+                reject_unmodelled_agg(&name, &bare)?;
                 // SOUNDNESS GUARD, the same as `lower_expr`'s: a set-returning function over
                 // aggregates is no more a scalar than one over columns, and lowering it as one
                 // understates the row count.
@@ -2046,6 +2151,26 @@ fn ir_levels(v: &Value, out: &mut Vec<usize>) {
         Value::Array(a) => a.iter().for_each(|x| ir_levels(x, out)),
         _ => {}
     }
+}
+
+/// Whether an aggregate whose arguments and `FILTER` read the column levels `read` belongs to an
+/// enclosing query rather than to the one being lowered over `scope`.
+///
+/// SOUNDNESS GUARD. Postgres gives an aggregate to the innermost query level its arguments read a
+/// column of: if the arguments and the `FILTER` contain only outer-level variables, "the aggregate
+/// then belongs to the nearest such outer level, and is evaluated over the rows of that query"
+/// (manual, 4.2.7). In `SELECT (SELECT count(t.a) FROM u) FROM t`, `count(t.a)` folds over `t` and
+/// makes the outer query an aggregate one, returning one row. Lowered where it is written, it folds
+/// over `u` instead, once per row of `t`. The IR has no way to say an aggregate is an enclosing
+/// query's, so such a call is refused.
+///
+/// Levels are absolute ([`crate::scope`]), so the test is arithmetic: below [`Scope::base`] is an
+/// enclosing query's column, within this query's own bindings is its own, and above both is a column
+/// bound by a subquery inside the argument, which Postgres does not count either. An aggregate that
+/// reads no column at all (`count(*)`, `count(1)`) is this query's.
+fn reads_only_enclosing_columns(scope: &Scope, read: &[usize]) -> bool {
+    let own = |l: usize| scope.inner().iter().any(|b| l >= b.offset && l < b.offset + b.cols.len());
+    read.iter().any(|&l| l < scope.base) && !read.iter().any(|&l| own(l))
 }
 
 /// Whether a lowered expression takes a single value within each group.
@@ -2379,6 +2504,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             reject_qualified_builtin_agg(&name, &bare)?;
             reject_nondeterministic(&name, &bare)?;
             reject_order_sensitive_agg(&name, &bare)?;
+            reject_unmodelled_agg(&name, &bare)?;
             // SOUNDNESS GUARD: see [`SET_RETURNING`] — these are not scalars and lowering them as
             // one would understate the row count. Matched on the *bare* name: `public.unnest(x)` is
             // still `unnest`, and widening a refusal can only ever cost completeness.

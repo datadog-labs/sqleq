@@ -105,6 +105,14 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
+  refused: modelled as the prover's own (`count`, `sum`, `avg`, `min`, `max`) or as an uninterpreted
+  function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop`, `corr`, `regr_*`, `range_agg`,
+  …); refused when the bag does not determine its result (`array_agg`, `string_agg`, the `json*_agg`
+  family, `any_value`) or when it is an ordered-set or hypothetical-set aggregate
+  (`percentile_cont`, `mode`, `rank(…) WITHIN GROUP`). An aggregate in a subquery whose arguments
+  read only an enclosing query's columns belongs to that query, and is refused. An aggregate a user
+  defines is recognised only through a `declare aggregate function` line.
 - **A call is more than a name and positional arguments.** A named argument
   (`make_interval(days => a)`, `json_object('k' VALUE a)`), a `t.*` argument, `WITHIN GROUP`, the
   SQL/JSON `ON NULL` and `RETURNING` clauses, an `ORDER BY` or `WHERE` inside the parentheses and
