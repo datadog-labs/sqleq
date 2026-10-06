@@ -265,8 +265,8 @@ def unqualify(text: str, schemas: list[str]) -> str:
     sqleq resolves a table by the last part of its name, and captured dumps rely on that: a dump
     can create `t` while its indexes say `s1.t` and the pair says `s2.t`, which Postgres cannot
     make one table. Putting everything in `public` is the Postgres reading of sqleq's rule. The
-    translator already refuses a last name that two tables share, so this cannot merge two
-    tables."""
+    translator already refuses a last name that two declared tables share, and `localise` keeps the
+    qualifiers on which the two statements' targets disagree, so this cannot merge two tables."""
     for sch in schemas:
         pat = '"' + re.escape(sch.replace('"', '""')) + '"' if not re.fullmatch(r"[a-z_][\w$]*", sch) else \
             r'(?:"' + re.escape(sch) + r'"|' + re.escape(sch) + r')'
@@ -367,9 +367,30 @@ def split_values(sql: str) -> tuple[str, str, str]:
     return "", "", sql
 
 
+_NAME_PART = r'(?:"(?:[^"]|"")+"|[a-z_][\w$]*)'
+_INSERT_TARGET = re.compile(r'\binsert\s+into\s+(' + _NAME_PART + r'(?:\s*\.\s*' + _NAME_PART + r')*)', re.I)
+
+
+def insert_target(sql: str) -> tuple[str, ...] | None:
+    """The parts of the name an INSERT writes, each folded as Postgres folds it, with a leading
+    `public` dropped (the replay puts every table there)."""
+    m = _INSERT_TARGET.search(sql)
+    if m is None:
+        return None
+    parts = tuple(p[1:-1].replace('""', '"') if p.startswith('"') else p.lower()
+                  for p in re.findall(_NAME_PART, m.group(1), re.I))
+    return parts[1:] if len(parts) > 1 and parts[0] == "public" else parts
+
+
 def localise(plan: dict) -> dict:
     """The plan with every schema qualifier stripped (see `unqualify`) and every nondeterministic
     generator made deterministic (see `determinise`), in the DDL and in the statements alike.
+
+    Except where the two statements' targets disagree: `a.events` on one side and `b.events` (or
+    `events`) on the other are two tables, and stripping both would make them one, so the replay
+    would confirm a pair that writes two different tables. Their qualifiers are kept in the
+    statements, and Postgres, which has only the stripped DDL's tables, then sees the disagreement:
+    a statement that does not prepare, an `inconclusive` rather than a `confirmed`.
 
     A default in the DDL and a generator in a statement's tail get a stream per site: the two sides'
     tails are the same text, so their sites line up. Every generator in the VALUES clause, on the
@@ -377,17 +398,20 @@ def localise(plan: dict) -> dict:
     schemas = schemas_in(plan["ddl"] + [plan["values_sql"], plan["unnest_sql"], plan["target"]])
     schemas += [x for x in ("public",) if x not in schemas]
     u = lambda t: unqualify(t, schemas)
+    targets = insert_target(plan["values_sql"]), insert_target(plan["unnest_sql"])
+    kept = set() if targets[0] == targets[1] else {q for t in targets for q in (t or ())[:-1]}
+    u_stmt = lambda t: unqualify(t, [x for x in schemas if x not in kept])
     st = Streams()
     ddl = st.site("d")
     ddl_out = [determinise(u(d), ddl) for d in plan["ddl"]]
 
     def statement(sql: str) -> str:
-        before, values, after = split_values(u(sql))
+        before, values, after = split_values(u_stmt(sql))
         tail = st.site("t")
         return determinise(before, tail) + determinise(values, st.shared("v")) + determinise(after, tail)
 
     out = {**plan, "ddl": ddl_out, "values_sql": statement(plan["values_sql"]),
-           "unnest_sql": statement(plan["unnest_sql"]), "target": u(plan["target"])}
+           "unnest_sql": statement(plan["unnest_sql"]), "target": u_stmt(plan["target"])}
     if plan.get("values_clause") is not None:
         out["values_clause"] = determinise(u(plan["values_clause"]), st.shared("v"))
     out["sequences"] = [f"sqleq_replay_{n}" for n in sorted(st.names.values())]

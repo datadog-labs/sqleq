@@ -215,7 +215,9 @@ deterministic so that both runs see the *same* stream, which is what the theorem
 is fixed, and a random value is drawn from a sequence created within the run: one per default in
 the DDL and per generator in a tail, and one shared by the generators in the `VALUES` clause, so a
 draw on one side only shifts nothing on the other. Schema qualifiers are dropped, which is how
-sqleq resolves a name.
+sqleq resolves a name, except on the targets when the two statements qualify them differently:
+`a.t` and `b.t` are two tables, so their qualifiers are kept, and the run does not prepare rather
+than confirm a pair that writes two tables.
 
 For a pair with generated cells, a probe first runs the `VALUES` clause into a copy of the table
 that has the target's defaults and identities but no constraints, and reads back what the generated
