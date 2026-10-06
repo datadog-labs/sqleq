@@ -44,7 +44,76 @@ fn nodes<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
     }
 }
 
+fn is_nullary(n: &Value) -> bool {
+    n["operand"].as_array().is_some_and(Vec::is_empty) && n.get("query").is_none()
+}
+
 const NUM: &str = r#"create table "t" ("a" INTEGER, "x" NUMERIC, "s" VARCHAR, "d" DATE);"#;
+
+/// The one constant `SELECT <lit> FROM t` projects, as lowered.
+fn literal(lit: &str) -> Value {
+    let q = format!(r#"SELECT {lit} FROM "t""#);
+    let v = lower(NUM, &q, &q);
+    v["queries"][0]["project"]["target"][0].clone()
+}
+
+fn constant(text: &str, ty: &str) -> Value {
+    json!({ "operator": text, "operand": [], "type": ty })
+}
+
+mod null_spelled_strings {
+    use super::*;
+
+    /// No nullary node is spelled like NULL unless it is SQL NULL: QED reads every such spelling as
+    /// NULL, `sqleq-solver` the upper-case one.
+    fn null_spellings(v: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        nodes(v, &mut out);
+        out.into_iter()
+            .filter(|n| is_nullary(n) && n["type"] == "VARCHAR")
+            .filter_map(|n| n["operator"].as_str())
+            .filter(|o| o.to_lowercase() == "null")
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_string_spelled_null_is_not_a_null_constant() {
+        for lit in ["'NULL'", "'null'", "'Null'", "'nUlL'"] {
+            let q = format!(r#"SELECT "s" FROM "t" WHERE "s" = {lit} OR {lit} IS NULL"#);
+            let v = lower(NUM, &q, &q);
+            assert_eq!(null_spellings(&v), Vec::<String>::new(), "{lit}: {v}");
+        }
+    }
+
+    #[test]
+    fn it_is_the_same_string_spelled_as_a_concatenation() {
+        assert_eq!(
+            literal("'NULL'"),
+            json!({ "operator": "||", "operand": [constant("N", "VARCHAR"), constant("ULL", "VARCHAR")], "type": "VARCHAR" })
+        );
+        // Two spellings are two strings, and neither is a NULL.
+        assert_ne!(literal("'NULL'"), literal("'null'"));
+        assert_ne!(literal("'null'"), literal("NULL"));
+        // Every other string, a longer one with `null` in it included, is a plain constant.
+        assert_eq!(literal("'nullable'"), constant("nullable", "VARCHAR"));
+        assert_eq!(literal("''"), constant("", "VARCHAR"));
+        // And SQL NULL is still the nullary NULL.
+        assert_eq!(literal("NULL"), constant("NULL", "INTEGER"));
+    }
+
+    #[test]
+    fn a_coerced_null_string_is_converted_not_relabelled() {
+        // `d = 'NULL'` compares a date with the string's conversion. Relabelling the string as the
+        // date NULL instead would make the comparison never hold.
+        let q = r#"SELECT "d" FROM "t" WHERE "d" = 'NULL'"#;
+        let v = lower(NUM, q, q);
+        let mut out = Vec::new();
+        nodes(&v["queries"][0], &mut out);
+        assert!(out.iter().any(|n| n["operator"] == "q_conv_varchar_date"), "{v}");
+        assert!(!out.iter().any(|n| is_nullary(n) && n["operator"] == "NULL"), "{v}");
+    }
+}
 
 mod integer_division {
     use super::*;

@@ -109,6 +109,9 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A constant says its value and nothing more.** A prover reads a constant's value off its name,
+  so a string spelled `null` in any case, which a prover would read as SQL NULL, is emitted as a
+  concatenation (`'n' || 'ull'`).
 - **Integer division truncates.** Postgres rounds `-7 / 2` toward zero and gives `-7 % 2` the sign
   of the dividend; a prover's integer division is Euclidean. So `/` and `%` on integers are
   functions named after their operand types (`q_arith_div_integer_integer`), never the native

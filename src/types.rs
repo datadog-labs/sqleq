@@ -29,6 +29,15 @@
 //! an uninterpreted function named after its operands' types: a prover that knows nothing about it
 //! can only fail to prove through it, and one that knows its Postgres meaning, infinities included,
 //! can interpret the name.
+//!
+//! # Constants
+//!
+//! A constant is a nullary operator whose name is its value: the provers parse the name by the
+//! node's type. Where that reading would say more than the value, the constant is spelled otherwise:
+//!
+//! * The nullary `NULL` is SQL NULL. Both provers check the name before the type -- QED for any
+//!   spelling that lowercases to `null`, `sqleq-solver` for `NULL` -- so no string literal is a
+//!   nullary node with that text: [`string_literal`] spells it as a concatenation.
 
 use serde_json::{json, Value};
 use sqlparser::ast::DataType;
@@ -371,6 +380,10 @@ pub fn coerce_in_operand(x: Value, col_ty: &str) -> std::result::Result<Value, S
 }
 
 /// Whether `v` is the nullary `NULL` constant.
+///
+/// The name alone decides it, and that is sound only because nothing else is ever a nullary node
+/// named `NULL`: [`string_literal`] does not emit the string `'NULL'` as one. The type cannot decide
+/// it, since a NULL is relabelled to whatever type it is coerced to.
 fn is_null_lit(v: &Value) -> bool {
     v.get("operator").and_then(|o| o.as_str()) == Some("NULL")
         && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
@@ -599,6 +612,23 @@ pub fn coerce_bool(mut v: Value) -> Value {
         }
         None => v,
     }
+}
+
+/// A string literal as a constant.
+///
+/// A string whose text lowercases to `null` is the one exception, because a nullary node with that
+/// name is SQL NULL to the provers (see the module docs). It is emitted as its first
+/// character concatenated with the rest: `'null'` is `'n' || 'ull'`, which is the same string in
+/// any reading of `||`, and spelled with two constants neither of which is `null`. Only the
+/// spelling changes, so `'null'` and `'NULL'` stay two different strings.
+pub fn string_literal(s: &str) -> Value {
+    let constant = |t: &str| json!({ "operator": t, "operand": [], "type": "VARCHAR" });
+    if s.to_lowercase() != "null" {
+        return constant(s);
+    }
+    let first = s.chars().next().map_or(0, char::len_utf8);
+    let (head, tail) = s.split_at(first);
+    json!({ "operator": "||", "operand": [constant(head), constant(tail)], "type": "VARCHAR" })
 }
 
 #[cfg(test)]
