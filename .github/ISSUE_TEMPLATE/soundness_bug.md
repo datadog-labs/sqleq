@@ -1,8 +1,8 @@
 ---
 name: Soundness bug
-about: A prover reported two queries equivalent, and they are not
+about: sqleq reported two queries equivalent, and they are not
 title: '[soundness] '
-labels: ''
+labels: soundness
 assignees: ''
 
 ---
@@ -27,7 +27,12 @@ pair does not need to be minimized: the fix minimizes it and pins it under tests
 
 ## What was reported
 
-<!-- Which axis claimed equivalence (qed or sqlsolver), and the command you ran. -->
+<!--
+Which axis claimed equivalence, and the command you ran. The claim can come from a prover (`qed`,
+`sqleq-solver` or `sqlsolver-jvm`) or from the frontend alone: `emit-reflexive` (both queries lowered
+to the same plan) or `reflexive` (refused, but both normalize to the same query). Under `--portfolio`,
+sqleq-check names the axes its verdict rests on.
+-->
 
 ## Why they are not equivalent
 

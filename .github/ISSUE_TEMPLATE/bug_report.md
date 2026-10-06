@@ -8,7 +8,7 @@ assignees: ''
 ---
 
 <!--
-If a prover reported two queries equivalent and they are not, please use the soundness bug
+If sqleq reported two queries equivalent and they are not, please use the soundness bug
 template instead.
 -->
 
