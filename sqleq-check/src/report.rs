@@ -194,9 +194,14 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
         }
     }
     println!("{}", rule(c));
-    // On the same footing as the qed axis's `capability`: pairs whose two queries differ.
-    let differ: Vec<&portfolio::Outcome> =
-        outcomes.iter().filter(|(x, _)| x.trivial == Some(false)).map(|(_, o)| *o).collect();
+    // The qed axis's `capability` footing, pairs whose two queries differ, less the refused pairs
+    // the frontend found reflexive: here those are `equivalent`, and their two sides are one query,
+    // so counting them would turn a difference in text alone into capability.
+    let differ: Vec<&portfolio::Outcome> = outcomes
+        .iter()
+        .filter(|(x, _)| x.trivial == Some(false) && !x.reflexive)
+        .map(|(_, o)| *o)
+        .collect();
     if !differ.is_empty() {
         let n = differ.iter().filter(|o| o.verdict == portfolio::EQUIVALENT).count();
         let pct = 100.0 * n as f64 / differ.len() as f64;
@@ -214,7 +219,10 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
         let both = eq.iter().filter(|o| has(o, "qed") && has(o, "sqleq-solver")).count();
         let qed = eq.iter().filter(|o| has(o, "qed") && !has(o, "sqleq-solver")).count();
         let ss = eq.iter().filter(|o| has(o, "sqleq-solver") && !has(o, "qed")).count();
-        println!("  {:<13} qed alone {qed} · sqleq-solver alone {ss} · both {both}", c.dim("proved by"));
+        // Settled with no prover: the frontend found the two sides one query.
+        let refl = eq.iter().filter(|o| !has(o, "qed") && !has(o, "sqleq-solver")).count();
+        let refl = if refl > 0 { format!(" · reflexivity alone {refl}") } else { String::new() };
+        println!("  {:<13} qed alone {qed} · sqleq-solver alone {ss} · both {both}{refl}", c.dim("proved by"));
     }
     let first: Vec<f64> = outcomes.iter().filter_map(|(_, o)| o.first_s).collect();
     let walls: Vec<f64> = outcomes.iter().map(|(x, _)| x.wall).collect();

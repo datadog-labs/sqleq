@@ -84,8 +84,9 @@ pub struct Case {
     /// The combined verdict, only under `--portfolio`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<crate::portfolio::Outcome>,
-    /// A refused corpus row whose two sides normalize to the same text, as the frontend's corpus
-    /// report calls it: settled by reflexivity without being lowered.
+    /// A refused case whose two sides normalize to the same query: settled by reflexivity without
+    /// being lowered. The frontend says so in its corpus report's `reflexive` status, and for a
+    /// single pair in a [`sqleq_frontend::REFLEXIVE_NOTE`] line ahead of the refusal.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reflexive: bool,
     /// Each backend's own record, unbucketed: the fuzz label with its partial-trial count, the
@@ -394,6 +395,7 @@ pub fn lower(
         if fr.rc != 0 || empty {
             case.status = s(REFUSED);
             (case.refuse_kind, case.message) = classify_refusal(&fr.err);
+            case.reflexive = fr.err.lines().any(|l| l.trim() == sqleq_frontend::REFLEXIVE_NOTE);
             set_triviality(case, None, src);
             return None;
         }

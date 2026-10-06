@@ -165,6 +165,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            // The corpus mode gives such a row a status of its own; a single pair says it here,
+            // ahead of the refusal, so the refusal is still the line a caller classifies.
+            if sqleq_frontend::reflexive(&src) {
+                eprintln!("{}", sqleq_frontend::REFLEXIVE_NOTE);
+            }
             eprintln!("{e}");
             ExitCode::FAILURE
         }

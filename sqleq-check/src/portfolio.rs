@@ -34,7 +34,8 @@ use crate::util::tail;
 pub const ALARM: &str = "alarm";
 /// sqleq-fuzz found an instance on which the two sides differ.
 pub const NOT_EQUIVALENT: &str = "not-equivalent";
-/// A prover proved it under index binding -- `$N` on one side is `$N` on the other.
+/// A prover proved it under index binding -- `$N` on one side is `$N` on the other -- or the
+/// frontend found the two sides one query (`emit-reflexive`, or refused but `reflexive`).
 pub const EQUIVALENT: &str = "equivalent";
 /// Only Lean proved it, under the gather rule: a different claim (docs/LEAN.md).
 pub const EQUIVALENT_GATHER: &str = "equivalent-gather";
@@ -390,6 +391,12 @@ mod tests {
             ("a proof", vec![("frontend", "emit"), ("qed", "proved"), ("fuzz", "no-counterexample")], EQUIVALENT),
             ("the second prover's proof", vec![("qed", "no-proof"), ("sqleq-solver", "proved")], EQUIVALENT),
             ("reflexive is still a proof", vec![("frontend", "emit-reflexive"), ("qed", "proved-literal")], EQUIVALENT),
+            // Settled by reflexivity although the frontend refused it: no plan, and no prover needed.
+            ("refused, but reflexive", vec![("frontend", "reflexive"), ("qed", "no-plan"), ("fuzz", "no-counterexample")], EQUIVALENT),
+            ("reflexive and a counterexample", vec![("frontend", "reflexive"), ("fuzz", "counterexample")], ALARM),
+            // Identical IR settles the pair even when the prover fails on it.
+            ("lowered alike, prover timed out", vec![("frontend", "emit-reflexive"), ("qed", "timeout")], EQUIVALENT),
+            ("a plain refusal decides nothing", vec![("frontend", "refuse:unsupported"), ("qed", "no-plan")], UNDECIDED),
             ("a counterexample", vec![("qed", "no-proof"), ("fuzz", "counterexample")], NOT_EQUIVALENT),
             ("a proof and a counterexample", vec![("qed", "proved"), ("fuzz", "counterexample")], ALARM),
             ("a literal proof and a counterexample", vec![("sqleq-solver", "proved-literal"), ("fuzz", "counterexample")], ALARM),
