@@ -52,8 +52,8 @@ mod params;
 /// statement what it could not read rather than dropping it silently.
 pub mod pgddl;
 mod scope;
-/// Public because it is an entry point: the `--sqlsolver` mode of the CLI turns a lowered plan, or
-/// a corpus of rows, into jobs for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
+/// Public because it is an entry point: the `--sqlsolver --ir` mode of the CLI turns a lowered plan
+/// into a job for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
 pub mod sqlsolver;
 mod types;
 mod verify;
