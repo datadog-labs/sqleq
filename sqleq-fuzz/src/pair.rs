@@ -5,7 +5,7 @@
 
 //! The per-pair test loop: generate valid instances, run both sides, look for a counterexample.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -21,7 +21,7 @@ use crate::gen::{
     CastTarget, Val,
 };
 use crate::lex::significant;
-use crate::limits;
+use crate::limits::{self, Count};
 use crate::patterns as pat;
 use crate::rewrite;
 use crate::schema::{parse_schema, Schema, VType};
@@ -29,11 +29,32 @@ use crate::shim;
 use crate::typing;
 
 /// Test configuration.
+///
+/// `trials` instances give every table `nrows` generated rows (fewer once the constraints drop the
+/// rows that violate them), so joins, `GROUP BY` and `DISTINCT` collide. Another `trials / 4`,
+/// interleaved with them and drawn from a stream of their own, give each table a size from `0` to
+/// `nrows` with most of the weight on 0 and 1: an empty or one-row table is where an aggregate over no
+/// rows, `EXISTS`, a scalar subquery or an outer join tells two queries apart, and a full-size
+/// instance never has one. The full-size trials draw exactly what they drew before the small ones
+/// existed, so adding them can only add refutations.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub trials: usize,
     pub nrows: usize,
     pub seed: u64,
+}
+
+/// Seeds the small-instance trials' stream, apart from the full-size trials' own.
+const SMALL_STREAM: u64 = 0x5eed_0fe3_177a_b100;
+
+/// The size of one table in a small-instance trial: 0 or 1 rows three times in ten each, otherwise
+/// anything from 2 to `nrows`.
+fn small_size(rng: &mut StdRng, nrows: usize) -> usize {
+    match rng.random_range(0..10) {
+        0..=2 => 0,
+        3..=5 => nrows.min(1),
+        _ => rng.random_range(nrows.min(2)..=nrows),
+    }
 }
 
 impl Default for Config {
@@ -308,23 +329,37 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     let parray = pat::array_params(&a, &b, &arraycols);
     let pnums: BTreeSet<u32> = ph_a.iter().chain(&ph_b).map(|p| p.n).collect();
 
-    // Row cuts (`LIMIT`/`OFFSET`/`FETCH`), read off the parse. Only neutralize a count param that is
-    // NOT also a value predicate (e.g. keyset pagination `WHERE id > $2 ... OFFSET $2`): binding a
-    // dual-purpose param large would hide the difference.
-    let cuts: Vec<limits::Cut> = limits::cuts(&a)
+    // Row cuts (`LIMIT`/`OFFSET`/`FETCH`), read off the parse. A count that is a bare `$N` and
+    // nothing else -- not also compared with a column, as keyset pagination's `WHERE id > $2 ...
+    // OFFSET $2` is, and not both a limit and an offset -- is bound so that it cuts nothing: a
+    // `LIMIT` large and an `OFFSET` to 0. Any other cut keeps an arbitrary choice among tied rows
+    // unless its `ORDER BY` is a total order, and then only cardinality is compared.
+    let cuts: Vec<limits::Cut> = limits::cuts(&a, &schema)
         .into_iter()
-        .chain(limits::cuts(&b))
+        .chain(limits::cuts(&b, &schema))
         .collect();
-    let neutralize: std::collections::HashSet<u32> = cuts
+    let mut counted: BTreeMap<u32, BTreeSet<Count>> = BTreeMap::new();
+    for c in &cuts {
+        for (n, kind) in &c.params {
+            counted.entry(*n).or_default().insert(*kind);
+        }
+    }
+    let neutral: HashMap<u32, Val> = counted
         .iter()
-        .flat_map(|c| c.params.iter().map(|(n, _)| *n))
-        .filter(|n| !pcol.contains_key(n))
+        .filter(|(n, kinds)| !pcol.contains_key(n) && kinds.len() == 1)
+        .map(|(n, kinds)| {
+            let v = match kinds.first() {
+                Some(Count::Offset) => Val::Int(0),
+                _ => Val::Int(1_000_000_000),
+            };
+            (*n, v)
+        })
         .collect();
-    // Nondeterministic row selection/content: a cut that cuts whatever is bound, a kept
-    // (non-neutralized) param count that can still truncate, or a string-flattening aggregate.
-    let cut_nondet = cuts
-        .iter()
-        .any(|c| c.fixed || c.params.iter().any(|(n, _)| !neutralize.contains(n)));
+    let cut_nondet = cuts.iter().any(|c| {
+        !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
+    });
+    // Nondeterministic row selection/content: a cut over rows the order leaves tied, or a
+    // string-flattening aggregate.
     let nondet = cut_nondet || pat::has_nondet_agg(&a, &b);
 
     let is_query_a = is_query(&a);
@@ -380,19 +415,32 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         return Verdict::Error(err_msg(&e));
     }
 
-    let mut rng = StdRng::seed_from_u64(cfg.seed);
+    let mut full_rng = StdRng::seed_from_u64(cfg.seed);
+    let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
+    let small_trials = cfg.trials / 4;
     let mut last_err: Option<String> = None;
     // Trials in which *both* sides ran. A pair where some trials error and the rest agree was really
     // tested; reporting it as ERROR (which the sticky `last_err` alone would do) hides that.
     let mut ok_trials = 0usize;
 
-    for _ in 0..cfg.trials {
-        let rng: &mut StdRng = &mut rng;
+    for i in 0..cfg.trials + small_trials {
+        // Every fifth trial is a small one, until there have been `small_trials` of them; see `Config`.
+        let small = i % 5 == 4 && i / 5 < small_trials;
+        let rng: &mut StdRng = if small {
+            &mut small_rng
+        } else {
+            &mut full_rng
+        };
         let mut rowdata: RowData = RowData::new();
         for t in &finals {
             let table = &schema[t];
-            let mut rows: Vec<Vec<Val>> = Vec::with_capacity(cfg.nrows);
-            for _ in 0..cfg.nrows {
+            let size = if small {
+                small_size(rng, cfg.nrows)
+            } else {
+                cfg.nrows
+            };
+            let mut rows: Vec<Vec<Val>> = Vec::with_capacity(size);
+            for _ in 0..size {
                 let row: Vec<Val> = table.cols.iter().map(|c| randval_col(c, rng)).collect();
                 // DuckDB enforces every other constraint on insert; `NULLS NOT DISTINCT` it does not.
                 if table.admits(&rows, &row) {
@@ -484,8 +532,8 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
                     randval(VType::Integer, false, rng)
                 }
             };
-            let v = if neutralize.contains(&n) {
-                Val::Int(1_000_000_000) // pure row-count param -> never truncates
+            let v = if let Some(v) = neutral.get(&n) {
+                v.clone() // a pure row-count param, bound so that it cuts nothing
             } else if is_array {
                 // 1-3 elements: enough to match real rows often, few enough that the predicate stays
                 // selective and can still discriminate the two sides.

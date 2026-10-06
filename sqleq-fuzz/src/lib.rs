@@ -6,7 +6,7 @@
 //! `sqleq-fuzz` — a license-clean concrete differential tester: a SQL *non-equivalence* disprover.
 //!
 //! For a query pair `(A, B)` under a schema, it generates small **valid** random database instances
-//! (honouring NOT NULL and every UNIQUE / PRIMARY KEY / UNIQUE INDEX), binds
+//! (honouring NOT NULL and every UNIQUE / PRIMARY KEY / UNIQUE INDEX, empty tables included), binds
 //! `$N` params to random typed values consistently across A and B, freezes `now()`/`current_*` and
 //! skips nondeterministic functions, runs both statements on DuckDB set up to compute as Postgres
 //! does, and compares outputs as **sorted multisets** (bag semantics — an ORDER BY-only difference

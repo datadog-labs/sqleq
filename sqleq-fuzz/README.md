@@ -15,7 +15,8 @@ the provers under `--portfolio`; the [Usage](#usage) below is for running it on 
 For a query pair `(A, B)` under a schema, it repeatedly:
 
 1. generates a small **valid** random database instance — honouring `NOT NULL` and *every* `UNIQUE` /
-   `PRIMARY KEY` / `UNIQUE INDEX`, wherever the DDL states it;
+   `PRIMARY KEY` / `UNIQUE INDEX`, wherever the DDL states it — with every table at full size in most
+   trials and empty or nearly so in the rest;
 2. binds `$N` parameters to random typed values, **consistently across A and B**, biasing each param
    toward a value that actually occurs in the column it is compared against (so equality filters
    match rows) — but only where that consistency is something the row supports, see
@@ -58,10 +59,12 @@ deterministic. The rules:
   microseconds apart) disagree spuriously. A clock spelled inside a string literal or a comment is
   left alone.
 - **`LIMIT`/`OFFSET` over an unordered set.** The clauses are read off the parse, so `LIMIT (1)`,
-  `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. Pure row-count params (a bare `$N` and nothing else)
-  are bound large (never truncate). Any other cut, a dual-purpose param count, or a
-  string-flattening aggregate marks the pair *nondeterministic*, after which only **cardinality**
-  differences (which stay deterministic) are trusted.
+  `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. A count that is a bare `$N` and nothing else is
+  bound so that it cuts nothing: a `LIMIT` large, an `OFFSET` to 0. Any other cut, and a
+  string-flattening aggregate, marks the pair *nondeterministic*, after which only **cardinality**
+  differences (which stay deterministic) are trusted — unless the cut's `ORDER BY` is provably a
+  total order (it determines a row of every table through a NOT NULL key, the join's equalities and
+  the columns `WHERE` pins), in which case the rows it keeps are determined and are compared whole.
 - **Evaluate as Postgres does, or not at all.** DuckDB's session runs with `integer_division`
   (integer `/` truncates), `default_null_order = 'postgres'` (NULLs first under `DESC`) and
   `TimeZone = 'UTC'` (not the host's), and `timestamptz` columns are DuckDB `TIMESTAMPTZ`. A divisor
@@ -219,7 +222,10 @@ without a verdict; `2` when the mode is missing or unknown, after printing the u
 Column values are drawn from a deliberately small domain — `0,1,2` for integers, doubles and
 numerics, `'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs and
 a few small JSON documents — so that joins, `GROUP BY` and `DISTINCT` actually collide on small
-instances.
+instances. Every table gets `--rows` rows in each of `--trials` trials; another `--trials / 4`
+trials, interleaved with those and drawn separately, give each table between 0 and `--rows` rows,
+mostly 0 or 1, which is where an aggregate over no rows, `EXISTS` or a scalar subquery tells two
+queries apart.
 Parameters are additionally biased toward a value the column really holds; a **literal is not**. A
 predicate against a literal outside the domain, `status = 'active'`, is therefore satisfied by no
 generated row: both sides return nothing on every trial and a non-equivalent pair reports
