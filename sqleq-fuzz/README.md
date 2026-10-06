@@ -76,7 +76,8 @@ deterministic. The rules:
   `numeric(p,s)` is `DECIMAL(p,s)`, and a bare `numeric`, as a column or a cast, is `DECIMAL(38,18)`
   rather than a `DOUBLE` or DuckDB's `DECIMAL(18,3)`. What has no faithful rendering is withheld as
   `NOT-COMPARABLE`: a `char(n)` column the pair reads (blank-padded comparison), `SIMILAR TO`, a
-  regex operator under `ANY`/`ALL`. Division of a `numeric` is still a `DOUBLE` in DuckDB, so two
+  regex operator under `ANY`/`ALL`, and a numeric literal DuckDB reads as a number and an alias
+  (Postgres 16's `0b101`, `0o17`, `0x1F`, or `1L`). Division of a `numeric` is still a `DOUBLE` in DuckDB, so two
   divisions Postgres computes exactly can differ in the last digits.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.

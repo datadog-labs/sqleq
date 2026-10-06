@@ -128,3 +128,35 @@ fn a_frozen_clock_in_a_literal_stays_text() {
         "SELECT 'now()', TIMESTAMP '2020-06-01 12:00:00' -- current_date"
     );
 }
+
+/// `0b101` is 5 in Postgres 16 and later; DuckDB and sqlparser read it as `0` and an alias named
+/// `b101`, so evaluating it would compare a value Postgres never computes (issue #80).
+#[test]
+fn a_non_decimal_integer_literal_gets_no_verdict() {
+    let ddl = r#"create table "t" ("id" INTEGER, unique ("id"))"#;
+    for lit in ["0b101", "0o17", "0x1F", "0X1F", "1L"] {
+        let v = label(
+            &format!(r#"SELECT {lit} FROM "t""#),
+            r#"SELECT 0 FROM "t""#,
+            ddl,
+        );
+        assert!(v.starts_with("NOT-COMPARABLE:"), "{lit}: {v}");
+    }
+    // Digits grouped by underscores mean the same in both engines, and a literal is only text.
+    assert_eq!(
+        label(
+            r#"SELECT 1_000 AS "x" FROM "t""#,
+            r#"SELECT 1000 AS "x" FROM "t""#,
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    assert_eq!(
+        label(
+            r#"SELECT '0b101' AS "x" FROM "t""#,
+            r#"SELECT '0b' || '101' AS "x" FROM "t""#,
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+}

@@ -261,6 +261,9 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     // one pass that can refuse: it makes a zero divisor raise and a regex match partial, and where it
     // cannot do either faithfully the pair gets no verdict.
     let prep = |sql: &str| -> Result<String, String> {
+        if let Some(why) = pat::odd_number(sql) {
+            return Err(why);
+        }
         let unqualified = rewrite::unqualify_stars(sql);
         let doubled = rewrite::double_precision_floats(&unqualified);
         let widened = rewrite::wide_numerics(&doubled);
