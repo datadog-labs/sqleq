@@ -37,7 +37,8 @@
 //!
 //! * `numeric` is REAL: its `+`, `-` and `*` are exact. Its division rounds to a finite scale
 //!   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over REAL is the uninterpreted `q_arith_div_real_real`
-//!   ([`make_arith`]).
+//!   ([`make_arith`]). REAL carries no scale, so a numeric turned into text, which shows it, is
+//!   refused ([`refuse_unfaithful`]).
 //! * `real`, `double precision` and the other floats are opaque (VARBINARY): float addition is not
 //!   associative, and arithmetic over any opaque operand is an uninterpreted `q_arith_*` function.
 //! * `citext` and the blank-padded `char(n)` are [`UNFAITHFUL`]: their `=` ignores case or trailing
@@ -75,8 +76,8 @@ pub fn emitted_type_name(t: &str) -> &str {
     if t == "TIMESTAMPTZ" {
         "TIMESTAMP"
     } else if UNFAITHFUL.iter().any(|(n, _)| *n == t) {
-        // Only ever a schema's column that no query reads ([`refuse_unfaithful`]): opaque, under the
-        // name both provers accept for that.
+        // A schema's column that no query reads, or a value in a pair whose two plans are one
+        // ([`refuse_unfaithful`]): opaque, under the name both provers accept for that.
         "VARBINARY"
     } else {
         t
@@ -230,19 +231,37 @@ pub fn unfaithful_type(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Refuse a lowered pair if either query carries a value of an [`UNFAITHFUL`] type.
+/// Refuse a lowered pair whose plans read something no prover reads the way Postgres does:
 ///
-/// Read off the `type` of every expression, so it reaches every way such a value enters a plan: a
-/// column, a cast, a function declared to return one. A column of that type that neither query reads
-/// appears only in the schema, where it costs nothing.
+/// * a value of an [`UNFAITHFUL`] type. Read off the `type` of every expression, so it reaches every
+///   way such a value enters a plan: a column, a cast, a function declared to return one. A column
+///   of that type that neither query reads appears only in the schema, where it costs nothing.
+/// * a `numeric` turned into text ([`numeric_to_text`]). A numeric carries a scale, which its text
+///   shows: `1.0` and `1.00` are one number and two strings, and `x * 1.0` and `x * 1.00` are the
+///   same REAL to a prover, whose casts are functions of the value. No spelling of the cast says the
+///   scale either: `x::text` reads a column in one query and `x * 1.0` behind an alias in another.
+///
+/// Except where the two queries lowered to one plan. Every node of a plan carries its type, and a
+/// literal its spelling, so a plan read with citext's own `=`, or with the scales Postgres computes,
+/// still says what the query computes, and two queries with one plan compute the same thing however
+/// those are read. The provers' misreading cannot matter to a proof that a plan equals itself.
 pub fn refuse_unfaithful(input: &Value) -> Result<()> {
-    fn walk(v: &Value) -> Option<&'static (&'static str, &'static str)> {
+    if input["queries"][0] == input["queries"][1] {
+        return Ok(());
+    }
+    fn walk(v: &Value) -> Option<crate::error::FrontendError> {
         match v {
             Value::Object(m) => {
                 if let Some(Value::String(t)) = m.get("type") {
-                    if let Some(u) = UNFAITHFUL.iter().find(|(n, _)| n == t) {
-                        return Some(u);
+                    if UNFAITHFUL.iter().any(|(n, _)| n == t) {
+                        return Some(unfaithful_refusal(t));
                     }
+                }
+                if numeric_to_text(v) {
+                    return Some(unsupported(
+                        "a numeric converted to text, whose scale it shows (1.0 and 1.00 are one number \
+                         and two strings) and the IR's REAL does not carry",
+                    ));
                 }
                 m.values().find_map(walk)
             }
@@ -250,10 +269,22 @@ pub fn refuse_unfaithful(input: &Value) -> Result<()> {
             _ => None,
         }
     }
-    match input.get("queries").and_then(walk) {
-        Some((name, _)) => Err(unfaithful_refusal(name)),
-        None => Ok(()),
-    }
+    input.get("queries").and_then(walk).map_or(Ok(()), Err)
+}
+
+/// Whether `v` turns a REAL, the IR's `numeric`, into text: a cast to a string type over a REAL
+/// operand (a `CAST`, a named `q_cast_` for a qualified target such as `varchar(8)`, or a `qcastK`
+/// of the inferring modes), or a `||` with a REAL operand, which casts it to text.
+fn numeric_to_text(v: &Value) -> bool {
+    let op = v.get("operator").and_then(Value::as_str).unwrap_or("");
+    let operands = v.get("operand").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let real = |e: &Value| e.get("type").and_then(Value::as_str) == Some("REAL");
+    // `get`, not slicing: an operator is any function's name, and a name need not be ASCII.
+    let qcast = op.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("qcast"))
+        && op.get(5..).is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()));
+    let cast = op == "CAST" || op.starts_with("q_cast_") || qcast;
+    let to_text = v.get("type").and_then(Value::as_str) == Some("VARCHAR");
+    (cast && to_text && operands.first().is_some_and(real)) || (op == "||" && operands.iter().any(real))
 }
 
 /// The refusal for a value of the [`UNFAITHFUL`] type `name`.

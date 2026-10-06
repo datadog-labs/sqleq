@@ -245,6 +245,16 @@ fn a_citext_or_char_column_no_query_reads_costs_nothing() {
 }
 
 #[test]
+fn a_pair_that_lowers_to_one_plan_is_not_refused_for_a_citext_value() {
+    // One plan computes one thing, however citext's `=` is read: the two sides differ only in an alias.
+    for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        let v = lower_in(U, r#"SELECT "c" FROM "t" WHERE "c" = 'A'"#, r#"SELECT "x"."c" FROM "t" AS "x" WHERE "x"."c" = 'A'"#, src);
+        assert_eq!(v["queries"][0], v["queries"][1], "{src:?}");
+        assert!(!v.to_string().contains("CITEXT"), "{src:?}: the type leaks to a prover: {v}");
+    }
+}
+
+#[test]
 fn raw_ddl_reads_citext_and_char_the_same_way() {
     let ddl = r#"CREATE TABLE public.t (id integer PRIMARY KEY, c citext, b character(3), v character varying(3));"#;
     let pair = "SELECT \"c\" FROM \"t\" WHERE \"c\" = 'A';\nSELECT \"c\" FROM \"t\";";
@@ -294,6 +304,32 @@ fn numeric_division_is_not_exact() {
     assert!(["*", "+", "-"].iter().all(|o| ops(&v).iter().any(|x| x == o)), "{:?}", ops(&v));
     // Postgres converts the integer side first, so these are one division.
     let v = lower_in(F, r#"SELECT "a" / 2.0 FROM "t""#, r#"SELECT CAST("a" AS numeric) / 2.0 FROM "t""#, CatalogSource::Declared);
+    assert_eq!(v["queries"][0], v["queries"][1]);
+}
+
+#[test]
+fn a_numeric_turned_into_text_is_refused() {
+    // A numeric's text shows its scale: for x = 2, `x * 1.0` is '2.0' and `x * 1.00` is '2.00', though
+    // both are the REAL 2 to a prover.
+    for (q0, q1) in [
+        (r#"SELECT CAST("n" * 1.0 AS TEXT) FROM "t""#, r#"SELECT CAST("n" * 1.00 AS TEXT) FROM "t""#),
+        (r#"SELECT "n" * 1.0 || 'x' FROM "t""#, r#"SELECT "n" * 1.00 || 'x' FROM "t""#),
+        (r#"SELECT ("n" * 1.0)::varchar(8) FROM "t""#, r#"SELECT ("n" * 1.00)::varchar(8) FROM "t""#),
+        // Equal numerics, unequal text: over t = {(1.0)}, u = {(1.00)}.
+        (
+            r#"SELECT "t"."n"::text FROM "t" JOIN "u" ON "t"."n" = "u"."n""#,
+            r#"SELECT "u"."n"::text FROM "t" JOIN "u" ON "t"."n" = "u"."n""#,
+        ),
+        // One spelling, two scales: a symbol keyed on the cast's text would not tell these apart.
+        (r#"SELECT CAST("n" AS TEXT) FROM "t""#, r#"SELECT CAST("n" AS TEXT) FROM (SELECT "n" * 1.0 AS "n" FROM "t") AS "s""#),
+    ] {
+        let ddl = r#"create table "t" ("n" NUMERIC); create table "u" ("n" NUMERIC);"#;
+        refused(ddl, q0, q1, "numeric converted to text");
+    }
+    // An integer's text has no scale to show, and one plan on both sides computes one thing.
+    let v = lower(r#"SELECT CAST("a" AS TEXT), "a" || 'x' FROM "t""#, r#"SELECT CAST("a" AS TEXT), "a" || 'x' FROM "t" AS "x""#);
+    assert_eq!(v["queries"][0], v["queries"][1]);
+    let v = lower(r#"SELECT CAST("n" AS TEXT) FROM "t""#, r#"SELECT CAST("x"."n" AS TEXT) FROM "t" AS "x""#);
     assert_eq!(v["queries"][0], v["queries"][1]);
 }
 

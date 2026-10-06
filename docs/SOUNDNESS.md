@@ -87,9 +87,11 @@ operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 A Postgres type is mapped onto an IR type only where the IR type's operations are the Postgres
 type's. Both provers read REAL as exact rational arithmetic and any type's `=` as equality, so:
 
-- **`numeric` is REAL, but its division is not exact.** Addition, subtraction and multiplication
-  of numerics are exact; division rounds to a finite scale (`1 / 3.0 * 3.0` is `0.99…990`), so
-  `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
+- **`numeric` is REAL, but its division is not exact, and REAL has no scale.** Addition,
+  subtraction and multiplication of numerics are exact; division rounds to a finite scale
+  (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
+  A numeric's text shows its scale, `1.0` and `1.00` being one number and two strings, so a numeric
+  cast to text, or concatenated with `||`, is refused unless both queries lower to one plan.
 - **Floats are opaque.** `real`, `double precision` and `float` round, and float addition is not
   associative: `(0.1 + 0.2) + 0.3` is `0.6000000000000001` and `0.1 + (0.2 + 0.3)` is `0.6`. A
   float is VARBINARY, and arithmetic over any opaque operand, a float or a range or a point, is an
@@ -99,7 +101,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   that equality: as VARCHAR, `'A'` and `'a'` would be different values, and as an opaque type
   their `=` would be the prover's equality, which substitutes equals for equals, so from
   `t.c = u.c` it would conclude `t.c::text = u.c::text`, which citext does not satisfy. A query
-  that reads a value of either type is refused; a column of one that no query reads costs nothing.
+  that reads a value of either type is refused, unless the two queries lower to one plan, which
+  computes the same thing however `=` is read; a column of one that no query reads costs nothing.
   `SELECT *`, `DELETE` and `UPDATE` read every column of the table they touch.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
