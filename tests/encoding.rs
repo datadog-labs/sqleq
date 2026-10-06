@@ -309,3 +309,57 @@ mod surviving_with {
         assert_eq!(v["queries"][0], v["queries"][1]);
     }
 }
+
+mod depth {
+    use super::*;
+
+    const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "c" VARCHAR, unique ("id"));"#;
+
+    /// Runs `f` on a thread with room for an unoptimised build's frames.
+    fn with_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(f)
+            .expect("spawns")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+
+    fn chain(op: &str, operand: &str, terms: usize) -> String {
+        vec![operand; terms].join(op)
+    }
+
+    #[test]
+    fn a_long_arithmetic_chain_is_refused() {
+        with_stack(|| {
+            for (op, operand) in [(" + ", r#""a""#), (" || ", r#""c""#)] {
+                for terms in [1026, 6_000, 100_000] {
+                    let src = format!("{T}\nSELECT \"id\", {} AS \"x\" FROM \"t\";\nSELECT \"id\" FROM \"t\";", chain(op, operand, terms));
+                    let m = refusal(&src, CatalogSource::Declared);
+                    assert!(m.contains("nested more than"), "{terms} terms of {op}: {m}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_long_set_operation_chain_is_refused() {
+        with_stack(|| {
+            for terms in [1026, 30_000] {
+                let src = format!("{T}\n{};\nSELECT \"a\" FROM \"t\";", chain(" UNION ALL ", r#"SELECT "a" FROM "t""#, terms));
+                let m = refusal(&src, CatalogSource::Declared);
+                assert!(m.contains("nested more than"), "{terms} branches: {m}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_chain_within_the_limit_lowers() {
+        with_stack(|| {
+            let src = format!("{T}\nSELECT \"id\", {} AS \"x\" FROM \"t\";\nSELECT \"id\" FROM \"t\";", chain(" + ", r#""a""#, 1000));
+            lower_in(&src, CatalogSource::Declared);
+            let src = format!("{T}\n{};\nSELECT \"a\" FROM \"t\";", chain(" UNION ALL ", r#"SELECT "a" FROM "t""#, 1000));
+            lower_in(&src, CatalogSource::Declared);
+        });
+    }
+}

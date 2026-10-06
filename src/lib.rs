@@ -39,6 +39,7 @@ mod casts;
 /// Public because it is an entry point: the `--csv` mode of the CLI reads a corpus row and lowers it
 /// without going through the `.sql` intermediate format at all.
 pub mod corpus;
+mod depth;
 mod dml;
 mod error;
 /// Selected on the shipping path by [`CatalogSource`], off by default.
@@ -406,11 +407,14 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
     let sql = sql_lines.join("\n");
     // The default nesting limit (50) is below what generated SQL reaches; the parser's own recursion
     // is stack-protected, and the lowering walks an `AND`/`OR` chain iteratively.
-    let statements = Parser::new(&DIALECT)
-        .with_recursion_limit(1024)
+    let mut statements = Parser::new(&DIALECT)
+        .with_recursion_limit(depth::MAX_DEPTH)
         .try_with_sql(&sql)
         .and_then(|mut p| p.parse_statements())
         .map_err(|e| FrontendError::Parse(e.to_string()))?;
+    // Before any pass that recurses on the tree: a loop in the parser can build one deeper than its
+    // recursion limit.
+    depth::check(&mut statements)?;
     Ok((fns, statements))
 }
 
