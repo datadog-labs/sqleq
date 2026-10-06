@@ -17,7 +17,8 @@ therefore **refuses** (returns an error) any construct it cannot lower faithfull
 functions, `HAVING` it can't express, correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`,
 `LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
 a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
-TIES`, etc. — rather than emitting best-effort IR. It never panics or exits on bad input.
+TIES`, a `WITH` it cannot inline (`RECURSIVE`, or one with a data-modifying binding, at any level),
+etc. — rather than emitting best-effort IR. It never panics or exits on bad input.
 
 Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
 `OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause

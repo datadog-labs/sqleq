@@ -11,7 +11,7 @@
 //! to say more than Postgres does, or an input that used to crash the frontend. They run no prover.
 
 use serde_json::{json, Value};
-use sqleq_frontend::{lower_with, CatalogSource};
+use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
 
 fn lower_in(src: &str, mode: CatalogSource) -> Value {
     lower_with(src, mode).unwrap_or_else(|e| panic!("expected Ok, got {e}\n{src}"))
@@ -20,6 +20,14 @@ fn lower_in(src: &str, mode: CatalogSource) -> Value {
 /// The pair lowered against `ddl`, declared catalog.
 fn lower(ddl: &str, q0: &str, q1: &str) -> Value {
     lower_in(&format!("{ddl}\n{q0};\n{q1};"), CatalogSource::Declared)
+}
+
+fn refusal(src: &str, mode: CatalogSource) -> String {
+    match lower_with(src, mode) {
+        Err(FrontendError::Unsupported(m)) => m,
+        Err(e) => panic!("expected an Unsupported refusal, got {e}\n{src}"),
+        Ok(_) => panic!("expected a refusal, but it lowered\n{src}"),
+    }
 }
 
 mod keys {
@@ -45,5 +53,49 @@ mod keys {
             keys(r#"create table "t" ("u" INTEGER NOT NULL, "v" INTEGER, unique ("u"), unique ("v"));"#),
             json!([[0]])
         );
+    }
+}
+
+mod surviving_with {
+    use super::*;
+
+    const T: &str = r#"create table "t" ("a" INTEGER); create table "u" ("a" INTEGER);"#;
+
+    fn refused(q0: &str, q1: &str, mode: CatalogSource) {
+        let m = refusal(&format!("{T}\n{q0};\n{q1};"), mode);
+        assert!(m.contains("WITH"), "{m}");
+    }
+
+    #[test]
+    fn a_recursive_with_is_refused_at_every_level() {
+        let rec = r#"WITH RECURSIVE "t" ("a") AS (SELECT 1 UNION ALL SELECT "a" + 1 FROM "t" WHERE "a" < 3) SELECT "a" FROM "t""#;
+        refused(rec, r#"SELECT "a" FROM "t""#, CatalogSource::Declared);
+        let nested = r#"SELECT "s"."a" FROM (WITH RECURSIVE "t" AS (SELECT 1 AS "a") SELECT "a" FROM "t") AS "s""#;
+        for mode in [CatalogSource::Declared, CatalogSource::InferredSeeded, CatalogSource::Inferred] {
+            refused(nested, r#"SELECT "s"."a" FROM (SELECT "a" FROM "t") AS "s""#, mode);
+        }
+        let sub = r#"SELECT "a" FROM "u" WHERE "a" IN (WITH RECURSIVE "t" AS (SELECT 1 AS "a") SELECT "a" FROM "t")"#;
+        refused(sub, r#"SELECT "a" FROM "u" WHERE "a" IN (SELECT "a" FROM "t")"#, CatalogSource::Declared);
+    }
+
+    #[test]
+    fn a_data_modifying_with_is_refused_read_or_not() {
+        refused(
+            r#"WITH "t" AS (DELETE FROM "u" RETURNING "a") SELECT "a" FROM "t""#,
+            r#"SELECT "a" FROM "t""#,
+            CatalogSource::Declared,
+        );
+        // Never read, its effect is still there: it empties `u`.
+        refused(
+            r#"WITH "d" AS (DELETE FROM "u" RETURNING "a") SELECT "a" FROM "t""#,
+            r#"SELECT "a" FROM "t""#,
+            CatalogSource::Declared,
+        );
+    }
+
+    #[test]
+    fn a_with_that_inlines_still_lowers() {
+        let v = lower(T, r#"WITH "c" AS (SELECT "a" FROM "u") SELECT "a" FROM "c""#, r#"SELECT "a" FROM (SELECT "a" FROM "u") AS "c""#);
+        assert_eq!(v["queries"][0], v["queries"][1]);
     }
 }

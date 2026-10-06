@@ -1166,7 +1166,7 @@ impl VisitorMut for ClearLocks {
 ///
 /// A `WITH` binding *is* a derived table that has been given a name and hoisted, so substituting the
 /// definition back into each use returns it to the form it is sugar for. The prover's IR has no
-/// binding construct at all — [`infer`][crate::infer] refuses a query that still carries a `WITH` —
+/// binding construct at all — lowering refuses a query that still carries a `WITH`, at any level —
 /// so without this every CTE-bearing pair is unlowerable — which on real rewrite pairs is the largest
 /// single refusal bucket there is.
 ///
