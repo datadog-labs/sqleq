@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use sqlparser::ast::visit_expressions;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
     Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
     Subscript, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue, Values,
@@ -783,6 +783,10 @@ fn lower_select_ctx(
     }
     if s.qualify.is_some() {
         return Err(unsupported("QUALIFY"));
+    }
+    // `SELECT ... INTO t` is `CREATE TABLE t AS SELECT ...`: it returns no rows and creates a table.
+    if s.into.is_some() {
+        return Err(unsupported("SELECT ... INTO"));
     }
     if s.from.is_empty() {
         let (rel, cols) = lower_fromless_select(cat, fns, s, outer)?;
@@ -1568,18 +1572,94 @@ struct Agg {
     filter: Option<Expr>,
 }
 
-/// Extract a function call's positional argument list, plus whether it carries DISTINCT or an
-/// ORDER BY clause. Returns an error for a sole-subquery argument (which we don't lower).
-fn fn_args(f: &Function) -> Result<(&[FunctionArg], bool, bool)> {
-    match &f.args {
-        FunctionArguments::List(l) => Ok((
-            &l.args,
-            matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)),
-            l.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))),
-        )),
-        FunctionArguments::None => Ok((&[], false, false)),
-        FunctionArguments::Subquery(_) => Err(unsupported("function with a subquery argument")),
+/// One argument of a call, as lowering reads it.
+enum CallArg<'a> {
+    /// A positional expression.
+    Expr(&'a Expr),
+    /// A bare `*`, which only `count(*)` gives a meaning to.
+    Star,
+}
+
+/// Everything call lowering reads of a [`Function`] besides its name: the arguments, whether they are
+/// `DISTINCT`, and the `FILTER`. The aggregate path ([`agg_of`]) reads all three; the scalar paths
+/// refuse a `DISTINCT`, a `FILTER` and a `*`, each of which says the call is an aggregate.
+struct CallParts<'a> {
+    args: Vec<CallArg<'a>>,
+    distinct: bool,
+    filter: Option<&'a Expr>,
+}
+
+/// Take a call apart into its [`CallParts`], refusing every other part it can carry.
+///
+/// SOUNDNESS GUARD. Each of these changes what a call computes, and none has a place in the IR:
+/// a named argument (`make_interval(days => a)`, and the SQL/JSON `json_object('k' VALUE a)`, which
+/// sqlparser reads as one), a `t.*` argument, `WITHIN GROUP`, an `ORDER BY`, `LIMIT`, `WHERE`,
+/// `HAVING`, `SEPARATOR` or `ON OVERFLOW` inside the parentheses, the SQL/JSON `ABSENT ON NULL` and
+/// `RETURNING`, `IGNORE NULLS`, a second parameter list, the ODBC `{fn ...}` form, and `OVER`. The
+/// call sites used to keep the positional arguments and skip the rest, so `make_interval(days => a)`
+/// and `make_interval(hours => a)` both lowered to `MAKE_INTERVAL()`: one term for two different
+/// calls, which every prover then proves equal.
+///
+/// [`Function`] and its argument list are destructured with no `..`, so a field a parser upgrade adds
+/// is a compile error here rather than one more part of a call that lowering drops.
+fn call_parts(f: &Function) -> Result<CallParts<'_>> {
+    let Function { name, uses_odbc_syntax, parameters, args, within_group, filter, null_treatment, over } =
+        f;
+    if over.is_some() {
+        return Err(unsupported("window function (OVER)"));
     }
+    if *uses_odbc_syntax {
+        return Err(unsupported(format!("ODBC-escaped call {{fn {name}(..)}}")));
+    }
+    if !matches!(parameters, FunctionArguments::None) {
+        return Err(unsupported(format!("second argument list on {name}")));
+    }
+    if !within_group.is_empty() {
+        return Err(unsupported(format!("WITHIN GROUP on {name}")));
+    }
+    if let Some(n) = null_treatment {
+        return Err(unsupported(format!("{n} on {name}")));
+    }
+    let filter = filter.as_deref();
+    let list = match args {
+        FunctionArguments::None => return Ok(CallParts { args: Vec::new(), distinct: false, filter }),
+        FunctionArguments::Subquery(_) => return Err(unsupported("function with a subquery argument")),
+        FunctionArguments::List(l) => l,
+    };
+    let FunctionArgumentList { duplicate_treatment, args, clauses } = list;
+    if let Some(c) = clauses.first() {
+        return Err(unsupported(format!("`{c}` in a call to {name}")));
+    }
+    let args = args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(CallArg::Expr(e)),
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(CallArg::Star),
+            other => Err(unsupported(format!("argument `{other}` in a call to {name}"))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
+    Ok(CallParts { args, distinct, filter })
+}
+
+/// The arguments of a call on a scalar path, where a `DISTINCT`, a `FILTER` or a `*` cannot be lowered.
+///
+/// SOUNDNESS GUARD. Postgres accepts each of the three only on an aggregate, so a call carrying one is
+/// an aggregate this frontend did not recognise, and a per-row reading of it gets the row count wrong.
+/// `DISTINCT` used to be dropped here outright.
+fn scalar_args<'a>(f: &'a Function, name: &str) -> Result<Vec<&'a Expr>> {
+    let parts = call_parts(f)?;
+    if parts.distinct || parts.filter.is_some() {
+        return Err(unsupported(format!("DISTINCT or FILTER on {name}, which is not a known aggregate")));
+    }
+    parts
+        .args
+        .into_iter()
+        .map(|a| match a {
+            CallArg::Expr(e) => Ok(e),
+            CallArg::Star => Err(unsupported(format!("`*` argument to {name}, which is not a known aggregate"))),
+        })
+        .collect()
 }
 
 /// Whether `e` is an aggregate function call: one of the builtins, or a name the input declared with
@@ -1673,29 +1753,27 @@ fn agg_of(e: &Expr) -> Result<Agg> {
     // makes [`is_agg_call`] true and sends the call straight down the Group path. A declaration is a
     // statement about the return type, not permission to assume the bag determines the value.
     reject_order_sensitive_agg(&name, bare_name(&name))?;
-    let (raw_args, distinct, has_order) = fn_args(f)?;
-    if has_order || f.null_treatment.is_some() {
-        return Err(unsupported(format!("aggregate modifier (ORDER BY/null-treatment) in {name}")));
-    }
+    // SOUNDNESS GUARD: see [`call_parts`]. An `ORDER BY` inside the parentheses, a null treatment and
+    // `WITHIN GROUP` are among what it refuses; `DISTINCT`, `FILTER` and `*` are read below.
+    let CallParts { args: raw_args, distinct, filter } = call_parts(f)?;
     // `FILTER (WHERE p)` is lowered by pushing the predicate into the argument as
     // `CASE WHEN p THEN arg END` (see [`AggCtx::add_agg`]), which is only faithful for aggregates
     // that skip NULL inputs. That is exactly the builtins: for anything else -- a declared
     // aggregate such as `QA_OP_ARRAYAGG` -- the rewrite would feed it a NULL per non-matching row
     // instead of dropping the row, and `array_agg` keeps NULLs. Refuse rather than guess.
-    if f.filter.is_some() && !BUILTIN_AGGS.contains(&name.as_str()) {
+    if filter.is_some() && !BUILTIN_AGGS.contains(&name.as_str()) {
         return Err(unsupported(format!("FILTER on the non-builtin aggregate {name}")));
     }
     let mut args = Vec::new();
     for a in raw_args {
         match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => args.push(e.clone()),
-            other => return Err(unsupported(format!("aggregate argument {other:?}"))),
+            CallArg::Star => {}
+            CallArg::Expr(e) => args.push(e.clone()),
         }
     }
     // `COUNT(*) FILTER (WHERE p)` counts matching rows, so it needs *something* to count; `1` is
     // the standard stand-in and makes the rewrite below `COUNT(CASE WHEN p THEN 1 END)`.
-    if f.filter.is_some() && args.is_empty() {
+    if filter.is_some() && args.is_empty() {
         if name != "COUNT" {
             return Err(unsupported(format!("FILTER on argument-less {name}")));
         }
@@ -1703,7 +1781,7 @@ fn agg_of(e: &Expr) -> Result<Agg> {
             SqlValue::Number("1".to_string(), false).with_empty_span(),
         ));
     }
-    Ok(Agg { op: name, args, distinct, filter: f.filter.as_deref().cloned() })
+    Ok(Agg { op: name, args, distinct, filter: filter.cloned() })
 }
 
 /// State for lowering expressions over a group's *output* scope (keys first, then aggregate results).
@@ -1865,13 +1943,8 @@ impl AggCtx<'_> {
                 if SET_RETURNING.contains(&bare.as_str()) {
                     return Err(unsupported(format!("set-returning function {name} in scalar position")));
                 }
-                let (raw_args, _, _) = fn_args(f)?;
-                let mut operand: Vec<Value> = Vec::new();
-                for a in raw_args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
-                        operand.push(self.lower_post(e)?);
-                    }
-                }
+                let operand =
+                    scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = fn_ret(self.fns, &name, &bare);
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
@@ -2051,9 +2124,9 @@ fn post_columns(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr, out: &mut Vec
             }
         }
         Expr::Function(f) => {
-            if let Ok((args, _, _)) = fn_args(f) {
-                for a in args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a {
+            if let Ok(parts) = call_parts(f) {
+                for a in parts.args {
+                    if let CallArg::Expr(x) = a {
                         post_columns(cat, scope, fns, x, out);
                     }
                 }
@@ -2302,10 +2375,6 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 let name = obj_name(&f.name).to_uppercase();
                 return Err(unsupported(format!("aggregate {name} in scalar position")));
             }
-            let (raw_args, _distinct, has_order) = fn_args(f)?;
-            if f.filter.is_some() || has_order {
-                return Err(unsupported("function FILTER / ORDER BY"));
-            }
             let (name, bare) = fn_names(f);
             reject_qualified_builtin_agg(&name, &bare)?;
             reject_nondeterministic(&name, &bare)?;
@@ -2316,12 +2385,10 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             if SET_RETURNING.contains(&bare.as_str()) {
                 return Err(unsupported(format!("set-returning function {name} in scalar position")));
             }
-            let mut operand: Vec<Value> = Vec::new();
-            for a in raw_args {
-                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
-                    operand.push(lower_expr(cat, scope, fns, e)?);
-                }
-            }
+            let operand = scalar_args(f, &name)?
+                .into_iter()
+                .map(|e| lower_expr(cat, scope, fns, e))
+                .collect::<Result<Vec<_>>>()?;
             Ok(json!({ "operator": name, "operand": operand, "type": fn_ret(fns, &name, &bare) }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the

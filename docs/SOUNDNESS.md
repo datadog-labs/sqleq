@@ -105,6 +105,11 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A call is more than a name and positional arguments.** A named argument
+  (`make_interval(days => a)`, `json_object('k' VALUE a)`), a `t.*` argument, `WITHIN GROUP`, the
+  SQL/JSON `ON NULL` and `RETURNING` clauses, an `ORDER BY` or `WHERE` inside the parentheses and
+  `IGNORE NULLS` are refused, and so are `DISTINCT`, `FILTER` and `*` on a call that is not a known
+  aggregate. `SELECT … INTO`, which creates a table, is refused too.
 - **A join-delete or join-update is a semi-join only when nothing it assigns or returns reads the
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of
