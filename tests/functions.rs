@@ -7,7 +7,7 @@
 //! which are volatile. Each refusal here is a call that used to lower to the same term as a
 //! different call, or to a per-row scalar where Postgres returns one row.
 
-use sqleq_frontend::{lower_sql, FrontendError};
+use sqleq_frontend::{lower_sql, reflexive, reflexive_forms, FrontendError, Rewrites};
 
 const T: &str = r#"create table "t" ("a" INTEGER, "b" VARCHAR, "c" DOUBLE PRECISION, unique ("a"));
 create table "u" ("k" INTEGER, unique ("k"));"#;
@@ -64,6 +64,112 @@ fn has_op(v: &serde_json::Value, op: &str) -> bool {
         }
         serde_json::Value::Array(a) => a.iter().any(|x| has_op(x, op)),
         _ => false,
+    }
+}
+
+mod volatile {
+    use super::*;
+
+    #[test]
+    fn volatile_functions_the_old_list_missed_are_refused() {
+        // Each is `VOLATILE` in Postgres (`uuidv4`/`uuidv7` from 18, `uuid_generate_v7` from the
+        // pg_uuidv7 extension), and each was an uninterpreted function: two calls one value.
+        for f in [
+            "random_normal()",
+            "timeofday()",
+            "gen_random_bytes(16)",
+            "gen_salt('bf')",
+            "uuid_generate_v1mc()",
+            "uuidv4()",
+            "uuidv7()",
+            "uuid_generate_v7()",
+            "lastval()",
+            "setseed(0.5)",
+            "array_shuffle(ARRAY[1, 2])",
+            "pgp_sym_encrypt('x', 'k')",
+        ] {
+            refused(&same(&format!(r#"SELECT {f} FROM "t""#)), "non-deterministic function");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_no_postgres_function_is_an_uninterpreted_function() {
+        // `uuid()` and `random_uuid()` were on the old list, but Postgres has neither; the list is
+        // Postgres's volatile functions and nothing else.
+        for f in ["uuid", "random_uuid"] {
+            let v = ok(&same(&format!(r#"SELECT {f}() FROM "t""#)));
+            assert!(has_op(&v, &f.to_uppercase()), "{f}() is lowered as a call");
+        }
+    }
+
+    /// The reflexive check compares trees without lowering, so it never met lowering's refusal.
+    /// Postgres evaluates a `WITH` binding read twice once; its inlined form calls `random()` twice.
+    #[test]
+    fn a_cte_read_twice_that_calls_random_is_not_its_inlined_form() {
+        let p = format!(
+            "{T}\n\
+             WITH \"c\" AS (SELECT random() AS \"r\") SELECT \"x\".\"r\" = \"y\".\"r\" FROM \"c\" AS \"x\", \"c\" AS \"y\";\n\
+             SELECT \"x\".\"r\" = \"y\".\"r\" FROM (SELECT random() AS \"r\") AS \"x\", (SELECT random() AS \"r\") AS \"y\";"
+        );
+        assert!(!reflexive(&p));
+        assert_eq!(reflexive_forms(&p, Rewrites::ALL), None, "the forms are not offered either");
+    }
+
+    #[test]
+    fn a_uuid_cte_read_twice_is_not_its_inlined_form() {
+        let p = format!(
+            "{T}\n\
+             WITH \"k\" AS (SELECT gen_random_uuid() AS \"id\") SELECT \"id\" FROM \"k\" UNION ALL SELECT \"id\" FROM \"k\";\n\
+             SELECT \"id\" FROM (SELECT gen_random_uuid() AS \"id\") AS \"k\" \
+             UNION ALL SELECT \"id\" FROM (SELECT gen_random_uuid() AS \"id\") AS \"k\";"
+        );
+        assert!(!reflexive(&p));
+    }
+
+    #[test]
+    fn a_volatile_call_reached_through_another_binding_counts() {
+        // `a` is read once, by `b`; `b` is read twice, and inlining it copies `a`'s call into both.
+        let p = format!(
+            "{T}\n\
+             WITH \"a\" AS (SELECT random() AS \"r\"), \"b\" AS (SELECT \"r\" FROM \"a\") \
+             SELECT \"x\".\"r\" = \"y\".\"r\" FROM \"b\" AS \"x\", \"b\" AS \"y\";\n\
+             SELECT \"x\".\"r\" = \"y\".\"r\" FROM (SELECT \"r\" FROM (SELECT random() AS \"r\") AS \"a\") AS \"x\", \
+             (SELECT \"r\" FROM (SELECT random() AS \"r\") AS \"a\") AS \"y\";"
+        );
+        assert!(!reflexive(&p));
+    }
+
+    #[test]
+    fn a_volatile_table_function_counts() {
+        let p = format!(
+            "{T}\n\
+             WITH \"c\" AS (SELECT \"r\" FROM random() AS \"r\") SELECT \"x\".\"r\" = \"y\".\"r\" FROM \"c\" AS \"x\", \"c\" AS \"y\";\n\
+             SELECT \"x\".\"r\" = \"y\".\"r\" FROM (SELECT \"r\" FROM random() AS \"r\") AS \"x\", \
+             (SELECT \"r\" FROM random() AS \"r\") AS \"y\";"
+        );
+        assert!(!reflexive(&p));
+    }
+
+    #[test]
+    fn a_cte_read_once_still_inlines_with_a_volatile_call() {
+        // One read is one evaluation either way, so nothing is duplicated.
+        let p = format!(
+            "{T}\n\
+             WITH \"c\" AS (SELECT random() AS \"r\") SELECT \"r\" FROM \"c\";\n\
+             SELECT \"r\" FROM (SELECT random() AS \"r\") AS \"c\";"
+        );
+        assert!(reflexive(&p));
+    }
+
+    #[test]
+    fn a_cte_read_twice_still_inlines_without_a_volatile_call() {
+        // `now()` is stable: one value for the whole statement, however many times it is evaluated.
+        let p = format!(
+            "{T}\n\
+             WITH \"c\" AS (SELECT now() AS \"r\", \"a\" FROM \"t\") SELECT \"x\".\"r\" FROM \"c\" AS \"x\", \"c\" AS \"y\";\n\
+             SELECT \"x\".\"r\" FROM (SELECT now() AS \"r\", \"a\" FROM \"t\") AS \"x\", (SELECT now() AS \"r\", \"a\" FROM \"t\") AS \"y\";"
+        );
+        assert!(reflexive(&p));
     }
 }
 

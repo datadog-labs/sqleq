@@ -183,29 +183,101 @@ const UNMODELLED_AGGS: [&str; 8] = [
     "CUME_DIST",
 ];
 
-/// Functions whose result can differ between two calls with the same arguments.
+/// The functions Postgres declares `VOLATILE`: their result can differ between two calls with the
+/// same arguments. Lowercase, as Postgres spells them, and sorted.
 ///
 /// SOUNDNESS GUARD. Every other unknown call is modelled as an uninterpreted *function*, and the
 /// whole force of that word is that equal arguments give equal results — which is what lets both
 /// sides of a rewrite share one symbol. These do not have that property: `random()` twice is two
 /// values, `nextval` advances a sequence, `clock_timestamp()` moves during the statement. Modelling
 /// one as a function asserts an equality the database does not honour, so a pair that differs only
-/// in how many times it calls one would come out equivalent.
+/// in how many times it calls one would come out equivalent. Lowering refuses every call to one, and
+/// [`reflexive`](crate::reflexive) declines a pair where inlining a `WITH` binding would copy one.
+///
+/// The list is every function `pg_proc` marks volatile (`provolatile = 'v'`) in Postgres 17, plus the
+/// volatile functions of the `pgcrypto` and `uuid-ossp` extensions, plus `uuidv4` and `uuidv7`
+/// (Postgres 18) and the `pg_uuidv7` extension's `uuid_generate_v7`. Left out are the functions whose
+/// result type no call in a query can produce (`trigger`, `event_trigger`, `internal` and the
+/// `*_handler` types). It is matched on a call's unqualified name in any case, which can only refuse
+/// more than Postgres would. It is a denylist all the same: a volatile function a user defines is a
+/// name nobody can tell from any other.
 ///
 /// Not to be confused with the statement-stable clocks — `now()`, `current_timestamp`,
 /// `transaction_timestamp()`, `localtimestamp` — which are fixed for the duration of a statement and
-/// so *are* faithful as shared constants. They are deliberately absent from this list.
-const NONDETERMINISTIC: [&str; 10] = [
-    "RANDOM",
-    "GEN_RANDOM_UUID",
-    "UUID_GENERATE_V1",
-    "UUID_GENERATE_V4",
-    "UUID",
-    "RANDOM_UUID",
-    "NEXTVAL",
-    "CURRVAL",
-    "SETVAL",
-    "CLOCK_TIMESTAMP",
+/// so *are* faithful as shared constants. Postgres declares them `STABLE`, and they are absent here.
+///
+/// Public so that it is the one list of its kind: `sqleq-lean` reads it, and `sqleq-fuzz`, which
+/// does not link this crate, keeps its skip pattern in step with it.
+pub const VOLATILE_FUNCTIONS: &[&str] = &[
+    "amvalidate", "array_sample", "array_shuffle", "binary_upgrade_add_sub_rel_state",
+    "binary_upgrade_create_empty_extension", "binary_upgrade_logical_slot_has_caught_up",
+    "binary_upgrade_replorigin_advance", "binary_upgrade_set_missing_value",
+    "binary_upgrade_set_next_array_pg_type_oid", "binary_upgrade_set_next_heap_pg_class_oid",
+    "binary_upgrade_set_next_heap_relfilenode", "binary_upgrade_set_next_index_pg_class_oid",
+    "binary_upgrade_set_next_index_relfilenode",
+    "binary_upgrade_set_next_multirange_array_pg_type_oid",
+    "binary_upgrade_set_next_multirange_pg_type_oid", "binary_upgrade_set_next_pg_authid_oid",
+    "binary_upgrade_set_next_pg_enum_oid", "binary_upgrade_set_next_pg_tablespace_oid",
+    "binary_upgrade_set_next_pg_type_oid", "binary_upgrade_set_next_toast_pg_class_oid",
+    "binary_upgrade_set_next_toast_relfilenode", "binary_upgrade_set_record_init_privs",
+    "brin_desummarize_range", "brin_summarize_new_values", "brin_summarize_range",
+    "clock_timestamp", "current_query", "currtid2", "currval", "cursor_to_xml",
+    "cursor_to_xmlschema", "gen_random_bytes", "gen_random_uuid", "gen_salt",
+    "gin_clean_pending_list", "lastval", "lo_close", "lo_creat", "lo_create", "lo_export",
+    "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_lseek64", "lo_open", "lo_put",
+    "lo_tell", "lo_tell64", "lo_truncate", "lo_truncate64", "lo_unlink", "loread", "lowrite",
+    "nextval", "pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock",
+    "pg_advisory_unlock_all", "pg_advisory_unlock_shared", "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared", "pg_available_wal_summaries", "pg_backup_start",
+    "pg_backup_stop", "pg_blocking_pids", "pg_cancel_backend", "pg_collation_actual_version",
+    "pg_control_checkpoint", "pg_control_init", "pg_control_recovery", "pg_control_system",
+    "pg_copy_logical_replication_slot", "pg_copy_physical_replication_slot",
+    "pg_create_logical_replication_slot", "pg_create_physical_replication_slot",
+    "pg_create_restore_point", "pg_current_logfile", "pg_current_wal_flush_lsn",
+    "pg_current_wal_insert_lsn", "pg_current_wal_lsn", "pg_database_collation_actual_version",
+    "pg_database_size", "pg_drop_replication_slot", "pg_export_snapshot",
+    "pg_extension_config_dump", "pg_get_backend_memory_contexts", "pg_get_multixact_members",
+    "pg_get_shmem_allocations", "pg_get_wait_events", "pg_get_wal_replay_pause_state",
+    "pg_get_wal_resource_managers", "pg_get_wal_summarizer_state", "pg_hba_file_rules",
+    "pg_ident_file_mappings", "pg_import_system_collations", "pg_indexes_size", "pg_is_in_recovery",
+    "pg_is_wal_replay_paused", "pg_isolation_test_session_is_blocked", "pg_jit_available",
+    "pg_last_committed_xact", "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp", "pg_lock_status", "pg_log_backend_memory_contexts",
+    "pg_log_standby_snapshot", "pg_logical_emit_message", "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_get_changes", "pg_logical_slot_peek_binary_changes",
+    "pg_logical_slot_peek_changes", "pg_ls_archive_statusdir", "pg_ls_dir", "pg_ls_logdir",
+    "pg_ls_logicalmapdir", "pg_ls_logicalsnapdir", "pg_ls_replslotdir", "pg_ls_tmpdir",
+    "pg_ls_waldir", "pg_nextoid", "pg_notification_queue_usage", "pg_notify",
+    "pg_partition_ancestors", "pg_partition_tree", "pg_prepared_xact", "pg_promote",
+    "pg_read_binary_file", "pg_read_file", "pg_relation_size", "pg_reload_conf",
+    "pg_replication_origin_advance", "pg_replication_origin_create", "pg_replication_origin_drop",
+    "pg_replication_origin_progress", "pg_replication_origin_session_is_setup",
+    "pg_replication_origin_session_progress", "pg_replication_origin_session_reset",
+    "pg_replication_origin_session_setup", "pg_replication_origin_xact_reset",
+    "pg_replication_origin_xact_setup", "pg_replication_slot_advance", "pg_rotate_logfile",
+    "pg_safe_snapshot_blocking_pids", "pg_sequence_last_value", "pg_show_all_file_settings",
+    "pg_show_replication_origin_status", "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    "pg_stat_clear_snapshot", "pg_stat_file", "pg_stat_force_next_flush", "pg_stat_get_io",
+    "pg_stat_get_recovery_prefetch", "pg_stat_get_xact_blocks_fetched",
+    "pg_stat_get_xact_blocks_hit", "pg_stat_get_xact_function_calls",
+    "pg_stat_get_xact_function_self_time", "pg_stat_get_xact_function_total_time",
+    "pg_stat_get_xact_numscans", "pg_stat_get_xact_tuples_deleted",
+    "pg_stat_get_xact_tuples_fetched", "pg_stat_get_xact_tuples_hot_updated",
+    "pg_stat_get_xact_tuples_inserted", "pg_stat_get_xact_tuples_newpage_updated",
+    "pg_stat_get_xact_tuples_returned", "pg_stat_get_xact_tuples_updated", "pg_stat_have_stats",
+    "pg_stat_reset", "pg_stat_reset_replication_slot", "pg_stat_reset_shared",
+    "pg_stat_reset_single_function_counters", "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_slru", "pg_stat_reset_subscription_stats", "pg_stop_making_pinned_objects",
+    "pg_switch_wal", "pg_sync_replication_slots", "pg_table_size", "pg_tablespace_size",
+    "pg_terminate_backend", "pg_total_relation_size", "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock", "pg_try_advisory_xact_lock_shared",
+    "pg_wal_replay_pause", "pg_wal_replay_resume", "pg_wal_summary_contents",
+    "pg_xact_commit_timestamp", "pg_xact_commit_timestamp_origin", "pg_xact_status",
+    "pgp_pub_encrypt", "pgp_pub_encrypt_bytea", "pgp_sym_encrypt", "pgp_sym_encrypt_bytea",
+    "plpgsql_inline_handler", "plpgsql_validator", "query_to_xml", "query_to_xml_and_xmlschema",
+    "query_to_xmlschema", "random", "random_normal", "set_config", "setseed", "setval", "timeofday",
+    "ts_rewrite", "ts_stat", "txid_status", "uuid_generate_v1", "uuid_generate_v1mc",
+    "uuid_generate_v4", "uuid_generate_v7", "uuidv4", "uuidv7",
 ];
 
 /// Set-returning functions: the ones that expand one input row into *many* output rows.
@@ -315,10 +387,15 @@ fn reject_qualified_builtin_agg(full: &str, bare: &str) -> Result<()> {
     Ok(())
 }
 
-/// SOUNDNESS GUARD: see [`NONDETERMINISTIC`]. Matched on the *bare* name, because `pg_catalog.random`
-/// is still `random` and widening a refusal can only ever cost completeness.
+/// Whether `name`, a function's unqualified name in any case, is on [`VOLATILE_FUNCTIONS`].
+pub fn is_volatile(name: &str) -> bool {
+    VOLATILE_FUNCTIONS.iter().any(|v| v.eq_ignore_ascii_case(name))
+}
+
+/// SOUNDNESS GUARD: see [`VOLATILE_FUNCTIONS`]. Matched on the *bare* name, because
+/// `pg_catalog.random` is still `random` and widening a refusal can only ever cost completeness.
 fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {
-    if NONDETERMINISTIC.contains(&bare) {
+    if is_volatile(bare) {
         return Err(unsupported(format!("non-deterministic function {full}")));
     }
     Ok(())

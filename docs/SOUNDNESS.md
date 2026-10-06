@@ -36,7 +36,10 @@ lost outright: when a refused pair's two sides normalize to one query, the front
 (`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
 many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
 `--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
-asks whether the QED prover proved the pair, still counts it as refused.
+asks whether the QED prover proved the pair, still counts it as refused. The claim needs every
+normalization to keep the number of times a call is evaluated, and `WITH` inlining does not: it
+evaluates a binding read twice twice, where Postgres evaluates it once. So the check declines a pair
+in which inlining would copy a volatile call such as `random()`.
 
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
@@ -105,6 +108,11 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A volatile function is not a function.** `random()`, `nextval`, `clock_timestamp()` and every
+  other function Postgres declares volatile, in its core or in `pgcrypto` and `uuid-ossp`
+  (`sqleq_frontend::VOLATILE_FUNCTIONS`), can give two calls with equal arguments two values, so a
+  call to one is refused rather than read as an uninterpreted function. A volatile function a user
+  defines is a name like any other.
 - **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
   refused: modelled as the prover's own (`count`, `sum`, `avg`, `min`, `max`) or as an uninterpreted
   function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop`, `corr`, `regr_*`, `range_agg`,
