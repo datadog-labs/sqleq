@@ -14,6 +14,12 @@ The pairs in `examples/` carry the same header and run with these.
 The Lean axis's pairs are under `insert_unnest/`, and are stated under the gather rule
 ([below](#the-gather-rule)).
 
+Not every pair records a defect. Those under `refusals/` are one non-equivalent pair for each
+construct [SOUNDNESS.md](../../docs/SOUNDNESS.md) says the frontend refuses rather than lowers, so a
+change that starts lowering one, unfaithfully, fails on whichever axis then proves the pair, and not
+only in a unit test. Those under `ordering/` do the same for the two constructs it lowers instead, a
+row slice and `DISTINCT ON`: a non-equivalent pair that no prover may prove.
+
 ## Running them
 
 ```sh
