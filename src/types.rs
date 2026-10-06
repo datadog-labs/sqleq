@@ -29,9 +29,30 @@
 //! an uninterpreted function named after its operands' types: a prover that knows nothing about it
 //! can only fail to prove through it, and one that knows its Postgres meaning, infinities included,
 //! can interpret the name.
+//!
+//! # Types a prover's arithmetic or equality would misread
+//!
+//! A type is mapped onto an IR type only where the IR type's operations are Postgres's. Both provers
+//! read REAL as exact rational arithmetic and every type's `=` as equality, so:
+//!
+//! * `numeric` is REAL: its `+`, `-` and `*` are exact. Its division rounds to a finite scale
+//!   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over REAL is the uninterpreted `q_arith_div_real_real`
+//!   ([`make_arith`]).
+//! * `real`, `double precision` and the other floats are opaque (VARBINARY): float addition is not
+//!   associative, and arithmetic over any opaque operand is an uninterpreted `q_arith_*` function.
+//! * `citext` and the blank-padded `char(n)` are [`UNFAITHFUL`]: their `=` ignores case or trailing
+//!   spaces, so two values it calls equal can still be told apart, and a value of either is refused
+//!   wherever it reaches the plan ([`refuse_unfaithful`]).
+//! * Integer types are matched by name, so `int4range` and `point` are not integers.
+//!
+//! A string literal compared with, or combined with, a value of another type is read at that type,
+//! as Postgres resolves an untyped literal: `a = '01'` over an INTEGER `a` compares with `1`
+//! ([`coerce_cmp`]). Casting the column to text instead would compare `'1'` with `'01'` as strings.
 
 use serde_json::{json, Value};
 use sqlparser::ast::DataType;
+
+use crate::error::{unsupported, Result};
 
 /// The temporal types this module keeps apart, as the type strings the rest of the frontend uses.
 pub const TEMPORAL: &[&str] = &["DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL"];
@@ -41,8 +62,8 @@ pub fn is_temporal(t: &str) -> bool {
     TEMPORAL.contains(&t)
 }
 
-/// The spelling a type leaves the frontend with. Only one differs: TIMESTAMPTZ is emitted as
-/// TIMESTAMP.
+/// The spelling a type leaves the frontend with. Two differ: TIMESTAMPTZ is emitted as TIMESTAMP,
+/// and an [`UNFAITHFUL`] type as VARBINARY.
 ///
 /// QED reads DATE, TIME and TIMESTAMP as its integer sort, which keeps their order and their
 /// arithmetic, and any other name as an uninterpreted sort with equality only. A TIMESTAMPTZ is an
@@ -53,6 +74,10 @@ pub fn is_temporal(t: &str) -> bool {
 pub fn emitted_type_name(t: &str) -> &str {
     if t == "TIMESTAMPTZ" {
         "TIMESTAMP"
+    } else if UNFAITHFUL.iter().any(|(n, _)| *n == t) {
+        // Only ever a schema's column that no query reads ([`refuse_unfaithful`]): opaque, under the
+        // name both provers accept for that.
+        "VARBINARY"
     } else {
         t
     }
@@ -132,15 +157,122 @@ pub fn temporal_data_type(t: &str) -> Option<DataType> {
     })
 }
 
+/// The scalar classes a type name can be read as, by [`scalar_class`]. Anything else is opaque.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scalar {
+    Int,
+    /// `numeric`: exact, so the IR's REAL.
+    Numeric,
+    /// `real`, `double precision` and the other floats: rounded, so opaque.
+    Float,
+    Str,
+    Bool,
+    Binary,
+}
+
+/// Classify a type's name by exact spelling: upper-cased, unquoted, without its typmod. `None` is a
+/// name this crate gives no meaning to, which every caller reads as opaque.
+///
+/// One table for both type readers, [`map_type`] for declared columns and casts and
+/// `infer::map_type_name` for inference and raw DDL, so the two cannot disagree about a name. It is
+/// an allowlist rather than substring tests: `INT4RANGE` and `POINT` contain `INT` and are not
+/// integers, and `CITEXT` contains `TEXT` and does not compare like text.
+pub fn scalar_class(name: &str) -> Option<Scalar> {
+    if name.trim().eq_ignore_ascii_case("\"char\"") {
+        return None;
+    }
+    let canon = name.replace(['"', '`'], "").to_uppercase();
+    let base = canon.split('(').next().unwrap_or(&canon).trim();
+    Some(match base {
+        "INT" | "INTEGER" | "INT2" | "INT4" | "INT8" | "SMALLINT" | "BIGINT" | "TINYINT" | "MEDIUMINT"
+        | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" | "OID" => Scalar::Int,
+        "NUMERIC" | "DECIMAL" | "DEC" => Scalar::Numeric,
+        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Scalar::Float,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" | "NCHAR VARYING"
+        | "NATIONAL CHARACTER VARYING" | "NATIONAL CHAR VARYING" | "NVARCHAR" | "STRING" | "CLOB" => {
+            Scalar::Str
+        }
+        "BOOL" | "BOOLEAN" => Scalar::Bool,
+        "BYTEA" | "BLOB" | "BINARY" | "VARBINARY" => Scalar::Binary,
+        _ => return None,
+    })
+}
+
+/// The types whose `=` is not equality on what a query can observe, with the reason. Each is its own
+/// name in the catalog and in the lowering, and [`refuse_unfaithful`] refuses any plan that carries a
+/// value of one.
+///
+/// No IR type models them. VARCHAR would compare `'A'` and `'a'`, or `'a'` and `'a '`, as different
+/// strings. An opaque type would make their `=` the prover's equality, which substitutes equals for
+/// equals: from `t.c = u.c` it concludes `t.c::text = u.c::text`, and over citext `'a'` and `'A'`
+/// are equal while their text is not. An array of either compares its elements the same way.
+pub const UNFAITHFUL: &[(&str, &str)] = &[
+    ("CITEXT", "citext compares case-insensitively"),
+    ("BPCHAR", "char(n) compares ignoring trailing spaces"),
+];
+
+/// The [`UNFAITHFUL`] type a type name denotes, an array of one included, or `None`.
+///
+/// The quoted `"char"` is not `char`: it is Postgres's one-byte type, whose `=` is equality, and it
+/// is left opaque, like every other name [`scalar_class`] does not know. (It reads a literal by its
+/// first byte, so `x = 'ab'` is `x = 'a'`, which is why it is not text either.)
+pub fn unfaithful_type(name: &str) -> Option<&'static str> {
+    if name.trim().trim_end_matches("[]").eq_ignore_ascii_case("\"char\"") {
+        return None;
+    }
+    let canon = name.replace(['"', '`'], "").to_uppercase();
+    let elem = canon.split(['(', '[']).next().unwrap_or(&canon).trim();
+    let elem = elem.strip_suffix(" ARRAY").unwrap_or(elem).trim();
+    match elem {
+        "CITEXT" => Some("CITEXT"),
+        "CHAR" | "CHARACTER" | "BPCHAR" | "NCHAR" | "NATIONAL CHAR" | "NATIONAL CHARACTER" => Some("BPCHAR"),
+        _ => None,
+    }
+}
+
+/// Refuse a lowered pair if either query carries a value of an [`UNFAITHFUL`] type.
+///
+/// Read off the `type` of every expression, so it reaches every way such a value enters a plan: a
+/// column, a cast, a function declared to return one. A column of that type that neither query reads
+/// appears only in the schema, where it costs nothing.
+pub fn refuse_unfaithful(input: &Value) -> Result<()> {
+    fn walk(v: &Value) -> Option<&'static (&'static str, &'static str)> {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::String(t)) = m.get("type") {
+                    if let Some(u) = UNFAITHFUL.iter().find(|(n, _)| n == t) {
+                        return Some(u);
+                    }
+                }
+                m.values().find_map(walk)
+            }
+            Value::Array(a) => a.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    match input.get("queries").and_then(walk) {
+        Some((name, _)) => Err(unfaithful_refusal(name)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a value of the [`UNFAITHFUL`] type `name`.
+pub fn unfaithful_refusal(name: &str) -> crate::error::FrontendError {
+    let why = UNFAITHFUL.iter().find(|(n, _)| *n == name).map_or("", |(_, w)| w);
+    unsupported(format!("a value of type {}: {why}, which no prover's equality does", name.to_lowercase()))
+}
+
 /// Map a sqlparser `DataType` to the prover's type string. Classifies on the rendered type name so
-/// it stays robust across sqlparser versions. Temporal types keep their own names (see the module
-/// docs); BINARY/BLOB/BYTEA become the opaque `VARBINARY`; unknown types pass through uppercased.
-// The arms below are kept apart on purpose: each names a distinct source class, and two of
-// them happening to land on the same type is a fact about the prover's type set, not a redundancy.
-#[allow(clippy::if_same_then_else)]
+/// it stays robust across sqlparser versions, by exact name ([`scalar_class`]). Temporal types keep
+/// their own names (see the module docs); floats and BINARY/BLOB/BYTEA become the opaque
+/// `VARBINARY`; the [`UNFAITHFUL`] types keep their own names; unknown types pass through uppercased.
 pub fn map_type(dt: &DataType) -> String {
     let s = format!("{dt}").to_uppercase();
     let base = s.split('(').next().unwrap_or(&s).trim();
+    // Before the array test: an array of these compares its elements their way.
+    if let Some(t) = unfaithful_type(&s) {
+        return t.into();
+    }
     // An array is opaque whatever its element type, and is tested first because every arm below
     // reads only the element's spelling: `int[]` would be an INTEGER and `timestamp[]` a
     // TIMESTAMP, and a scalar reading of an array value lets `||` and `= ANY` be modelled as
@@ -149,37 +281,43 @@ pub fn map_type(dt: &DataType) -> String {
         return "VARBINARY".into();
     }
     if let Some(t) = temporal_class(&s) {
-        // Before the `INT` arm below, which INTERVAL would otherwise reach through its spelling.
-        t.unwrap_or("VARBINARY").into()
-    } else if base.contains("CHAR") || base.contains("TEXT") || base.contains("STRING") || base.contains("CLOB") {
-        "VARCHAR".into()
-    } else if base.contains("BINARY") || base == "BLOB" || base == "BYTEA" {
-        "VARBINARY".into()
-    } else if base.starts_with("BOOL") {
-        "BOOLEAN".into()
-    } else if base.contains("INT") {
-        "INTEGER".into()
-    } else if base.contains("REAL") || base.contains("FLOAT") || base.contains("DOUBLE")
-        || base.contains("DEC") || base.contains("NUMERIC")
-    {
-        "REAL".into()
-    } else {
-        base.to_string()
+        return t.unwrap_or("VARBINARY").into();
     }
+    match scalar_class(base) {
+        Some(Scalar::Int) => "INTEGER",
+        Some(Scalar::Numeric) => "REAL",
+        Some(Scalar::Float | Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Str) => "VARCHAR",
+        Some(Scalar::Bool) => "BOOLEAN",
+        None => base,
+    }
+    .to_string()
 }
 
 /// Normalise a type name written in the `declare ... function ... returns T` DSL.
+///
+/// The DSL names the IR's types, so `REAL`, and `DOUBLE`, the spelling the preprocessor wrote for
+/// it, are the IR's exact REAL, and `VARBINARY` is the opaque type. Postgres's other names read as
+/// they do in a `CREATE TABLE` ([`map_type`]): `float8` is opaque, and `char` and `citext` are
+/// [`UNFAITHFUL`].
 pub fn normalize_type_name(t: &str) -> String {
     let up = t.to_uppercase();
     if let Some(class) = temporal_class(&up) {
         return class.unwrap_or("VARBINARY").to_string();
     }
-    match up.as_str() {
-        "INT" | "INTEGER" | "SMALLINT" | "BIGINT" | "TINYINT" => "INTEGER",
-        "VARCHAR" | "CHAR" | "TEXT" | "STRING" => "VARCHAR",
-        "BOOL" | "BOOLEAN" => "BOOLEAN",
-        "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" => "REAL",
-        other => return other.to_string(),
+    if matches!(up.as_str(), "REAL" | "DOUBLE") {
+        return "REAL".into();
+    }
+    if let Some(u) = unfaithful_type(&up) {
+        return u.into();
+    }
+    match scalar_class(&up) {
+        Some(Scalar::Int) => "INTEGER",
+        Some(Scalar::Numeric) => "REAL",
+        Some(Scalar::Float | Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Str) => "VARCHAR",
+        Some(Scalar::Bool) => "BOOLEAN",
+        None => return up,
     }
     .to_string()
 }
@@ -217,6 +355,88 @@ pub fn common_type(a: &str, b: &str) -> String {
         "VARCHAR".into()
     } else {
         "INTEGER".into()
+    }
+}
+
+/// Whether `v` is a string literal: a nullary VARCHAR constant other than `NULL`. That is how the
+/// lowering writes one, and how both provers read one.
+fn is_string_literal(v: &Value) -> bool {
+    ty_of(v) == "VARCHAR"
+        && !is_null_lit(v)
+        && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
+        && v.get("operator").is_some_and(Value::is_string)
+}
+
+/// [`common_type`] of two operands, where a string literal takes the other operand's type, as
+/// Postgres resolves an `unknown` literal: in `a = '01'` over an INTEGER `a`, `'01'` is read as an
+/// integer, not `a` as text. [`common_type`] alone would rank VARCHAR above INTEGER and BOOLEAN and
+/// compare `a::text` with `'01'` as strings, so `a = '1' AND NOT a = '01'` would reduce to `a = '1'`.
+/// For every other type of `a` the two rules already agree.
+fn common_type_of(l: &Value, r: &Value) -> String {
+    match (is_string_literal(l), is_string_literal(r)) {
+        (true, false) => ty_of(r),
+        (false, true) => ty_of(l),
+        _ => common_type(&ty_of(l), &ty_of(r)),
+    }
+}
+
+/// A string literal read as a value of `ty`, where `ty` is INTEGER or BOOLEAN; `None` otherwise.
+///
+/// Postgres reads such a literal with the type's input function, before the query runs. Where the
+/// text is one the reading below understands, the literal becomes that constant: `' +01 '` is the
+/// integer `1` and `'yes'` is `TRUE`. Any other text -- one Postgres rejects, which fails the query
+/// before it reads a row, or one only Postgres's fuller syntax accepts, such as `'0x1F'` -- stays a
+/// `CAST` of the literal, which neither prover reads as a number: each parses a cast constant with a
+/// grammar narrower than the one here, so nothing reaching it gets a value.
+fn read_literal(v: &Value, ty: &str) -> Option<Value> {
+    if !is_string_literal(v) || !matches!(ty, "INTEGER" | "BOOLEAN") {
+        return None;
+    }
+    let text = v["operator"].as_str().unwrap_or_default();
+    let constant = match ty {
+        "INTEGER" => pg_integer(text).map(|n| n.to_string()),
+        _ => pg_boolean(text).map(|b| if b { "TRUE" } else { "FALSE" }.to_string()),
+    };
+    Some(match constant {
+        Some(c) => json!({ "operator": c, "operand": [], "type": ty }),
+        None => json!({ "operator": "CAST", "operand": [v], "type": ty }),
+    })
+}
+
+/// The whitespace Postgres's input functions skip around a value, as far as this reading accepts it.
+/// Narrower than C's `isspace`, which they use; narrower only costs a constant.
+fn pg_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// The integer Postgres's `int8in` reads from `s`, for the decimal subset of its syntax: optional
+/// surrounding whitespace, an optional sign and decimal digits. `None` for anything else, Postgres's
+/// own extensions (`0x1F`, `1_000`) included, and for a value past `i64`.
+fn pg_integer(s: &str) -> Option<i64> {
+    let t = s.trim_matches(pg_space);
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<i64>().ok()
+}
+
+/// The boolean Postgres's `boolin` reads from `s`: after surrounding whitespace, case-insensitively,
+/// a non-empty prefix of `true`, `false`, `yes` or `no`, at least two letters of `on` or `off`, or
+/// `1` or `0`. `None` for anything else, which Postgres rejects.
+fn pg_boolean(s: &str) -> Option<bool> {
+    let t = s.trim_matches(pg_space).to_ascii_lowercase();
+    let prefix_of = |word: &str| !t.is_empty() && word.starts_with(t.as_str());
+    match t.as_bytes().first()? {
+        b't' if prefix_of("true") => Some(true),
+        b'f' if prefix_of("false") => Some(false),
+        b'y' if prefix_of("yes") => Some(true),
+        b'n' if prefix_of("no") => Some(false),
+        b'o' if t.len() >= 2 && prefix_of("on") => Some(true),
+        b'o' if t.len() >= 2 && prefix_of("off") => Some(false),
+        b'1' if t.len() == 1 => Some(true),
+        b'0' if t.len() == 1 => Some(false),
+        _ => None,
     }
 }
 
@@ -377,13 +597,17 @@ fn is_null_lit(v: &Value) -> bool {
 }
 
 /// Wrap `v` in a CAST to `ct` unless it already has that type. A crossing that involves a temporal
-/// type is a [`convert`] call instead; see the module docs.
+/// type is a [`convert`] call instead; see the module docs. A string literal cast to INTEGER or
+/// BOOLEAN is read as one ([`read_literal`]).
 pub fn cast_to(mut v: Value, ct: &str) -> Value {
     if ty_of(&v) == ct {
         return v;
     }
     if is_temporal(&ty_of(&v)) || is_temporal(ct) {
         return convert(v, ct);
+    }
+    if let Some(read) = read_literal(&v, ct) {
+        return read;
     }
     // NULL is a *typed nullary constant* to the prover (`Op("NULL", [], ty)`), and it recognises a
     // value as null by comparing against the constant of that same type. Casting instead of
@@ -401,12 +625,13 @@ pub fn cast_to(mut v: Value, ct: &str) -> Value {
 /// Coerce two comparison operands to a common type so the prover doesn't hit a z3 sort mismatch.
 /// Numeric mismatches (INTEGER vs REAL) are left for the prover's own promotion. Sound: the same
 /// cast is applied deterministically on both queries, and CAST is a faithful uninterpreted coercion.
+/// A string literal takes the other operand's type ([`common_type_of`]).
 pub fn coerce_cmp(l: Value, r: Value) -> (Value, Value) {
     let (a, b) = (ty_of(&l), ty_of(&r));
     if a == b || (is_num(&a) && is_num(&b)) {
         return (l, r);
     }
-    let ct = common_type(&a, &b);
+    let ct = common_type_of(&l, &r);
     (cast_to(l, &ct), cast_to(r, &ct))
 }
 
@@ -420,16 +645,45 @@ pub fn make_cmp(opstr: &str, l: Value, r: Value) -> Value {
 ///
 /// `num_ty` is the numeric result type the operator would have on numbers (INTEGER, REAL, VARCHAR
 /// for `||`). An operand of a temporal type takes Postgres's own operator table instead
-/// ([`temporal_arith`]). Past that, the numeric rule is still wrong once an operand is opaque: an
-/// INTEGER-typed `+` over an opaque operand is ill-sorted, and the prover builds a broken z3 term
-/// from it. Coercing both sides to their common type — and taking that type as the result when it
-/// is opaque — keeps the term well-sorted. Sound for the same reason as [`coerce_cmp`]: the cast is
-/// deterministic, so both queries get it identically, and `+` over an opaque type is uninterpreted
-/// either way.
+/// ([`temporal_arith`]).
+///
+/// Two rows of the numeric table are not native either, because the provers would read them as
+/// exact arithmetic that Postgres does not compute, and each is an uninterpreted
+/// `q_arith_<op>_<left>_<right>` function, deterministic, so both queries get the same one:
+///
+/// * any operator but `||` over an opaque operand, with the opaque type as its result. A float is
+///   opaque, and float addition is not associative: `(0.1 + 0.2) + 0.3` is `0.6000000000000001`
+///   and `0.1 + (0.2 + 0.3)` is `0.6`. So is a range, whose `+` is union. A native `+` would let a
+///   prover reassociate or cancel them, and one typed INTEGER over an opaque operand is ill-sorted.
+/// * `/` over a REAL operand, which is `numeric` division. It rounds to a finite scale, so
+///   `x / 3.0 * 3.0` is not `x`. Both operands are converted to REAL first, as Postgres does, so
+///   `a / 2.0` and `a::numeric / 2.0` are one term.
+///
+/// A string literal operand of anything but `||` against an INTEGER is read as an integer, as in a
+/// comparison: `a + '1'` adds the integer `1`. ([`common_type`] would make it text, and every other
+/// type already wins over a literal there.)
 pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
+    let int = |v: &Value| opstr != "||" && ty_of(v) == "INTEGER";
+    let (l, r) = match (is_string_literal(&l), is_string_literal(&r)) {
+        (true, false) if int(&r) => (cast_to(l, "INTEGER"), r),
+        (false, true) if int(&l) => (l, cast_to(r, "INTEGER")),
+        _ => (l, r),
+    };
     let (a, b) = (ty_of(&l), ty_of(&r));
     if is_temporal(&a) || is_temporal(&b) {
         return temporal_arith(opstr, l, r);
+    }
+    if opstr != "||" && !(is_builtin(&a) && is_builtin(&b)) {
+        let ct = common_type(&a, &b);
+        let ty = if is_builtin(&ct) { num_ty } else { &ct };
+        return json!({ "operator": arith_symbol(opstr, &a, &b), "operand": [l, r], "type": ty });
+    }
+    if opstr == "/" && is_num(&a) && is_num(&b) && (a == "REAL" || b == "REAL") {
+        return json!({
+            "operator": arith_symbol("/", "REAL", "REAL"),
+            "operand": [cast_to(l, "REAL"), cast_to(r, "REAL")],
+            "type": "REAL"
+        });
     }
     // `||` is text concatenation only over text and the other builtin scalars, and there it is
     // strict. Over anything opaque it may be something else: array `||` is not strict
@@ -472,21 +726,26 @@ fn temporal_arith(op: &str, l: Value, r: Value) -> Value {
         ("||", ..) => native("VARCHAR", cast_to(l, "VARCHAR"), cast_to(r, "VARCHAR")),
         _ => {
             let ty = temporal_arith_type(op, &a, &b);
-            let name = match op {
-                "+" => "add",
-                "-" => "sub",
-                "*" => "mul",
-                "/" => "div",
-                "%" => "mod",
-                other => other,
-            };
-            json!({
-                "operator": format!("q_arith_{name}_{}_{}", a.to_lowercase(), b.to_lowercase()),
-                "operand": [l, r],
-                "type": ty
-            })
+            json!({ "operator": arith_symbol(op, &a, &b), "operand": [l, r], "type": ty })
         }
     }
+}
+
+/// `q_arith_<op>_<left>_<right>`: the uninterpreted function an arithmetic operator over the types
+/// `a` and `b` becomes, with each type's name reduced to lower-case letters, digits and `_`.
+fn arith_symbol(op: &str, a: &str, b: &str) -> String {
+    let name = match op {
+        "+" => "add",
+        "-" => "sub",
+        "*" => "mul",
+        "/" => "div",
+        "%" => "mod",
+        other => other,
+    };
+    let safe = |t: &str| -> String {
+        t.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+    };
+    format!("q_arith_{name}_{}_{}", safe(a), safe(b))
 }
 
 /// The result type Postgres gives a temporal operator that [`temporal_arith`] leaves uninterpreted,
@@ -534,7 +793,11 @@ pub fn make_case(mut ops: Vec<Value>) -> Value {
     if n % 2 == 1 {
         res.push(n - 1);
     }
-    let ct = res
+    // A string literal branch takes the type of the others, as in a comparison ([`common_type_of`]),
+    // unless every other branch is a literal or a NULL, where Postgres makes the CASE text.
+    let voters: Vec<usize> = res.iter().copied().filter(|&i| !is_string_literal(&ops[i])).collect();
+    let voters = if voters.iter().all(|&i| is_null_lit(&ops[i])) { res.clone() } else { voters };
+    let ct = voters
         .iter()
         .map(|&i| ty_of(&ops[i]))
         .reduce(|a, b| common_type(&a, &b))

@@ -82,6 +82,34 @@ elsewhere the value keeps its own type, which costs exactness and not soundness.
 would put two temporal types in one column with no comparison to hang a conversion on — a set
 operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 
+### Types the provers would read with the wrong arithmetic or the wrong equality
+
+A Postgres type is mapped onto an IR type only where the IR type's operations are the Postgres
+type's. Both provers read REAL as exact rational arithmetic and any type's `=` as equality, so:
+
+- **`numeric` is REAL, but its division is not exact.** Addition, subtraction and multiplication
+  of numerics are exact; division rounds to a finite scale (`1 / 3.0 * 3.0` is `0.99…990`), so
+  `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
+- **Floats are opaque.** `real`, `double precision` and `float` round, and float addition is not
+  associative: `(0.1 + 0.2) + 0.3` is `0.6000000000000001` and `0.1 + (0.2 + 0.3)` is `0.6`. A
+  float is VARBINARY, and arithmetic over any opaque operand, a float or a range or a point, is an
+  uninterpreted `q_arith_<op>_<left>_<right>`. Proofs that need float arithmetic, or a float's
+  order against a constant, are given up with it.
+- **`citext` and `char(n)` are refused.** Their `=` ignores case or trailing spaces. No IR type has
+  that equality: as VARCHAR, `'A'` and `'a'` would be different values, and as an opaque type
+  their `=` would be the prover's equality, which substitutes equals for equals, so from
+  `t.c = u.c` it would conclude `t.c::text = u.c::text`, which citext does not satisfy. A query
+  that reads a value of either type is refused; a column of one that no query reads costs nothing.
+  `SELECT *`, `DELETE` and `UPDATE` read every column of the table they touch.
+- **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
+  The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
+  inference, read every name from one table, so `uuid` and `money` are opaque in both.
+- **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
+  over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
+  the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
+  with `'01'` as strings. Text it cannot read the way Postgres does stays an uninterpreted cast of
+  the literal.
+
 ### Shapes that look like something simpler
 
 A few constructs read like a simpler one and compute something else, and each is either lowered as
@@ -96,6 +124,10 @@ what it is or refused:
   opaque operand is a function, not text concatenation, because array `||` is not strict (`'{a}' ||
   NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every element is
   a scalar, since over `ARRAY[arr]` it ranges over the leaves.
+- **A key is not a path.** `j -> 'k'` looks up one key and `j #> '{k}'` follows a path, so they
+  are two uninterpreted functions, and `jsonb_extract_path(j, 'k')`, which takes the path one
+  element per argument, is a third: over `[5]`, `jsonb_extract_path(j, '0')` is `5` and `j -> '0'`
+  is NULL.
 - **A row against a parameter is a record comparison.** In `(a, b) IN ($1, ..)` each parameter
   stands for a composite value, and Postgres compares a row with one under record semantics, where
   two NULL fields are equal. Each such item is one opaque predicate, never per-field comparisons.

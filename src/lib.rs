@@ -339,6 +339,9 @@ fn emit(
     let q1 = lower::lower_query(catalog, decls, &queries[1])?;
 
     let mut input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
+    // A `citext` or `char(n)` value has an `=` no prover's equality can stand for. Checked on the
+    // lowered queries, so a column of that type that neither query reads costs nothing.
+    types::refuse_unfaithful(&input)?;
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
     verify::check_levels(&input)?;

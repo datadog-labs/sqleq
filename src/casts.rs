@@ -16,7 +16,7 @@
 //! | 1 | `$N` | `$N` | the parameter *is* an uninterpreted constant of the target type, so the cast is the identity on it |
 //! | 2/3 | a literal or `NULL` | `CAST(lit AS T′)` | a real cast survives; `T′` is only the prover's spelling of `T` |
 //! | 4 | anything already of type `T`, target unqualified | the operand | a no-op cast |
-//! | 5a | `INTEGER` → `REAL` | `CAST(x AS DOUBLE)` | a widening the prover models natively |
+//! | 5a | `INTEGER` → `REAL` | `CAST(x AS NUMERIC)` | a widening the prover models natively |
 //! | 5b | any other real conversion | `qcastK(x)` | an uninterpreted function, shared across both sides |
 //!
 //! Rule 4's *unqualified* condition is load-bearing: `x::varchar` over a VARCHAR column is a no-op,
@@ -139,7 +139,8 @@ enum Decision {
 fn data_type(t: Ty) -> DataType {
     match t {
         Ty::Int => DataType::Integer(None),
-        Ty::Real => DataType::Double(ExactNumberInfo::None),
+        // `numeric`, not `double precision`: a float is opaque to `map_type`, and `Ty::Real` is exact.
+        Ty::Real => DataType::Numeric(ExactNumberInfo::None),
         Ty::Str => DataType::Varchar(None),
         Ty::Bool => DataType::Boolean,
         Ty::Date => DataType::Date,
@@ -290,6 +291,11 @@ fn decide(
         sweep(q, |e| {
             let Expr::Cast { expr, data_type: dt, .. } = e else { return Ok(()) };
             let txt = dt.to_string();
+            // A `citext` or `char(n)` value is refused wherever it appears (`types::UNFAITHFUL`). A
+            // `qcast` would carry it as an opaque value, whose `=` is the prover's equality.
+            if let Some(u) = crate::types::unfaithful_type(&txt) {
+                return Err(crate::types::unfaithful_refusal(u));
+            }
             let (target, qualified) = map_type_name(&txt);
             // A target with no `Ty` is still a deterministic function of its operand; what is missing
             // is an interpretation, not a value. `Ty::Opaque` carries it -- VARBINARY, which the
@@ -702,10 +708,9 @@ mod tests {
 
     #[test]
     fn a_cast_over_a_literal_keeps_the_cast_and_retargets_it() {
-        // Rules 2/3: `numeric` is not a type the prover names, `DOUBLE` is the same type spelled
-        // the way it does name it.
-        let q = one("SELECT t.a, CAST(1 AS numeric) FROM t");
-        assert!(q.to_uppercase().contains("CAST(1 AS DOUBLE)"), "{q}");
+        // Rules 2/3: `decimal` is retargeted to `numeric`, the spelling `Ty::Real` reads back as.
+        let q = one("SELECT t.a, CAST(1 AS decimal) FROM t");
+        assert!(q.to_uppercase().contains("CAST(1 AS NUMERIC)"), "{q}");
     }
 
     #[test]
@@ -739,9 +744,13 @@ mod tests {
         // Rule 5a: the prover understands this one, so it does not need a symbol. Only the target
         // is rewritten -- sqlparser keeps the `::` spelling, and `lower.rs` reads the target rather
         // than the spelling, so the two forms lower identically.
-        let (q, rw) = run("SELECT t.user_id::float FROM t").expect("rewrites");
-        assert!(q[0].to_uppercase().contains("T.USER_ID::DOUBLE"), "{}", q[0]);
+        let (q, rw) = run("SELECT t.user_id::numeric FROM t").expect("rewrites");
+        assert!(q[0].to_uppercase().contains("T.USER_ID::NUMERIC"), "{}", q[0]);
         assert!(rw.qcasts.is_empty());
+        // A float is not a REAL: it rounds. Its cast is a `qcast` into the opaque type.
+        let (q, rw) = run("SELECT t.user_id::float FROM t").expect("rewrites");
+        assert!(q[0].contains("qcast0"), "{}", q[0]);
+        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), arg: Ty::Int, ret: Ty::Opaque }]);
     }
 
     #[test]

@@ -443,8 +443,8 @@ fn ident(name: &str) -> String {
 /// The MySQL spelling of a prover type.
 ///
 /// The domain is closed: [`pgddl`] types every column through `map_pg_type`, which returns one of
-/// the five builtin names or a temporal one, and falls back to `VARBINARY` for everything it does not
-/// recognise. That closure is load-bearing — their grammar rejects `json`, `uuid`, `inet`, `money`
+/// the five builtin names, a temporal one or one of the two names a query may not read
+/// (`types::UNFAITHFUL`), and falls back to `VARBINARY` for everything it does not recognise. That closure is load-bearing — their grammar rejects `json`, `uuid`, `inet`, `money`
 /// and `xml`, and **one unparseable type name loses the whole `CREATE TABLE`**, so a schema is
 /// all-or-nothing per table. All five spellings below were checked against the built jar.
 ///

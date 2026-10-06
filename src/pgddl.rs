@@ -43,8 +43,8 @@ pub const OPAQUE: &str = "VARBINARY";
 /// Map a rendered Postgres type name to the prover type string a `Catalog` holds, or `None` if it
 /// has no faithful mapping.
 ///
-/// `None` is not a failure — it is the honest answer for `jsonb`, `geometry`, `inet`, `bytea`, an
-/// enum, or any array. The caller turns it into [`OPAQUE`].
+/// `None` is not a failure — it is the honest answer for `jsonb`, `geometry`, `inet`, `bytea`, a
+/// float, `uuid`, an enum, or any array. The caller turns it into [`OPAQUE`].
 ///
 /// The classification is `map_type_name`'s, not a second copy of it: the rule for reading a
 /// Postgres type name is one rule, and this module needing a different *rendering* of the answer is
@@ -55,6 +55,12 @@ pub const OPAQUE: &str = "VARBINARY";
 /// schema disagreeing with the CAST targets in its own queries is a needless thing to leave for
 /// someone to debug later.
 pub fn map_pg_type(rendered: &str) -> Option<&'static str> {
+    // `citext` and `char(n)` keep their own names, as `types::map_type` gives them, so that a query
+    // reading such a column is refused (`types::refuse_unfaithful`) rather than handed an opaque
+    // value whose `=` is not theirs.
+    if let Some(u) = crate::types::unfaithful_type(rendered) {
+        return Some(u);
+    }
     Some(match map_type_name(rendered).0? {
         Ty::Int => "INTEGER",
         Ty::Real => "REAL",
@@ -490,10 +496,21 @@ mod tests {
         assert_eq!(map_pg_type("time with time zone"), None);
         assert_eq!(map_pg_type("numeric(10,2)"), Some("REAL"));
         assert_eq!(map_pg_type("character varying(255)"), Some("VARCHAR"));
-        assert_eq!(map_pg_type("double precision"), Some("REAL"));
+        // A float is opaque: it rounds, and the IR's REAL is exact.
+        assert_eq!(map_pg_type("double precision"), None);
+        assert_eq!(map_pg_type("real"), None);
         assert_eq!(map_pg_type("BIGSERIAL"), Some("INTEGER"));
         assert_eq!(map_pg_type("boolean"), Some("BOOLEAN"));
-        assert_eq!(map_pg_type("uuid"), Some("VARCHAR"));
+        // `uuid` reads `'{A0EE…}'` and `'a0ee…'` as one value, so it is not text; as in a declared
+        // `CREATE TABLE`, it is opaque.
+        assert_eq!(map_pg_type("uuid"), None);
+        // Integers by name: these contain `INT` and are not integers.
+        assert_eq!(map_pg_type("int4range"), None);
+        assert_eq!(map_pg_type("point"), None);
+        // `=` ignores case or trailing spaces: kept by name, so a query reading one is refused.
+        assert_eq!(map_pg_type("citext"), Some("CITEXT"));
+        assert_eq!(map_pg_type("character(3)"), Some("BPCHAR"));
+        assert_eq!(map_pg_type("bpchar"), Some("BPCHAR"));
     }
 
     #[test]
@@ -571,10 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn the_postgres_quoted_char_type_is_a_string() {
-        // `"char"` is a real Postgres type; a parser that keeps the quotes must not be fooled by them.
+    fn the_postgres_quoted_char_type_is_opaque() {
+        // `"char"` is a real Postgres type, a parser that keeps the quotes must not lose the table
+        // over them, and it is neither `char(n)` nor text: one byte, which reads `'ab'` as `'a'`.
         let cat = parse_provided_schema(r#"CREATE TABLE t (a "char" NOT NULL);"#);
-        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARCHAR".into())]);
+        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARBINARY".into())]);
     }
 
     #[test]
