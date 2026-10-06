@@ -163,24 +163,87 @@ pub fn ddl_for(parts: &[String], t: &Table) -> String {
             .join(", ");
         cols.push(format!("UNIQUE ({names})"));
     }
+    format!("CREATE TABLE {} ({})", qualify(parts), cols.join(", "))
+}
+
+/// One `CREATE UNIQUE INDEX` per expression key of `t` ([`Table::expr_keys`]), on the table named
+/// by `parts`.
+///
+/// A unique index over expressions has no column-list form, so it is created as a DuckDB unique
+/// index, which rejects a colliding row on insert just as `UNIQUE (..)` does. An index is named
+/// within its table's schema, so the name carries the whole qualified table name to keep two
+/// spellings of one table apart; `DROP TABLE` takes the index along.
+pub fn expr_index_ddl(parts: &[String], t: &Table) -> Vec<String> {
     let qn = qualify(parts);
-    let mut ddl = format!("CREATE TABLE {qn} ({})", cols.join(", "));
-    // A unique index over expressions has no column-list form, so it is created as a DuckDB unique
-    // index, which rejects a colliding row on insert just as `UNIQUE (..)` does. An index is named
-    // within its table's schema, so the name carries the whole qualified table name to keep two
-    // spellings of one table apart; `DROP TABLE` takes the index along.
     let tag: String = parts
         .join("_")
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    for (i, exprs) in t.expr_keys.iter().enumerate() {
-        ddl.push_str(&format!(
-            "; CREATE UNIQUE INDEX \"sqleq_uix_{tag}_{i}\" ON {qn} ({})",
-            exprs.join(", ")
-        ));
+    t.expr_keys
+        .iter()
+        .enumerate()
+        .map(|(i, exprs)| {
+            format!(
+                "CREATE UNIQUE INDEX \"sqleq_uix_{tag}_{i}\" ON {qn} ({})",
+                exprs.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// Create the table `parts` names, with every constraint of `t`. Returns the expression keys DuckDB
+/// would not index -- it refuses a JSON operator in an index expression, for one -- which
+/// [`insert_rows`] and [`accepted_rows`] then enforce by checking each insert.
+fn create_table<'t>(
+    con: &Connection,
+    parts: &[String],
+    t: &'t Table,
+) -> duckdb::Result<Vec<&'t Vec<String>>> {
+    con.execute_batch(&ddl_for(parts, t))?;
+    Ok(expr_index_ddl(parts, t)
+        .iter()
+        .zip(&t.expr_keys)
+        .filter(|(ddl, _)| con.execute_batch(ddl).is_err())
+        .map(|(_, key)| key)
+        .collect())
+}
+
+/// Insert one row as a unique index on `unindexed` would: inside a transaction that is rolled back
+/// if the row fails a constraint DuckDB enforces, or leaves two rows equal and non-NULL on one of
+/// those expression lists. Whether it went in.
+///
+/// Evaluating the expressions after the insert, rather than refusing the table, keeps the pair: the
+/// rows the generator draws mostly leave such an expression NULL, which never collides. A key whose
+/// expressions DuckDB cannot evaluate at all makes the row fail, so nothing is inserted and the
+/// trial compares tables both sides see empty -- never a row Postgres would have refused.
+fn insert_checked(con: &Connection, qn: &str, row: &str, unindexed: &[&Vec<String>]) -> bool {
+    if con
+        .execute_batch(&format!("BEGIN TRANSACTION; INSERT INTO {qn} VALUES ({row})"))
+        .is_err()
+    {
+        let _ = con.execute_batch("ROLLBACK");
+        return false;
     }
-    ddl
+    let collides = |key: &Vec<String>| -> duckdb::Result<bool> {
+        let exprs = key.join(", ");
+        let present = key
+            .iter()
+            .map(|e| format!("{e} IS NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        con.query_row(
+            &format!(
+                "SELECT count(*) > 0 FROM (SELECT 1 FROM {qn} WHERE {present} \
+                 GROUP BY {exprs} HAVING count(*) > 1)"
+            ),
+            [],
+            |r| r.get(0),
+        )
+    };
+    let ok = unindexed.iter().all(|k| matches!(collides(k), Ok(false)));
+    let _ = con.execute_batch(if ok { "COMMIT" } else { "ROLLBACK" });
+    ok
 }
 
 /// One database, reused for every trial of a pair. Constructing a DuckDB instance costs ~20ms —
@@ -286,9 +349,21 @@ fn rows_all_valid(t: &Table, rows: &[Vec<Val>]) -> bool {
 
 /// Insert the generated rows. A failing multi-row `INSERT` is atomic in DuckDB (it leaves the table
 /// untouched), so falling back row-by-row reproduces exactly the survivor set the row-by-row path
-/// would have produced on its own.
-fn insert_rows(con: &Connection, qn: &str, t: &Table, rows: &[Vec<Val>]) {
+/// would have produced on its own. Expression keys DuckDB would not index are checked row by row.
+fn insert_rows(
+    con: &Connection,
+    qn: &str,
+    t: &Table,
+    rows: &[Vec<Val>],
+    unindexed: &[&Vec<String>],
+) {
     let render = |row: &Vec<Val>| row.iter().map(lit).collect::<Vec<_>>().join(", ");
+    if !unindexed.is_empty() {
+        for row in rows {
+            insert_checked(con, qn, &render(row), unindexed);
+        }
+        return;
+    }
     if rows_all_valid(t, rows) {
         let all = rows
             .iter()
@@ -507,7 +582,7 @@ pub fn accepted_rows(
     for (fname, partsets) in forms {
         for parts in partsets {
             ensure_namespace(con, parts, &mut attached)?;
-            con.execute_batch(&ddl_for(parts, &schema[fname]))?;
+            let unindexed = create_table(con, parts, &schema[fname])?;
             let qn = qualify(parts);
             // Row by row unconditionally: the batched path in `insert_rows` is an optimisation for
             // the case where nothing is dropped, and it is the row-by-row path that reveals which.
@@ -515,8 +590,12 @@ pub fn accepted_rows(
                 .iter()
                 .filter(|row| {
                     let vals = row.iter().map(lit).collect::<Vec<_>>().join(", ");
-                    con.execute_batch(&format!("INSERT INTO {qn} VALUES ({vals})"))
-                        .is_ok()
+                    if unindexed.is_empty() {
+                        con.execute_batch(&format!("INSERT INTO {qn} VALUES ({vals})"))
+                            .is_ok()
+                    } else {
+                        insert_checked(con, &qn, &vals, &unindexed)
+                    }
                 })
                 .cloned()
                 .collect();
@@ -560,8 +639,14 @@ pub fn run_side(
     for (fname, partsets) in forms {
         for parts in partsets {
             ensure_namespace(con, parts, &mut attached)?;
-            con.execute_batch(&ddl_for(parts, &schema[fname]))?;
-            insert_rows(con, &qualify(parts), &schema[fname], &rowdata[fname]);
+            let unindexed = create_table(con, parts, &schema[fname])?;
+            insert_rows(
+                con,
+                &qualify(parts),
+                &schema[fname],
+                &rowdata[fname],
+                &unindexed,
+            );
         }
     }
 

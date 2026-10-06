@@ -68,6 +68,31 @@ fn a_unique_index_on_an_expression_is_enforced() {
     );
 }
 
+/// DuckDB will not index a JSON operator, so such a key is enforced by checking each insert instead
+/// of costing the pair its trials.
+#[test]
+fn a_unique_expression_duckdb_will_not_index_is_still_enforced() {
+    let ddl = r#"create table "t" ("id" INTEGER NOT NULL, "j" JSONB, unique ("id"));
+                 create unique index "t_j_a" on "t" (("j" ->> 'a'))"#;
+    assert_eq!(
+        label(
+            r#"SELECT "j" ->> 'a' AS "k" FROM "t" WHERE "j" ->> 'a' IS NOT NULL"#,
+            r#"SELECT DISTINCT "j" ->> 'a' AS "k" FROM "t" WHERE "j" ->> 'a' IS NOT NULL"#,
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    // NULL keys never collide, so they stay, and DISTINCT does remove those.
+    assert_eq!(
+        label(
+            r#"SELECT "j" ->> 'a' AS "k" FROM "t""#,
+            r#"SELECT DISTINCT "j" ->> 'a' AS "k" FROM "t""#,
+            ddl
+        ),
+        "NOT-EQUIVALENT"
+    );
+}
+
 #[test]
 fn nulls_not_distinct_admits_one_null() {
     for ddl in [

@@ -44,8 +44,8 @@ deterministic. The rules:
   database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
   makes its columns `NOT NULL` too), from `CREATE UNIQUE INDEX`, and from `ALTER TABLE … ADD
   PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET NOT NULL`. A unique index over an expression is
-  created as a DuckDB unique index on that expression, and `NULLS NOT DISTINCT` admits at most one
-  NULL key. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over the raw
+  created as a DuckDB unique index on that expression (or, where DuckDB will not index it, checked
+  after each insert), and `NULLS NOT DISTINCT` admits at most one NULL key. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over the raw
   DDL; partial indexes are treated as *total* (conservative — only shrinks the valid space). A
   uniqueness statement nothing can read withholds every pair over its table (`NOT-COMPARABLE`).
 - **A table is the table Postgres resolves.** `public.t` and `t` are one table (the default
