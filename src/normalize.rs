@@ -2071,14 +2071,22 @@ mod tests {
         );
     }
 
-    /// A bare name beside a qualified one is the same table under two spellings — which is the whole
-    /// point of the rewrite, so it must not be read as a collision.
+    /// Two bare names under one qualifier are two tables, not a collision, and the strip reaches the
+    /// ones in a subquery too.
     #[test]
-    fn a_bare_name_beside_its_qualified_form_still_strips() {
+    fn two_tables_under_one_qualifier_strip_everywhere() {
         assert_eq!(
             unschemad("SELECT x FROM s.orders WHERE id IN (SELECT oid FROM s.lines)"),
             "SELECT x FROM orders WHERE id IN (SELECT oid FROM lines)"
         );
+    }
+
+    /// A bare name beside its qualified form is a collision: `orders` and `s.orders` are one table only
+    /// if the search path reaches `s` first, which nothing here knows, so neither is stripped.
+    #[test]
+    fn a_bare_name_beside_its_qualified_form_is_a_collision() {
+        let sql = "SELECT x FROM orders WHERE id IN (SELECT oid FROM s.orders)";
+        assert_eq!(unschemad(sql), sql);
     }
 
     #[test]
