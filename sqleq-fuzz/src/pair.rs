@@ -451,6 +451,8 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         }
 
         let mut binds: HashMap<u32, Val> = HashMap::new();
+        // Row-count params this trial binds so that they do cut; see below.
+        let mut cutting: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &n in &pnums {
             let loc = pcol.get(&n).and_then(|c| colloc.get(c));
             // The values the linked column actually holds, as *scalars*. An array column holds lists,
@@ -533,7 +535,20 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
                 }
             };
             let v = if let Some(v) = neutral.get(&n) {
-                v.clone() // a pure row-count param, bound so that it cuts nothing
+                // A pure row-count param is bound so that it cuts nothing, which lets the whole bag
+                // be compared -- and hides the one difference a cut makes, when the other side has
+                // no cut at all. So half the small trials bind it so that it does cut, and compare
+                // only cardinality there, unless the cut's order is total.
+                if small && rng.random_bool(0.5) {
+                    cutting.insert(n);
+                    let count = match counted.get(&n).and_then(|k| k.first()) {
+                        Some(Count::Offset) => rng.random_range(1..=cfg.nrows.max(1)),
+                        _ => rng.random_range(0..=cfg.nrows),
+                    };
+                    Val::Int(count as i64)
+                } else {
+                    v.clone()
+                }
             } else if is_array {
                 // 1-3 elements: enough to match real rows often, few enough that the predicate stays
                 // selective and can still discriminate the two sides.
@@ -580,8 +595,12 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             break;
         }
 
+        let trial_nondet = nondet
+            || cuts
+                .iter()
+                .any(|c| !c.total && c.params.iter().any(|(n, _)| cutting.contains(n)));
         if ra != rb {
-            if nondet && sa == sb {
+            if trial_nondet && sa == sb {
                 continue; // equal cardinality + nondeterministic clause -> not a sound counterexample
             }
             // Report the rows the database accepted, not the rows we generated: a row violating

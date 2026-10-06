@@ -60,7 +60,9 @@ deterministic. The rules:
   left alone.
 - **`LIMIT`/`OFFSET` over an unordered set.** The clauses are read off the parse, so `LIMIT (1)`,
   `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. A count that is a bare `$N` and nothing else is
-  bound so that it cuts nothing: a `LIMIT` large, an `OFFSET` to 0. Any other cut, and a
+  bound so that it cuts nothing: a `LIMIT` large, an `OFFSET` to 0 — except in half the
+  small-instance trials, where it is bound so that it does cut (and those trials compare only
+  cardinality), so a cut on one side alone is still seen. Any other cut, and a
   string-flattening aggregate, marks the pair *nondeterministic*, after which only **cardinality**
   differences (which stay deterministic) are trusted — unless the cut's `ORDER BY` is provably a
   total order (it determines a row of every table through a NOT NULL key, the join's equalities and

@@ -65,6 +65,24 @@ fn a_pagination_offset_parameter_is_bound_to_zero() {
 }
 
 #[test]
+fn a_cut_on_one_side_only_is_seen() {
+    // Binding the counts so that they cut nothing would make B the whole table, as A is; for any
+    // OFFSET of 1 or more, or a LIMIT smaller than the table, it is not.
+    let ddl = r#"create table "t" ("id" INTEGER PRIMARY KEY, "a" INTEGER)"#;
+    for tail in ["LIMIT $1 OFFSET $2", "OFFSET $1", "LIMIT $1"] {
+        assert_eq!(
+            label(
+                r#"SELECT "id", "a" FROM "t""#,
+                &format!(r#"SELECT "id", "a" FROM "t" ORDER BY "id" {tail}"#),
+                ddl
+            ),
+            "NOT-EQUIVALENT",
+            "{tail}"
+        );
+    }
+}
+
+#[test]
 fn an_empty_table_is_drawn() {
     // `sum` over no rows is NULL, so A is empty and B is not exactly when s is empty.
     let ddl = r#"create table "t" ("id" INTEGER, unique ("id"));
