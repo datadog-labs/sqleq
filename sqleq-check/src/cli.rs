@@ -10,12 +10,15 @@ use clap::{Parser, ValueEnum};
 use crate::suite;
 
 const EPILOG: &str = "\
-Each .sql file must contain table/function declarations and exactly two SELECT queries to compare.
+Each .sql file holds optional table/function declarations and exactly two statements to compare:
+two SELECTs, or two DELETEs, UPDATEs or INSERTs. A .json input is an already-lowered plan, and
+--corpus reads the rows of a CSV instead of files.
 
 Exit codes:
-  0  policy satisfied (see --expect)
-  1  policy not satisfied (some case failed expectation)
-  2  usage / setup error (a missing tool, a bad flag)";
+  0    policy satisfied (see --expect)
+  1    policy not satisfied (some case failed expectation); under --portfolio, any alarm
+  2    usage / setup error (a missing tool, a bad flag)
+  130  interrupted by Ctrl-C (143 by SIGTERM); every backend still running is killed first";
 
 /// The catalog a case is lowered against when its own header names none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -42,9 +45,9 @@ impl Catalog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Expect {
     /// Nonzero exit unless every case is provable -- for validating known-equivalent rewrite pairs
-    /// in CI.
+    /// in CI. Under --portfolio, unless every case's verdict is equivalent.
     Equivalent,
-    /// Always exit 0.
+    /// Exit 0 whatever the cases say; under --portfolio an alarm still exits 1.
     ReportOnly,
     /// Every case's header pins each axis's answer, and any movement fails (tests/pairs/README.md).
     Pinned,
@@ -57,8 +60,8 @@ fn default_jobs() -> usize {
 #[derive(Debug, Parser)]
 #[command(
     name = "sqleq-check",
-    about = "Batch SQL equivalence checking: run each pair past the frontend, the QED prover and any other \
-             axis asked for, and report or judge the answers.",
+    about = "Batch SQL equivalence checking: run each pair past the axes asked for -- by default \
+             the frontend and the QED prover -- and report or judge the answers.",
     after_help = EPILOG,
     infer_long_args = true
 )]
@@ -86,12 +89,13 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub catalog: Option<Catalog>,
 
-    /// Append each case to FILE as one JSON line the moment its last asked axis has answered: the
+    /// Write each case to FILE as one JSON line the moment its last asked axis has answered: the
     /// same object `--json` holds, written as the run goes, so an interrupted run keeps what it had.
+    /// FILE is started afresh unless --resume.
     #[arg(long, value_name = "FILE")]
     pub jsonl: Option<String>,
 
-    /// With --jsonl: skip every case already in FILE, and append the rest.
+    /// With --jsonl: keep FILE, skip every case already in it, and append the rest.
     #[arg(long, requires = "jsonl")]
     pub resume: bool,
 
@@ -120,7 +124,8 @@ pub struct Args {
 
     /// sqleq-solver drivers to run side by side, each over its share of the rows (default: 1). More
     /// is faster, but the per-row cap is load-sensitive: a row near it can decide differently with
-    /// other drivers running, so one is the reproducible choice.
+    /// other drivers running, so one is the reproducible choice. Not used under --portfolio, which
+    /// runs sqleq-solver per case.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub sqleq_solver_jobs: usize,
 
@@ -130,7 +135,7 @@ pub struct Args {
     pub bin_dir: Option<String>,
 
     /// With the Lean axis: have sqleq-lean also write FILE, what `tools/lean_replay.py` needs to
-    /// re-run its proved pairs on Postgres.
+    /// re-run its proved pairs on Postgres. Not under --portfolio, which runs Lean per case.
     #[arg(long, value_name = "FILE")]
     pub lean_replay_plan: Option<String>,
 
@@ -145,10 +150,11 @@ pub struct Args {
     pub timeout: f64,
 
     /// Run every asked backend on each case at once, within the one --timeout, and report one
-    /// combined verdict per case: equivalent, not-equivalent, alarm (a proof and a counterexample),
-    /// timeout or undecided. Asks frontend, qed, sqleq-solver and fuzz unless --axes says
-    /// otherwise; --lean adds Lean. The verdict decides the exit code, and an alarm always fails
-    /// the run. Not with --expect pinned or --sqlsolver-jvm.
+    /// combined verdict per case: equivalent, equivalent-gather or equivalent-gather-generated
+    /// (Lean's weaker claims), not-equivalent, alarm (a proof and a counterexample), timeout or
+    /// undecided. Asks frontend, qed, sqleq-solver and fuzz unless --axes says otherwise; --lean
+    /// adds Lean. The verdict decides the exit code, and an alarm always fails the run. Not with
+    /// --expect pinned or --sqlsolver-jvm.
     #[arg(long)]
     pub portfolio: bool,
 
@@ -171,7 +177,8 @@ pub struct Args {
     #[arg(long)]
     pub bless: bool,
 
-    /// Path to sqleq-fuzz (else $SQLEQ_FUZZ / PATH / this repo's target/{release,debug}).
+    /// Path to sqleq-fuzz (else --bin-dir / $SQLEQ_FUZZ / PATH / the newer of this repo's
+    /// target/{release,debug} builds).
     #[arg(long, value_name = "PATH")]
     pub fuzz_bin: Option<String>,
 
@@ -193,7 +200,7 @@ pub struct Args {
     #[arg(long)]
     pub no_retry: bool,
 
-    /// Print each case as it finishes.
+    /// Print each case as it finishes (not under --expect pinned, which prints a table of pins).
     #[arg(short, long)]
     pub verbose: bool,
 
@@ -205,7 +212,8 @@ pub struct Args {
     #[arg(long)]
     pub no_color: bool,
 
-    /// Path to sqleq-frontend (else $SQLEQ_FRONTEND / PATH / this repo's target/{release,debug}).
+    /// Path to sqleq-frontend (else --bin-dir / $SQLEQ_FRONTEND / PATH / the newer of this repo's
+    /// target/{release,debug} builds).
     #[arg(long, value_name = "PATH")]
     pub frontend: Option<String>,
 
@@ -214,19 +222,19 @@ pub struct Args {
     pub prover: Option<String>,
 
     /// Also ask sqleq-solver (a Rust rewrite of SQLSolver) about every case that lowered, over the
-    /// same Input JSON the QED prover gets. Informational only: it never changes the exit code, and
-    /// its NEQ is not a refutation. See docs/SQLSOLVER.md.
+    /// same Input JSON the QED prover gets. Outside --portfolio and --expect pinned it never
+    /// changes the exit code, and its NEQ is never a refutation. See docs/SQLSOLVER.md.
     #[arg(long, conflicts_with = "sqlsolver_jvm")]
     pub sqleq_solver: bool,
 
-    /// With --sqleq-solver: the binary (else $SQLEQ_SOLVER_BIN / PATH / this repo's
-    /// target/{release,debug}).
+    /// The sqleq-solver binary, whenever a run asks it (else --bin-dir / $SQLEQ_SOLVER_BIN / PATH /
+    /// the newer of this repo's target/{release,debug} builds).
     #[arg(long, value_name = "PATH")]
     pub sqleq_solver_bin: Option<String>,
 
     /// Ask the original SQLSolver instead, as a JVM fork through tools/sqlsolver/IrDriver:
-    /// sqleq-solver's backup cross-check. Same jobs, same result rows, same buckets; needs a JDK
-    /// and the fork tree. Not with --sqleq-solver.
+    /// sqleq-solver's backup cross-check, and deprecated. Same jobs, same result rows, same
+    /// buckets; needs a JDK and the fork tree. Not with --sqleq-solver or --portfolio.
     #[arg(long)]
     pub sqlsolver_jvm: bool,
 
@@ -235,19 +243,22 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub sqlsolver_tree: Option<String>,
 
-    /// Also run the Lean axis (sqleq-lean) over the .sql cases: INSERT ... VALUES vs INSERT ...
-    /// SELECT * FROM unnest(..) pairs, proved under the gather rule. The same as adding `lean` to
-    /// --axes; outside --expect pinned it never changes the exit code.
+    /// Also run the Lean axis (sqleq-lean) over the .sql cases and corpus rows: INSERT ... VALUES
+    /// vs INSERT ... SELECT * FROM unnest(..) pairs, proved under the gather rule. The same as
+    /// adding `lean` to --axes; outside --expect pinned it never changes the exit code, and under
+    /// --portfolio its proof is a gather verdict, not `equivalent`.
     #[arg(long)]
     pub lean: bool,
 
-    /// Path to sqleq-lean (else $SQLEQ_LEAN / target/{release,debug}).
+    /// Path to sqleq-lean (else --bin-dir / $SQLEQ_LEAN / this repo's target/release, then
+    /// target/debug). Given but not an executable, it falls through to $SQLEQ_LEAN and the builds,
+    /// skipping --bin-dir.
     #[arg(long, value_name = "PATH")]
     pub lean_bin: Option<String>,
 
     /// Per-row cap for the second opinion (sqleq-solver, or the fork with --sqlsolver-jvm), in ms
-    /// (default: --timeout). Its rows run sequentially, so this is a per-row budget, not a share of
-    /// one.
+    /// (default: --timeout): a budget for each row, not a share of one. Under --portfolio it is
+    /// also capped by what is left of the case's deadline.
     #[arg(long, value_name = "MS")]
     pub sqleq_solver_timeout: Option<u64>,
 }

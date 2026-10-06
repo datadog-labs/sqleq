@@ -2,33 +2,37 @@
 
 Each `.sql` file here is a pair whose truth is known — equivalent or not in Postgres — together with
 what every axis said about it when it was last reviewed. `sqleq-check --expect pinned` asks the
-axes again and fails on any movement. Most of these pairs are a defect that was found once, kept as
-the smallest pair that shows it, so that from then on it is checked on every axis and not only on
+axes again and fails on any movement. Most of these pairs record a defect that was found once, kept
+as the smallest pair that shows it, so that from then on it is checked on every axis and not only on
 the one that found it: a false proof found in one prover is a pin on all of them.
 
 They are a **regression pin, not a control.** A pinned pair can only fail in a way someone has
 already seen, so passing them says nothing about whether a change that grows the provable set is
 sound. That evidence is still the cross-check in [CONTRIBUTING.md](../../CONTRIBUTING.md) rule 2.
 
-`examples/dropped_filter.sql` and `examples/in_vs_or.sql` carry the same header and run with these.
+The pairs in `examples/` carry the same header and run with these.
 The Lean axis's pairs are under `insert_unnest/`, and are stated under the gather rule
 ([below](#the-gather-rule)).
 
 ## Running them
 
 ```sh
-# The axes CI runs, one job each (`cargo build --release` builds sqleq-check):
+# The axes CI runs, one job per axis there. `cargo build --release` builds sqleq-check and the
+# frontend; the other two need `cargo build --release -p sqleq-fuzz -p sqleq-solver` as well.
 sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
-# The two it never installs (one SQLSolver per run):
-sqleq-check --expect pinned --axes qed --prover "$QED_PROVER" tests/pairs examples/*.sql
+# The axes CI does not install (one SQLSolver per run). qed needs the prover, found as
+# sqleq-check/README.md says; sqlsolver-jvm needs the fork, named by --sqlsolver-tree or
+# $SQLEQ_SQLSOLVER, and $SQLEQ_SQLSOLVER_DEPS:
+sqleq-check --expect pinned --axes qed tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
 # The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
 sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
 ```
 
-The output is one row per pair and one column per axis that ran. Exit code 0 means every pin held,
-1 that something moved or broke a rule below, 2 that a tool is missing or a flag is wrong. Add
-`--bless` to rewrite the `expect` lines from what the axes said, then read the diff.
+The output is one row per pair, with its `truth` and one column per axis that ran. Exit code 0
+means every pin held, 1 that something moved or broke a rule below, 2 that a tool is missing or a
+flag is wrong. Add `--bless` to rewrite the `expect` lines from what the axes said, then read the
+diff.
 
 ## A pinned pair
 
@@ -41,6 +45,7 @@ The output is one row per pair and one column per axis that ran. Exit code 0 mea
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved !known-unsound
+-- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a boolean in the SELECT list was read two-valued, as if NULL were false
 -- witness: t = {(1, NULL)}, $1 = 1: A yields false, B yields NULL
@@ -51,8 +56,10 @@ SELECT "x" <= 5 FROM "t" WHERE "id" = $1;
 ```
 
 Directives are read from the leading comment block only, up to the first SQL line, and only in the
-form `-- key: value` with a lowercase key. Any other comment is prose. A directive below the SQL is
-an error, not a comment, because a pin nobody reads looks exactly like one that holds.
+form `-- key: value` with a lowercase key. Any other comment is prose, an indented line under a
+directive included: a long `origin:` or `argument:` may run on that way, but only the directive's
+own line is its value. A directive below the SQL is an error, not a comment, because a pin nobody
+reads looks exactly like one that holds.
 
 | directive | written by | |
 |---|---|---|
@@ -61,7 +68,7 @@ an error, not a comment, because a pin nobody reads looks exactly like one that 
 | `binding:` | a person | `index` (the default), `gather` or `gather-generated`: how the truth binds `$N` across the two sides ([below](#the-gather-rule)) |
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
-| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` (not under `binding: gather`). |
+| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample`, which counts only under `binding: index`. |
 | `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, the frontend's is `emit-reflexive` or `reflexive`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
 
 ## What each axis may say
@@ -73,7 +80,7 @@ nothing and changing what is refused moves a pin.
 |---|---|
 | `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `reflexive` (refused, but the two sides normalize to the same tree: settled without a plan), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
 | `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
-| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend refused), `panic`, `error` |
+| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
 | `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `proved-gather-generated`, `no-witness-generated` (the same, under the weaker claim for generated cells), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
 
@@ -94,13 +101,13 @@ length, a date at infinity or a second session is pinned `no-counterexample` and
 
 | what the run sees | result |
 |---|---|
-| an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend lowers one to the same IR on both sides, or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
+| an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend finds its two sides one query (`emit-reflexive` or `reflexive`), or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
 | the same, on a line marked `!known-unsound` | passes while the bug reproduces |
 | a `!known-unsound` line whose answer no longer contradicts `truth` | fails; `--bless` drops the marker |
 | a pinned answer that moved, either way | fails; `--bless` takes the new answer |
 | an axis that ran with no `expect` line | fails; `--bless` adds one |
 | `timeout` or `missing` | fails; shrink the pair or raise `--timeout` |
-| a header error: no `truth` or `origin`, an unknown key, axis or word, a duplicate, a directive below the SQL, a pin that contradicts `truth` without a marker, a marker on one that contradicts nothing, or no evidence for the truth | fails; `--bless` skips the file |
+| a header error: no `truth` or `origin`, an unknown key, axis or word, a `truth`, `binding` or `catalog` that is not one of its values, an `expect` line of more than one word, a duplicate, a directive below the SQL, a pin that contradicts `truth` without a marker, a marker on one that contradicts nothing, or no evidence for the truth | fails; `--bless` skips the file |
 | a line for an axis this run did not ask | not checked |
 
 An improvement fails too. That is deliberate: the review of the diff is the point, and a proof
@@ -156,16 +163,16 @@ covers one axis's line, and a marker on an answer that contradicts nothing is a 
 ## Last review on every axis
 
 The `qed` and `sqlsolver-jvm` pins are checked only where those tools are installed, so they can
-drift between reviews. The last time all five axes were blessed together:
+drift between reviews. The last time every axis was blessed together:
 
 * **qed** — [qed-solver/prover](https://github.com/qed-solver/prover) with its empty-grouping-set
   fix applied, on Z3 5.1.0 and cvc5 1.4.1. A build without that fix proves
   `aggregates/scalar_agg_empty_group.sql`, and the run fails there, as it should.
 * **sqlsolver-jvm** — the unpublished fork described in [SQLSOLVER.md](../../docs/SQLSOLVER.md),
-  at its revision `8c5548b`.
+  at its revision `8c5548b` (a commit of that fork, not of this repository).
 * **sqleq-solver**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
   the toolchain `lean/lean-toolchain` names, as in CI.
 
 The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared
 statement, the `unnest` side under the gather binding of the `VALUES` side's parameters, once on an
-empty table and once twice over.
+empty table and once run twice, so that the second run meets the rows the first one wrote.

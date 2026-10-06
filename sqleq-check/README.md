@@ -1,45 +1,64 @@
 # sqleq-check
 
-The batch harness: a directory of `.sql` pairs in, verdicts and a CI exit code out.
+The command-line entry point: `.sql` pairs (or a corpus CSV) in, verdicts and a CI exit code out.
 
 ```
-.sql ──▶ sqleq-frontend ──▶ .json ──▶ qed-prover ──▶ verdict ──▶ consolidated report
+pair.sql ─┬─▶ sqleq-frontend ──▶ Input JSON ─┬─▶ qed-prover ───┐
+          │                                  └─▶ sqleq-solver ─┤
+          ├─▶ sqleq-fuzz ──────────────────────────────────────┼─▶ report + exit code
+          └─▶ sqleq-lean ──────────────────────────────────────┘
 ```
 
-Point it at `.sql` files or directories; it lowers each, proves equivalence of the two queries
-inside, classifies the outcome, and prints a summary with timings — plus machine-readable JSON/CSV
-and CI-friendly exit codes. It also consumes **pre-parsed `.json`** plans directly (e.g. the
-prover's bundled `tests/calcite/` corpus), skipping the lowering stage. More axes can be asked about
-the same pairs: [sqleq-solver](#second-opinion-sqleq-solver), [sqleq-fuzz](../sqleq-fuzz/README.md)
-and the [Lean axis](../docs/LEAN.md) — one after another, or [all at once on each
-pair](#portfolio-every-backend-at-once), for one combined verdict.
+Point it at `.sql` files or directories; it lowers each, asks the QED prover whether the two
+statements inside are equivalent, classifies the outcome, and prints a summary with timings — plus
+machine-readable JSON/CSV and CI-friendly exit codes. It also consumes **pre-parsed `.json`** plans
+directly (e.g. the prover's bundled `tests/calcite/` corpus), skipping the lowering stage. More axes
+can be asked about the same pairs: [sqleq-solver](#second-opinion-sqleq-solver),
+[sqleq-fuzz](../sqleq-fuzz/README.md) and the [Lean axis](../docs/LEAN.md) — one after another, or
+[all at once on each pair](#portfolio-every-backend-at-once), for one combined verdict.
 
 Every backend runs as a subprocess, in a process group of its own, so this crate builds none of
 them: it is light enough to be a default workspace member, and a timeout or a Ctrl-C kills a
-backend together with whatever it started (the prover's z3 and cvc5, Lean under `lake`).
+backend together with whatever it started (the prover's z3 and cvc5, Lean under `lake`). It links
+only the frontend's library, to read a corpus CSV exactly as the frontend reads it.
 
 ## Requirements
 
 - `sqleq-check` and `sqleq-frontend` — `cargo build --release` in this repo builds both, as
-  `target/release/sqleq-check` and `target/release/sqleq-frontend`; the harness finds the frontend
-  there (then in `target/debug`) on its own.
-- `qed-prover` — the external prover binary.
+  `target/release/sqleq-check` and `target/release/sqleq-frontend`.
+- `qed-prover` — the external prover binary, for the `qed` axis, which is asked by default.
+- For the axes that ask them, and only then: `sqleq-fuzz`, `sqleq-solver` and `sqleq-lean`, each
+  built with `cargo build --release -p <crate>` (none is a default workspace member), and the JVM
+  fork for `--sqlsolver-jvm`.
 
-Resolution order is `--frontend`/`--prover` flags, then `$SQLEQ_FRONTEND`/`$QED_PROVER`, then
-`PATH`. Beyond that the frontend falls back to this repo's build and the prover to the newest
-wrapped binary under `/nix/store` (that wrapper carries z3 + cvc5 on its own `PATH`, so it works
-outside the Nix dev shell).
+Each binary is looked up in this order, and the first that is found wins:
+
+| binary | flag | then | variable | then |
+|---|---|---|---|---|
+| `sqleq-frontend` | `--frontend` | `--bin-dir` | `$SQLEQ_FRONTEND` | `PATH`, then this repo's `target/release` or `target/debug` build, whichever is newer |
+| `qed-prover` | `--prover` | — | `$QED_PROVER` | `PATH`, then the newest wrapped prover under `/nix/store` (that wrapper carries z3 + cvc5 on its own `PATH`, so it works outside the Nix dev shell) |
+| `sqleq-fuzz` | `--fuzz-bin` | `--bin-dir` | `$SQLEQ_FUZZ` | `PATH`, then the newer of this repo's two builds |
+| `sqleq-solver` | `--sqleq-solver-bin` | `--bin-dir` | `$SQLEQ_SOLVER_BIN` | `PATH`, then the newer of this repo's two builds |
+| `sqleq-lean` | `--lean-bin` | `--bin-dir` | `$SQLEQ_LEAN` | this repo's `target/release`, then `target/debug` |
+
+A flag, a variable or a `--bin-dir` that names a missing or non-executable file is an error, never a
+fallback to another binary — except for `sqleq-lean`, where a `--lean-bin` or `$SQLEQ_LEAN` that
+names no executable falls through to the next candidate (`$SQLEQ_LEAN`, then the two builds; a
+`--lean-bin` skips `--bin-dir` either way). `--bin-dir` covers every binary but the prover, and is
+passed over for the one binary a flag names.
 
 ## Input format
 
-Each `.sql` file must contain, in order: `CREATE TABLE` statements, optional
-`declare {scalar,aggregate} function` lines, and **exactly two** `SELECT` statements. See
-[`../examples/`](../examples/) for two runnable pairs. To build them in bulk from a CSV corpus, use
-the frontend's own `--csv` mode.
+Each `.sql` file holds, in order: optional `CREATE TABLE` statements, optional
+`declare {scalar,aggregate} function` lines, and **exactly two** statements — the pair. Normally
+those are two `SELECT`s; a pair of `DELETE`s, of `UPDATE`s or of `INSERT`s is reduced by the
+frontend to the queries computing their effect, and the Lean axis reads `INSERT … VALUES` against
+`INSERT … SELECT * FROM unnest(…)` pairs itself. See [`../examples/`](../examples/) for runnable
+pairs. A corpus needs no `.sql` files at all: see [Corpus runs](#corpus-runs).
 
 An already-lowered `.json` plan is also a first-class case: the harness skips the lowering stage and
-hands it straight to the prover. That is how an archived `Input` is re-checked, and it is also the
-path `--sqleq-solver` was built around.
+hands it straight to the prover, and to sqleq-solver when that is asked. That is how an archived
+`Input` is re-checked. The axes that read SQL themselves, fuzz and Lean, pass a plan over.
 
 ## Usage
 
@@ -66,32 +85,35 @@ sqleq-check --keep ./work rewrites/
 | `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60). On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. |
 | `--portfolio` | Run every asked backend on each case at once, within `-t`, and report one combined verdict per case — see [Portfolio](#portfolio-every-backend-at-once). |
 | `--smt-timeout MS` | Sets `QED_SMT_TIMEOUT` per SMT request (prover default is 10000 ms). |
-| `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable`. |
-| `--expect report-only` | Always exit 0; just report. |
+| `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable` — a policy on the qed axis, so `--axes` must ask `qed`. Under `--portfolio`, unless every case's verdict is `equivalent`. |
+| `--expect report-only` | Exit 0 whatever the cases say; just report. Under `--portfolio` an `alarm` still exits 1. |
 | `--expect pinned` | Each case's header pins every axis's answer; exit non-zero on any movement. See [Pinned pairs](#pinned-pairs). |
 | `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqleq-solver`, `sqlsolver-jvm`, `lean` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. `sqlsolver-rust`, sqleq-solver's axis before it was renamed, is still read as `sqleq-solver`. |
-| `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. |
-| `--fuzz-bin PATH` | The `sqleq-fuzz` binary (else `$SQLEQ_FUZZ`, `PATH`, or this repo's `target/{release,debug}`). |
-| `--json` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
+| `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. Never pins an answer that contradicts the case's truth, nor a timeout. |
+| `--frontend PATH` | The `sqleq-frontend` binary ([lookup order](#requirements)). |
+| `--prover PATH` | The `qed-prover` binary ([lookup order](#requirements)). |
+| `--fuzz-bin PATH` | The `sqleq-fuzz` binary ([lookup order](#requirements)). |
+| `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR, unless a flag names one. |
+| `--json FILE` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs. |
-| `--no-retry` | Don't re-run transient failures serially at the end. |
-| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Never changes the exit code. |
-| `--sqleq-solver-bin PATH` | The `sqleq-solver` binary (else `$SQLEQ_SOLVER_BIN`, `PATH`, or this repo's `target/{release,debug}`). |
-| `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check. Same jobs, same result rows, same buckets. Not with `--sqleq-solver`. |
+| `--no-retry` | Don't re-run transient failures at the end. |
+| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism, a second, longer tier (defaults: `--timeout`, `--smt-timeout`, and 1 — serially). |
+| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Outside `--portfolio` and `--expect pinned`, it never changes the exit code. |
+| `--sqleq-solver-bin PATH` | The `sqleq-solver` binary ([lookup order](#requirements)). |
+| `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. Under `--portfolio` it is also capped by what is left of the case's deadline. |
+| `--sqleq-solver-jobs N` | sqleq-solver drivers side by side (default 1, the reproducible choice). Not used under `--portfolio`, which runs it per case. |
+| `--sqleq-solver-mem-gib G` / `--qed-mem-gib G` | Cap each sqleq-solver driver's or the QED prover's (z3 and cvc5 included) address space, as `ulimit -v` does. |
+| `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check, and deprecated. Same jobs, same result rows, same buckets. Not with `--sqleq-solver` or `--portfolio`. |
 | `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
-| `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. |
-| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair files itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
-| `--lean-bin PATH` | The `sqleq-lean` binary (else `$SQLEQ_LEAN`, or this repo's `target/{release,debug}`). It needs `lake` on `PATH`. |
-| `-v` / `-q` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
+| `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases and corpus rows: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
+| `--lean-bin PATH` | The `sqleq-lean` binary ([lookup order](#requirements)). It needs `lake` on `PATH`. |
+| `--lean-replay-plan FILE` | Have sqleq-lean also write what `tools/lean_replay.py` needs. Not under `--portfolio`, which runs Lean per case. |
+| `-v, --verbose` / `-q, --quiet` | Verbose (every case) / quiet (summary only). Default shows non-provable cases + summary. |
+| `--no-color` | No ANSI colour (none is used when stdout is not a terminal either). |
 | `--corpus FILE` | Run the rows of a corpus CSV instead of PATHs — see [Corpus runs](#corpus-runs). |
 | `--only FILE` | Run only the cases named in FILE, one per line. |
 | `--catalog C` | `declared` (default), `inferred` or `inferred-seeded`: the catalog every case is lowered against unless its own `-- catalog:` header names one. |
-| `--jsonl FILE` / `--resume` | Append each case to FILE as one JSON line once its last axis has answered; with `--resume`, skip the cases FILE already holds. |
-| `--qed-mem-gib G` / `--sqleq-solver-mem-gib G` | Cap the QED prover's (z3 and cvc5 included) or each sqleq-solver driver's address space, as `ulimit -v` does. |
-| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism: a second, longer tier. |
-| `--sqleq-solver-jobs N` | sqleq-solver drivers side by side (default 1, the reproducible choice). |
-| `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR, unless a flag names one. |
-| `--lean-replay-plan FILE` | Have sqleq-lean also write what `tools/lean_replay.py` needs. |
+| `--jsonl FILE` / `--resume` | Write each case to FILE as one JSON line once its last axis has answered, starting FILE afresh; with `--resume`, keep FILE, skip the cases it already holds, and append the rest. |
 
 ## Status taxonomy
 
@@ -103,11 +125,16 @@ sqleq-check --keep ./work rewrites/
 | `panic` | The prover panicked/crashed on the case. |
 | `timeout` | Exceeded the per-case wall-clock budget. |
 | `error` | Anything else (e.g. an unreadable result). |
-| `lowered` | The frontend lowered the pair, and the qed axis was not asked (`--axes` without `qed`). |
+| `lowered` | The frontend lowered the pair, and the qed axis was not asked (`--axes` without `qed`). When no asked axis needs the frontend (`--axes fuzz`, `--axes lean`), every case carries this status as a placeholder, with `lowered: false`. |
+
+A refused case whose two sides normalize to the same query carries `reflexive: true` in the JSON: it
+is settled by reflexivity without being lowered. It stays `refused` here, so `--expect equivalent`
+fails on it; under `--portfolio` and `--expect pinned` it counts as the frontend's claim of
+equivalence.
 
 > **`unprovable` is not `non-equivalent`.** QED is sound but not complete, so `unprovable` means
-> "not proven equivalent" and nothing more. For a definite counterexample use
-> [`../sqleq-fuzz/`](../sqleq-fuzz/), which evaluates both sides on random instances.
+> "not proven equivalent" and nothing more. For a definite counterexample ask the `fuzz` axis
+> ([`../sqleq-fuzz/`](../sqleq-fuzz/)), which evaluates both sides on random instances.
 
 > **`refused` is a feature.** The prover is sound *given faithful IR*, so the frontend refuses
 > anything it cannot lower faithfully rather than emitting best-effort IR. A refusal costs
@@ -119,8 +146,8 @@ A pair is **trivial** when its two queries reach the prover identical. That is c
 is not the prover's doing: the frontend normalizes both sides, its normalizations are
 equivalence-preserving rewrites, and on many pairs the rewrite one of them undoes *is* the
 optimization the pair was written to exercise. Proving those is still sound — normalize soundly,
-then prove — but the prover is confirming `x = x`, so counting them as capability can overstate it
-by close to an order of magnitude.
+then prove — but the prover is confirming `x = x`, so counting them as capability overstates it by
+as much as such pairs are common.
 
 So the summary prints two numbers, always together:
 
@@ -143,7 +170,10 @@ comparing the two statements in the source text after whitespace normalization
 
 `--sqleq-solver` runs a second prover over **the same lowered plan** and prints a second table:
 `sqleq-solver`, this repo's Rust rewrite of SQLSolver. With `--sqlsolver-jvm` instead, the original
-SQLSolver answers, kept as a cross-check. It is off by default, and it cannot change the exit code.
+SQLSolver answers, kept as a deprecated backup cross-check. It is off by default. Under
+`--expect equivalent` and `report-only` it never changes the exit code — that policy is the qed
+axis's — while `--expect pinned` judges its pins like any other axis's, and under `--portfolio` its
+proof counts toward the combined verdict.
 
 ```sh
 sqleq-check --expect report-only --sqleq-solver -j 8 -t 30 corpus/
@@ -152,15 +182,15 @@ sqleq-check --expect report-only --sqleq-solver -j 8 -t 30 corpus/
 ```
   Second opinion  — sqleq-solver, over the same lowered IR
   ────────────────────────────────────────
-  proved                    27
-  no-proof                   2
-  unsupported                1
+  proved                   <n>
+  no-proof                 <n>
+  unsupported              <n>
   ────────────────────────────────────────
-  of pairs that differ      30
-  both provers              25
-  only the QED prover        2
-  only sqleq-solver          2   what the second opinion adds
-  neither                    1
+  of pairs that differ     <n>
+  both provers             <n>
+  only the QED prover      <n>
+  only sqleq-solver        <n>   what the second opinion adds
+  neither                  <n>
 ```
 
 The cells below the rule use **the same denominator as `capability`** — pairs whose two queries
@@ -169,8 +199,8 @@ reason the flag exists. The buckets are the `s_bucket` column of the JSON and CS
 
 | bucket | meaning |
 |---|---|
-| `proved` | It proved the pair equivalent. The only bucket that is a claim. |
-| `proved-literal` | Its tier 0: the two plans were *already identical*, so nothing was proved. Held apart from `proved` for the same reason this harness holds `trivial` apart from `capability`. |
+| `proved` | It proved the pair equivalent. The only bucket the cells below the rule count. |
+| `proved-literal` | Its tier 0: the two plans were *already identical*, so nothing had to be proved. Still a claim of equivalence wherever claims are judged (`--expect pinned`, `--portfolio`), but held apart from `proved` here for the same reason this harness holds `trivial` apart from `capability`. |
 | `no-proof` | It considered the pair and found no proof. |
 | `unsupported` | **Ours, not theirs.** Either the frontend refused the row, or the bridge could not express the plan. The `s_note` column says which. |
 | `timeout` | The cap ran out. Kept out of `no-proof` deliberately: that prover answers `UNKNOWN` when interrupted, so `killed` is the only thing separating "we stopped asking" from "they declined". |
@@ -188,9 +218,10 @@ Two things about the numbers, both printed under the table on every run:
 
 Mechanics worth knowing before reading a slow run:
 
-- Without `--portfolio`, the rows go to one driver process **at the end, sequentially**, not per
-  case. A JVM's startup would otherwise swamp the cases, and the per-row cap is load-sensitive — a
-  second opinion that changes under `-j` is not one. That makes this the mode to compare the two
+- Without `--portfolio`, the rows go to the driver **at the end, as one pass**, not per case: one
+  driver process reading them sequentially, unless `--sqleq-solver-jobs N` splits them across N. A
+  JVM's startup would otherwise swamp the cases, and the per-row cap is load-sensitive — a second
+  opinion that changes under `-j` is not one. That makes this the mode to compare the two
   implementations in, or to pin; `--portfolio` trades it for an answer within a deadline.
 - A row can outlive its cap, so the driver writes what it has and then halts itself; the harness
   notices the missing answers and resumes. The wall line reports `N driver self-halt(s) in M
@@ -202,9 +233,10 @@ Mechanics worth knowing before reading a slow run:
   cmake and a C++20 compiler).
 - With `--sqlsolver-jvm` it requires the fork tree (its `lib/` holds the Z3 natives), a JDK, and
   `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded dependency directory the fork was compiled
-  against. The driver compiles itself on first use and recompiles when
-  `tools/sqlsolver/IrDriver.java` or `IrToRel.java` is newer than the class. Both drivers take the
-  same arguments and write the same rows, including the exit-3 self-halt.
+  against. The harness compiles the bridge driver with `javac` on first use, into
+  `tools/sqlsolver/out-fork/`, and recompiles it when `tools/sqlsolver/IrDriver.java` or
+  `IrToRel.java` is newer than the class. Both drivers take the same arguments and write the same
+  rows, including the exit-3 self-halt.
 
 See [`../docs/SQLSOLVER.md`](../docs/SQLSOLVER.md) for what `sqleq-solver` rewrites and where it
 differs from the original, the bridge to the JVM fork and the Calcite-ectomy behind it, and the
@@ -216,7 +248,7 @@ false proofs that keep the fork a cross-check.
 # One verdict per pair, every backend at once, 60s per pair; exit 1 unless every pair is equivalent:
 sqleq-check --portfolio -t 60 rewrites/
 # The same over a corpus, with the Lean axis too, as a report:
-sqleq-check --portfolio --lean --expect report-only -t 30 --json out.json corpus/
+sqleq-check --portfolio --lean --expect report-only -t 30 --json out.json --corpus corpus.csv
 ```
 
 `--portfolio` runs the backends side by side on each case instead of axis by axis. sqleq-fuzz and
@@ -242,21 +274,24 @@ parameter binding:
 | `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. |
 | `undecided` | Nothing decisive, and every backend finished. |
 
-Lean's `no-witness` may be vacuous, so it can raise an alarm but is not evidence of equivalence. A
-Lean proof and a fuzz counterexample are never an alarm: they are about different relations between
-the two sides' parameters. Neither `timeout` nor `undecided` says the pair is not equivalent.
+Lean's `no-witness` is a kernel proof that may be vacuous, so it is never evidence of equivalence:
+alone, it leaves a case `undecided`. Nor can a Lean answer meet a fuzz counterexample in an alarm:
+Lean answers only under the gather rule and sqleq-fuzz only under index binding, which are different
+relations between the two sides' parameters. Neither `timeout` nor `undecided` says the pair is not
+equivalent.
 
 **The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
-case is `equivalent`, so a proof from either prover, or the frontend's reflexivity, counts and a Lean proof does not. `--expect
-report-only` passes unless some case is an `alarm`, which fails every run. `--expect pinned` and
-`--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend on a time budget, and a JVM
-started per case would cost more than the case.
+case is `equivalent`, so a proof from any prover that reads the IR, or the frontend's reflexivity,
+counts, and a Lean proof does not. `--expect report-only` passes unless some case is an `alarm`, which fails every
+run. `--expect pinned` and `--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend
+on a time budget, and a JVM started per case would cost more than the case.
 
 Output: the per-axis tables as without it, then a `Portfolio` table — the verdict counts,
-`capability` (`equivalent` among the pairs whose two queries differ), which prover the proofs came
-from, the time to the first decisive answer against the case's wall time, which backends were cut
-off, and every alarm by name. Each case's line says which backends its verdict rests on and when
-each answered. `--json` adds a `portfolio` object to each case (`verdict`, `by`, `pending`, `done`,
+`capability` (`equivalent` among the pairs whose two queries differ, the refused pairs found
+reflexive left out), which prover the proofs came from (and how many rest on reflexivity alone), the
+time to the first decisive answer against the case's wall time, which backends were cut off, and
+every alarm by name. Each case's line says which backends its verdict rests on and when each
+answered. `--json` adds a `portfolio` object to each case (`verdict`, `by`, `pending`, `done`,
 `first_s`, `retried`) and `meta.portfolio` (`deadline_s`, `backends`, `counts`, `alarms`,
 `retried`); `--csv` appends `p_verdict`, `p_by`, `p_pending`, `p_first_s` and `p_retried`.
 
@@ -264,14 +299,15 @@ Three things to know before reading one:
 
 - **Its answers are bought with a time budget, under load.** A backend near its cap can decide
   differently with other cases running beside it than it does alone, sqleq-solver included, which
-  here runs per case beside the others rather than in the sequential pass the [second
+  here runs per case beside the others rather than in the separate pass the [second
   opinion](#second-opinion-sqleq-solver) uses. Read `timeout` as "not within this budget"; compare
   or pin axes without `--portfolio`.
-- **`-j` still counts cases.** Each one runs up to four backends at once, and the QED prover runs z3
+- **`-j` still counts cases.** Each one runs every asked backend at once, and the QED prover runs z3
   and cvc5 besides, so lower `-j` when `timeout` shows up where a lighter run decides.
-- **A case left without a verdict is re-run once, serially** — one that ended `timeout`, or
-  `undecided` after a prover crash or a sqleq-solver error — unless `--no-retry`. The re-run is kept
-  only if it decides the case, and the case is marked `retried`.
+- **A case left without a verdict is re-run once** — one that ended `timeout`, or `undecided` after
+  a prover crash, an error, or a sqleq-solver error or missing answer — unless `--no-retry`. The
+  re-run uses the retry pass's budget and parallelism (`--retry-timeout`, `--retry-jobs`; serially by
+  default), is kept only if it decides the case, and marks the case `retried`.
 
 ## Corpus runs
 
@@ -283,19 +319,20 @@ sqleq-check --corpus corpus.csv --catalog inferred-seeded --expect report-only -
 ```
 
 A corpus is a CSV with no header line, one pair per row: query A, query B, and the Postgres DDL
-both were run against. The DDL is optional. Row *N* is case `pairNNNN`, and a row with fewer than two
-fields is no pair but still uses up its number, so a name means the same row in every tool's report.
-`--only` keeps the rows it names without renumbering the rest.
+both were run against. The DDL is optional. Rows count from 0, and row *N* is case `pairNNNN`; a row
+with fewer than two fields is no pair but still uses up its number, so a name means the same row in
+every tool's report. `--only` keeps the rows it names without renumbering the rest.
 
-Each row reaches every backend through that backend's own corpus code, handed the row as a
-one-row corpus:
+Each row reaches every backend that reads SQL through that backend's own corpus code:
 
-- the frontend lowers it with `--csv`, exactly as it lowers that row of the whole file — its DDL
-  read leniently, statement by statement, where a `.sql` file's goes through a stricter reader;
-- its report says whether the row was emitted, refused, or refused but settled by reflexivity
-  (`reflexive`), with the refusal's kind and reason;
+- the frontend lowers it with `--csv`, handed the row as a one-row corpus, exactly as it lowers that
+  row of the whole file — its DDL read leniently, statement by statement, where a `.sql` file's goes
+  through a stricter reader. Its report says whether the row was emitted, refused, or refused but
+  settled by reflexivity (`reflexive`), with the refusal's kind and reason. The QED prover and
+  sqleq-solver then get the plan it lowered, as for a pair file;
 - sqleq-fuzz tests it with `row`, the code its `csv` mode runs on every row;
-- sqleq-lean is asked about all of them at once with `--csv` and `--names`.
+- sqleq-lean is asked about all the rows at once, with `--csv` and `--names` — or, under
+  `--portfolio`, about each row on its own as a one-row corpus.
 
 So a corpus run's answers are the corpus modes' answers, row for row. Each row also runs in its own
 process with its own timeout, so one row that hangs or crashes costs that row and nothing else.
@@ -304,7 +341,8 @@ What a long run needs:
 
 - **`--jsonl` and `--resume`.** `--json` is written at the end; `--jsonl` gets each case the moment
   its last asked axis has answered, as the same object. `--resume` skips every case the file already
-  holds, so a run that was stopped is finished by running it again.
+  holds, so a run that was stopped is finished by running it again. Without `--resume`, `--jsonl`
+  starts its file afresh.
 - **Memory caps.** `--qed-mem-gib` and `--sqleq-solver-mem-gib` cap a backend's address space. A
   sqleq-solver driver that dies on a row — out of memory under its cap, or a crash — has that row
   recorded as `error` (with `died` in `s_raw`) and goes on with the rest.
@@ -314,10 +352,11 @@ What a long run needs:
   the default, because the per-row cap is load-sensitive.
 - **One directory of binaries.** `--bin-dir` takes every sibling binary from one build, so a run
   cannot mix binaries from two trees.
-- **The raw records.** Each case keeps every backend's own record beside the bucket: `f_raw` (the
-  fuzz label, and `ok_trials` / `trial_error` when only some trials compared both sides), `s_raw`
-  (the solver's row), `l_raw` (the Lean record), and for a crashed prover `q_tail` (the end of its
-  output) and `q_rc` (its exit code, or minus the signal that ended it).
+- **The raw records**, in the JSON and JSONL only (the CSV has the bucketed columns). Each case
+  keeps every backend's own record beside the bucket: `f_raw` (the fuzz label, and `ok_trials` /
+  `trial_error` when only some trials compared both sides), `s_raw` (the solver's row), `l_raw`
+  (the Lean record), and for a crashed prover `q_tail` (the end of its output) and `q_rc` (its exit
+  code, or minus the signal that ended it).
 
 `--expect pinned` does not combine with `--corpus`: a pin lives in a pair file's header.
 
@@ -327,15 +366,19 @@ What a long run needs:
 in its header whether it is equivalent, and what each axis answered when it was last reviewed. The
 run asks the axes in `--axes` again and fails on any movement — an improvement as much as a
 regression — and on any answer that contradicts the case's truth, which `--bless` will never pin.
+It prints one table of pins in place of the per-case lines.
 
 ```sh
-# What CI checks, one axis per job:
-sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
-# After a change that moves answers: rewrite the pins, then review the diff.
+# What CI checks, one axis per job (each needs that axis's binary built):
+sqleq-check --expect pinned --axes frontend     tests/pairs examples/*.sql
+sqleq-check --expect pinned --axes fuzz         tests/pairs examples/*.sql
+sqleq-check --expect pinned --axes sqleq-solver tests/pairs examples/*.sql
+# After a change that moves answers: rewrite the pins, then review the diff (add qed and lean
+# where they are installed).
 sqleq-check --expect pinned --bless --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
-Two things differ from the other policies:
+Two things a pin depends on, though neither is particular to this policy:
 
 * **The fuzz axis.** `fuzz` runs `sqleq-fuzz file` on each pair with its trial budget passed
   explicitly (`--trials 120 --rows 5 --seed 0`), so a change to the tool's defaults cannot move a
@@ -353,9 +396,10 @@ replaces a file atomically, only when its bytes change.
 - `0` — policy satisfied (see `--expect`).
 - `1` — policy not satisfied (some case failed the expectation).
 - `2` — usage / setup error (no inputs, binary not found, a flag that does not combine, …).
+- `130` / `143` — interrupted by Ctrl-C / `SIGTERM` (128 + the signal); every backend still running
+  is killed first.
 
 Under `--portfolio` the combined verdict decides `0` or `1`, and an `alarm` is always `1`.
-- `130` — interrupted (Ctrl-C); every backend still running is killed first.
 
 ## Implementation notes
 
@@ -366,10 +410,12 @@ Under `--portfolio` the combined verdict decides `0` or `1`, and an `alarm` is a
   populated.
 - A zero exit from the frontend with no JSON on disk is still counted as `refused`. The exit code is
   reliable, but a case we cannot prove must never be silently dropped.
-- Transient failures (`panic`/`timeout`/`error`) are retried once serially, so a heavy case starved
-  under `-j` isn't misreported. Refusals are deterministic and never retried.
+- Transient failures (`panic`/`timeout`/`error`) are retried once after the main pass, `--retry-jobs`
+  at a time (serially by default), so a heavy case starved under `-j` isn't misreported. Refusals are
+  deterministic and never retried.
 - `--json` writes `{meta, cases}`, one object per case with the fields of `Case` in
-  [`src/case.rs`](src/case.rs); `--csv` writes the scalar ones, one row per case.
+  [`src/case.rs`](src/case.rs); `--csv` writes most of its scalar fields, one row per case (not
+  `path`, `lowered`, `reflexive`, `q_tail` or `q_rc`).
 
 ## Tests
 
