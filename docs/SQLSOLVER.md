@@ -170,6 +170,17 @@ Each difference is there for soundness:
 * **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
   fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
   types is not treated as an identity either, since the frontend drops the ones that are.
+* **A value keeps its type.** Postgres picks a function by its name and argument types, so every
+  uninterpreted symbol (a cast, `/`, any function) is named after its operand and result types:
+  `/` on two integers truncates and on a decimal does not, and `CAST(1 AS TEXT)` is `'1'` where
+  `CAST(1.0 AS TEXT)` is `'1.0'`. A constant is a value of its own type, compared exactly and never
+  through a float, so `1`, `1.0` and `1.00` are three values that `=` calls equal. SQL's `=` is read
+  as identity, which lets normalization put one side in place of the other, only between two
+  values of one type on which it is identity; between two decimals, an integer and a decimal, or
+  two intervals it compares the values through a key. Two string constants are not ordered by
+  bytes, which only the `C` collation does. The two sides' output columns must have the same types,
+  since `TRUE` and `1` are one term. A literal that does not denote a value of its IR type (an
+  INTEGER `1e-5`) is refused.
 * **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
   is derive their nullness; any other function — parameter carriers included, since a parameter
   may be bound to `NULL` — gets an uninterpreted nullness of its own.

@@ -385,6 +385,32 @@ impl Relation {
         let tag = o.keys().next().cloned().unwrap_or_default();
         Err(TranslateError::UnknownRelation(tag))
     }
+
+    /// The IR type of each output column, `schemas` giving the scanned tables'. A set operation
+    /// whose two branches disagree on a column's type leaves that column `None`: Postgres resolves
+    /// such a column to a common type the IR does not record.
+    pub fn output_types(&self, schemas: &[Schema]) -> Vec<Option<Type>> {
+        match self {
+            Relation::Scan(i) => schemas.get(*i).map(|s| s.types.iter().copied().map(Some).collect()).unwrap_or_default(),
+            Relation::Distinct(source) | Relation::Filter { source, .. } | Relation::Sort { source, .. } => {
+                source.output_types(schemas)
+            }
+            Relation::Project { target, .. } => target.iter().map(|e| Some(e.ty())).collect(),
+            Relation::Join { left, right, .. } => {
+                let mut types = left.output_types(schemas);
+                types.extend(right.output_types(schemas));
+                types
+            }
+            Relation::Group { keys, function, .. } => {
+                keys.iter().map(|k| Some(k.ty())).chain(function.iter().map(|f| Some(f.ty))).collect()
+            }
+            Relation::Values { schema, .. } => schema.iter().copied().map(Some).collect(),
+            Relation::Union(sides) | Relation::Except(sides) | Relation::Intersect(sides) => {
+                let (l, r) = (sides[0].output_types(schemas), sides[1].output_types(schemas));
+                l.iter().zip(r.iter()).map(|(a, b)| if a == b { *a } else { None }).collect()
+            }
+        }
+    }
 }
 
 fn set_op(v: &Value, schema_count: usize, kind: &str) -> Result<[Box<Relation>; 2], TranslateError> {

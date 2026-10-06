@@ -5,8 +5,9 @@
 
 //! The decision ladder: what `IrDriver.java` + `Verification.verify` do for one job row, ported rung
 //! by rung. Tier 0 (identical IR trees) answers first; then both sides are translated, checked for
-//! equal arity, normalized with and without the integrity constraints, and compared up to renaming
-//! of bound variables (rung 2), with the set solver as the last resort (rung 3).
+//! equal arity and equal output column types, normalized with and without the integrity
+//! constraints, and compared up to renaming of bound variables (rung 2), with the set solver as the
+//! last resort (rung 3).
 
 use crate::alpha::alpha_eq;
 use crate::ic::Ics;
@@ -37,6 +38,10 @@ pub enum Verdict {
 pub enum NotProvedReason {
     /// The two sides return different numbers of columns (`LogicSupport.java:221,239`).
     ArityMismatch,
+    /// The two sides' output columns differ in type, or one's type is not known. Not in Java: its
+    /// translation keeps the types, ours keeps only the values, and a value alone does not say
+    /// its type -- `TRUE` and `1` are both the term `1`.
+    TypeMismatch,
     /// A term is larger than [`MAX_TREE_SIZE`].
     TooLarge,
     /// Every rung ran and none proved equality.
@@ -49,6 +54,7 @@ impl std::fmt::Display for Verdict {
             Verdict::Eq { literal: true } => f.write_str("EQ literal"),
             Verdict::Eq { literal: false } => f.write_str("EQ"),
             Verdict::NotProved(NotProvedReason::ArityMismatch) => f.write_str("NEQ arity-mismatch"),
+            Verdict::NotProved(NotProvedReason::TypeMismatch) => f.write_str("NEQ type-mismatch"),
             Verdict::NotProved(NotProvedReason::TooLarge) => f.write_str("NEQ too-large"),
             Verdict::NotProved(NotProvedReason::Exhausted) => f.write_str("NEQ"),
             Verdict::Refused(e) => write!(f, "NOTRANS {e}"),
@@ -83,6 +89,12 @@ pub fn prove(input: &Input) -> Verdict {
 fn decide(l: &Query, r: &Query, ics: &Ics) -> Verdict {
     if l.arity != r.arity {
         return Verdict::NotProved(NotProvedReason::ArityMismatch);
+    }
+    // Equal terms are equal values only of one type: a boolean is the 0/1 a predicate is, so
+    // `SELECT TRUE` and `SELECT 1` are one term, and an output whose type the IR leaves unresolved
+    // matches nothing.
+    if l.types != r.types || l.types.iter().any(Option::is_none) {
+        return Verdict::NotProved(NotProvedReason::TypeMismatch);
     }
     if l.term.tree_size(MAX_TREE_SIZE + 1) > MAX_TREE_SIZE || r.term.tree_size(MAX_TREE_SIZE + 1) > MAX_TREE_SIZE {
         return Verdict::NotProved(NotProvedReason::TooLarge);
@@ -186,8 +198,9 @@ mod tests {
             { "operator": "CAST", "type": "REAL", "operand": [col(0)] }, col(1),
         ]}));
         let int_div = project_one(json!({ "operator": "/", "type": "INTEGER", "operand": [col(0), col(1)] }));
+        // Their output types differ as well, which now settles it first.
         let v = verify(&json!({ "schemas": schema(), "queries": [real_div, int_div] }));
-        assert_eq!(v, Verdict::NotProved(NotProvedReason::Exhausted));
+        assert_eq!(v, Verdict::NotProved(NotProvedReason::TypeMismatch));
     }
 
     #[test]

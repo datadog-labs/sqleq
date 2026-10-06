@@ -25,7 +25,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::ic::Ics;
-use crate::translate::OUT_VAR_ID;
+use crate::translate::{NUMERIC_EQ_KEY, OUT_VAR_ID};
 use crate::uterm::{mk_mul, mk_sum, PredKind, UConst, UTerm, UVar};
 
 /// Rounds of (simplify, eliminate bound vars, rename apart) before giving up on a fixpoint. Stopping
@@ -667,27 +667,24 @@ fn int(n: i64) -> UTerm {
     UTerm::Const(UConst::Int(n))
 }
 
-fn as_number(c: &UConst) -> Option<f64> {
-    match c {
-        UConst::Int(n) => Some(*n as f64),
-        UConst::Decimal(s) => s.parse().ok(),
+/// The number a constant `[key(c)]` under SQL's numeric `=` key compares by.
+fn numeric_key_operand(t: &UTerm) -> Option<crate::uterm::Number> {
+    match t {
+        UTerm::Func { name, args } if name == NUMERIC_EQ_KEY => match args.as_slice() {
+            [UTerm::Const(c)] => c.number(),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// Identity of two constants, numbers compared numerically (so `Decimal("1.0")` is `Int(1)`) --
-/// the canonicalisation any "two distinct constants" rule needs first, or `1.0` against `1` would
-/// look like a contradiction.
-fn same_const(a: &UConst, b: &UConst) -> bool {
-    match (as_number(a), as_number(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// Folds `Pred`s decidable from their arguments alone. Mirrors [`crate::eval`]'s semantics: `Eq`
-/// is identity (`Null` equals `Null`), order comparisons hold only between two numbers or two
-/// strings.
+/// is identity (`Null` equals `Null`), so it folds only when the two constants are the same value
+/// or certainly different ones -- `1` against `1.0` is neither, being equal numbers of different
+/// types (see [`UConst::same_value`]). An order comparison holds only between two numbers, and is
+/// decided exactly. One between two strings is left alone: its answer depends on the collation,
+/// which the IR does not carry, and only `C` orders by bytes. SQL's `=` between two numbers is
+/// identity of their numeric-key images, which do fold, by exact value.
 fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
     let (kind, a, b) = match (kind, args) {
         (PredKind::Gt, [a, b]) => (PredKind::Lt, b, a),
@@ -696,19 +693,23 @@ fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
         _ => return UTerm::Pred { kind, args: args.to_vec() },
     };
     if let (UTerm::Const(x), UTerm::Const(y)) = (a, b) {
-        let ordered = matches!((x, y), (UConst::Str(_), UConst::Str(_))) || (as_number(x).is_some() && as_number(y).is_some());
-        let less = match (x, y) {
-            (UConst::Str(p), UConst::Str(q)) => p < q,
-            _ => matches!((as_number(x), as_number(y)), (Some(p), Some(q)) if p < q),
-        };
-        let holds = match kind {
-            PredKind::Eq => same_const(x, y),
-            PredKind::Ne => !same_const(x, y),
-            PredKind::Lt => less,
-            PredKind::Le => less || (ordered && same_const(x, y)),
+        let folded = match kind {
+            PredKind::Eq => x.same_value(y),
+            PredKind::Ne => x.same_value(y).map(|same| !same),
+            PredKind::Lt | PredKind::Le => match (x.number(), y.number()) {
+                (Some(p), Some(q)) => Some(if kind == PredKind::Lt { p < q } else { p <= q }),
+                _ if matches!((x, y), (UConst::Str(_), UConst::Str(_))) => None,
+                // NULL, or a number against a string: never ordered.
+                _ => Some(false),
+            },
             PredKind::Gt | PredKind::Ge => unreachable!("oriented above"),
         };
-        return int(holds as i64);
+        if let Some(holds) = folded {
+            return int(holds as i64);
+        }
+    }
+    if let (PredKind::Eq | PredKind::Ne, Some(p), Some(q)) = (kind, numeric_key_operand(a), numeric_key_operand(b)) {
+        return int(((p == q) == (kind == PredKind::Eq)) as i64);
     }
     if a == b {
         match kind {
@@ -768,6 +769,18 @@ fn strip_squash(t: UTerm) -> UTerm {
 pub fn simplify(t: &UTerm) -> UTerm {
     match t {
         UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
+        // The numeric `=` key depends on its operand's value alone, so a constant there may be any
+        // constant of that value; one canonical spelling lets `a = 1.0` and `a = 1` meet.
+        UTerm::Func { name, args } if name == NUMERIC_EQ_KEY => {
+            let args = args
+                .iter()
+                .map(|a| match simplify_value(a) {
+                    UTerm::Const(c) => UTerm::Const(c.numeric_canonical().unwrap_or(c)),
+                    other => other,
+                })
+                .collect();
+            UTerm::Func { name: name.clone(), args }
+        }
         UTerm::Func { name, args } => UTerm::Func { name: name.clone(), args: args.iter().map(simplify_value).collect() },
         UTerm::Pred { kind, args } => simplify_pred(*kind, &args.iter().map(simplify_value).collect::<Vec<_>>()),
         UTerm::Squash(c) => match strip_squash(simplify(c)) {
@@ -1101,7 +1114,10 @@ fn rep_rank(t: &UTerm) -> (u8, u64, u64) {
 /// identical to every other wherever the product is non-zero, so each other occurrence of a column
 /// member may be replaced by the class's representative. The class's own equalities are kept, in
 /// the canonical star form `[member = rep]`, so no binding is lost. A class holding two distinct
-/// constants makes the product 0 (`simplifyMultiplication`).
+/// constants makes the product 0 (`simplifyMultiplication`). One holding two constants that are
+/// neither the same value nor certainly different ones (`1` and `1.0`, see
+/// [`UConst::same_value`]) is left as it stands: no member is replaced, so neither constant is put
+/// where the other was.
 fn canonicalize_congruence(t: &UTerm) -> UTerm {
     match t {
         UTerm::Mul(fs) => {
@@ -1255,17 +1271,24 @@ fn rewrite_product(factors: Vec<UTerm>) -> Option<Vec<UTerm>> {
     for (term, &i) in &uf.ids {
         by_root.entry(uf.find(i)).or_default().push(term.clone());
     }
-    let mut classes: Vec<Vec<UTerm>> = by_root.into_values().collect();
-    for members in &mut classes {
+    let mut classes: Vec<(usize, Vec<UTerm>)> = by_root.into_iter().collect();
+    for (_, members) in &mut classes {
         members.sort_by_key(rep_rank);
     }
-    classes.sort_by_key(|members| rep_rank(&members[0]));
+    classes.sort_by_key(|(_, members)| rep_rank(&members[0]));
     let mut subst: HashMap<UTerm, UTerm> = HashMap::new();
     let mut stars: Vec<UTerm> = Vec::new();
-    for members in &classes {
+    let mut kept_roots: HashSet<usize> = HashSet::new();
+    for (root, members) in &classes {
         let consts: Vec<&UConst> = members.iter().filter_map(|m| if let UTerm::Const(c) = m { Some(c) } else { None }).collect();
-        if consts.windows(2).any(|w| !same_const(w[0], w[1])) {
+        // "Certainly different" is the complement of one equivalence (same kind and number, or
+        // same string), so it shows between some two neighbours whenever it shows at all.
+        if consts.windows(2).any(|w| w[0].same_value(w[1]) == Some(false)) {
             return None;
+        }
+        if consts.windows(2).any(|w| w[0].same_value(w[1]).is_none()) {
+            kept_roots.insert(*root);
+            continue;
         }
         let rep = members[0].clone();
         for m in members {
@@ -1277,8 +1300,17 @@ fn rewrite_product(factors: Vec<UTerm>) -> Option<Vec<UTerm>> {
             }
         }
     }
-    let mut out: Vec<UTerm> =
-        factors.iter().zip(&defining).filter(|(_, d)| !**d).map(|(f, _)| substitute(f, &subst)).collect();
+    // A defining equality of a class left alone stays as it was.
+    let kept = |f: &UTerm| match f {
+        UTerm::Pred { args, .. } => uf.ids.get(&args[0]).is_some_and(|&i| kept_roots.contains(&uf.find(i))),
+        _ => false,
+    };
+    let mut out: Vec<UTerm> = factors
+        .iter()
+        .zip(&defining)
+        .filter(|(f, d)| !**d || kept(f))
+        .map(|(f, _)| substitute(f, &subst))
+        .collect();
     out.extend(stars);
     Some(out)
 }
@@ -1702,8 +1734,15 @@ mod tests {
     }
 
     #[test]
-    fn decimal_and_integer_constants_compare_numerically() {
-        let got = simplify_pred(PredKind::Eq, &[UTerm::Const(UConst::Decimal("1.0".into())), int(1)]);
-        assert_eq!(got, int(1));
+    fn decimal_and_integer_constants_compare_numerically_only_under_sql_equality() {
+        // `Eq` is identity, and `1.0` and `1` are equal numbers but not one value (`CAST(1.0 AS
+        // TEXT)` is not `CAST(1 AS TEXT)`), so their identity is left open. SQL's `1.0 = 1`, the
+        // numeric key's equality, is true; and two different numbers are different either way.
+        let (one, one_dec) = (int(1), UTerm::Const(UConst::Decimal("1.0".into())));
+        let open = UTerm::Pred { kind: PredKind::Eq, args: vec![one_dec.clone(), one.clone()] };
+        assert_eq!(simplify_pred(PredKind::Eq, &[one_dec.clone(), one.clone()]), open);
+        let key = |c: UTerm| simplify(&UTerm::Func { name: NUMERIC_EQ_KEY.into(), args: vec![c] });
+        assert_eq!(simplify_pred(PredKind::Eq, &[key(one_dec.clone()), key(one.clone())]), int(1));
+        assert_eq!(simplify_pred(PredKind::Eq, &[UTerm::Const(UConst::Decimal("1.5".into())), one]), int(0));
     }
 }
