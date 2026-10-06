@@ -109,6 +109,10 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **Integer division truncates.** Postgres rounds `-7 / 2` toward zero and gives `-7 % 2` the sign
+  of the dividend; a prover's integer division is Euclidean. So `/` and `%` on integers are
+  functions named after their operand types (`q_arith_div_integer_integer`), never the native
+  operators.
 - **A join-delete or join-update is a semi-join only when nothing it assigns or returns reads the
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of

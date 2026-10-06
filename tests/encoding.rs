@@ -30,6 +30,55 @@ fn refusal(src: &str, mode: CatalogSource) -> String {
     }
 }
 
+/// Every node anywhere in `v` that has an `"operator"`.
+fn nodes<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("operator") {
+                out.push(v);
+            }
+            m.values().for_each(|x| nodes(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| nodes(x, out)),
+        _ => {}
+    }
+}
+
+const NUM: &str = r#"create table "t" ("a" INTEGER, "x" NUMERIC, "s" VARCHAR, "d" DATE);"#;
+
+mod integer_division {
+    use super::*;
+
+    fn target(q: &str) -> Value {
+        let v = lower(NUM, q, q);
+        v["queries"][0]["project"]["target"][0].clone()
+    }
+
+    #[test]
+    fn integer_division_and_modulo_are_functions() {
+        let div = target(r#"SELECT "a" / 2 FROM "t""#);
+        assert_eq!((div["operator"].as_str(), div["type"].as_str()), (Some("q_arith_div_integer_integer"), Some("INTEGER")));
+        let rem = target(r#"SELECT "a" % 2 FROM "t""#);
+        assert_eq!((rem["operator"].as_str(), rem["type"].as_str()), (Some("q_arith_mod_integer_integer"), Some("INTEGER")));
+        let lit = target(r#"SELECT (-7) / 2 FROM "t""#);
+        assert_eq!(lit["operator"], "q_arith_div_integer_integer");
+        // Over aggregates too.
+        let q = r#"SELECT sum("a") / count(*) FROM "t""#;
+        let v = lower(NUM, q, q);
+        let mut out = Vec::new();
+        nodes(&v["queries"][0], &mut out);
+        assert!(out.iter().any(|n| n["operator"] == "q_arith_div_integer_integer"), "{v}");
+        assert!(!out.iter().any(|n| n["operator"] == "/"), "{v}");
+    }
+
+    #[test]
+    fn other_arithmetic_stays_native() {
+        assert_eq!(target(r#"SELECT "x" / 2 FROM "t""#)["operator"], "/");
+        assert_eq!(target(r#"SELECT "a" / 2.0 FROM "t""#)["operator"], "/");
+        assert_eq!(target(r#"SELECT "a" * 2 FROM "t""#)["operator"], "*");
+    }
+}
+
 mod keys {
     use super::*;
 

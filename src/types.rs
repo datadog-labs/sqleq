@@ -426,6 +426,8 @@ pub fn make_cmp(opstr: &str, l: Value, r: Value) -> Value {
 /// is opaque — keeps the term well-sorted. Sound for the same reason as [`coerce_cmp`]: the cast is
 /// deterministic, so both queries get it identically, and `+` over an opaque type is uninterpreted
 /// either way.
+///
+/// Integer `/` and `%` are never native ([`integer_arith`]).
 pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
     let (a, b) = (ty_of(&l), ty_of(&r));
     if is_temporal(&a) || is_temporal(&b) {
@@ -444,11 +446,29 @@ pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
         });
     }
     if a == b || (is_num(&a) && is_num(&b)) {
-        return json!({ "operator": opstr, "operand": [l, r], "type": num_ty });
+        return integer_arith(opstr, l, r, num_ty);
     }
     let ct = common_type(&a, &b);
     let ty = if is_builtin(&ct) { num_ty } else { &ct };
-    json!({ "operator": opstr, "operand": [cast_to(l.clone(), &ct), cast_to(r, &ct)], "type": ty })
+    integer_arith(opstr, cast_to(l.clone(), &ct), cast_to(r, &ct), ty)
+}
+
+/// `l op r` of result type `ty`: the native operator, except an INTEGER `/` or `%`.
+///
+/// Those two are the uninterpreted functions `q_arith_div_<l>_<r>` and `q_arith_mod_<l>_<r>`, named
+/// like [`temporal_arith`]'s, because a prover's integer division is not Postgres's. Postgres
+/// truncates toward zero and gives `%` the sign of the dividend: `-7 / 2` is `-3` and `-7 % 2` is
+/// `-1`. QED reads an INTEGER `/` as z3's `div`, which SMT-LIB defines as Euclidean division
+/// (`-7 div 2` is `-4`), and has a z3 `mod` ready for `%`, which is never negative. A function is
+/// sound whatever the prover knows about division: the real operator is one of its interpretations.
+fn integer_arith(op: &str, l: Value, r: Value, ty: &str) -> Value {
+    let name = match op {
+        "/" if ty == "INTEGER" => "div",
+        "%" if ty == "INTEGER" => "mod",
+        _ => return json!({ "operator": op, "operand": [l, r], "type": ty }),
+    };
+    let operator = format!("q_arith_{name}_{}_{}", ty_of(&l).to_lowercase(), ty_of(&r).to_lowercase());
+    json!({ "operator": operator, "operand": [l, r], "type": ty })
 }
 
 /// [`make_arith`] with a temporal operand: Postgres's operator table, split by whether the result
