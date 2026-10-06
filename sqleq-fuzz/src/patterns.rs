@@ -236,8 +236,12 @@ pub fn has_hard_nondet(a: &str, b: &str) -> bool {
     })
 }
 
-/// What the frozen clocks read.
-const FROZEN_TS: &str = "TIMESTAMP '2020-06-01 00:00:00'";
+/// The one instant every frozen clock reads, as a naive timestamp in the UTC session `open_db`
+/// sets. Every clock is derived from it -- the time of day and the date as well as the timestamp --
+/// so `now()::time = localtime` and `now()::date = current_date` hold as they do in Postgres, where
+/// all of them read the transaction's start. It stays naive rather than `TIMESTAMPTZ` because DuckDB
+/// has no cast from `TIMESTAMPTZ` to `TIME`; in a UTC session the two denote the same instant.
+const FROZEN_TS: &str = "TIMESTAMP '2020-06-01 12:00:00'";
 const FROZEN_TIME: &str = "TIME '12:00:00'";
 const FROZEN_DATE: &str = "DATE '2020-06-01'";
 

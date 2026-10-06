@@ -125,6 +125,6 @@ fn a_placeholder_past_u32_is_an_error_not_a_panic() {
 fn a_frozen_clock_in_a_literal_stays_text() {
     assert_eq!(
         freeze_time("SELECT 'now()', now() -- current_date"),
-        "SELECT 'now()', TIMESTAMP '2020-06-01 00:00:00' -- current_date"
+        "SELECT 'now()', TIMESTAMP '2020-06-01 12:00:00' -- current_date"
     );
 }

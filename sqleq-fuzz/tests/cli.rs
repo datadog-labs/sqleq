@@ -4,7 +4,7 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! The executable's own behaviour: `csv` mode keeps every row and writes beside its input
-//! (issues #63, #67).
+//! (issues #63, #67), and `file` mode reads an `ALTER TABLE` as DDL (issue #64).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -87,4 +87,28 @@ fn csv_mode_writes_beside_its_input_by_default() {
         .unwrap();
     assert!(st.status.success(), "{st:?}");
     assert_eq!(verdicts(&dir.join("corpus.fuzz.json")).len(), 3);
+}
+
+/// `ALTER TABLE` belongs to the schema, so a pair file carrying one has two statements, not three.
+#[test]
+fn file_mode_reads_alter_table_as_ddl() {
+    let dir = scratch("alter");
+    let pair = dir.join("pair.sql");
+    std::fs::write(
+        &pair,
+        "-- a pair\ncreate table t (id INTEGER NOT NULL, a INTEGER);\n\
+         alter table t add primary key (id);\n\
+         SELECT id FROM t;\nSELECT DISTINCT id FROM t;\n",
+    )
+    .unwrap();
+    let st = Command::new(BIN)
+        .arg("file")
+        .arg(&pair)
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{st:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&st.stdout).lines().next(),
+        Some("NO-COUNTEREXAMPLE")
+    );
 }

@@ -10,8 +10,8 @@
 //!     `names.txt` lists `pairNNNN` entries (the digits index a corpus row). Parallel with `--jobs`.
 //!     `out.json` defaults to the corpus path with its extension replaced by `.fuzz.json`.
 //!   * `sqleq-fuzz row <corpus.csv> <index>` — test a single corpus row and print the verdict.
-//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE TABLEs + exactly two
-//!     statements).
+//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE and ALTER statements + exactly
+//!     two statements).
 //!
 //! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`. Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
@@ -32,7 +32,7 @@ usage:
   sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to the
                                                         corpus path with extension .fuzz.json)
   sqleq-fuzz row  <corpus.csv> <index>                  test one corpus row (counting from 0)
-  sqleq-fuzz file <pair.sql>                            test a file: CREATE TABLEs, two statements
+  sqleq-fuzz file <pair.sql>                            test a file: DDL, then two statements
 options:
   -j, --jobs N   parallel workers (csv mode, default 1)
   --trials N     random instances per pair (default 120)
@@ -257,7 +257,8 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     let path = args.first().ok_or("file mode needs <pair.sql>")?;
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // Drop the frontend's `declare ... function` DSL lines (not runnable SQL), then split into
-    // statements: CREATE* form the DDL, the remaining two are the query pair.
+    // statements: CREATE* and ALTER* form the DDL, the remaining two are the query pair. An
+    // `ALTER TABLE ... ADD PRIMARY KEY` is as much a part of the schema as the CREATE it alters.
     let cleaned: String = src
         .lines()
         .filter(|l| {
@@ -269,7 +270,8 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     let mut ddl_parts: Vec<String> = Vec::new();
     let mut queries: Vec<String> = Vec::new();
     for s in split_statements(&cleaned) {
-        if s.to_uppercase().starts_with("CREATE") {
+        let upper = s.to_uppercase();
+        if upper.starts_with("CREATE") || upper.starts_with("ALTER") {
             ddl_parts.push(s);
         } else {
             queries.push(s);
@@ -277,7 +279,7 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     }
     if queries.len() != 2 {
         return Err(format!(
-            "expected exactly 2 non-CREATE statements, got {}",
+            "expected exactly 2 statements besides the DDL, got {}",
             queries.len()
         ));
     }

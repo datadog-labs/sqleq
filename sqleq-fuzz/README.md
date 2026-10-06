@@ -15,18 +15,20 @@ the provers under `--portfolio`; the [Usage](#usage) below is for running it on 
 For a query pair `(A, B)` under a schema, it repeatedly:
 
 1. generates a small **valid** random database instance — honouring `NOT NULL` and *every* `UNIQUE` /
-   `PRIMARY KEY` / `UNIQUE INDEX`;
+   `PRIMARY KEY` / `UNIQUE INDEX`, wherever the DDL states it;
 2. binds `$N` parameters to random typed values, **consistently across A and B**, biasing each param
    toward a value that actually occurs in the column it is compared against (so equality filters
    match rows) — but only where that consistency is something the row supports, see
    [Parameter binding](#parameter-binding-is-an-assumption-not-a-given) below;
-3. freezes `now()` / `current_*` to constants and skips truly nondeterministic functions;
-4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install);
+3. freezes `now()` / `current_*` to one instant and skips truly nondeterministic functions;
+4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install), set up
+   and fed so that it computes what Postgres computes — or, where it cannot, gives no verdict;
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
    counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state,
    and the returned rows as well when both sides carry `RETURNING`. A pair with no one observable
    to compare — a query against a mutation, `RETURNING` on one side only, or an `EXPLAIN` — is
-   reported `NOT-COMPARABLE` instead of run.
+   reported `NOT-COMPARABLE` instead of run, and so is a pair DuckDB cannot be made to evaluate as
+   Postgres does (see the rules below).
 
 Any difference on a valid, deterministic instance is a **sound counterexample** ⇒ the pair is
 **non-equivalent**. This is a disprover: it can show non-equivalence (with a witness), never prove
@@ -38,30 +40,53 @@ A reported counterexample is only valid if the instance is valid *and* both quer
 deterministic. The rules:
 
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
-  database admits. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over
-  the raw DDL; partial indexes are treated as *total* (conservative — only shrinks the valid space).
+  database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
+  makes its columns `NOT NULL` too), from `CREATE UNIQUE INDEX`, and from `ALTER TABLE … ADD
+  PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET NOT NULL`. A unique index over an expression is
+  created as a DuckDB unique index on that expression, and `NULLS NOT DISTINCT` admits at most one
+  NULL key. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over the raw
+  DDL; partial indexes are treated as *total* (conservative — only shrinks the valid space). A
+  uniqueness statement nothing can read withholds every pair over its table (`NOT-COMPARABLE`).
+- **A table is the table Postgres resolves.** `public.t` and `t` are one table (the default
+  `search_path`), so `public.` is dropped from the queries. Tables of one name in two schemas
+  (`s1.t`, `s2.t`) draw rows of their own. Any other second spelling of a table in a mutation pair
+  (`s.t` beside a DDL's `t`) is withheld, since a write through one spelling would not show
+  through the other.
 - **Freeze time.** `now()`/`statement_timestamp()` and the bare `current_timestamp`/`localtimestamp`
-  keywords are frozen; otherwise A and B (run microseconds apart) disagree spuriously. A clock spelled
-  inside a string literal or a comment is left alone.
+  keywords are frozen, and so are `current_time`/`localtime`/`current_date` — all to the one instant
+  2020-06-01 12:00:00 UTC, so `now()::time = localtime` holds as in Postgres; otherwise A and B (run
+  microseconds apart) disagree spuriously. A clock spelled inside a string literal or a comment is
+  left alone.
 - **`LIMIT`/`OFFSET` over an unordered set.** The clauses are read off the parse, so `LIMIT (1)`,
   `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. Pure row-count params (a bare `$N` and nothing else)
   are bound large (never truncate). Any other cut, a dual-purpose param count, or a
   string-flattening aggregate marks the pair *nondeterministic*, after which only **cardinality**
   differences (which stay deterministic) are trusted.
+- **Evaluate as Postgres does, or not at all.** DuckDB's session runs with `integer_division`
+  (integer `/` truncates), `default_null_order = 'postgres'` (NULLs first under `DESC`) and
+  `TimeZone = 'UTC'` (not the host's), and `timestamptz` columns are DuckDB `TIMESTAMPTZ`. A divisor
+  of `/`, `%` or `mod()` that is not a non-zero literal is wrapped so that a zero raises, as in
+  Postgres, rather than answering `inf` or NULL: a trial in which a side raises is skipped. `~`,
+  `~*`, `!~` and `!~*` match anywhere, as Postgres's do, where DuckDB's `~` is a full match.
+  `numeric(p,s)` is `DECIMAL(p,s)`, and a bare `numeric`, as a column or a cast, is `DECIMAL(38,18)`
+  rather than a `DOUBLE` or DuckDB's `DECIMAL(18,3)`. What has no faithful rendering is withheld as
+  `NOT-COMPARABLE`: a `char(n)` column the pair reads (blank-padded comparison), `SIMILAR TO`, a
+  regex operator under `ANY`/`ALL`. Division of a `numeric` is still a `DOUBLE` in DuckDB, so two
+  divisions Postgres computes exactly can differ in the last digits.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
 - **Compare numbers by value, not by type.** A declared `bigint` is materialized as DuckDB `INTEGER`,
   so `c` and `c::bigint` come back as different DuckDB types carrying the same number, and a
   `numeric` of another scale does the same. Cells are compared by numeric value, which can only merge
-  them, never split them.
+  them, never split them — inside a record, a map or an array as well, where a record's field names
+  are not compared either.
 - **A bare `float` is `double precision`.** Postgres reads `float` as `double precision`; DuckDB
   reads it as single-precision `REAL`, so a `::float` cast would compute a different value from the
   same cast spelled `::double precision`. Bare `float` cast targets are rewritten to `DOUBLE` before
   anything runs; `float(p)`, `float4`, `float8` and `real` already agree between the two.
 - **Read placeholders off the tokens.** `$N` is found by the tokenizer, never inside a string literal
   or a comment, and substituted at those positions only. A placeholder Postgres would reject (`$0`,
-  a number past `u32`) makes the pair `ERROR`. Nondeterministic functions are recognised the same
-  way, as calls rather than as text.
+  a number past `u32`) makes the pair `ERROR`.
 - **Don't invent a parameter correspondence.** See the next section.
 - **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
   functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as
@@ -69,7 +94,8 @@ deterministic. The rules:
   two sides call the function on different arguments that Postgres maps to one value, a mapping
   that keeps them apart refutes an equivalent pair. Anything needing a real translation rather than
   a rename — format strings, regex semantics, full-text and jsonpath — is left undefined, and the
-  pair keeps reporting an error.
+  pair keeps reporting an error. `jsonb_build_object` normalizes its object as `jsonb` does (keys by
+  length then bytes, the last of duplicate keys kept); `json_build_object` keeps what it is given.
 - **A shim has to refuse what Postgres refuses.** Refusing an input is part of a function's
   semantics, and being more permissive is the unsafe direction: Postgres raises for
   `json_array_elements` of a non-array, where DuckDB answers with an empty list. An error makes the
@@ -159,7 +185,7 @@ the defaults below cannot move its answers. On its own:
 ```
 sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   # batch (rows are a,b,ddl); names are pairNNNN
 sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting from 0)
-sqleq-fuzz file <pair.sql>                            # CREATE TABLEs + exactly two statements
+sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER) + exactly two statements
 
 options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
          --seed N (default 0)
@@ -179,18 +205,21 @@ panic while testing one row is that row's `ERROR:panic: …`, and the run goes o
 
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
 `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
-a `:` still bucket correctly for a consumer that splits on the first one.
+a `:` still bucket correctly for a consumer that splits on the first one. `NOT-COMPARABLE` is a
+withheld verdict: either the two sides share no observable, or DuckDB cannot be made to evaluate them
+as Postgres does.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file without exactly two
-statements, `row` without an index), or when a `csv` worker died and left rows without a verdict;
-`2` when the mode is missing or unknown, after printing the usage.
+statements besides its DDL, `row` without an index), or when a `csv` worker died and left rows
+without a verdict; `2` when the mode is missing or unknown, after printing the usage.
 
 ### The generated value domain (why a literal can make a pair look equivalent)
 
-Column values are drawn from a deliberately small domain — `0,1,2` for integers and doubles,
-`'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs and a few
-small JSON documents — so that joins, `GROUP BY` and `DISTINCT` actually collide on small instances.
+Column values are drawn from a deliberately small domain — `0,1,2` for integers, doubles and
+numerics, `'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs and
+a few small JSON documents — so that joins, `GROUP BY` and `DISTINCT` actually collide on small
+instances.
 Parameters are additionally biased toward a value the column really holds; a **literal is not**. A
 predicate against a literal outside the domain, `status = 'active'`, is therefore satisfied by no
 generated row: both sides return nothing on every trial and a non-equivalent pair reports

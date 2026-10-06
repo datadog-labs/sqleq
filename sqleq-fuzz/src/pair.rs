@@ -15,15 +15,16 @@ use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::duck::{accepted_rows, open_db, run_side, table_forms, RowData};
+use crate::duck::{accepted_rows, open_db, run_side, table_forms, Forms, RowData};
 use crate::gen::{
     array_element_type, cast_target, lit, randval, randval_cast, randval_col, randval_need,
     CastTarget, Val,
 };
+use crate::lex::significant;
 use crate::limits;
 use crate::patterns as pat;
 use crate::rewrite;
-use crate::schema::{parse_schema, VType};
+use crate::schema::{parse_schema, Schema, VType};
 use crate::shim;
 use crate::typing;
 
@@ -50,10 +51,12 @@ impl Default for Config {
 pub enum Verdict {
     /// A truly nondeterministic function is present — untestable.
     NondetSkip,
-    /// The two sides have no shared observable, so running them would compare something neither
-    /// pair member is about (carries which shape it was). Two reasons reach this: a side is an
-    /// `EXPLAIN`, which has query plans rather than query results (see
-    /// [`crate::patterns::has_explain`]), or one side is a query and the other a mutation.
+    /// The two sides cannot be compared soundly, so no verdict is given either way (carries why).
+    /// Either they have no shared observable -- a side is an `EXPLAIN`, which has query plans rather
+    /// than query results (see [`crate::patterns::has_explain`]), or one side is a query and the
+    /// other a mutation -- or DuckDB cannot be made to compute what Postgres computes on them: a
+    /// `char(n)` column, `SIMILAR TO`, a constraint that could not be read, a table spelled two ways
+    /// in a mutation pair (see [`test_pair`]).
     NotComparable(String),
     /// No parseable table schema.
     NoSchema,
@@ -231,13 +234,23 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     //
     // One closure, applied to both sides, so the two sides cannot drift apart in how they are
     // prepared — which is the shape the `is_query` defect took.
-    let prep = |sql: &str| {
+    //
+    // `wide_numerics` respells a type like `double_precision_floats` does, and `strip_public` only
+    // drops a qualifier, so neither changes what the later passes find. `postgres_operators` is the
+    // one pass that can refuse: it makes a zero divisor raise and a regex match partial, and where it
+    // cannot do either faithfully the pair gets no verdict.
+    let prep = |sql: &str| -> Result<String, String> {
         let unqualified = rewrite::unqualify_stars(sql);
         let doubled = rewrite::double_precision_floats(&unqualified);
-        pat::freeze_time(&rewrite::parenthesize_json_ops(&doubled))
+        let widened = rewrite::wide_numerics(&doubled);
+        let parenthesized = rewrite::parenthesize_json_ops(&widened);
+        let guarded = rewrite::postgres_operators(&rewrite::strip_public(&parenthesized))?;
+        Ok(pat::freeze_time(&guarded))
     };
-    let a = prep(a);
-    let b = prep(b);
+    let (a, b) = match (prep(a), prep(b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(why), _) | (_, Err(why)) => return Verdict::NotComparable(why),
+    };
     let forms = table_forms(&a, &b, &schema);
     if forms.is_empty() {
         return Verdict::NoTables;
@@ -346,6 +359,9 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             if ret_b { "returning" } else { "none" },
         ));
     }
+    if let Some(why) = unfaithful(&a, &b, &finals, &forms, &schema, is_query_a && is_query_b) {
+        return Verdict::NotComparable(why);
+    }
 
     // If *either* side can leave objects behind, both sides get the thorough catalog sweep: the two
     // sides and every trial share one database, so B must be cleaned up after A just as much.
@@ -371,21 +387,20 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     let mut ok_trials = 0usize;
 
     for _ in 0..cfg.trials {
-        let rowdata: RowData = finals
-            .iter()
-            .map(|t| {
-                let rows = (0..cfg.nrows)
-                    .map(|_| {
-                        schema[t]
-                            .cols
-                            .iter()
-                            .map(|c| randval_col(c, &mut rng))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                (t.clone(), rows)
-            })
-            .collect();
+        let rng: &mut StdRng = &mut rng;
+        let mut rowdata: RowData = RowData::new();
+        for t in &finals {
+            let table = &schema[t];
+            let mut rows: Vec<Vec<Val>> = Vec::with_capacity(cfg.nrows);
+            for _ in 0..cfg.nrows {
+                let row: Vec<Val> = table.cols.iter().map(|c| randval_col(c, rng)).collect();
+                // DuckDB enforces every other constraint on insert; `NULLS NOT DISTINCT` it does not.
+                if table.admits(&rows, &row) {
+                    rows.push(row);
+                }
+            }
+            rowdata.insert(t.clone(), rows);
+        }
 
         let mut binds: HashMap<u32, Val> = HashMap::new();
         for &n in &pnums {
@@ -470,18 +485,18 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
                 }
             };
             let v = if neutralize.contains(&n) {
-                Val::Int(1_000_000_000) // pure row-limit param -> never truncates
+                Val::Int(1_000_000_000) // pure row-count param -> never truncates
             } else if is_array {
                 // 1-3 elements: enough to match real rows often, few enough that the predicate stays
                 // selective and can still discriminate the two sides.
                 let k = rng.random_range(1..=3);
                 let mut elems = Vec::with_capacity(k);
                 for _ in 0..k {
-                    elems.push(pick(&mut rng));
+                    elems.push(pick(rng));
                 }
                 Val::List(elems)
             } else {
-                pick(&mut rng)
+                pick(rng)
             };
             binds.insert(n, v);
         }
@@ -546,6 +561,103 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         },
         (_, None) => Verdict::NoCounterexample,
     }
+}
+
+/// Why DuckDB cannot be trusted to compute what Postgres computes on this pair's tables, if it
+/// cannot: then no verdict is given, in either direction.
+///
+/// * A table whose constraints could not all be read ([`crate::schema::Table::unreadable`]): the rows
+///   generated for it may be rows Postgres would reject.
+/// * A `char(n)` column the pair reads. Postgres pads it with blanks and ignores trailing blanks in
+///   comparisons, so `c = 'a'` and `c = 'a  '` agree there and not on a VARCHAR, while `c LIKE 'a'`
+///   is false there and true on one. A query reads such a column when it names it, selects `*` over
+///   its table, or joins `NATURAL`ly; a mutation pair writes it however the statement is spelled
+///   (`INSERT ... VALUES` names no column), so any `char(n)` column in a table it touches counts.
+/// * A table spelled two ways in a mutation pair, `s.t` beside `t`. Each spelling is a table of its
+///   own here, loaded from the same rows, and a mutation through one leaves the other as it was;
+///   both are one table in Postgres only if they resolve to it, which the DDL does not say. (`public.t`
+///   and `t` are one table, and `rewrite::strip_public` has already made them one spelling.)
+fn unfaithful(
+    a: &str,
+    b: &str,
+    finals: &[String],
+    forms: &Forms,
+    schema: &Schema,
+    queries: bool,
+) -> Option<String> {
+    for t in finals {
+        if let Some(why) = &schema[t].unreadable {
+            return Some(format!("table {t}: {why}"));
+        }
+    }
+    let padded: Vec<(&String, &String)> = finals
+        .iter()
+        .flat_map(|t| {
+            schema[t]
+                .cols
+                .iter()
+                .filter(|c| c.padded)
+                .map(move |c| (t, &c.name))
+        })
+        .collect();
+    if let Some((t, c)) = padded.first() {
+        if !queries {
+            return Some(format!("char(n) column {t}.{c} in a table a mutation writes"));
+        }
+        for sql in [a, b] {
+            let Some(toks) = significant(sql) else {
+                return Some(format!("char(n) column {t}.{c}"));
+            };
+            for (i, tok) in toks.iter().enumerate() {
+                use sqlparser::keywords::Keyword;
+                use sqlparser::tokenizer::Token;
+                let reads = match &tok.token {
+                    Token::Word(w) if w.quote_style.is_none() && w.keyword == Keyword::NATURAL => {
+                        Some(format!("char(n) column {t}.{c} under a NATURAL join"))
+                    }
+                    Token::Word(w) => padded
+                        .iter()
+                        .find(|(_, name)| w.value.to_lowercase() == **name)
+                        .map(|(t, c)| format!("char(n) column {t}.{c}")),
+                    // `*` right after SELECT/DISTINCT/RETURNING, a comma or a qualifier's dot is a
+                    // wildcard; anywhere else it is a product or `count(*)`.
+                    Token::Mul if i > 0 => match &toks[i - 1].token {
+                        Token::Comma | Token::Period => Some(()),
+                        Token::Word(w)
+                            if w.quote_style.is_none()
+                                && matches!(
+                                    w.keyword,
+                                    Keyword::SELECT
+                                        | Keyword::DISTINCT
+                                        | Keyword::ALL
+                                        | Keyword::RETURNING
+                                ) =>
+                        {
+                            Some(())
+                        }
+                        _ => None,
+                    }
+                    .map(|()| format!("char(n) column {t}.{c} under a wildcard")),
+                    _ => None,
+                };
+                if reads.is_some() {
+                    return reads;
+                }
+            }
+        }
+    }
+    if !queries {
+        for (t, spellings) in forms {
+            if spellings.len() > 1 {
+                let names: Vec<String> = spellings.iter().map(|p| p.join(".")).collect();
+                return Some(format!(
+                    "table {t} is spelled {} in a mutation pair",
+                    names.join(" and ")
+                ));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
