@@ -12,9 +12,10 @@
 # caches do not evict each other. Each job lints the crate it builds, so the union is
 # `cargo clippy --workspace` without any job paying for another's dependencies.
 #
-# Three of them also run the pinned pairs under tests/pairs on the axes they build: the frontend,
-# sqleq-fuzz and sqleq-solver. The QED prover and the JVM fork of SQLSolver are never installed
-# here, so their pins are checked where those tools exist -- see tests/pairs/README.md.
+# Three of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
+# build: the frontend, sqleq-fuzz and sqleq-solver. The `sqleq-lean` job checks the Lean pins through
+# that crate's own integration test. The QED prover and the JVM fork of SQLSolver are never
+# installed here, so their pins are checked where those tools exist -- see tests/pairs/README.md.
 #
 # `licenses` builds nothing. It checks that every dependency is under a permissive licence and
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
@@ -91,9 +92,10 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
 
-      # The `internals` feature is off by default, so the two lines above never compile it.
-      # Without this step it would rot silently until the benchmark harness that depends on it
-      # failed to build against a new frontend.
+      # The `internals` feature is off by default, so the two lines above never compile it. sqleq-lean
+      # depends on it, and the `sqleq-lean` job's clippy lints the library with it on, but only this
+      # step lints the frontend's own tests and binary with it; without it, a lint would land
+      # unnoticed in code the out-of-repo benchmark harness also links.
       - run: cargo clippy --features internals --all-targets -- -D warnings
 
       # Intra-doc links are resolved only when the docs are built, which nothing above does, so a
@@ -318,9 +320,9 @@ jobs:
           key: lean-toolchain-${{ runner.os }}-4.34.1-47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4
 
       # No elan and no toolchain action: the release archive carries `lean` and `lake`, and putting
-      # its `bin` on PATH is all `lake build` and sqleq-lean need. Pinned by digest like Z3 below:
-      # the value is the SHA-256 GitHub lists for the release asset, so a replaced upload fails the
-      # build.
+      # its `bin` on PATH is all `lake build` and sqleq-lean need. Pinned by digest like libduckdb in
+      # the fuzz job: the value is the SHA-256 GitHub lists for the release asset, so a replaced
+      # upload fails the build.
       - name: fetch Lean (digest-pinned)
         run: |
           set -euo pipefail
@@ -344,8 +346,8 @@ jobs:
         run: cd lean && lake build Sqleq SqleqTest
 
       # The integration test runs every pinned pair under tests/pairs that pins the Lean axis through
-      # real Lean and asserts
-      # the verdict its header declares; it fails, rather than skips, without `lake` on PATH.
+      # real Lean and asserts the verdict its header declares; it fails, rather than skips, without
+      # `lake` on PATH.
       - run: cargo test -p sqleq-lean
       - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built.

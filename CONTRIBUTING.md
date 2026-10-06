@@ -10,25 +10,30 @@ cargo test                 # the frontend: 206 + 10 + 7 + 2 + 190 + 19 + 11 + 11
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 34 + 6 (needs Lean, see below)
+cargo build -p sqleq-fuzz -p sqleq-solver
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
-`cargo test` covers the frontend and `sqleq-check`, the batch harness. Among the frontend's suites
-is `tests/doc_links.rs`, which fails on any relative link in a Markdown file that resolves to
-nothing; among the harness's is the hygiene gate over every committed pair. The last line runs the
-[pinned pairs](tests/pairs/README.md) on three of the axes CI has; it needs the `sqleq-frontend`,
-`sqleq-fuzz` and `sqleq-solver` binaries built. Their Lean pins are checked by
-`cargo test -p sqleq-lean`.
+`cargo test` covers the frontend and `sqleq-check`, the command that runs every backend. Among the
+frontend's suites is `tests/doc_links.rs`, which fails on any relative link in a Markdown file that
+resolves to nothing; among `sqleq-check`'s is the hygiene gate over every committed pair
+(`sqleq-check/tests/real_cases.rs`). The last line runs the
+[pinned pairs](tests/pairs/README.md) on the frontend, fuzz and sqleq-solver axes, the ones CI runs
+through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries;
+`cargo test -p sqleq-solver` builds no binary (that crate has no integration test), so the
+`cargo build` line before it makes sure of both opt-in ones. The Lean pins are checked by
+`cargo test -p sqleq-lean`, and the `qed` and `sqlsolver-jvm` pins only where those tools are
+installed.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
 `sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and the first build
 of `sqleq-solver` compiles Z3 from source, which takes minutes and needs cmake and a C++20
 compiler — so the root manifest sets `default-members = [".", "sqleq-check"]` and both are
-opt-in. `sqleq-lean`
-is opt-in too: it runs the Lean 4 toolchain that `lean/lean-toolchain` names, with `lake` on `PATH`
-(elan installs it, or put a release's `bin` there yourself), and its integration test fails rather
-than skips without it. `cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks
-its controls. CI gives each crate its own job for the same reason, and fetches Lean from a
+opt-in. `sqleq-lean` is opt-in too: it runs the Lean 4 toolchain that `lean/lean-toolchain` names,
+with `lake` on `PATH` (elan installs it, or put a release's `bin` there yourself), and its
+integration test fails rather than skips without it. `cd lean && lake build Sqleq SqleqTest`
+builds the Lean library and checks its controls. CI splits its jobs along the same lines — the
+frontend and `sqleq-check` share one, and each opt-in crate has its own — and fetches Lean from a
 digest-pinned release archive.
 
 ### Licensing
@@ -88,11 +93,19 @@ mis-lowering costs soundness, which is not. See [`docs/DESIGN.md`](docs/DESIGN.m
 **2. Anything that grows the provable set needs the fuzz-axis cross-check — and the run is its own
 control.** A change that makes more pairs provable is exactly the shape of a change that makes
 unsound pairs provable, so the claim is not "N more proofs" but "N more proofs and zero of them
-carries a counterexample". Run both axes over the same corpus and report the cross-tab; the cell
-where a prover says *equivalent* and `sqleq-fuzz` says *here is a counterexample* is the alarm, and
-it is also the control. Do **not** add a separate hand-built negative-control batch — in a two-axis
-run that control set already *is* a cell of the table, and building a second one invites reporting
-the easy half. See [`docs/VALIDATION.md`](docs/VALIDATION.md), *Each axis is the other's control*.
+carries a counterexample". Run the provers and `sqleq-fuzz` over the same corpus and report the
+cross-tab — one run does both:
+
+```sh
+sqleq-check --portfolio --expect report-only --corpus corpus.csv --json out.json
+```
+
+The cell where a prover says *equivalent* and `sqleq-fuzz` says *here is a counterexample* is the
+alarm, and it is also the control: `--portfolio` reports such a case as `alarm` and fails the run
+even under `report-only`. Do **not** add a separate hand-built negative-control batch — in a run
+over every axis that control set already *is* a cell of the table, and building a second one
+invites reporting the easy half. See [`docs/VALIDATION.md`](docs/VALIDATION.md) for why the run is
+its own control.
 
 The [pinned pairs](tests/pairs/README.md) are not that batch, and passing them is not that evidence.
 They are a regression pin: each records what every axis said about a pair whose truth is already
@@ -113,16 +126,27 @@ pairs" — rewrite it so the engineering reason survives without the figure.
 Two consequences:
 
 * The documentation carries no benchmark numbers at all.
-* No default may resolve on one machine only. Every path is an explicit flag, then a `$SQLEQ_*`
-  environment variable, then an error naming the variable — or `required=True` when it is the run's
-  primary input. A machine-specific default fails as *"nothing there"* rather than as *"you did not
-  say where"*, and the first is much more expensive to debug.
+* No default may resolve on one machine only. `sqleq-check` finds each backend by its flag, then
+  `--bin-dir` for the binaries this repository builds, then the backend's environment variable
+  (`$SQLEQ_FRONTEND`, `$SQLEQ_FUZZ`, `$SQLEQ_SOLVER_BIN`, `$SQLEQ_LEAN`, `$QED_PROVER`), then
+  `PATH`, then this checkout's own `target/` build, the newer of release and debug; the QED
+  prover's last resort is the newest Nix-built prover in `/nix/store`, and `sqleq-lean` skips
+  `PATH` and takes release before debug. A flag, a variable or a `--bin-dir` that names no
+  executable is an error, not a fallback — except that `sqleq-lean`'s `--lean-bin` and `$SQLEQ_LEAN`
+  fall through to the next candidate. No step is a path that exists on one developer's machine
+  only. An input with no such default —
+  the SQLSolver fork's tree and its dependency directory — must be named (`--sqlsolver-tree` or
+  `$SQLEQ_SQLSOLVER`, and `$SQLEQ_SQLSOLVER_DEPS`), and leaving it out is an error that names
+  both. A machine-specific default fails as *"nothing there"* rather than as *"you did not say
+  where"*, and the first is much more expensive to debug.
 
 ## Changes we are most interested in
 
 * **Lowering coverage.** Most undecided pairs in any run are undecided because the frontend refused
-  them, not because a prover gave up. `sqleq-frontend --csv <corpus.csv> -o <dir>` prints the top
-  refusal reasons, bucketed, at the end of the run; that list is the work queue.
+  them, not because a prover gave up. `sqleq-check --corpus <corpus.csv> --axes frontend --expect
+  report-only` counts the refusals by kind; for the finer list, the frontend's own corpus mode,
+  `sqleq-frontend --csv <corpus.csv> -o <dir>`, prints the top refusal reasons, bucketed by
+  construct, at the end of the run. That list is the work queue.
 * **Counterexample quality** in `sqleq-fuzz` — instance generation that reaches cases the current
   generators do not, without ever manufacturing a witness that is not one.
 * **Defects in the method itself.** [`docs/VALIDATION.md`](docs/VALIDATION.md) lists what this
@@ -135,7 +159,9 @@ that lowered alike — comes with that pair under [`tests/pairs/`](tests/pairs/R
 
 1. Minimize it on an invented schema. Nothing in it may come from a corpus that is not public.
 2. Write its `truth`, its `origin`, and a `witness` (not equivalent) or an `argument` (equivalent).
-3. Rebuild every binary, then run `sqleq-check --expect pinned --bless` with every axis you have.
+3. Rebuild every binary, then run `sqleq-check --expect pinned --bless --axes <list> <pair.sql>`
+   naming every axis you have: `--axes` defaults to `frontend,qed`, and a run takes one SQLSolver,
+   so `sqlsolver-jvm` is blessed in a second run beside `sqleq-solver`.
 4. Read the diff against `truth`, and show the pair fails on a build from before the fix.
 5. In the pull request, say why every pin that moved, moved.
 
