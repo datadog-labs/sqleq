@@ -619,6 +619,9 @@ fn parse_input(
     // Before anything reads the tree: sqlparser mis-parses `IS [NOT] DISTINCT FROM`, and lowering
     // the mis-parse is a false-proof channel. See `normalize`.
     normalize::fix_precedence(&mut statements)?;
+    // Also before anything reads the tree: sqlparser gives `TRY_CAST`/`SAFE_CAST` a `CAST`'s node,
+    // and every rewrite and lowering below would treat it as one.
+    casts::refuse_foreign_kinds(&statements)?;
     // Before the shape check and the placeholder passes, which see a `$N` only in an expression
     // position, and a typed literal's `DATE $1` is not one.
     normalize::desugar_special_forms(&mut statements);

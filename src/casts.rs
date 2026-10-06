@@ -81,9 +81,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    DataType, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, TimezoneInfo, Value as SqlValue, VisitMut,
-    VisitorMut,
+    visit_expressions, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Query,
+    Statement, TimezoneInfo, Value as SqlValue, VisitMut, VisitorMut,
 };
 
 use crate::catalog::{obj_name, FnDecl};
@@ -469,6 +469,31 @@ impl VisitorMut for Apply<'_> {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// Refuse every cast that is neither `CAST(x AS T)` nor `x::T`: `TRY_CAST(x AS T)` and
+/// `SAFE_CAST(x AS T)`, which yield `NULL` where `CAST` raises an error, and are not Postgres syntax.
+///
+/// sqlparser accepts both under the Postgres dialect and builds them the node it builds for a
+/// `CAST`, told apart only by `kind`. Nothing past this point reads `kind` — not the rules above, not
+/// inference, not lowering — so each would be lowered as a plain `CAST`, and a pair that differs
+/// only in which of the two it wrote would lower to one plan. Run on the parsed input before any
+/// rewrite, so no rule gets to hoist or wrap one first. A kind sqlparser adds later is refused too.
+pub fn refuse_foreign_kinds(statements: &[Statement]) -> Result<()> {
+    for st in statements {
+        let found = visit_expressions(st, |e| match e {
+            Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, .. } => ControlFlow::Continue(()),
+            Expr::Cast { kind, .. } => ControlFlow::Break(kind.clone()),
+            _ => ControlFlow::Continue(()),
+        });
+        match found {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(CastKind::TryCast) => return Err(unsupported("TRY_CAST")),
+            ControlFlow::Break(CastKind::SafeCast) => return Err(unsupported("SAFE_CAST")),
+            ControlFlow::Break(other) => return Err(unsupported(format!("cast written as {other:?}"))),
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite every cast in `queries`, updating `inf`'s identity maps to match.
