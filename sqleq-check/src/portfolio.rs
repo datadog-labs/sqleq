@@ -106,6 +106,14 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
     (if pending.is_empty() { UNDECIDED } else { TIMEOUT }, Vec::new(), pending)
 }
 
+/// The axes of an alarm on `case`, from what each axis in `axes` said of it: under one binding, one
+/// claims equivalence and another refutes it. Read off the same answers as [`verdict`], so a run
+/// without `--portfolio` sees exactly the alarms a portfolio would.
+pub fn alarm(case: &Case, axes: &[&str]) -> Option<Vec<String>> {
+    let (v, by, _) = verdict(&crate::pinned::observe(case, axes));
+    (v == ALARM).then_some(by)
+}
+
 /// Everything a portfolio case needs besides the case itself.
 pub struct Ctx<'a> {
     pub axes: &'a [&'static str],
