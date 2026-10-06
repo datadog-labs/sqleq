@@ -192,7 +192,9 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             };
             let ms = started.elapsed().as_millis();
             match &partial {
-                Some((ok, _)) => println!("{name}: {label} (ok={ok}/{}) {ms}ms", cfg.trials),
+                Some((ok, _)) => {
+                    println!("{name}: {label} (ok={ok}/{}) {ms}ms", cfg.total_trials())
+                }
                 None => println!("{name}: {label} {ms}ms"),
             }
             results

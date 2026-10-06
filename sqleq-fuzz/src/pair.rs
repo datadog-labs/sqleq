@@ -57,6 +57,13 @@ fn small_size(rng: &mut StdRng, nrows: usize) -> usize {
     }
 }
 
+impl Config {
+    /// How many trials a pair gets in all: the full-size ones and the small ones.
+    pub fn total_trials(&self) -> usize {
+        self.trials + self.trials / 4
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -426,7 +433,7 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     // tested; reporting it as ERROR (which the sticky `last_err` alone would do) hides that.
     let mut ok_trials = 0usize;
 
-    for i in 0..cfg.trials + small_trials {
+    for i in 0..cfg.total_trials() {
         // Every fifth trial is a small one, until there have been `small_trials` of them; see `Config`.
         let small = i % 5 == 4 && i / 5 < small_trials;
         let rng: &mut StdRng = if small {
