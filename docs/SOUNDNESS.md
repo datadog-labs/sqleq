@@ -128,11 +128,17 @@ what it is or refused:
 - **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
   two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
   coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.
+  A `USING (k)` whose left or right side has two `k` columns that no earlier `USING` merged is
+  refused, as Postgres rejects it, rather than compared with the first.
 - **An alias's column list renames by position.** In `t AS x(b, a)`, `x.b` is `t`'s first column,
   whatever that column is called. A list that leaves two columns with one name is refused.
 - **Parentheses in a `FROM` clause group.** `a LEFT JOIN (b JOIN c ON p) ON q` is lowered with its
   grouping, since it is not `(a LEFT JOIN b ON q) JOIN c ON p`, and the inner `ON` sees only the
   inner join's own tables. An aliased one, `(b JOIN c) AS x`, is refused.
+- **A comma groups too, loosest of all.** `FROM a, b RIGHT JOIN c ON p` is `a` crossed with
+  `b RIGHT JOIN c ON p`, not `(a CROSS JOIN b) RIGHT JOIN c ON p`, which keeps `c`'s rows when `a`
+  is empty. Each comma item is lowered as its own join tree, and its `ON` and `USING` see only that
+  tree's tables.
 
 ## A query that raises an error
 

@@ -1310,8 +1310,9 @@ fn a_parenthesized_join_condition_sees_the_outer_query_but_not_its_from_siblings
 
 #[test]
 fn using_reaches_into_a_parenthesized_join() {
-    // `x.b` against the first `b` of the parenthesized side, `y.b`.
-    let v = ok(&same(r#"SELECT "x"."a" FROM "t" AS "x" JOIN ("t" AS "y" JOIN "t" AS "z" ON TRUE) USING ("b")"#));
+    // `x.b` against the parenthesized side's one `b`, which its own `USING` merged: `y.b`. (With
+    // `ON TRUE` inside, that side would have two, which Postgres rejects.)
+    let v = ok(&same(r#"SELECT "x"."a" FROM "t" AS "x" JOIN ("t" AS "y" JOIN "t" AS "z" USING ("b")) USING ("b")"#));
     assert_eq!(compared(&top_join(&v)["condition"]), (1, 4));
 }
 

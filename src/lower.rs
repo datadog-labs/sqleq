@@ -1149,11 +1149,11 @@ fn order_key_value(
     lower_expr(cat, scope, fns, e)
 }
 
-/// A join step in a FROM clause. With both `on` and `precomputed` `None` this is an unrestricted
-/// join (a comma-separated item or a `CROSS JOIN`), lowered to a join on `TRUE`. `on` borrows the
-/// condition from the FROM AST (lifetime `'a`); `precomputed` carries one we built ourselves, which
-/// is how `USING` arrives — its equalities are resolved against the two sides of that one join
-/// rather than the finished scope. `upto` is how many bindings the FROM clause has once this
+/// A join step in a FROM item's join tree. With both `on` and `precomputed` `None` this is an
+/// unrestricted join (a `CROSS JOIN`, or the item's first factor), lowered to a join on `TRUE`. `on`
+/// borrows the condition from the FROM AST (lifetime `'a`); `precomputed` carries one we built
+/// ourselves, which is how `USING` arrives — its equalities are resolved against the two sides of
+/// that one join rather than the finished scope. `upto` is how many bindings the tree has once this
 /// step's factor is in: a parenthesized join brings several, so the step's index does not say
 /// where its row ends.
 struct Step<'a> {
@@ -1179,14 +1179,79 @@ impl Factor {
     }
 }
 
-/// Build the resolution scope and relation tree for a whole FROM clause (comma items become cross
-/// joins; each item may carry joins; factors may be base tables or derived tables). `outer` are the
+/// Build the resolution scope and relation tree for a whole FROM clause. `outer` are the
 /// enclosing-query bindings; this query's own bindings are offset past them so de-Bruijn indices stay
 /// absolute across nesting.
-fn build_from_clause<'a>(
+///
+/// A comma binds looser than any `JOIN`. Postgres reads `FROM a, b RIGHT JOIN c ON p` as `a`
+/// crossed with `b RIGHT JOIN c ON p`, and `p` — or a `USING` there — sees `b` and `c` but not `a`.
+/// Folding every item and join into one left-deep chain instead would give
+/// `(a CROSS JOIN b) RIGHT JOIN c ON p`, which keeps `c`'s rows when `a` is empty, and would let
+/// `p` and `USING` reach `a`. So each comma item is lowered as its own join tree, exactly as a
+/// parenthesized join is ([`join_tree_factor`]), and the items' trees are then cross-joined left
+/// to right.
+fn build_from_clause(
     cat: &Catalog,
     fns: &Fns,
-    from: &'a [TableWithJoins],
+    from: &[TableWithJoins],
+    outer: &[Binding],
+) -> Result<(Scope, Value)> {
+    let base = Scope::outer_width(outer);
+    let mut binds: Vec<Binding> = Vec::new();
+    let mut offset = base;
+    let mut merged: Vec<String> = Vec::new();
+    let mut merged_outer = false;
+    let mut coalesced: Vec<String> = Vec::new();
+    let mut rel: Option<Value> = None;
+
+    for item in from {
+        let f = join_tree_factor(cat, fns, item, offset, outer)?;
+        offset += f.width();
+        merged.extend(f.merged);
+        merged_outer |= f.merged_outer;
+        coalesced.extend(f.coalesced);
+        binds.extend(f.binds);
+        rel = Some(match rel {
+            None => f.rel,
+            Some(left) => {
+                let cond = json!({ "operator": "TRUE", "operand": [], "type": "BOOLEAN" });
+                json!({ "join": { "condition": cond, "left": left, "right": f.rel, "kind": "INNER" } })
+            }
+        });
+    }
+    let inner_count = binds.len();
+    binds.extend(outer.iter().cloned()); // outer appended for correlated resolution only
+    let scope = Scope { binds, inner_count, base, merged, merged_outer, coalesced };
+    Ok((scope, rel.expect("non-empty FROM")))
+}
+
+/// One FROM item's join tree (a factor and the joins that follow it), lowered on its own against
+/// the enclosing context, as a factor whose row starts at `offset`.
+///
+/// Its `ON` conditions and `USING` lists may name only its own tables, since Postgres hides the
+/// item's FROM siblings from them, and its relation numbers its columns from the enclosing width,
+/// like every other join input. Its bindings then move to where its columns sit in the enclosing
+/// row. Both a comma item and a parenthesized join are lowered this way.
+fn join_tree_factor(
+    cat: &Catalog,
+    fns: &Fns,
+    item: &TableWithJoins,
+    offset: usize,
+    outer: &[Binding],
+) -> Result<Factor> {
+    let (inner, rel) = build_join_tree(cat, fns, item, outer)?;
+    let shift = offset - Scope::outer_width(outer);
+    let binds = inner.inner().iter().map(|b| Binding { offset: b.offset + shift, ..b.clone() }).collect();
+    Ok(Factor { binds, rel, merged: inner.merged, merged_outer: inner.merged_outer, coalesced: inner.coalesced })
+}
+
+/// The scope and relation of one FROM item's join tree, numbered from the enclosing width: its
+/// first factor, then each join in turn, as a left-deep chain (factors may be base tables, derived
+/// tables or parenthesized joins).
+fn build_join_tree<'a>(
+    cat: &Catalog,
+    fns: &Fns,
+    item: &'a TableWithJoins,
     outer: &[Binding],
 ) -> Result<(Scope, Value)> {
     let base = Scope::outer_width(outer);
@@ -1198,49 +1263,46 @@ fn build_from_clause<'a>(
     let mut merged_outer = false;
     let mut coalesced: Vec<String> = Vec::new();
 
-    for item in from {
-        let f = from_factor(cat, fns, &item.relation, offset, outer)?;
+    let f = from_factor(cat, fns, &item.relation, offset, outer)?;
+    offset += f.width();
+    merged.extend(f.merged);
+    merged_outer |= f.merged_outer;
+    coalesced.extend(f.coalesced);
+    binds.extend(f.binds);
+    leaves.push(f.rel);
+    steps.push(Step { on: None, kind: "INNER", precomputed: None, upto: binds.len() });
+    for j in &item.joins {
+        let f = from_factor(cat, fns, &j.relation, offset, outer)?;
         offset += f.width();
+        let (kind, cond) = join_op(&j.join_operator)?;
+        // `USING` is resolved here, against the bindings as they stand: its names are looked up
+        // on the left of this join and on the factor being added, not through the whole scope.
+        let (on, precomputed) = match cond {
+            JoinCond::On(e) => (Some(e), None),
+            JoinCond::Always => (None, None),
+            JoinCond::Using(cols) => {
+                // A name a `RIGHT` or `FULL` join has merged is a coalesce of its two sides,
+                // which `using_condition` would read as whichever binding has the name first.
+                if cols.iter().any(|c| coalesced.contains(c) || f.coalesced.contains(c)) {
+                    return Err(unsupported("JOIN ... USING a column a RIGHT or FULL join already merged"));
+                }
+                let c = using_condition((&binds, &merged), (&f.binds, &f.merged), &cols)?;
+                if kind != "INNER" {
+                    merged_outer = true;
+                }
+                if matches!(kind, "RIGHT" | "FULL") {
+                    coalesced.extend(cols.iter().cloned());
+                }
+                merged.extend(cols);
+                (None, Some(c))
+            }
+        };
         merged.extend(f.merged);
         merged_outer |= f.merged_outer;
         coalesced.extend(f.coalesced);
         binds.extend(f.binds);
         leaves.push(f.rel);
-        // First of item: a cross join, unless it is the very first.
-        steps.push(Step { on: None, kind: "INNER", precomputed: None, upto: binds.len() });
-        for j in &item.joins {
-            let f = from_factor(cat, fns, &j.relation, offset, outer)?;
-            offset += f.width();
-            let (kind, cond) = join_op(&j.join_operator)?;
-            // `USING` is resolved here, against the bindings as they stand: its names are looked up
-            // on the left of this join and on the factor being added, not through the whole scope.
-            let (on, precomputed) = match cond {
-                JoinCond::On(e) => (Some(e), None),
-                JoinCond::Always => (None, None),
-                JoinCond::Using(cols) => {
-                    // A name a `RIGHT` or `FULL` join has merged is a coalesce of its two sides,
-                    // which `using_condition` would read as whichever binding has the name first.
-                    if cols.iter().any(|c| coalesced.contains(c) || f.coalesced.contains(c)) {
-                        return Err(unsupported("JOIN ... USING a column a RIGHT or FULL join already merged"));
-                    }
-                    let c = using_condition(&binds, &f.binds, &cols)?;
-                    if kind != "INNER" {
-                        merged_outer = true;
-                    }
-                    if matches!(kind, "RIGHT" | "FULL") {
-                        coalesced.extend(cols.iter().cloned());
-                    }
-                    merged.extend(cols);
-                    (None, Some(c))
-                }
-            };
-            merged.extend(f.merged);
-            merged_outer |= f.merged_outer;
-            coalesced.extend(f.coalesced);
-            binds.extend(f.binds);
-            leaves.push(f.rel);
-            steps.push(Step { on, kind, precomputed, upto: binds.len() });
-        }
+        steps.push(Step { on, kind, precomputed, upto: binds.len() });
     }
     let inner_count = binds.len();
     binds.extend(outer.iter().cloned()); // outer appended for correlated resolution only
@@ -1262,16 +1324,14 @@ fn build_from_clause<'a>(
             }
         });
     }
-    Ok((scope, rel.expect("non-empty FROM")))
+    Ok((scope, rel.expect("a join tree has a first factor")))
 }
 
 /// One FROM factor, lowered.
 ///
-/// A parenthesized join is lowered on its own, against the enclosing context. Its `ON` conditions
-/// may name only its own tables, since Postgres hides the factor's FROM siblings from them, and its
-/// relation numbers its columns from the enclosing width, like every other join input. Its
-/// bindings then move to where its columns sit in this row. The parentheses cannot simply be
-/// dropped: `a LEFT JOIN (b JOIN c ON p) ON q` is not `(a LEFT JOIN b ON q) JOIN c ON p`.
+/// A parenthesized join is lowered on its own, as [`join_tree_factor`] describes. The parentheses
+/// cannot simply be dropped: `a LEFT JOIN (b JOIN c ON p) ON q` is not
+/// `(a LEFT JOIN b ON q) JOIN c ON p`.
 fn from_factor(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, outer: &[Binding]) -> Result<Factor> {
     let TableFactor::NestedJoin { table_with_joins, alias } = tf else {
         let (b, rel) = factor_instance(cat, fns, tf, offset, outer)?;
@@ -1283,10 +1343,7 @@ fn from_factor(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, outer:
     if alias.is_some() {
         return Err(unsupported("parenthesized join with an alias"));
     }
-    let (inner, rel) = build_from_clause(cat, fns, std::slice::from_ref(table_with_joins.as_ref()), outer)?;
-    let shift = offset - Scope::outer_width(outer);
-    let binds = inner.inner().iter().map(|b| Binding { offset: b.offset + shift, ..b.clone() }).collect();
-    Ok(Factor { binds, rel, merged: inner.merged, merged_outer: inner.merged_outer, coalesced: inner.coalesced })
+    join_tree_factor(cat, fns, table_with_joins, offset, outer)
 }
 
 /// A single FROM relation factor -> (binding with output columns, leaf relation Value).
@@ -1441,19 +1498,36 @@ fn join_op(op: &JoinOperator) -> Result<(&'static str, JoinCond<'_>)> {
 }
 
 /// The `ON` equalities a `USING (c, ...)` stands for: `left.c = right.c` for each name, where
-/// `left` is everything joined so far and `right` is the factor being joined in (several bindings,
-/// for a parenthesized join).
-fn using_condition(left: &[Binding], right: &[Binding], cols: &[String]) -> Result<Value> {
+/// `left` is everything joined so far in this join tree and `right` is the factor being joined in
+/// (several bindings, for a parenthesized join). Each side comes with the names `USING` merged
+/// inside it.
+///
+/// Postgres requires the name to be present on each side exactly once, and raises "common column
+/// name … appears more than once" otherwise: `a JOIN b ON TRUE JOIN c USING (x)` with `x` in `a`
+/// and in `b` has no one left column to compare. A side's copies of a name are its bindings'
+/// columns of that name less one for each `USING` inside it that merged two of them into one, so
+/// `a JOIN b USING (x) JOIN c USING (x)` has one `x` on the left. When there is one, the first
+/// binding that has the name holds its value: the merge of an inner join equals both sides, and
+/// a `LEFT` join's is its left side's (a `RIGHT` or `FULL` join's coalesce is refused by the caller).
+fn using_condition(
+    (left, left_merged): (&[Binding], &[String]),
+    (right, right_merged): (&[Binding], &[String]),
+    cols: &[String],
+) -> Result<Value> {
     let mut terms: Vec<Value> = Vec::new();
     for c in cols {
-        // SQL requires the name to be present and unambiguous on each side.
-        let find = |bs: &[Binding]| -> Option<(usize, String)> {
-            bs.iter().find_map(|b| {
-                b.cols.iter().position(|(n, _)| n == c).map(|i| (b.offset + i, b.cols[i].1.clone()))
-            })
+        let find = |bs: &[Binding], merged: &[String], side: &str| -> Result<(usize, String)> {
+            let present: usize = bs.iter().map(|b| b.cols.iter().filter(|(n, _)| n == c).count()).sum();
+            let copies = present.saturating_sub(merged.iter().filter(|m| *m == c).count());
+            if copies > 1 {
+                return Err(schema(format!("common USING column {c} appears more than once on the {side}")));
+            }
+            bs.iter()
+                .find_map(|b| b.cols.iter().position(|(n, _)| n == c).map(|i| (b.offset + i, b.cols[i].1.clone())))
+                .ok_or_else(|| schema(format!("USING column {c} not on the {side}")))
         };
-        let (li, lt) = find(left).ok_or_else(|| schema(format!("USING column {c} not on the left")))?;
-        let (ri, rt) = find(right).ok_or_else(|| schema(format!("USING column {c} not on the right")))?;
+        let (li, lt) = find(left, left_merged, "left")?;
+        let (ri, rt) = find(right, right_merged, "right")?;
         terms.push(make_cmp("=", json!({ "column": li, "type": lt }), json!({ "column": ri, "type": rt })));
     }
     Ok(match terms.len() {
