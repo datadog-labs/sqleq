@@ -5,7 +5,7 @@
 
 //! The per-pair test loop: generate valid instances, run both sides, look for a counterexample.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -20,6 +20,7 @@ use crate::gen::{
     array_element_type, cast_target, lit, randval, randval_cast, randval_col, randval_need,
     CastTarget, Val,
 };
+use crate::limits;
 use crate::patterns as pat;
 use crate::rewrite;
 use crate::schema::{parse_schema, VType};
@@ -242,6 +243,13 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         return Verdict::NoTables;
     }
     let finals: Vec<String> = forms.keys().cloned().collect();
+    // Placeholders are read off the tokens, once: substitution splices values in at these offsets on
+    // every trial. A placeholder Postgres would reject (`$0`, a number past `u32`) is an error in the
+    // statement, not something to bind.
+    let (ph_a, ph_b) = match (pat::placeholders(&a), pat::placeholders(&b)) {
+        (Ok(pa), Ok(pb)) => (pa, pb),
+        (Err(e), _) | (_, Err(e)) => return Verdict::Error(e),
+    };
 
     // Held, not returned: the pair still runs, because whether it runs *at all* is the one question a
     // misaligned pair has left and only the trials can answer it.
@@ -285,19 +293,26 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         .map(|(n, _)| n.clone())
         .collect();
     let parray = pat::array_params(&a, &b, &arraycols);
-    let pnums = pat::param_nums(&a, &b);
-    let limit_params = pat::limit_params(&a, &b);
-    // Only neutralize a limit/offset param that is NOT also a value predicate (e.g. keyset pagination
-    // `WHERE id > $2 ... OFFSET $2`): binding a dual-purpose param large would hide the difference.
-    let neutralize: std::collections::HashSet<u32> = limit_params
+    let pnums: BTreeSet<u32> = ph_a.iter().chain(&ph_b).map(|p| p.n).collect();
+
+    // Row cuts (`LIMIT`/`OFFSET`/`FETCH`), read off the parse. Only neutralize a count param that is
+    // NOT also a value predicate (e.g. keyset pagination `WHERE id > $2 ... OFFSET $2`): binding a
+    // dual-purpose param large would hide the difference.
+    let cuts: Vec<limits::Cut> = limits::cuts(&a)
+        .into_iter()
+        .chain(limits::cuts(&b))
+        .collect();
+    let neutralize: std::collections::HashSet<u32> = cuts
         .iter()
-        .copied()
+        .flat_map(|c| c.params.iter().map(|(n, _)| *n))
         .filter(|n| !pcol.contains_key(n))
         .collect();
-    // Nondeterministic row selection/content: a literal LIMIT/OFFSET, a kept (non-neutralized) param
-    // limit that can still truncate, or a string-flattening aggregate.
-    let kept_limit = limit_params.iter().any(|n| !neutralize.contains(n));
-    let nondet = pat::has_literal_limit(&a, &b) || kept_limit || pat::has_nondet_agg(&a, &b);
+    // Nondeterministic row selection/content: a cut that cuts whatever is bound, a kept
+    // (non-neutralized) param count that can still truncate, or a string-flattening aggregate.
+    let cut_nondet = cuts
+        .iter()
+        .any(|c| c.fixed || c.params.iter().any(|(n, _)| !neutralize.contains(n)));
+    let nondet = cut_nondet || pat::has_nondet_agg(&a, &b);
 
     let is_query_a = is_query(&a);
     let is_query_b = is_query(&b);
@@ -471,8 +486,8 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             binds.insert(n, v);
         }
 
-        let sub_a = pat::substitute(&a, &binds);
-        let sub_b = pat::substitute(&b, &binds);
+        let sub_a = pat::substitute_at(&a, &ph_a, &binds);
+        let sub_b = pat::substitute_at(&b, &ph_b, &binds);
 
         let (ra, sa) = match run_side(
             &con, &sub_a, is_query_a, ret_a, mutates, &forms, &schema, &rowdata,

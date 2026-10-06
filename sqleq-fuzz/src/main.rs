@@ -15,9 +15,11 @@
 //!
 //! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`. Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
-//! usage and exits 2.
+//! usage and exits 2. A panic while testing one pair is that pair's `ERROR:panic: …` verdict, and in
+//! `csv` mode the worker goes on to the next row.
 
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,6 +110,28 @@ fn load_corpus(path: &str) -> Result<Vec<(String, String, String)>, String> {
     Ok(out)
 }
 
+/// Test one pair, turning a panic into that pair's `ERROR` verdict instead of the process's end.
+///
+/// A panic is a defect in this crate, never a fact about the pair, so it must not read as a verdict
+/// about it; but it must not take other rows down with it either. In `csv` mode an uncaught panic
+/// killed the worker thread that drew the row, and with it every row that worker would have run
+/// next, while the run still exited 0.
+fn guarded_test(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
+    guarded(|| test_pair(a, b, ddl, cfg))
+}
+
+/// Run `f`, turning a panic into an `ERROR:panic: …` verdict.
+fn guarded(f: impl FnOnce() -> Verdict) -> Verdict {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        Verdict::Error(format!("panic: {}", msg.lines().next().unwrap_or("")))
+    })
+}
+
 /// Where `csv` mode writes when no `out.json` is given: beside the corpus, as `<corpus>.fuzz.json`.
 /// A fixed path elsewhere would let two runs overwrite each other.
 fn default_out(corpus_path: &str) -> String {
@@ -160,7 +184,7 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             let started = std::time::Instant::now();
             let (label, partial) = match row.and_then(|r| corpus.get(r)) {
                 Some((a, b, ddl)) => {
-                    let v = test_pair(a, b, ddl, cfg);
+                    let v = guarded_test(a, b, ddl, cfg);
                     let p = v.partial().map(|(ok, e)| (ok, e.to_string()));
                     (v.label(), p)
                 }
@@ -173,18 +197,18 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             }
             results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(name.clone(), (label, partial, ms));
         }));
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    // A worker can only die now through a defect outside `test_pair`; its unfinished rows would be
+    // missing from the output, so that is the run's failure rather than a quiet gap.
+    let died = handles.into_iter().map(|h| h.join()).filter(Result::is_err).count();
 
     // Write `{name: {"verdict": label, "ms": wall}}` (a superset of the Python tester's output
     // shape). Partially-run pairs carry two extra keys; consumers that only read "verdict" are
     // unaffected.
-    let map = results.lock().unwrap();
+    let map = results.lock().unwrap_or_else(|e| e.into_inner());
     let json: serde_json::Map<String, serde_json::Value> = map
         .iter()
         .map(|(k, (label, partial, ms))| {
@@ -204,6 +228,13 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot write {out_path}: {e}"))?;
     eprintln!("wrote {} verdicts to {out_path}", map.len());
+    if died > 0 {
+        return Err(format!(
+            "{died} worker(s) died; {} of {} rows have no verdict",
+            work.len() - map.len(),
+            work.len()
+        ));
+    }
     Ok(())
 }
 
@@ -218,7 +249,7 @@ fn run_row(args: &[String], cfg: Config) -> Result<(), String> {
     let (a, b, ddl) = corpus
         .get(idx)
         .ok_or(format!("row {idx} out of range (len {})", corpus.len()))?;
-    report(&test_pair(a, b, ddl, cfg));
+    report(&guarded_test(a, b, ddl, cfg));
     Ok(())
 }
 
@@ -251,7 +282,7 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
         ));
     }
     let ddl = ddl_parts.join(";\n");
-    report(&test_pair(&queries[0], &queries[1], &ddl, cfg));
+    report(&guarded_test(&queries[0], &queries[1], &ddl, cfg));
     Ok(())
 }
 
@@ -338,7 +369,23 @@ fn report(v: &Verdict) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_out, split_statements};
+    use super::{default_out, guarded, split_statements};
+    use sqleq_fuzz::Verdict;
+
+    /// A panic inside one pair's test is that pair's `ERROR` verdict. It used to unwind through the
+    /// `csv` worker that drew the row, and every row that worker would have run next went missing.
+    #[test]
+    fn a_panic_is_the_rows_error_verdict() {
+        match guarded(|| panic!("boom")) {
+            Verdict::Error(e) => assert_eq!(e, "panic: boom"),
+            other => panic!("{other:?}"),
+        }
+        match guarded(|| panic!("{} went wrong", 1 + 1)) {
+            Verdict::Error(e) => assert_eq!(e, "panic: 2 went wrong"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(guarded(|| Verdict::NoSchema), Verdict::NoSchema));
+    }
 
     #[test]
     fn the_default_output_sits_beside_the_corpus() {

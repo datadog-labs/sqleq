@@ -3,7 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! The executable's own behaviour: `csv` mode writes beside its input (issue #67).
+//! The executable's own behaviour: `csv` mode keeps every row and writes beside its input
+//! (issues #63, #67).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,6 +24,10 @@ const DDL: &str = "create table t (id INTEGER, a INTEGER, unique (id))";
 fn corpus(dir: &Path) -> PathBuf {
     let rows = [
         ("SELECT id FROM t WHERE a = 1", "SELECT id FROM t WHERE 1 = a"),
+        (
+            "SELECT id FROM t WHERE a = $4294967296",
+            "SELECT id FROM t WHERE a = $4294967296",
+        ),
         ("SELECT id FROM t", "SELECT id FROM t WHERE a > 0"),
     ];
     let mut w = csv::Writer::from_path(dir.join("corpus.csv")).unwrap();
@@ -30,7 +35,7 @@ fn corpus(dir: &Path) -> PathBuf {
         w.write_record([a, b, DDL]).unwrap();
     }
     w.flush().unwrap();
-    std::fs::write(dir.join("names.txt"), "row0\nrow1\n").unwrap();
+    std::fs::write(dir.join("names.txt"), "row0\nrow1\nrow2\n").unwrap();
     dir.join("corpus.csv")
 }
 
@@ -39,6 +44,31 @@ fn verdicts(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     match serde_json::from_str(&text).unwrap() {
         serde_json::Value::Object(m) => m,
         other => panic!("{other}"),
+    }
+}
+
+/// One row that cannot be tested must not cost the others their verdicts. With one worker the row
+/// after it used to be missing, and the run still exited 0.
+#[test]
+fn csv_mode_gives_every_row_a_verdict() {
+    for jobs in ["1", "2"] {
+        let dir = scratch(&format!("rows-{jobs}"));
+        let corpus = corpus(&dir);
+        let out = dir.join("out.json");
+        let st = Command::new(BIN)
+            .args(["csv"])
+            .arg(&corpus)
+            .arg(dir.join("names.txt"))
+            .arg(&out)
+            .args(["--jobs", jobs, "--trials", "20"])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{st:?}");
+        let v = verdicts(&out);
+        assert_eq!(v.len(), 3, "jobs {jobs}: {v:?}");
+        let label = |k: &str| v[k]["verdict"].as_str().unwrap().to_string();
+        assert!(label("row1").starts_with("ERROR:"), "{v:?}");
+        assert_eq!(label("row2"), "NOT-EQUIVALENT");
     }
 }
 
@@ -56,5 +86,5 @@ fn csv_mode_writes_beside_its_input_by_default() {
         .output()
         .unwrap();
     assert!(st.status.success(), "{st:?}");
-    assert_eq!(verdicts(&dir.join("corpus.fuzz.json")).len(), 2);
+    assert_eq!(verdicts(&dir.join("corpus.fuzz.json")).len(), 3);
 }

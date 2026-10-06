@@ -6,15 +6,19 @@
 //! Text-level rewriting and analysis of the query pair.
 //!
 //! Several soundness rules live here:
-//!   * nondeterministic *functions* (random/uuid/nextval/clock_timestamp) make a pair untestable → skip;
+//!   * nondeterministic *functions* (random/uuid/nextval/clock_timestamp/txid_current, ...) make a
+//!     pair untestable → skip;
 //!   * runtime *time* sources (now/current_*) must be frozen, else A and B — run microseconds apart —
 //!     disagree spuriously;
 //!   * row-locking clauses (`FOR UPDATE`/`SHARE`) don't affect the result bag → strip so DuckDB runs;
-//!   * `LIMIT`/`OFFSET` over an unordered set makes the row *selection* nondeterministic. We bind
-//!     pure limit/offset params large (never truncate); a remaining literal or a dual-purpose param
-//!     limit marks the pair `nondet`, after which only cardinality differences are trusted (see pair.rs);
 //!   * a pair whose two queries number their parameters differently is not testable by substituting
 //!     one value per `$N` → [`misalignment`], and no verdict either way (see pair.rs).
+//!
+//! What decides a verdict is read off the token stream ([`crate::lex`]), never off raw text: the
+//! placeholders a statement has and where they are ([`placeholders`]), and the functions it calls
+//! ([`has_hard_nondet`]). The remaining patterns only *bias* the values drawn for a placeholder, and
+//! run over text whose literals and comments are blanked, so a `'$1'` is not a placeholder to them
+//! either. `LIMIT`/`OFFSET`/`FETCH` are read off the parse, in [`crate::limits`].
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
@@ -26,6 +30,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::gen::{lit, Val};
+use crate::lex::{lex, mask, significant, Tok};
+use sqlparser::tokenizer::Token;
 
 macro_rules! re {
     ($name:ident, $pat:expr) => {
@@ -41,10 +47,53 @@ re!(RETURNING_WORD, r"(?i)\breturning\b");
 // equivalence and would be reported as a counterexample. Neither is a statement about the rewrite, so
 // the pair is withdrawn rather than answered.
 re!(EXPLAIN, r"(?i)^\s*explain\b");
-// Truly nondeterministic functions: no way to make A and B agree → the pair is untestable.
+/// Functions whose value differs between two calls, or between the two sides of a pair -- each side
+/// runs as a statement of its own, so a function that is stable only within a transaction differs
+/// between them as well. No binding makes A and B agree on one, so a pair calling one is untestable.
+///
+/// The source of truth for which Postgres functions are volatile is the frontend's
+/// `sqleq_frontend::VOLATILE_FUNCTIONS` (every function Postgres's catalog marks volatile, plus the
+/// pgcrypto and uuid-ossp ones). This crate does not depend on the frontend, so it keeps the part of
+/// that list a query calls for a value -- random numbers and UUIDs, sequences, clocks that move,
+/// pgcrypto's salted output -- and must be kept in step with it by hand. It adds what is not volatile
+/// in Postgres's sense yet still differs between the two sides here: `txid_current()` and
+/// `pg_current_xact_id()`, stable within one transaction while each side runs in its own, the query's
+/// own text, and DuckDB's random `uuid()`. Matched on the bare function name, so
+/// `pg_catalog.random()` is caught too.
+const NONDET_FUNCS: &[&str] = &[
+    "random",
+    "random_normal",
+    "setseed",
+    "array_shuffle",
+    "array_sample",
+    "gen_random_bytes",
+    "gen_random_uuid",
+    "gen_salt",
+    "pgp_sym_encrypt",
+    "pgp_sym_encrypt_bytea",
+    "pgp_pub_encrypt",
+    "pgp_pub_encrypt_bytea",
+    "uuidv4",
+    "uuidv7",
+    "nextval",
+    "currval",
+    "setval",
+    "lastval",
+    "clock_timestamp",
+    "timeofday",
+    "current_query",
+    // Not Postgres functions, but DuckDB's random UUIDs.
+    "uuid",
+    "random_uuid",
+];
+/// Name families in the same class: `uuid_generate_v1`, `_v1mc`, `_v4`, `_v7`; `txid_current`,
+/// `txid_current_if_assigned`, `txid_current_snapshot`; `pg_current_xact_id[_if_assigned]`,
+/// `pg_current_snapshot` and the `pg_current_wal_*` positions.
+const NONDET_PREFIXES: &[&str] = &["uuid_generate", "txid_current", "pg_current_"];
+// The text-level form of the same list, used only when the tokenizer rejects a statement.
 re!(
     NONDET,
-    r"(?i)\b(random|gen_random_uuid|uuid_generate\w*|uuid|nextval|clock_timestamp)\s*\("
+    r"(?i)\b(random\w*|setseed|array_shuffle|array_sample|gen_random_\w+|gen_salt|pgp_\w+_encrypt\w*|uuid\w*|nextval|currval|setval|lastval|clock_timestamp|timeofday|current_query|txid_current\w*|pg_current_\w+)\s*\("
 );
 // Time sources evaluated at runtime. now()/etc. take parens; current_timestamp/localtimestamp are
 // bare keywords (a `()`-anchored pattern silently misses them).
@@ -67,14 +116,6 @@ re!(CURDATE, r"(?i)\bcurrent_date\b(?:\s*\(\s*\))?");
 re!(
     LOCKING,
     r#"(?i)\bfor\s+(?:update|share|no\s+key\s+update|key\s+share)\b(?:\s+of\s+[\w\s,."]+?)?(?:\s+(?:nowait|skip\s+locked))?\s*(\)|;|$)"#
-);
-re!(
-    LIMIT_PARAM,
-    r"(?i)\b(?:limit|offset)\s+\$(\d+)|\bfetch\s+(?:first|next)\s+\$(\d+)"
-);
-re!(
-    LIMIT_LIT,
-    r"(?i)\b(?:limit|offset)\s+\d+|\bfetch\s+(?:first|next)\s+\d+"
 );
 re!(
     NONDET_AGG,
@@ -177,19 +218,67 @@ pub fn has_explain(a: &str, b: &str) -> bool {
 }
 
 /// A pair using a truly nondeterministic function can't be tested for equivalence → NONDET-SKIP.
+///
+/// Read off the tokens: a function is called where its name is followed by `(`, so a column, an
+/// alias or a string literal spelling the name is not a call. A statement the tokenizer rejects
+/// falls back to the text-level pattern, which can only over-match -- skipping a pair it need not.
 pub fn has_hard_nondet(a: &str, b: &str) -> bool {
-    NONDET.is_match(a) || NONDET.is_match(b)
+    [a, b].iter().any(|sql| match significant(sql) {
+        Some(toks) => toks.windows(2).any(|w| match (&w[0].token, &w[1].token) {
+            (Token::Word(word), Token::LParen) => {
+                let name = word.value.to_lowercase();
+                NONDET_FUNCS.contains(&name.as_str())
+                    || NONDET_PREFIXES.iter().any(|p| name.starts_with(p))
+            }
+            _ => false,
+        }),
+        None => NONDET.is_match(sql),
+    })
 }
 
+/// What the frozen clocks read.
+const FROZEN_TS: &str = "TIMESTAMP '2020-06-01 00:00:00'";
+const FROZEN_TIME: &str = "TIME '12:00:00'";
+const FROZEN_DATE: &str = "DATE '2020-06-01'";
+
 /// Freeze runtime time sources to constants and strip row-locking clauses.
+///
+/// The patterns match over the [`mask`]ed statement and the edits land at the same offsets in the
+/// real one, so a `'now()'` in a string literal or a comment stays as written.
 pub fn freeze_time(sql: &str) -> String {
-    let s = NOWFN.replace_all(sql, "TIMESTAMP '2020-06-01 00:00:00'");
-    let s = NOWKW.replace_all(&s, "TIMESTAMP '2020-06-01 00:00:00'");
-    let s = CURTIMEKW.replace_all(&s, "TIME '12:00:00'");
-    let s = CURDATE.replace_all(&s, "DATE '2020-06-01'");
-    // Drop the locking clause but keep whatever terminated it (`)` / `;` / end of string).
-    let trimmed = s.trim_end();
-    LOCKING.replace_all(trimmed, "${1}").into_owned()
+    let sql = sql.trim_end();
+    let mut cur = (sql.to_string(), mask(sql).unwrap_or_else(|| sql.to_string()));
+    for (re, rep) in [
+        (&*NOWFN, FROZEN_TS),
+        (&*NOWKW, FROZEN_TS),
+        (&*CURTIMEKW, FROZEN_TIME),
+        (&*CURDATE, FROZEN_DATE),
+        // Drop the locking clause but keep whatever terminated it (`)` / `;` / end of string).
+        (&*LOCKING, "${1}"),
+    ] {
+        cur = replace_outside_literals(&cur.0, &cur.1, re, rep);
+    }
+    cur.0
+}
+
+/// Replace every match of `re` in `masked` -- the same statement as `sql` with its literals and
+/// comments blanked -- in both strings at once, so the two stay aligned for the next pattern.
+fn replace_outside_literals(sql: &str, masked: &str, re: &Regex, rep: &str) -> (String, String) {
+    let (mut out, mut out_masked) = (String::new(), String::new());
+    let mut last = 0;
+    for caps in re.captures_iter(masked) {
+        let m = caps.get(0).unwrap();
+        let mut with = String::new();
+        caps.expand(rep, &mut with);
+        out.push_str(&sql[last..m.start()]);
+        out_masked.push_str(&masked[last..m.start()]);
+        out.push_str(&with);
+        out_masked.push_str(&with);
+        last = m.end();
+    }
+    out.push_str(&sql[last..]);
+    out_masked.push_str(&masked[last..]);
+    (out, out_masked)
 }
 
 /// The last dotted component of `name`, lower-cased, if it is a known column.
@@ -242,33 +331,33 @@ fn operand_is_array(operand: &str, cast: Option<&str>, arraycols: &HashSet<Strin
 /// be drawn from that column's generated data and equality filters actually match rows.
 pub fn param_cols(a: &str, b: &str, cols: &HashSet<String>) -> HashMap<u32, String> {
     let mut out: HashMap<u32, String> = HashMap::new();
-    for sql in [a, b] {
+    for sql in [masked(a), masked(b)] {
+        let sql = sql.as_str();
         for caps in IN_LIST.captures_iter(sql) {
             if let Some(col) = known_col(&caps[1], cols) {
-                for m in PARAM.captures_iter(&caps[2]) {
-                    out.entry(m[1].parse().unwrap())
-                        .or_insert_with(|| col.clone());
+                for n in PARAM.captures_iter(&caps[2]).filter_map(|m| m[1].parse().ok()) {
+                    out.entry(n).or_insert_with(|| col.clone());
                 }
             }
         }
         for caps in ANY_COL_PARAM.captures_iter(sql) {
-            if let Some(col) = known_col(&caps[1], cols) {
-                out.entry(caps[2].parse().unwrap()).or_insert(col);
+            if let (Some(col), Ok(n)) = (known_col(&caps[1], cols), caps[2].parse()) {
+                out.entry(n).or_insert(col);
             }
         }
         for caps in PARAM_ANY_COL.captures_iter(sql) {
-            if let Some(col) = known_col(&caps[2], cols) {
-                out.entry(caps[1].parse().unwrap()).or_insert(col);
+            if let (Some(col), Ok(n)) = (known_col(&caps[2], cols), caps[1].parse()) {
+                out.entry(n).or_insert(col);
             }
         }
         for caps in CMP_COL_PARAM.captures_iter(sql) {
-            if let Some(col) = known_col(&caps[1], cols) {
-                out.entry(caps[2].parse().unwrap()).or_insert(col);
+            if let (Some(col), Ok(n)) = (known_col(&caps[1], cols), caps[2].parse()) {
+                out.entry(n).or_insert(col);
             }
         }
         for caps in CMP_PARAM_COL.captures_iter(sql) {
-            if let Some(col) = known_col(&caps[2], cols) {
-                out.entry(caps[1].parse().unwrap()).or_insert(col);
+            if let (Some(col), Ok(n)) = (known_col(&caps[2], cols), caps[1].parse()) {
+                out.entry(n).or_insert(col);
             }
         }
         // `col && $1`, `$1 <@ col`, `ARRAY[$1, $2]::text[] <@ col`, `col @> ARRAY[$3]`. The last two
@@ -284,9 +373,8 @@ pub fn param_cols(a: &str, b: &str, cols: &HashSet<String>) -> HashMap<u32, Stri
                 if let Some(n) = operand_param(operand) {
                     out.entry(n).or_insert(col);
                 } else if starts_with_array(operand) {
-                    for m in PARAM.captures_iter(operand) {
-                        out.entry(m[1].parse().unwrap())
-                            .or_insert_with(|| col.clone());
+                    for n in PARAM.captures_iter(operand).filter_map(|m| m[1].parse().ok()) {
+                        out.entry(n).or_insert_with(|| col.clone());
                     }
                 }
             }
@@ -316,13 +404,13 @@ pub fn array_params(a: &str, b: &str, arraycols: &HashSet<String>) -> BTreeSet<u
     // array everywhere it appears.
     let mut in_array: HashMap<u32, HashSet<(usize, usize)>> = HashMap::new();
     let mut total: HashMap<u32, HashSet<(usize, usize)>> = HashMap::new();
-    for (side, sql) in [a, b].into_iter().enumerate() {
+    for (side, sql) in [masked(a), masked(b)].iter().enumerate() {
+        let sql = sql.as_str();
         for caps in ARRAY_ARG_PARAM.captures_iter(sql) {
             let m = caps.get(1).unwrap();
-            in_array
-                .entry(m.as_str().parse().unwrap())
-                .or_default()
-                .insert((side, m.start()));
+            if let Ok(n) = m.as_str().parse() {
+                in_array.entry(n).or_default().insert((side, m.start()));
+            }
         }
         for caps in ARRAY_OP_APP.captures_iter(sql) {
             let (l, r) = (caps.get(1).unwrap(), caps.get(3).unwrap());
@@ -345,10 +433,9 @@ pub fn array_params(a: &str, b: &str, arraycols: &HashSet<String>) -> BTreeSet<u
         }
         for caps in PARAM.captures_iter(sql) {
             let m = caps.get(1).unwrap();
-            total
-                .entry(m.as_str().parse().unwrap())
-                .or_default()
-                .insert((side, m.start()));
+            if let Ok(n) = m.as_str().parse() {
+                total.entry(n).or_default().insert((side, m.start()));
+            }
         }
     }
     in_array
@@ -361,25 +448,75 @@ pub fn array_params(a: &str, b: &str, arraycols: &HashSet<String>) -> BTreeSet<u
 /// Map each `$N` carrying an explicit `::type` cast to that raw type name (first match wins).
 pub fn param_casts(a: &str, b: &str) -> HashMap<u32, String> {
     let mut out: HashMap<u32, String> = HashMap::new();
-    for sql in [a, b] {
-        for caps in PARAM_CAST.captures_iter(sql) {
-            out.entry(caps[1].parse().unwrap())
-                .or_insert_with(|| caps[2].trim().to_string());
+    for sql in [masked(a), masked(b)] {
+        for caps in PARAM_CAST.captures_iter(&sql) {
+            if let Ok(n) = caps[1].parse() {
+                out.entry(n).or_insert_with(|| caps[2].trim().to_string());
+            }
         }
     }
     out
 }
 
+/// `sql` with its literals and comments blanked ([`mask`]), for the value-biasing patterns; the
+/// statement itself if the tokenizer rejects it.
+fn masked(sql: &str) -> String {
+    mask(sql).unwrap_or_else(|| sql.to_string())
+}
+
+/// One `$N` placeholder: its number and the byte range it spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placeholder {
+    pub n: u32,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Every `$N` placeholder in `sql`, in order, found on the token stream -- so the same characters
+/// inside a string literal, a quoted identifier or a comment are not one.
+///
+/// A placeholder Postgres would reject is an error rather than something to skip or wrap: `$0`, a
+/// number past `u32`, or `$1abc` (`there is no parameter $0`, `trailing junk after parameter`). A
+/// statement the tokenizer rejects is an error only if it could hold a placeholder at all.
+pub fn placeholders(sql: &str) -> Result<Vec<Placeholder>, String> {
+    let Some(toks) = lex(sql) else {
+        return if sql.contains('$') {
+            Err("statement could not be tokenized to find its parameters".to_string())
+        } else {
+            Ok(Vec::new())
+        };
+    };
+    let mut out = Vec::new();
+    for Tok {
+        token, start, end, ..
+    } in toks
+    {
+        let Token::Placeholder(p) = token else {
+            continue;
+        };
+        let Some(digits) = p.strip_prefix('$') else {
+            continue; // `?` and `:name` are not Postgres placeholders, and DuckDB will say so
+        };
+        match digits.parse::<u32>() {
+            Ok(n) if n > 0 && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                out.push(Placeholder { n, start, end })
+            }
+            _ => return Err(format!("there is no parameter {p}")),
+        }
+    }
+    Ok(out)
+}
+
 /// The `$N` placeholders one query mentions.
 ///
-/// Text-level, exactly like [`substitute`], and deliberately so: what this returns is the set
-/// substitution will replace, so a check built on it is a check on the binding sqleq-fuzz actually
-/// performs rather than on one a parser would infer for it.
+/// The same set substitution replaces ([`placeholders`], [`substitute_at`]), so a check built on it
+/// is a check on the binding sqleq-fuzz actually performs. A statement whose placeholders cannot be
+/// read gives the empty set; [`crate::pair::test_pair`] reports such a statement as an error before
+/// it asks.
 pub fn params_of(sql: &str) -> BTreeSet<u32> {
-    PARAM
-        .captures_iter(sql)
-        .map(|caps| caps[1].parse().unwrap())
-        .collect()
+    placeholders(sql)
+        .map(|ps| ps.iter().map(|p| p.n).collect())
+        .unwrap_or_default()
 }
 
 /// All `$N` placeholders appearing in the pair.
@@ -483,24 +620,6 @@ pub fn misalignment(a: &str, b: &str) -> Option<String> {
     ))
 }
 
-/// Params used directly as a `LIMIT`/`OFFSET`/`FETCH` count.
-pub fn limit_params(a: &str, b: &str) -> BTreeSet<u32> {
-    let mut out = BTreeSet::new();
-    for sql in [a, b] {
-        for caps in LIMIT_PARAM.captures_iter(sql) {
-            // Exactly one of the two alternation groups is present per match.
-            for g in [caps.get(1), caps.get(2)].into_iter().flatten() {
-                out.insert(g.as_str().parse().unwrap());
-            }
-        }
-    }
-    out
-}
-
-pub fn has_literal_limit(a: &str, b: &str) -> bool {
-    LIMIT_LIT.is_match(a) || LIMIT_LIT.is_match(b)
-}
-
 pub fn has_nondet_agg(a: &str, b: &str) -> bool {
     NONDET_AGG.is_match(a) || NONDET_AGG.is_match(b)
 }
@@ -552,12 +671,25 @@ fn stmt_returns(stmt: &Statement) -> bool {
     }
 }
 
-/// Substitute every `$N` with the SQL literal of its bound value.
+/// Substitute every `$N` with the SQL literal of its bound value. A statement whose placeholders
+/// cannot be read is returned as it is.
 pub fn substitute(sql: &str, binds: &HashMap<u32, Val>) -> String {
-    PARAM
-        .replace_all(sql, |caps: &regex::Captures| {
-            let n: u32 = caps[1].parse().unwrap();
-            binds.get(&n).map(lit).unwrap_or_else(|| "NULL".to_string())
-        })
-        .into_owned()
+    match placeholders(sql) {
+        Ok(ps) => substitute_at(sql, &ps, binds),
+        Err(_) => sql.to_string(),
+    }
+}
+
+/// Substitute the placeholders `ps` ([`placeholders`] of `sql`) with the SQL literals of their bound
+/// values, by position: nothing but those byte ranges changes.
+pub fn substitute_at(sql: &str, ps: &[Placeholder], binds: &HashMap<u32, Val>) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for p in ps {
+        out.push_str(&sql[last..p.start]);
+        out.push_str(&binds.get(&p.n).map(lit).unwrap_or_else(|| "NULL".to_string()));
+        last = p.end;
+    }
+    out.push_str(&sql[last..]);
+    out
 }

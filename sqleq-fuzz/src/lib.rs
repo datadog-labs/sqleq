@@ -28,6 +28,8 @@
 
 pub mod duck;
 pub mod gen;
+pub mod lex;
+pub mod limits;
 pub mod pair;
 pub mod patterns;
 pub mod rewrite;

@@ -41,11 +41,13 @@ deterministic. The rules:
   database admits. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over
   the raw DDL; partial indexes are treated as *total* (conservative — only shrinks the valid space).
 - **Freeze time.** `now()`/`statement_timestamp()` and the bare `current_timestamp`/`localtimestamp`
-  keywords are frozen; otherwise A and B (run microseconds apart) disagree spuriously.
-- **`LIMIT`/`OFFSET` over an unordered set.** Pure row-limit params are bound large (never truncate).
-  A remaining literal limit, a dual-purpose param limit, or a string-flattening aggregate marks the
-  pair *nondeterministic*, after which only **cardinality** differences (which stay deterministic)
-  are trusted.
+  keywords are frozen; otherwise A and B (run microseconds apart) disagree spuriously. A clock spelled
+  inside a string literal or a comment is left alone.
+- **`LIMIT`/`OFFSET` over an unordered set.** The clauses are read off the parse, so `LIMIT (1)`,
+  `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. Pure row-count params (a bare `$N` and nothing else)
+  are bound large (never truncate). Any other cut, a dual-purpose param count, or a
+  string-flattening aggregate marks the pair *nondeterministic*, after which only **cardinality**
+  differences (which stay deterministic) are trusted.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
 - **Compare numbers by value, not by type.** A declared `bigint` is materialized as DuckDB `INTEGER`,
@@ -56,6 +58,10 @@ deterministic. The rules:
   reads it as single-precision `REAL`, so a `::float` cast would compute a different value from the
   same cast spelled `::double precision`. Bare `float` cast targets are rewritten to `DOUBLE` before
   anything runs; `float(p)`, `float4`, `float8` and `real` already agree between the two.
+- **Read placeholders off the tokens.** `$N` is found by the tokenizer, never inside a string literal
+  or a comment, and substituted at those positions only. A placeholder Postgres would reject (`$0`,
+  a number past `u32`) makes the pair `ERROR`. Nondeterministic functions are recognised the same
+  way, as calls rather than as text.
 - **Don't invent a parameter correspondence.** See the next section.
 - **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
   functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as
@@ -168,7 +174,8 @@ reached by a `partial: K trials compared both sides; last error: …` line. Thos
 `NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
 only some trials compared both sides), and writes `{ "pairNNNN": { "verdict": "...", "ms": ... } }`
 to `out.json` (default: beside the corpus, its extension replaced by `.fuzz.json`), adding
-`ok_trials` and `trial_error` for a partial run. A name whose digits number no row gets `NO-ROW`.
+`ok_trials` and `trial_error` for a partial run. A name whose digits number no row gets `NO-ROW`. A
+panic while testing one row is that row's `ERROR:panic: …`, and the run goes on to the next one.
 
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
 `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
@@ -176,8 +183,8 @@ a `:` still bucket correctly for a consumer that splits on the first one.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file without exactly two
-statements, `row` without an index); `2` when the mode is missing or unknown, after printing the
-usage.
+statements, `row` without an index), or when a `csv` worker died and left rows without a verdict;
+`2` when the mode is missing or unknown, after printing the usage.
 
 ### The generated value domain (why a literal can make a pair look equivalent)
 
