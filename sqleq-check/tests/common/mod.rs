@@ -87,6 +87,13 @@ esac
 pos=""
 for a in "$@"; do case "$a" in --*) ;; *) pos="$pos $a" ;; esac; done
 set -- $pos
+# A single pair refuses as the real binary does: the refusal last on stderr, after the reflexive
+# note ($FAKE_FE_NOTE) when the two sides are one query.
+case "${FAKE_FE_STATUS:-emit}" in
+emit) ;;
+reflexive) printf '%s\n' "$FAKE_FE_NOTE" "unsupported: LIMIT" >&2; exit 1 ;;
+*) printf '%s\n' "unsupported: LIMIT" >&2; exit 1 ;;
+esac
 printf '{"schemas": [], "queries": [{"scan": 0}, {"scan": 1}]}' > "$2"
 "#;
 

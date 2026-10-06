@@ -193,3 +193,50 @@ fn the_rendered_forms_agree_with_the_verdict() {
     assert_ne!(a, b);
     assert_eq!(reflexive_forms("SELECT 1;", Rewrites::ALL), None);
 }
+
+/// The binary says so too. `sqleq-frontend <input.sql>` on a refused pair that is nonetheless
+/// reflexive writes [`sqleq_frontend::REFLEXIVE_NOTE`] on a line of its own *before* the refusal,
+/// so the refusal is still the last line and the exit code still says no plan was written; a
+/// refused pair that is not reflexive, and a pair that lowers, write no such line.
+#[test]
+fn the_single_file_mode_reports_a_reflexive_refusal() {
+    let dir = std::env::temp_dir().join(format!("sqleq-reflexive-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ddl = "create table t (a int);\ncreate table u (x int);\n";
+    let run = |name: &str, a: &str, b: &str| {
+        let input = dir.join(format!("{name}.sql"));
+        std::fs::write(&input, format!("{ddl}{}\n", pair(a, b))).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_sqleq-frontend"))
+            .arg(&input)
+            .arg(dir.join(format!("{name}.json")))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let lines: Vec<String> =
+            stderr.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        (out.status.success(), lines)
+    };
+
+    let (ok, lines) = run(
+        "refused_reflexive",
+        "SELECT row_number() OVER (ORDER BY a) FROM t WHERE a IN (SELECT DISTINCT x FROM u)",
+        "SELECT row_number() OVER (ORDER BY a) FROM t WHERE a IN (SELECT x FROM u)",
+    );
+    assert!(!ok, "a refusal is still a failure: no plan was written");
+    assert_eq!(lines.first().map(String::as_str), Some(sqleq_frontend::REFLEXIVE_NOTE));
+    assert_ne!(lines.last().map(String::as_str), Some(sqleq_frontend::REFLEXIVE_NOTE),
+               "the refusal itself must stay the last line");
+
+    let (ok, lines) = run(
+        "refused_different",
+        "SELECT row_number() OVER (ORDER BY a) FROM t",
+        "SELECT rank() OVER (ORDER BY a) FROM t",
+    );
+    assert!(!ok);
+    assert!(!lines.iter().any(|l| l == sqleq_frontend::REFLEXIVE_NOTE), "{lines:?}");
+
+    let (ok, lines) = run("lowered", "SELECT a FROM t", "SELECT a FROM t");
+    assert!(ok, "{lines:?}");
+    assert!(!lines.iter().any(|l| l == sqleq_frontend::REFLEXIVE_NOTE));
+    let _ = std::fs::remove_dir_all(&dir);
+}

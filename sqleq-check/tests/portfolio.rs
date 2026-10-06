@@ -246,3 +246,35 @@ fn what_a_portfolio_cannot_be_combined_with_is_a_setup_error() {
         assert_eq!(ran.code, 2, "{extra:?}: {}{}", ran.out, ran.err);
     }
 }
+
+/// A pair the frontend refuses, but whose two sides normalize to one query, is settled all the same:
+/// the frontend's `reflexive` is the evidence, with no plan and no prover. A counterexample against
+/// it is an alarm, and a refusal without it decides nothing.
+#[test]
+fn a_refused_pair_whose_sides_are_one_query_is_equivalent() {
+    let f = setup();
+    let mut p = Portfolio::new(&f);
+    p.set("FAKE_FE_STATUS", "reflexive").set("FAKE_FE_NOTE", sqleq_frontend::REFLEXIVE_NOTE);
+    let (ran, c) = p.case(&["--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(c["reflexive"], true, "{c}");
+    assert_eq!((verdict(&c), strings(&c["portfolio"]["by"])), ("equivalent", vec![s("frontend")]));
+    assert_eq!(p.run(&["--expect", "equivalent"]).code, 0, "an equivalent case passes --expect equivalent");
+    // The summary says what settled it, and keeps it out of `capability`: its two sides differ in
+    // text alone, which is not what that figure measures.
+    assert_eq!(c["trivial"], false, "the capability check below is vacuous unless the texts differ");
+    let ran = p.run(&["--expect", "report-only"]);
+    let block = ran.out.split_once("Portfolio").map(|(_, b)| b).unwrap_or_default();
+    assert!(block.contains("reflexivity alone 1"), "{}", ran.out);
+    assert!(!block.contains("capability"), "{}", ran.out);
+
+    p.set("FAKE_FUZZ", "NOT-EQUIVALENT");
+    let (ran, c) = p.case(&["--expect", "report-only"]);
+    assert_eq!((verdict(&c), ran.code), ("alarm", 1));
+
+    p.set("FAKE_FUZZ", "NO-COUNTEREXAMPLE").set("FAKE_FE_STATUS", "refuse");
+    let (_, c) = p.case(&["--expect", "report-only"]);
+    assert!(c.get("reflexive").is_none(), "{c}");
+    assert_eq!(verdict(&c), "undecided");
+}
+

@@ -154,6 +154,19 @@ fn a_refused_row_carries_its_reason_and_whether_reflexivity_settled_it() {
 }
 
 #[test]
+fn the_portfolio_credits_a_reflexive_row() {
+    let f = Fakes::new();
+    let mut r = Run::new(&f);
+    r.set("FAKE_FE_STATUS", "reflexive");
+    let (_, cases) = r.cases(&["--portfolio", "--axes", "frontend,qed"]);
+    assert_eq!(cases[0]["portfolio"]["verdict"], "equivalent", "{}", cases[0]);
+    assert_eq!(cases[0]["portfolio"]["by"], serde_json::json!(["frontend"]));
+    r.set("FAKE_FE_STATUS", "refuse");
+    let (_, cases) = r.cases(&["--portfolio", "--axes", "frontend,qed"]);
+    assert_eq!(cases[0]["portfolio"]["verdict"], "undecided", "{}", cases[0]);
+}
+
+#[test]
 fn jsonl_streams_every_case_and_resume_skips_the_ones_it_holds() {
     let f = Fakes::new();
     let r = Run::new(&f);

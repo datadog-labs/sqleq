@@ -33,6 +33,10 @@ pub fn observe(case: &Case, axes: &[&str]) -> HashMap<String, (String, String)> 
     if axes.contains(&"frontend") {
         if case.lowered {
             put("frontend", if case.trivial == Some(true) { "emit-reflexive" } else { "emit" }, "");
+        } else if case.status == REFUSED && case.reflexive {
+            // Refused, but the two sides normalize to one query: settled all the same, and the
+            // refusal's reason kept as the note.
+            put("frontend", "reflexive", &case.message);
         } else if case.status == REFUSED {
             put("frontend", &format!("refuse:{}", case.refuse_kind), &case.message);
         } else if case.status == TIMEOUT {

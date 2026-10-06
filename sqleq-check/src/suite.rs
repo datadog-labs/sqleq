@@ -78,6 +78,11 @@ pub fn axis_bindings(axis: &str) -> &'static [&'static str] {
 
 pub const PROVED_WORDS: [&str; 2] = ["proved", "proved-literal"];
 
+/// The frontend's two ways of finding the sides one query: `emit-reflexive`, lowered to the same
+/// IR, and `reflexive`, refused but normalized to the same tree. Either settles the pair without a
+/// prover, so either is a claim of equivalence -- and against a fuzz counterexample, an alarm.
+pub const FRONTEND_SAME: [&str; 2] = ["emit-reflexive", "reflexive"];
+
 /// What may be pinned, per axis. Only the stable *kind* of an answer is pinned, never its message,
 /// so rewording a refusal does not move a pin and changing what is refused does.
 pub fn words(axis: &str) -> &'static [&'static str] {
@@ -85,6 +90,7 @@ pub fn words(axis: &str) -> &'static [&'static str] {
         "frontend" => &[
             "emit",
             "emit-reflexive",
+            "reflexive",
             "refuse:parse",
             "refuse:unsupported",
             "refuse:schema",
@@ -132,6 +138,7 @@ pub fn claims_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
     }
     match axis {
         "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
+        "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather", "no-witness"],
         _ => &[],
     }
@@ -147,6 +154,7 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
     }
     match axis {
         "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
+        "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather"],
         _ => &[],
     }
@@ -359,9 +367,7 @@ pub fn contradicts(truth: Option<&str>, axis: &str, word: &str, binding: &str) -
         return false;
     }
     match truth {
-        Some(NOT_EQUIVALENT) => {
-            claims_equivalent(axis, binding).contains(&word) || (axis == "frontend" && word == "emit-reflexive")
-        }
+        Some(NOT_EQUIVALENT) => claims_equivalent(axis, binding).contains(&word),
         Some(EQUIVALENT) => refutes(axis).contains(&word),
         _ => false,
     }
@@ -427,7 +433,9 @@ pub fn lint(h: &Header) -> Vec<String> {
         errs.push(if gather {
             format!("an equivalent pair needs `expect lean: {proved}` or an `argument:`")
         } else {
-            "an equivalent pair needs a prover's `proved` pin or an `argument:`".to_string()
+            "an equivalent pair needs a prover's `proved` pin, the frontend's `reflexive` or \
+             `emit-reflexive`, or an `argument:`"
+                .to_string()
         });
     }
     errs
@@ -701,11 +709,11 @@ mod tests {
                 vec!["-- truth: not-equivalent", "-- origin: x", "-- expect fuzz: no-counterexample"],
             ),
             (
-                "needs a prover's `proved` pin or an `argument:`",
+                "needs a prover's `proved` pin, the frontend's `reflexive` or `emit-reflexive`, or an `argument:`",
                 vec!["-- truth: equivalent", "-- origin: x", "-- expect qed: no-proof"],
             ),
             (
-                "needs a prover's `proved` pin or an `argument:`",
+                "needs a prover's `proved` pin, the frontend's `reflexive` or `emit-reflexive`, or an `argument:`",
                 // A proof that is itself marked unsound is no evidence for anything.
                 vec!["-- truth: equivalent", "-- origin: x", "-- expect fuzz: counterexample"],
             ),
@@ -804,6 +812,17 @@ mod tests {
     }
 
     #[test]
+    fn the_frontends_reflexive_answers_are_evidence_on_their_own() {
+        for word in FRONTEND_SAME {
+            let pin = format!("-- expect frontend: {word}");
+            let directives = ["-- truth: equivalent", "-- origin: a test", pin.as_str()];
+            assert_eq!(errors(&directives), Vec::<String>::new(), "{word}");
+        }
+        let refused = ["-- truth: equivalent", "-- origin: a test", "-- expect frontend: refuse:unsupported"];
+        assert!(errors(&refused).iter().any(|e| e.contains("an equivalent pair needs")));
+    }
+
+    #[test]
     fn a_pin_below_the_sql_is_an_error_not_a_comment() {
         let errs = lint(&parse_header(&pair_sql(&NEQ_OK, &format!("{SQL}-- expect qed: no-proof\n"))));
         assert!(errs.iter().any(|e| e.contains("below the first SQL line")), "{errs:?}");
@@ -814,6 +833,7 @@ mod tests {
         for directives in [
             with(&NEQ_OK, &["-- expect qed: proved !known-unsound"]),
             with(&NEQ_OK, &["-- expect frontend: emit-reflexive !known-unsound"]),
+            with(&NEQ_OK, &["-- expect frontend: reflexive !known-unsound"]),
             with(&EQ_OK, &["-- expect fuzz: counterexample !known-unsound"]),
         ] {
             assert_eq!(errors(&directives), Vec::<String>::new(), "{directives:?}");
@@ -860,6 +880,8 @@ mod tests {
             ("false proof", NEQ_OK.to_vec(), ("qed", "proved"), INVARIANT),
             ("false proof over a pin", with(&NEQ_OK, &["-- expect qed: no-proof"]), ("qed", "proved-literal"), INVARIANT),
             ("lowered alike", NEQ_OK.to_vec(), ("frontend", "emit-reflexive"), INVARIANT),
+            ("refused, but alike", NEQ_OK.to_vec(), ("frontend", "reflexive"), INVARIANT),
+            ("a refusal, not alike", NEQ_OK.to_vec(), ("frontend", "refuse:unsupported"), UNPINNED),
             ("false refutation", EQ_OK.to_vec(), ("fuzz", "counterexample"), INVARIANT),
             ("known", with(&NEQ_OK, &["-- expect qed: proved !known-unsound"]), ("qed", "proved"), KNOWN),
             (

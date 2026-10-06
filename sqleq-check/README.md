@@ -234,9 +234,9 @@ parameter binding:
 
 | verdict | when |
 |---|---|
-| `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair and sqleq-fuzz found a counterexample. One of them is wrong. |
+| `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair (or the frontend found its two sides one query) and sqleq-fuzz found a counterexample. One of them is wrong. |
 | `not-equivalent` | sqleq-fuzz found an instance on which the two sides differ. |
-| `equivalent` | The QED prover or sqleq-solver proved the pair (`proved` or `proved-literal`), under index binding: the claim `provable` makes. |
+| `equivalent` | The QED prover or sqleq-solver proved the pair (`proved` or `proved-literal`), or the frontend found its two sides one query — lowered to the same IR (`emit-reflexive`), or refused but normalized to the same tree (`reflexive`) — under index binding: the claim `provable` makes. |
 | `equivalent-gather` | Only Lean proved it, under the gather rule. A different claim from `equivalent` — see [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `equivalent-gather-generated` | Only Lean proved it, under the gather rule's weaker generated form. |
 | `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. |
@@ -247,7 +247,7 @@ Lean proof and a fuzz counterexample are never an alarm: they are about differen
 the two sides' parameters. Neither `timeout` nor `undecided` says the pair is not equivalent.
 
 **The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
-case is `equivalent`, so a proof from either prover counts and a Lean proof does not. `--expect
+case is `equivalent`, so a proof from either prover, or the frontend's reflexivity, counts and a Lean proof does not. `--expect
 report-only` passes unless some case is an `alarm`, which fails every run. `--expect pinned` and
 `--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend on a time budget, and a JVM
 started per case would cost more than the case.

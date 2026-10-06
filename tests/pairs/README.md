@@ -62,7 +62,7 @@ an error, not a comment, because a pin nobody reads looks exactly like one that 
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
 | `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` (not under `binding: gather`). |
-| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
+| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, the frontend's is `emit-reflexive` or `reflexive`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
 
 ## What each axis may say
 
@@ -71,7 +71,7 @@ nothing and changing what is refused moves a pin.
 
 | axis | words |
 |---|---|
-| `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
+| `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `reflexive` (refused, but the two sides normalize to the same tree: settled without a plan), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
 | `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
 | `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend refused), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |

@@ -512,6 +512,12 @@ pub fn reflexive(src: &str) -> bool {
     reflexive_with(src, Rewrites::ALL)
 }
 
+/// What `sqleq-frontend <input.sql>` writes to stderr when it refuses a pair that [`reflexive`]
+/// nonetheless settles: the single-file counterpart of the corpus report's `reflexive` status. It is
+/// a line of its own, written *before* the refusal, so the refusal stays the last line -- the one a
+/// caller classifying the refusal reads -- and the exit code still says no plan was written.
+pub const REFLEXIVE_NOTE: &str = "reflexive: refused, but both sides normalize to one query";
+
 /// [`reflexive`] with an explicit set of normalizations; see [`Rewrites`].
 pub fn reflexive_with(src: &str, rewrites: Rewrites) -> bool {
     match normalized_pair(src, rewrites) {
