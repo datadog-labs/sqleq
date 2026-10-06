@@ -2927,14 +2927,12 @@ fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     }
 }
 
-/// A literal. A string is emitted as [`string_literal`] encodes it.
+/// A literal. Numbers and strings are emitted as `types` encodes constants: see
+/// [`number_literal`] and [`string_literal`].
 fn lower_value(v: &SqlValue) -> Result<Value> {
     use SqlValue::*;
     Ok(match v {
-        Number(n, _) => {
-            let ty = if n.contains('.') { "REAL" } else { "INTEGER" };
-            json!({ "operator": n, "operand": [], "type": ty })
-        }
+        Number(n, _) => number_literal(n).map_err(unsupported)?,
         SingleQuotedString(s) | DoubleQuotedString(s) | NationalStringLiteral(s) => string_literal(s),
         Boolean(b) => {
             json!({ "operator": if *b { "TRUE" } else { "FALSE" }, "operand": [], "type": "BOOLEAN" })

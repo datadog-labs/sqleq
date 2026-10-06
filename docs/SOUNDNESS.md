@@ -111,7 +111,11 @@ what it is or refused:
 - **A set-returning function is not a scalar** in any position, over aggregates included.
 - **A constant says its value and nothing more.** A prover reads a constant's value off its name,
   so a string spelled `null` in any case, which a prover would read as SQL NULL, is emitted as a
-  concatenation (`'n' || 'ull'`).
+  concatenation (`'n' || 'ull'`). A numeric literal has Postgres's type — `1e-5` and an integer past
+  the `bigint` range are `numeric`, not integers — and Postgres's spelling (`.5` is `0.5`). The QED
+  prover reads a decimal constant through an `f32`, so one that is not exactly such an `f32`
+  (`0.1`, `20000000.5`) is an uninterpreted function of its text, and so is a string constant cast
+  to a decimal type that the cast would round the same way.
 - **Integer division truncates.** Postgres rounds `-7 / 2` toward zero and gives `-7 % 2` the sign
   of the dividend; a prover's integer division is Euclidean. So `/` and `%` on integers are
   functions named after their operand types (`q_arith_div_integer_integer`), never the native

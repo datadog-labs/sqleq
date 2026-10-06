@@ -61,6 +61,10 @@ fn constant(text: &str, ty: &str) -> Value {
     json!({ "operator": text, "operand": [], "type": ty })
 }
 
+fn opaque_numeric(text: &str) -> Value {
+    json!({ "operator": "q_numeric", "operand": [constant(text, "VARCHAR")], "type": "REAL" })
+}
+
 mod null_spelled_strings {
     use super::*;
 
@@ -112,6 +116,94 @@ mod null_spelled_strings {
         nodes(&v["queries"][0], &mut out);
         assert!(out.iter().any(|n| n["operator"] == "q_conv_varchar_date"), "{v}");
         assert!(!out.iter().any(|n| is_nullary(n) && n["operator"] == "NULL"), "{v}");
+    }
+}
+
+mod numeric_literals {
+    use super::*;
+
+    #[test]
+    fn an_exponent_or_out_of_range_literal_is_numeric() {
+        // Postgres types both `numeric`; they were INTEGER, and `sqleq-solver` read them as 0 and
+        // as i64::MAX.
+        assert_eq!(literal("1e-5"), opaque_numeric("0.00001"));
+        assert_eq!(literal("9223372036854775808"), opaque_numeric("9223372036854775808"));
+        assert_eq!(literal("1E+1"), constant("10", "REAL"));
+        // The largest bigint is still an integer.
+        assert_eq!(literal("9223372036854775807"), constant("9223372036854775807", "INTEGER"));
+    }
+
+    #[test]
+    fn a_decimal_qed_would_round_is_opaque() {
+        // As `f32`s, `20000000.5` is `20000000` and `0.100000001` is `0.1`.
+        assert_eq!(literal("20000000.5"), opaque_numeric("20000000.5"));
+        assert_eq!(literal("0.1"), opaque_numeric("0.1"));
+        assert_eq!(literal("0.100000001"), opaque_numeric("0.100000001"));
+        // Their `f32`'s denominator, and numerator, do not fit an `i32`: QED panicked on these.
+        assert_eq!(literal("0.00001"), opaque_numeric("0.00001"));
+        assert_eq!(literal("3000000000.5"), opaque_numeric("3000000000.5"));
+        // Two different decimals are two different terms.
+        assert_ne!(literal("20000000.5"), literal("20000000.0"));
+    }
+
+    #[test]
+    fn a_decimal_qed_reads_exactly_stays_a_constant() {
+        assert_eq!(literal("0.5"), constant("0.5", "REAL"));
+        assert_eq!(literal("20000000.0"), constant("20000000.0", "REAL"));
+        assert_eq!(literal("8388607.5"), constant("8388607.5", "REAL")); // (2^24 - 1) / 2
+        assert_eq!(literal("16777216.0"), constant("16777216.0", "REAL")); // 2^24
+        assert_eq!(literal("1073741824.0"), constant("1073741824.0", "REAL")); // 2^30
+        assert_eq!(literal("0.000000000931322574615478515625"), constant("0.000000000931322574615478515625", "REAL")); // 2^-30
+        assert_eq!(literal("0.0"), constant("0.0", "REAL"));
+        // Just past each bound.
+        assert_eq!(literal("8388608.5"), opaque_numeric("8388608.5")); // (2^24 + 1) / 2
+        assert_eq!(literal("16777217.0"), opaque_numeric("16777217.0")); // 2^24 + 1
+        assert_eq!(literal("2147483648.0"), opaque_numeric("2147483648.0")); // 2^31
+        assert_eq!(
+            literal("0.0000000004656612873077392578125"),
+            opaque_numeric("0.0000000004656612873077392578125")
+        ); // 2^-31
+    }
+
+    #[test]
+    fn the_text_is_the_one_postgres_prints() {
+        // QED reads a constant cast to text as its spelling, so the spelling is Postgres's output.
+        assert_eq!(literal(".5"), constant("0.5", "REAL"));
+        assert_eq!(literal("5."), constant("5", "REAL"));
+        assert_eq!(literal("1.50e1"), constant("15.0", "REAL"));
+        assert_eq!(literal("00.250"), constant("0.250", "REAL"));
+        assert_eq!(literal("007"), constant("7", "INTEGER"));
+        assert_eq!(literal("1_000"), constant("1000", "INTEGER"));
+        assert_eq!(literal("1_000.5"), constant("1000.5", "REAL"));
+        // A scale is part of a numeric's value as text: `0.10` and `0.1` stay apart.
+        assert_ne!(literal("0.10"), literal("0.1"));
+    }
+
+    #[test]
+    fn an_exponent_past_a_thousand_is_refused() {
+        let src = format!("{NUM}\nSELECT 1e1001 FROM \"t\";\nSELECT 1 FROM \"t\";");
+        assert!(refusal(&src, CatalogSource::Declared).contains("numeric literal"));
+        literal("1e1000");
+    }
+
+    #[test]
+    fn a_string_qed_would_round_is_not_cast_as_a_constant() {
+        // Explicitly and by coercion, a string becomes a REAL through QED's parse of its text.
+        let conv = |text: &str| {
+            json!({ "operator": "q_conv_varchar_real", "operand": [constant(text, "VARCHAR")], "type": "REAL" })
+        };
+        let cast = |text: &str| json!({ "operator": "CAST", "operand": [constant(text, "VARCHAR")], "type": "REAL" });
+        assert_eq!(literal("CAST('20000000.5' AS NUMERIC)"), conv("20000000.5"));
+        assert_eq!(literal("'0.00001'::numeric"), conv("0.00001"));
+        assert_eq!(literal("'NaN'::numeric"), conv("NaN"));
+        assert_eq!(literal("'1.5'::numeric"), cast("1.5"));
+        assert_eq!(literal("'-1.5'::numeric"), cast("-1.5"));
+        // A NULL is still a NULL, and a number becomes text through its Postgres spelling.
+        assert_eq!(literal("CAST(NULL AS NUMERIC)")["operand"][0], constant("NULL", "INTEGER"));
+        assert_eq!(literal("CAST(.5 AS TEXT)"), json!({ "operator": "CAST", "operand": [constant("0.5", "REAL")], "type": "VARCHAR" }));
+        let q = r#"SELECT "x" FROM "t" WHERE "x" = '20000000.5'"#;
+        let v = lower(NUM, q, q);
+        assert_eq!(v["queries"][0]["project"]["source"]["filter"]["condition"]["operand"][1], conv("20000000.5"), "{v}");
     }
 }
 

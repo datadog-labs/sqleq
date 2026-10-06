@@ -38,6 +38,14 @@
 //! * The nullary `NULL` is SQL NULL. Both provers check the name before the type -- QED for any
 //!   spelling that lowercases to `null`, `sqleq-solver` for `NULL` -- so no string literal is a
 //!   nullary node with that text: [`string_literal`] spells it as a concatenation.
+//! * QED parses a REAL constant as an `f32`, and builds its value from the `f32`'s numerator and
+//!   denominator as `i32`s. A decimal that is not exactly such an `f32` would be rounded, or would
+//!   panic the prover, so [`number_literal`] emits only the exact ones as constants.
+//! * QED evaluates a `CAST` over a constant by parsing the constant's text as the target type, so
+//!   `CAST('0.1' AS REAL)` is the same rounded `f32`, and `CAST(c AS VARCHAR)` is the text `c` is
+//!   spelled with. So a numeric constant is spelled the way Postgres prints it, and [`cast_to`] and
+//!   [`lower_cast`] give a string constant QED would misread as a REAL an uninterpreted conversion
+//!   instead.
 
 use serde_json::{json, Value};
 use sqlparser::ast::DataType;
@@ -324,7 +332,7 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
         if let Some(name) = named_cast(dt, &target) {
             return json!({ "operator": name, "operand": [v], "type": target });
         }
-        return json!({ "operator": "CAST", "operand": [v], "type": target });
+        return cast_node(v, &target);
     }
     let qualifier = cast_qualifier(&format!("{dt}").to_uppercase());
     if from == target && qualifier.is_none() {
@@ -408,7 +416,7 @@ pub fn cast_to(mut v: Value, ct: &str) -> Value {
         v["type"] = json!(ct);
         return v;
     }
-    json!({ "operator": "CAST", "operand": [v], "type": ct })
+    cast_node(v, ct)
 }
 
 /// Coerce two comparison operands to a common type so the prover doesn't hit a z3 sort mismatch.
@@ -614,6 +622,36 @@ pub fn coerce_bool(mut v: Value) -> Value {
     }
 }
 
+/// A numeric literal as a constant: `INTEGER` when Postgres types it `integer` or `bigint`, `REAL`
+/// (Postgres's `numeric`) otherwise.
+///
+/// Postgres types a literal with no `.` and no exponent as an integer while it fits `bigint`, and
+/// every other one, `1e-5` and `9223372036854775808` included, as `numeric`. The emitted text is the
+/// one Postgres prints: no `_` separators, no leading zeros, and as many fraction digits as the
+/// literal's scale (`.5` is `0.5`, `1.50e1` is `15.0`, `1e1` is `10`, `1_000` is `1000`).
+///
+/// A `numeric` value QED cannot read exactly (see [`qed_reads_exactly`]) is not a constant at all:
+/// it is `q_numeric('<text>')`, one uninterpreted function applied to the literal's text. A prover
+/// knows nothing of `q_numeric` but that it is a function, so the literal's real value is one of the
+/// readings it has to prove the pair under: a proof holds for the literal, and only arithmetic on it
+/// is lost.
+///
+/// `Err` names a literal this cannot read: one not in Postgres's numeric grammar, or one whose
+/// exponent is past ±1000.
+pub fn number_literal(text: &str) -> std::result::Result<Value, String> {
+    let n = Numeral::parse(text).ok_or_else(|| format!("numeric literal {text}"))?;
+    if !n.numeric {
+        if let Ok(i) = n.text.parse::<i64>() {
+            return Ok(json!({ "operator": i.to_string(), "operand": [], "type": "INTEGER" }));
+        }
+    }
+    if qed_reads_exactly(&n.int, &n.frac) {
+        return Ok(json!({ "operator": n.text, "operand": [], "type": "REAL" }));
+    }
+    let text = json!({ "operator": n.text, "operand": [], "type": "VARCHAR" });
+    Ok(json!({ "operator": "q_numeric", "operand": [text], "type": "REAL" }))
+}
+
 /// A string literal as a constant.
 ///
 /// A string whose text lowercases to `null` is the one exception, because a nullary node with that
@@ -629,6 +667,122 @@ pub fn string_literal(s: &str) -> Value {
     let first = s.chars().next().map_or(0, char::len_utf8);
     let (head, tail) = s.split_at(first);
     json!({ "operator": "||", "operand": [constant(head), constant(tail)], "type": "VARCHAR" })
+}
+
+/// A numeric literal's text, read the way Postgres reads it.
+struct Numeral {
+    /// Postgres types it `numeric` rather than as an integer: it has a `.` or an exponent.
+    numeric: bool,
+    /// The digits before the point, without leading zeros (`"0"` if none are left).
+    int: String,
+    /// The digits after the point, as many as the literal's scale.
+    frac: String,
+    /// `int`, and `.` and `frac` if the scale is not zero: the text Postgres prints.
+    text: String,
+}
+
+impl Numeral {
+    /// `None` unless `text` is `digits [. digits] [e [+-] digits]` with at least one mantissa digit,
+    /// after the `_` digit separators Postgres 16 admits are dropped.
+    fn parse(text: &str) -> Option<Numeral> {
+        let text: String = text.chars().filter(|&c| c != '_').collect();
+        let (mantissa, exp) = match text.find(['e', 'E']) {
+            Some(i) => (&text[..i], Some(&text[i + 1..])),
+            None => (text.as_str(), None),
+        };
+        let numeric = mantissa.contains('.') || exp.is_some();
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if int.len() + frac.len() == 0 || !digits(int) || !digits(frac) {
+            return None;
+        }
+        let exp: i64 = match exp {
+            None => 0,
+            Some(e) => {
+                let body = e.strip_prefix(['+', '-']).unwrap_or(e);
+                if body.is_empty() || !digits(body) {
+                    return None;
+                }
+                e.parse().ok().filter(|x: &i64| x.abs() <= 1000)?
+            }
+        };
+        // The value is `all * 10^shift`, and the scale is the number of fraction digits that leaves.
+        let all = format!("{int}{frac}");
+        let shift = exp - frac.len() as i64;
+        let (int, frac) = if shift >= 0 {
+            (format!("{all}{}", "0".repeat(shift as usize)), String::new())
+        } else {
+            let scale = (-shift) as usize;
+            let padded = format!("{}{all}", "0".repeat((scale + 1).saturating_sub(all.len())));
+            let (i, f) = padded.split_at(padded.len() - scale);
+            (i.to_string(), f.to_string())
+        };
+        let int = match int.trim_start_matches('0') {
+            "" => "0".to_string(),
+            rest => rest.to_string(),
+        };
+        let text = if frac.is_empty() { int.clone() } else { format!("{int}.{frac}") };
+        Some(Numeral { numeric, int, frac, text })
+    }
+}
+
+/// Whether QED reads the decimal `int.frac` as exactly that value.
+///
+/// QED parses a REAL constant with `str::parse::<f32>()`, takes the `f32`'s exact value as a reduced
+/// fraction `p/q`, and builds the z3 real from `p` and `q` converted to `i32` -- unwrapped, so a part
+/// that does not fit panics the prover. A decimal survives that exactly when it *is* such an `f32`:
+/// reduced, its denominator is a power of two no larger than `2^30`, its numerator fits an `i32`, and
+/// the numerator's odd part fits the `f32`'s 24-bit significand. `sqleq-solver` reads a REAL constant
+/// through `f64`, which is exact on every `f32`.
+fn qed_reads_exactly(int: &str, frac: &str) -> bool {
+    // `int.frac` is `d / 10^m`. Drop the factors of ten the digits share with the denominator.
+    let digits = format!("{int}{frac}");
+    let digits = digits.trim_start_matches('0');
+    let mut m = frac.len() as u32;
+    let Ok(mut d) = (if digits.is_empty() { Ok(0) } else { digits.parse::<u128>() }) else {
+        return false;
+    };
+    if d == 0 {
+        return true;
+    }
+    while m > 0 && d % 10 == 0 {
+        d /= 10;
+        m -= 1;
+    }
+    // What is left of `10^m = 2^m * 5^m` must cancel against `d` down to a power of two, and `d` is
+    // then odd (it is a multiple of 5 and not of 10), so the fraction is reduced.
+    let p = if m == 0 {
+        d
+    } else {
+        match 5u128.checked_pow(m) {
+            Some(f) if m <= 30 && d % f == 0 => d / f,
+            _ => return false,
+        }
+    };
+    let odd = p >> p.trailing_zeros();
+    p <= i32::MAX as u128 && odd < 1 << 24
+}
+
+/// `CAST(v AS target)`, unless QED would read it as a value Postgres's cast does not compute.
+///
+/// QED evaluates a `CAST` whose operand is a constant by parsing the constant's text as the target
+/// type. Text to REAL goes through the `f32` reading [`qed_reads_exactly`] describes, so
+/// `'20000000.5'` would be `20000000`, and `'0.00001'` would panic the prover. Such a cast is the
+/// uninterpreted conversion `q_conv_varchar_real` instead, which is what QED makes of a cast whose
+/// text it cannot parse. The other crossings parse to what Postgres computes (text to INTEGER as an
+/// `i64`, to BOOLEAN as `true`/`false`, a number to text as the spelling Postgres prints, which
+/// [`number_literal`] emits), or fail to parse and are left uninterpreted.
+fn cast_node(v: Value, target: &str) -> Value {
+    let nullary = v.get("operand").and_then(Value::as_array).is_some_and(|a| a.is_empty());
+    if target == "REAL" && nullary && ty_of(&v) == "VARCHAR" {
+        let text = v.get("operator").and_then(Value::as_str).unwrap_or_default();
+        let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+        let exact = Numeral::parse(unsigned).is_some_and(|n| !unsigned.contains('_') && qed_reads_exactly(&n.int, &n.frac));
+        if !exact && !is_null_lit(&v) {
+            return json!({ "operator": conv_name("VARCHAR", "REAL", None), "operand": [v], "type": "REAL" });
+        }
+    }
+    json!({ "operator": "CAST", "operand": [v], "type": target })
 }
 
 #[cfg(test)]
