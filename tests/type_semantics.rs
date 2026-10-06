@@ -3,7 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Operators and types whose Postgres meaning a prover would misread.
+//! Operators and types whose Postgres meaning a prover would misread, and two inputs that used to
+//! panic the frontend or the QED prover.
 //!
 //! * `->` and `#>` (and `->>` and `#>>`) are two operations, and `json_extract_path` is neither.
 //! * A string literal against an INTEGER or BOOLEAN is read at that type, as Postgres reads it, not
@@ -11,6 +12,8 @@
 //! * `citext` and `char(n)` compare in a way no prover's `=` does, and are refused; floats round and
 //!   are opaque; `numeric` division rounds and is uninterpreted; `int4range` and `point` are not
 //!   integers. Both type readers agree on every name.
+//! * `parse_declare` reads a line with non-ASCII letters in it without panicking or misreading it.
+//! * `x IN (SELECT ..)` reaches the prover with the operand and the column of one type, or is refused.
 //!
 //! Each "not identical" or "refused" test is a pair that is **not** equivalent in Postgres and used to
 //! lower to IR a prover proves equal. They do not run a prover; they pin the lowering.
@@ -346,4 +349,89 @@ fn both_type_readers_agree_on_every_name() {
         assert!(!builtin(&t), "{name}: {t}");
     }
     assert_eq!(read_column("numeric", false).unwrap(), "REAL");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// #67 (2): `parse_declare` and non-ASCII letters
+// ---------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_declare_line_with_non_ascii_letters_does_not_panic() {
+    // `İ` lowercases to three bytes, so an offset found in the lowercased copy fell inside `é`.
+    let src = "declare İİ scalar function ée(int) returns int;\n\
+               create table t (id INTEGER, a INTEGER, unique (id));\n\
+               SELECT id FROM t WHERE g(a) = g(a);\nSELECT id FROM t;";
+    let r = std::panic::catch_unwind(|| lower_sql(src));
+    assert!(r.is_ok(), "parse_declare panicked");
+}
+
+#[test]
+fn a_kelvin_sign_does_not_shift_the_declaration() {
+    // The Kelvin sign lowercases from three bytes to one, so the return type was read two bytes late,
+    // as `URNS TEXT`.
+    let src = "declare scalar function g(int /* \u{212A}\u{212A} */) returns text;\n\
+               create table t (id INTEGER, a INTEGER, unique (id));\n\
+               SELECT id FROM t WHERE g(a) = 'x';\nSELECT id FROM t;";
+    let v = lower_sql(src).expect("lowers");
+    let call = &v["queries"][0]["project"]["source"]["filter"]["condition"]["operand"][0];
+    assert_eq!((call["operator"].as_str(), call["type"].as_str()), (Some("G"), Some("VARCHAR")), "{call}");
+    // Before `aggregate`, it moved the name: `g` was left undeclared, and a per-row scalar.
+    let src = "declare \u{212A}\u{212A} aggregate function g(int) returns int;\n\
+               create table t (id INTEGER, a INTEGER, unique (id));\n\
+               SELECT g(a) FROM t;\nSELECT 1 FROM t;";
+    let v = lower_sql(src).expect("lowers");
+    assert_eq!(v["queries"][0]["group"]["function"][0]["operator"], "G", "{}", v["queries"][0]);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// #67 (5): the operand of `IN (SELECT ..)` and the subquery's column get one type
+// ---------------------------------------------------------------------------------------------------
+
+/// Every `IN` node in `v`, as (operand types, the subquery's column types).
+fn in_nodes(v: &Value, out: &mut Vec<(Vec<String>, Vec<String>)>) {
+    match v {
+        Value::Object(m) => {
+            if m.get("operator").and_then(Value::as_str) == Some("IN") && m.contains_key("query") {
+                let tys = |a: Option<&Value>| -> Vec<String> {
+                    a.and_then(Value::as_array)
+                        .map(|a| a.iter().map(|e| e["type"].as_str().unwrap_or("").to_string()).collect())
+                        .unwrap_or_default()
+                };
+                out.push((tys(m.get("operand")), tys(m["query"]["project"].get("target"))));
+            }
+            m.values().for_each(|x| in_nodes(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| in_nodes(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn an_in_subquery_operand_takes_the_columns_type() {
+    // An undeclared function is VARBINARY, `a / 2.0` is REAL: the QED prover asserts that the operand
+    // and the column have one sort, and panicked on both.
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "a" IN (SELECT abs("a") FROM "t")"#, r#"SELECT "id" FROM "t" WHERE "a" IN (SELECT abs("a") FROM "t" WHERE "a" IS NOT NULL)"#),
+        (r#"SELECT "id" FROM "t" WHERE "id" IN (SELECT "a" / 2.0 FROM "t")"#, r#"SELECT "id" FROM "t" WHERE "id" = ANY (SELECT "a" / 2.0 FROM "t")"#),
+        (r#"SELECT "id" FROM "t" WHERE NULL IN (SELECT "a" / 2.0 FROM "t")"#, r#"SELECT "id" FROM "t" WHERE '1' IN (SELECT "a" FROM "t")"#),
+        (r#"SELECT "id" FROM "t" WHERE ("a", "id") IN (SELECT "n", abs("a") FROM "t")"#, r#"SELECT "id" FROM "t" WHERE "id" IN (SELECT "n" FROM "t")"#),
+    ] {
+        for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+            let v = lower_in(T, q0, q1, src);
+            let mut nodes = Vec::new();
+            in_nodes(&v["queries"], &mut nodes);
+            assert_eq!(nodes.len(), 2, "{q0}");
+            for (operand, column) in nodes {
+                assert_eq!(operand, column, "{src:?}: {q0} / {q1}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_in_subquery_operand_that_cannot_take_the_columns_type_is_refused() {
+    // A numeric against an integer column: Postgres converts the column, which the lowering cannot
+    // reach from the operand's side.
+    refused(T, r#"SELECT "id" FROM "t" WHERE "n" IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
+    refused(T, r#"SELECT "id" FROM "t" WHERE abs("a") IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
 }

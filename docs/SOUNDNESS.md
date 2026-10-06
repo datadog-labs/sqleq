@@ -128,6 +128,10 @@ what it is or refused:
   are two uninterpreted functions, and `jsonb_extract_path(j, 'k')`, which takes the path one
   element per argument, is a third: over `[5]`, `jsonb_extract_path(j, '0')` is `5` and `j -> '0'`
   is NULL.
+- **An `IN` subquery compares values of one type.** Its operand is converted to the type of the
+  subquery's column (`i IN (SELECT a / 2.0 ..)` compares `i::numeric`), and where only the column
+  could be converted (`n IN (SELECT i ..)` over a numeric `n`), the pair is refused, since the QED
+  prover asserts that the two have one sort.
 - **A row against a parameter is a record comparison.** In `(a, b) IN ($1, ..)` each parameter
   stands for a composite value, and Postgres compares a row with one under record semantics, where
   two NULL fields are equal. Each such item is one opaque predicate, never per-field comparisons.

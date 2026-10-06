@@ -564,8 +564,8 @@ fn named_cast(dt: &DataType, target: &str) -> Option<String> {
 }
 
 /// Whether two column types are two *different temporal types*. Where a relation-shaped construct
-/// (a set operation, a `VALUES` list, an `IN (subquery)`) would pair such columns without any
-/// comparison to hang a conversion on, the values of two units would share one column.
+/// (a set operation, a `VALUES` list) would pair such columns without any comparison to hang a
+/// conversion on, the values of two units would share one column.
 ///
 /// A temporal type against a non-temporal one is not a mismatch here. That pairing is exactly what
 /// the INTEGER a temporal type used to be met in the same place -- an untyped parameter in a `UNION`
@@ -576,14 +576,19 @@ pub fn temporal_mismatch(a: &str, b: &str) -> bool {
 
 /// Coerce the left operand of `x IN (subquery)` to the type of the subquery's column, which is
 /// what Postgres does when that column is the higher type (`d IN (SELECT ts ..)` compares
-/// `d::timestamp`). `Err` names the pair when the conversion would have to go on the subquery's
-/// side instead, which the lowering cannot reach from here.
+/// `d::timestamp`, `i IN (SELECT a / 2.0 ..)` compares `i::numeric`). `Err` names the pair when the
+/// conversion would have to go on the subquery's side instead, which the lowering cannot reach from
+/// here.
+///
+/// Every pair of types, not only temporal ones: the QED prover equates the operand with the
+/// subquery's column and asserts that the two have one sort, so any mismatch left here panics it. A
+/// `NULL` is relabelled and a string literal read at the column's type, as in a comparison.
 pub fn coerce_in_operand(x: Value, col_ty: &str) -> std::result::Result<Value, String> {
     let xt = ty_of(&x);
-    if !temporal_mismatch(&xt, col_ty) || is_null_lit(&x) {
+    if xt == col_ty {
         return Ok(x);
     }
-    if common_type(&xt, col_ty) == col_ty {
+    if is_null_lit(&x) || is_string_literal(&x) || common_type(&xt, col_ty) == col_ty {
         Ok(cast_to(x, col_ty))
     } else {
         Err(format!("{xt} compared with a subquery column of type {col_ty}"))
