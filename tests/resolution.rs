@@ -400,12 +400,12 @@ const KNOWN_OPEN: &[(&str, &str)] = &[
     ("from/a-quoted-derived-column-against-the-folded-name", "#57"),
     ("with/a-quoted-binding-name-against-the-folded-name", "#57"),
     ("update/the-keyword-default-against-a-column-named-default", "#57"),
-    // No issue yet. `strip_identical_pagination` drops an `ORDER BY a LIMIT 1` whose text is the same
+    // #74. `strip_identical_pagination` drops an `ORDER BY a LIMIT 1` whose text is the same
     // on both sides once each side's key is one of its own outputs, but `a` is the second output of
     // one side and the first of the other: the two sides return the same bag and page it by
     // different columns.
-    ("select/swap-two-output-aliases-under-order-by", "unfiled"),
-    ("select/swap-two-output-aliases-under-offset", "unfiled"),
+    ("select/swap-two-output-aliases-under-order-by", "#74"),
+    ("select/swap-two-output-aliases-under-offset", "#74"),
 ];
 
 const CONTROLS: &[Control] = &[
