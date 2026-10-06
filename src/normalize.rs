@@ -1065,6 +1065,21 @@ impl VisitorMut for StripOrder {
 /// But A's `y` *is* its output while B's `y` is `t.b`, which B does not project — so over
 /// `t = {(a=1, b=2), (a=2, b=1)}` A yields `1` and B yields `2`. Checking A alone would strip and
 /// report a verdict for a pair whose two sides return different rows.
+///
+/// # And it names the same column on both
+///
+/// Determined on each side is still not enough, because the two sides can determine it by different
+/// columns:
+///
+/// ```text
+/// A: SELECT a AS b, b AS a FROM t ORDER BY a LIMIT 1    -- sorts by its 2nd column, t.b
+/// B: SELECT a, b FROM t ORDER BY a LIMIT 1              -- sorts by its 1st column, t.a
+/// ```
+///
+/// Both return the bag of `(t.a, t.b)`, so the stripped pair is provable, but over
+/// `t = {(a=1, b=2), (a=2, b=1)}` A yields `(2, 1)` and B yields `(1, 2)`. Equal bags give equal sets
+/// of pages only under one ordering of them, so each key is resolved to a position in its side's
+/// select list, and the clause is stripped only when the positions agree.
 pub fn strip_identical_pagination(queries: &mut [Query]) {
     let [a, b] = queries else { return };
     if !(has_row_slice(a) || has_row_slice(b)) {
@@ -1086,8 +1101,10 @@ pub fn strip_identical_pagination(queries: &mut [Query]) {
         return;
     }
     // Both sides: each names its key against its own projection, and identical clause text does not
-    // make one reading stand in for the other.
-    if !order_determined_by_projection(a) || !order_determined_by_projection(b) {
+    // make one reading stand in for the other. Each key has to be a column the side returns, and the
+    // same column, by position, on both.
+    let (Some(pa), Some(pb)) = (order_positions(a), order_positions(b)) else { return };
+    if pa != pb {
         return;
     }
     for q in [a, b] {
@@ -1434,56 +1451,74 @@ fn safe_to_strip(names: &[ObjectName]) -> bool {
     true
 }
 
-/// Is every `ORDER BY` key of this query recoverable from the rows it returns?
+/// The output column each `ORDER BY` key of this query sorts by, as a position in its select list,
+/// or `None` when some key is not one of the columns the query returns.
 ///
-/// Conservative by construction: it answers yes only for keys it can *match* to the projection, so
-/// an ordering it cannot analyse blocks the strip rather than being assumed harmless.
-fn order_determined_by_projection(q: &Query) -> bool {
-    let Some(order_by) = &q.order_by else { return true };
-    let OrderByKind::Expressions(keys) = &order_by.kind else { return false };
-    let SetExpr::Select(select) = &*q.body else { return false };
+/// A key is resolved as Postgres resolves it: an integer is a position; a bare name is the output
+/// column of that name, and only when no output column has it, an expression over the input; and
+/// anything else is an expression over the input. An expression is a returned column only when the
+/// select list computes it, spelled the same way. Conservative by construction: it answers only for
+/// keys it can match, so an ordering it cannot analyse blocks the strip rather than being assumed
+/// harmless.
+fn order_positions(q: &Query) -> Option<Vec<usize>> {
+    let Some(order_by) = &q.order_by else { return Some(Vec::new()) };
+    let OrderByKind::Expressions(keys) = &order_by.kind else { return None };
+    let SetExpr::Select(select) = &*q.body else { return None };
 
-    // Two lists, because a key is matched against each differently. `exprs` holds every projected
-    // expression as text, which keeps its quoting, so a key spelled the same way is the same value.
-    // `names` holds every alias under Postgres's folding (an unquoted name lower-cased, a quoted one
-    // as written), and only a bare-name key is compared with it: Postgres looks `ORDER BY x` up among
-    // the output names before the input columns, but evaluates any other key over the input. Matching
-    // an alias by its text instead lets the unquoted key `A`, which is the input column `a`, meet the
-    // alias `"A"` (and the key `t.a` meet an alias `"t.a"`), and counts a column the projection drops
-    // as projected.
-    let mut exprs: Vec<String> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
+    // Each item as its output name, where this can tell it, and its expression as text. The text keeps
+    // its quoting, so a key spelled the same way is the same value. The name is under Postgres's
+    // folding (an unquoted name lower-cased, a quoted one as written), and is taken only from an
+    // alias or a column; an expression's name is Postgres's choice (`CAST(a AS TEXT)` is named `a`,
+    // `count(*)` is `count`), and is left unknown. Matching an alias by its text instead would let
+    // the unquoted key `A`, which is the input column `a`, meet the alias `"A"`, and the key `t.a`
+    // meet an alias `"t.a"`.
+    let mut items: Vec<(Option<String>, String)> = Vec::new();
     for item in &select.projection {
-        match item {
-            // A star projects everything the sources have, so any key over those sources is
-            // recoverable — but working out *which* columns those are is name resolution, which has
-            // not run yet. Refuse rather than guess.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
-            SelectItem::UnnamedExpr(e) => exprs.push(e.to_string()),
-            SelectItem::ExprWithAlias { expr, alias } => {
-                exprs.push(expr.to_string());
-                names.push(crate::dml::fold_ident(alias));
+        items.push(match item {
+            // A star projects everything the sources have, but working out *which* columns, and at
+            // which positions, is name resolution, which has not run yet. Refuse rather than guess.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+            SelectItem::UnnamedExpr(e) => {
+                let name = match e {
+                    Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
+                    Expr::CompoundIdentifier(parts) => parts.last().map(crate::dml::fold_ident),
+                    _ => None,
+                };
+                (name, e.to_string())
             }
+            SelectItem::ExprWithAlias { expr, alias } => (Some(crate::dml::fold_ident(alias)), expr.to_string()),
             // A Spark multi-alias projection expands one expression into several output columns;
             // which key maps to which is not something this needs to work out to refuse.
-            SelectItem::ExprWithAliases { .. } => return false,
-        }
+            SelectItem::ExprWithAliases { .. } => return None,
+        });
     }
 
-    keys.iter().all(|key| {
-        // `ORDER BY 2` is the second output column by position — determined whenever it is in range.
-        if let Expr::Value(v) = &key.expr {
-            if let sqlparser::ast::Value::Number(n, _) = &v.value {
-                return n.parse::<usize>().is_ok_and(|i| i >= 1 && i <= select.projection.len());
+    keys.iter()
+        .map(|key| {
+            // `ORDER BY 2` is the second output column.
+            if let Expr::Value(v) = &key.expr {
+                if let Value::Number(n, _) = &v.value {
+                    return n.parse::<usize>().ok().filter(|i| (1..=items.len()).contains(i)).map(|i| i - 1);
+                }
             }
-        }
-        if let Expr::Identifier(id) = &key.expr {
-            if names.contains(&crate::dml::fold_ident(id)) {
-                return true;
+            if let Expr::Identifier(id) = &key.expr {
+                let name = crate::dml::fold_ident(id);
+                let named: Vec<usize> = (0..items.len()).filter(|&i| items[i].0.as_ref() == Some(&name)).collect();
+                if let Some(&first) = named.first() {
+                    // Two output columns of one name: Postgres sorts by them only if they are the
+                    // same expression, which then sorts the same either way.
+                    return named.iter().all(|&i| items[i].1 == items[first].1).then_some(first);
+                }
+                // No output column has the name as far as this can tell, but an expression's name
+                // could be it, and then Postgres sorts by that column, not by the input.
+                if items.iter().any(|(n, _)| n.is_none()) {
+                    return None;
+                }
             }
-        }
-        exprs.contains(&key.expr.to_string())
-    })
+            let text = key.expr.to_string();
+            items.iter().position(|(_, e)| *e == text)
+        })
+        .collect()
 }
 
 #[cfg(test)]

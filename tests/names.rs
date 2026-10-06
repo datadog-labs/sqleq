@@ -144,6 +144,52 @@ fn a_key_that_names_the_alias_still_strips_the_pagination() {
     }
 }
 
+// --- `strip_identical_pagination` needs the same output column on both sides ----------------------
+
+const TID: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "b" INTEGER, unique ("id"));"#;
+
+/// A's key `a` is its second output column (`t.b`), B's is its first (`t.a`). Each is determined by
+/// its own projection, and the two inner queries are the same bag, but the pages are not.
+#[test]
+fn one_key_naming_two_output_positions_keeps_the_pagination() {
+    for tail in ["LIMIT 1", "LIMIT 1 OFFSET 1", "OFFSET 1"] {
+        let v = lowered(
+            &format!("{TID}\nSELECT a AS b, b AS a FROM t ORDER BY a {tail};\nSELECT a, b FROM t ORDER BY a {tail};"),
+            CatalogSource::Declared,
+        );
+        assert!(has_sort(&v["queries"][0]) && has_sort(&v["queries"][1]), "{tail}: the pagination was stripped");
+        assert_ne!(v["queries"][0], v["queries"][1], "{tail}: the two sides lowered alike");
+    }
+}
+
+/// `CAST(a AS TEXT)` is named `a` by Postgres, so in A the key `a` is that column, sorted as text, and
+/// in B, where the cast has an alias, it is the input column, sorted as a number. Only the strip is
+/// checked here: lowering still reads A's key as the input column, which is a defect of its own.
+#[test]
+fn a_key_an_unnamed_expression_could_answer_to_keeps_the_pagination() {
+    let v = lowered(
+        &format!(
+            "{TID}\nSELECT CAST(a AS TEXT), a AS z FROM t ORDER BY a LIMIT 1;\n\
+             SELECT CAST(a AS TEXT) AS w, a AS z FROM t ORDER BY a LIMIT 1;"
+        ),
+        CatalogSource::Declared,
+    );
+    assert!(has_sort(&v["queries"][0]), "the pagination was stripped");
+}
+
+/// Control: the same key at the same position on both sides still strips, whatever it is called.
+#[test]
+fn one_key_at_one_output_position_still_strips_the_pagination() {
+    for (a, b, key) in [
+        ("SELECT a AS b, b AS a FROM t", "SELECT a AS b, b AS a FROM t WHERE id > 0", "a"),
+        ("SELECT b, a FROM t", "SELECT b AS a, a AS b FROM t WHERE id > 0", "1"),
+        ("SELECT a + 1, b FROM t", "SELECT a + 1 AS c, b FROM t WHERE id > 0", "a + 1"),
+    ] {
+        let v = lowered(&format!("{TID}\n{a} ORDER BY {key} LIMIT 1;\n{b} ORDER BY {key} LIMIT 1;"), CatalogSource::Declared);
+        assert!(!has_sort(&v["queries"][0]) && !has_sort(&v["queries"][1]), "{a} | {b}: the pagination was kept");
+    }
+}
+
 // --- `inline_ctes` matches a use to its binding under folding -------------------------------------
 
 /// `"T"` is not `t`: the binding is unused, and `t` is still the base table.
