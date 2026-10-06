@@ -37,7 +37,7 @@ Things that are working as intended, and not vulnerabilities:
   of each pair file whose pins moved; a file with a header error is left alone. `--sqlsolver-jvm` writes the compiled bridge to `tools/sqlsolver/out-fork/`,
   and `sqleq-lean` writes the Lean build to `lean/.lake/`. `sqleq-frontend pair.sql` without an
   output path writes `pair.fe.json` beside its input, and `sqleq-fuzz csv` without one writes
-  `/tmp/concrete_results.json`.
+  `<corpus>.fuzz.json` beside its corpus.
 
 ## Soundness bugs
 

@@ -167,8 +167,8 @@ reached by a `partial: K trials compared both sides; last error: …` line. Thos
 `csv` mode takes each name in `names.txt` to the corpus row its digits number (`pairNNNN` is row
 `NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
 only some trials compared both sides), and writes `{ "pairNNNN": { "verdict": "...", "ms": ... } }`
-to `out.json` (default `/tmp/concrete_results.json`), adding `ok_trials` and `trial_error` for a
-partial run. A name whose digits number no row gets `NO-ROW`.
+to `out.json` (default: beside the corpus, its extension replaced by `.fuzz.json`), adding
+`ok_trials` and `trial_error` for a partial run. A name whose digits number no row gets `NO-ROW`.
 
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
 `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after

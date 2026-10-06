@@ -289,16 +289,9 @@ pub fn install(con: &Connection, sqls: &[&str]) -> duckdb::Result<()> {
     Ok(())
 }
 
-/// Whether `sqls` mentions any shimmed name — the same test [`install`] applies, exposed so a
-/// caller can tell "no macro was needed" from "macros were installed".
-pub fn touches_shim(sqls: &[&str]) -> bool {
-    let hay: Vec<String> = sqls.iter().map(|s| s.to_ascii_lowercase()).collect();
-    SHIMS.iter().any(|(n, _)| hay.iter().any(|h| h.contains(n)))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{install, touches_shim, SHIMS};
+    use super::{install, SHIMS};
     use crate::duck::open_db;
     use duckdb::Connection;
 
@@ -547,7 +540,6 @@ mod tests {
     #[test]
     fn nothing_is_installed_for_sql_that_names_no_shimmed_function() {
         let sql = "SELECT id, name FROM t WHERE x = $1";
-        assert!(!touches_shim(&[sql]));
 
         let con = open_db().unwrap();
         install(&con, &[sql]).unwrap();
@@ -557,7 +549,6 @@ mod tests {
         );
 
         // ... and the same connection gains it as soon as the SQL does mention it.
-        assert!(touches_shim(&["SELECT JSONB_AGG(x) FROM t"]));
         install(&con, &["SELECT JSONB_AGG(x) FROM t"]).unwrap();
         assert!(con.execute_batch("SELECT jsonb_agg(1)").is_ok());
     }

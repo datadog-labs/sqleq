@@ -410,13 +410,6 @@ fn fetch_rows(con: &Connection, sql: &str) -> duckdb::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Create tables, insert `rowdata`, run `stmt`, and return (comparable, row_count). `row_count` is
-/// deterministic even under a truncating LIMIT, so a count difference is always a sound signal.
-///
-/// `con` is shared across the pair's trials, so the catalog is cleared on the way *in* — an earlier
-/// side that failed mid-way may have left tables behind. `mutates` marks a statement that can create
-/// objects of its own, which the cheap name-directed reset would miss.
-#[allow(clippy::too_many_arguments)]
 /// Replay an instance and report, per table, the generated rows the database actually **accepted**.
 ///
 /// [`insert_rows`] drops any row violating a UNIQUE or NOT NULL constraint, so the generated rows
@@ -469,6 +462,12 @@ pub fn accepted_rows(
     Ok(out)
 }
 
+/// Create tables, insert `rowdata`, run `stmt`, and return (comparable, row_count). `row_count` is
+/// deterministic even under a truncating LIMIT, so a count difference is always a sound signal.
+///
+/// `con` is shared across the pair's trials, so the catalog is cleared on the way *in* — an earlier
+/// side that failed mid-way may have left tables behind. `mutates` marks a statement that can create
+/// objects of its own, which the cheap name-directed reset would miss.
 // Eight arguments, all of them per-side facts the caller already has; bundling them into a
 // struct would only move the same list one level out.
 #[allow(clippy::too_many_arguments)]

@@ -211,8 +211,8 @@ impl Visitor for JsonOps {
 /// This is neither hypothetical nor a hygiene nit. Pairs with the shape on one side and not the
 /// other have been observed as refutations, and among them pairs a prover independently calls
 /// equivalent — the soundness-alarm cell of the cross-tab, reached from the disproving side. So it
-/// is a false-refutation channel. The pass is not wired into `test_pair` yet; doing so changes
-/// verdicts and needs the cross-check re-run.
+/// is a false-refutation channel, and `test_pair` runs this pass on both sides before anything
+/// reaches DuckDB.
 ///
 /// The parenthesization is read off the **Postgres** parse, not guessed: the span of a
 /// [`BinaryOperator::Arrow`] / [`BinaryOperator::LongArrow`] node is by construction the operand

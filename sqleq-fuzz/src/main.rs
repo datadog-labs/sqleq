@@ -8,6 +8,7 @@
 //! Modes:
 //!   * `sqleq-fuzz csv <corpus.csv> <names.txt> [out.json]` — batch a corpus (rows are `a,b,ddl`);
 //!     `names.txt` lists `pairNNNN` entries (the digits index a corpus row). Parallel with `--jobs`.
+//!     `out.json` defaults to the corpus path with its extension replaced by `.fuzz.json`.
 //!   * `sqleq-fuzz row <corpus.csv> <index>` — test a single corpus row and print the verdict.
 //!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE TABLEs + exactly two
 //!     statements).
@@ -17,6 +18,7 @@
 //! usage and exits 2.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,8 +27,8 @@ use sqleq_fuzz::{test_pair, Config, Verdict};
 
 const USAGE: &str = "\
 usage:
-  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to
-                                                        /tmp/concrete_results.json)
+  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to the
+                                                        corpus path with extension .fuzz.json)
   sqleq-fuzz row  <corpus.csv> <index>                  test one corpus row (counting from 0)
   sqleq-fuzz file <pair.sql>                            test a file: CREATE TABLEs, two statements
 options:
@@ -106,13 +108,22 @@ fn load_corpus(path: &str) -> Result<Vec<(String, String, String)>, String> {
     Ok(out)
 }
 
+/// Where `csv` mode writes when no `out.json` is given: beside the corpus, as `<corpus>.fuzz.json`.
+/// A fixed path elsewhere would let two runs overwrite each other.
+fn default_out(corpus_path: &str) -> String {
+    Path::new(corpus_path)
+        .with_extension("fuzz.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     let corpus_path = args.first().ok_or("csv mode needs <corpus.csv>")?;
     let names_path = args.get(1).ok_or("csv mode needs <names.txt>")?;
     let out_path = args
         .get(2)
         .cloned()
-        .unwrap_or_else(|| "/tmp/concrete_results.json".to_string());
+        .unwrap_or_else(|| default_out(corpus_path));
 
     let corpus = Arc::new(load_corpus(corpus_path)?);
     let names_txt = std::fs::read_to_string(names_path)
@@ -327,7 +338,13 @@ fn report(v: &Verdict) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_statements;
+    use super::{default_out, split_statements};
+
+    #[test]
+    fn the_default_output_sits_beside_the_corpus() {
+        assert_eq!(default_out("runs/corpus.csv"), "runs/corpus.fuzz.json");
+        assert_eq!(default_out("corpus"), "corpus.fuzz.json");
+    }
 
     /// The shape of `examples/*.sql`: a comment above the DDL used to hide `CREATE` from the
     /// classifier, so the schema was counted as a third query and the file was rejected.
