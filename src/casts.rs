@@ -97,29 +97,14 @@ use crate::infer::{
 pub struct QCast {
     /// `qcast0`, `qcast1`, … — numbered in the order the rewrite first needed them.
     pub name: String,
-    /// The operand's inferred type, as declared.
-    pub arg: Ty,
-    /// The cast's target type.
+    /// The cast's target type: the symbol's declared return type.
     pub ret: Ty,
-}
-
-/// How many casts each rule that *deletes* one accounted for.
-///
-/// Only the deleting rules are counted, because the count exists to explain the differential: a
-/// deleted cast is evidence the emitted case no longer states, so anything re-inferring from that
-/// case is working from strictly less than the preprocessor had. Mirrors `dropped_casts`.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dropped {
-    pub param: usize,
-    pub identity: usize,
-    pub qcast: usize,
 }
 
 /// What the rewrite produced.
 #[derive(Default, Debug)]
 pub struct Rewrite {
     pub qcasts: Vec<QCast>,
-    pub dropped: Dropped,
 }
 
 /// What to do with one cast. Recorded against the cast node's [`nid`] by [`decide`].
@@ -303,7 +288,6 @@ fn decide(
             // parameter's type and nothing more. A qualified one takes rule 5b, keyed on the
             // qualified spelling.
             if placeholder_index(op).is_some() && !qualified {
-                rw.dropped.param += 1;
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
                 return Ok(());
             }
@@ -314,10 +298,10 @@ fn decide(
                 return Ok(());
             }
 
-            // Only rules 4 and 5a consult the operand's type; rule 5b does not. `QCast::arg` is
-            // recorded for the record's sake and never reaches a declaration — `emit_decls` writes
-            // `decl(q.ret, ..)` — so an operand nobody can type is not a reason to refuse. It is a
-            // reason to take 5b, and `Ty::Opaque` gets it there on its own:
+            // Only rules 4 and 5a consult the operand's type; rule 5b does not, and its symbol is
+            // declared from the target alone — `declarations` writes `decl(q.ret, ..)` — so an
+            // operand nobody can type is not a reason to refuse. It is a reason to take 5b, and
+            // `Ty::Opaque` gets it there on its own:
             //
             // * rule 4 is gated on `target.is_some() && cqt == tq`, and [`map_type_name`] returns
             //   `Some` only for Int/Real/Str/Bool — never `Some(Ty::Opaque)` — so the two cannot
@@ -366,7 +350,6 @@ fn decide(
             // and dropping the cast then equates `x::jsonb` with a bare `x`. Not knowing what a cast
             // computes is the opposite of knowing it computes nothing.
             if target.is_some() && !qualified && cqt == tq {
-                rw.dropped.identity += 1;
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
             } else if cqt == Ty::Int && tq == Ty::Real {
                 dec.insert(nid(e), Decision::Retarget(Ty::Real));
@@ -384,7 +367,6 @@ fn decide(
                 // of unknown type still takes rule 5b below.
                 dec.insert(nid(e), Decision::Retarget(tq));
             } else {
-                rw.dropped.qcast += 1;
                 // Keyed on the operand's *pre-rewrite* text, so `(x::varchar)::varchar(8)` and
                 // `x::varchar(8)` get separate symbols even though the inner cast is about to be
                 // hoisted away and the two render identically afterwards. Splitting is sound (see
@@ -394,7 +376,6 @@ fn decide(
                 let idx = *seen.entry(key).or_insert_with(|| {
                     rw.qcasts.push(QCast {
                         name: format!("qcast{}", rw.qcasts.len()),
-                        arg: cqt,
                         ret: tq,
                     });
                     rw.qcasts.len() - 1
@@ -722,7 +703,7 @@ mod tests {
         let (q, rw) = run("SELECT * FROM t WHERE t.a = $1::integer").expect("rewrites");
         assert!(q[0].contains("qp1(0)"), "{}", q[0]);
         assert!(!q[0].to_uppercase().contains("CAST"), "{}", q[0]);
-        assert_eq!(rw.dropped.param, 1);
+        assert!(rw.qcasts.is_empty(), "{:?}", rw.qcasts);
     }
 
     #[test]
@@ -741,10 +722,9 @@ mod tests {
             "SELECT t.name::varchar FROM t; SELECT t.name::varchar(8) FROM t",
         )
         .expect("rewrites");
-        assert!(!q[0].to_uppercase().contains("CAST"), "{}", q[0]);
-        assert_eq!(rw.dropped.identity, 1);
+        assert_eq!(q[0], "SELECT t.name FROM t");
         assert!(q[1].contains("qcast0"), "{}", q[1]);
-        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), arg: Ty::Str, ret: Ty::Str }]);
+        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), ret: Ty::Str }]);
     }
 
     #[test]
@@ -779,7 +759,6 @@ mod tests {
         .expect("rewrites");
         assert!(q[0].contains("qcast0") && q[1].contains("qcast0"), "{q:?}");
         assert_eq!(rw.qcasts.len(), 1);
-        assert_eq!(rw.dropped.qcast, 2);
     }
 
     #[test]
@@ -794,8 +773,9 @@ mod tests {
     fn parentheses_do_not_hide_the_operand() {
         // `($1)::int` is still rule 1, not "cast over unsupported operand Expr".
         let (q, rw) = run("SELECT * FROM t WHERE t.a = ($1)::integer").expect("rewrites");
-        assert_eq!(rw.dropped.param, 1);
+        assert!(rw.qcasts.is_empty(), "{:?}", rw.qcasts);
         assert!(q[0].contains("qp1(0)"), "{}", q[0]);
+        assert!(!q[0].to_uppercase().contains("CAST") && !q[0].contains("::"), "{}", q[0]);
     }
 
     #[test]
@@ -806,8 +786,7 @@ mod tests {
         // on 5b, which names the conversion instead of dropping or retargeting it.
         let (q, rw) = run("SELECT (t.a + 1)::integer FROM t").expect("rewrites");
         assert_eq!(q[0], "SELECT qcast0(t.a + 1) FROM t");
-        assert_eq!(rw.dropped.identity, 0);
-        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), arg: Ty::Opaque, ret: Ty::Int }]);
+        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), ret: Ty::Int }]);
     }
 
     #[test]
@@ -821,8 +800,8 @@ mod tests {
         assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
         assert_eq!(rw.qcasts[0].ret, Ty::Str, "outer target");
         assert_eq!(rw.qcasts[1].ret, Ty::Int, "inner target");
-        // The point of the arm: the outer read `Int` off the inner's target, not off `name`.
-        assert_eq!(rw.qcasts[0].arg, Ty::Int);
+        // The point of the arm: the outer read `Int` off the inner's target, not off `name`. Read
+        // off `name` it would be VARCHAR to VARCHAR, an identity, and the outer would be gone.
     }
 
     #[test]
@@ -845,7 +824,7 @@ mod tests {
         let mut inf = infer(&queries, None).expect("infers");
         let rw = rewrite_casts(&mut queries, &mut inf).expect("rewrites");
         assert_eq!(queries[0].to_string(), "SELECT t.user_id FROM t");
-        assert_eq!(rw.dropped.identity, 2);
+        assert!(rw.qcasts.is_empty(), "{:?}", rw.qcasts);
         // The surviving node is the one the outer cast used to occupy, and inference still knows
         // which column it is.
         let mut found = 0;
@@ -863,7 +842,6 @@ mod tests {
         // `varchar(8)` produces a VARCHAR, so casting that to unqualified `varchar` is a no-op and
         // rule 4 takes the *outer*. The truncation underneath must not be touched.
         let (q, rw) = run("SELECT t.name::varchar(8)::varchar FROM t").expect("rewrites");
-        assert_eq!(rw.dropped.identity, 1);
         assert_eq!(q[0], "SELECT qcast0(t.name) FROM t", "the truncation was dropped");
         assert_eq!(rw.qcasts.len(), 1);
     }
@@ -873,8 +851,8 @@ mod tests {
         // The mirror: `varchar` then `varchar(8)` cuts the string, so the outer has to survive even
         // though both sides read VARCHAR. Rule 4's `!qualified` condition is what saves it.
         let (q, rw) = run("SELECT t.name::varchar::varchar(8) FROM t").expect("rewrites");
-        assert_eq!(rw.dropped.identity, 1, "the inner no-op should still go");
-        assert!(q[0].contains("qcast0"), "{}", q[0]);
+        assert_eq!(q[0], "SELECT qcast0(t.name) FROM t", "the inner no-op should still go");
+        assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
         assert_eq!(rw.qcasts[0].ret, Ty::Str);
     }
 
@@ -914,7 +892,7 @@ mod tests {
 
     #[test]
     fn two_different_unmappable_targets_are_not_one_symbol() {
-        // Every unmappable target carries as `Opaque`, so `arg` and `ret` alone cannot tell `jsonb`
+        // Every unmappable target carries as `Opaque`, so the sorts alone cannot tell `jsonb`
         // from `uuid[]` -- and a Z3 uninterpreted function *is* its name plus its sorts. If these
         // shared a symbol the pair would prove that converting a column to JSON and to a UUID array
         // give the same value.
@@ -928,9 +906,8 @@ mod tests {
         // The identity rule drops a cast whose target the operand already has. Both sides here read
         // `Opaque` -- an unknown column, an unreadable target -- and letting them match would drop the
         // cast outright, proving `a::jsonb` equal to a bare `a`.
-        let (q, rw) = run("SELECT a::jsonb FROM t").expect("rewrites");
-        assert_eq!(rw.dropped.identity, 0, "an unreadable cast was dropped as an identity");
-        assert_eq!(q[0], "SELECT qcast0(a) FROM t");
+        let q = one("SELECT a::jsonb FROM t");
+        assert_eq!(q, "SELECT qcast0(a) FROM t", "an unreadable cast was dropped as an identity");
     }
 
     #[test]

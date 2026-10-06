@@ -377,13 +377,6 @@ fn lowers_with_split_params(
 type ParsedInput =
     (HashMap<String, FnDecl>, catalog::Catalog, Vec<sqlparser::ast::Query>, Vec<BTreeSet<u32>>);
 
-/// Split the preprocessor `.sql` format into its function declarations, its declared catalog and its
-/// two queries. The `declare ... function` lines are a custom DSL, not SQL, so they come out first.
-///
-/// `ddl_catalog` is the caller's own schema, from [`lower_with_ddl`]; when it is given, the input's own
-/// `CREATE TABLE`s are ignored. It is resolved *here* rather than by the caller because the DML
-/// reduction needs the catalog the pair will actually be lowered against, and it runs inside this
-/// function.
 /// The head of [`parse_input`]: the `declare ... function` DSL lines split off, the rest parsed.
 ///
 /// Its own function because [`reflexive`] needs exactly this much and nothing below it. Two copies
@@ -611,6 +604,13 @@ fn normalized_pair(
     Some((it.next()?, it.next()?))
 }
 
+/// Split the preprocessor `.sql` format into its function declarations, its declared catalog and its
+/// two queries. The `declare ... function` lines are a custom DSL, not SQL, so they come out first.
+///
+/// `ddl_catalog` is the caller's own schema, from [`lower_with_ddl`]; when it is given, the input's own
+/// `CREATE TABLE`s are ignored. It is resolved *here* rather than by the caller because the DML
+/// reduction needs the catalog the pair will actually be lowered against, and it runs inside this
+/// function.
 fn parse_input(
     src: &str,
     ddl_catalog: Option<catalog::Catalog>,
