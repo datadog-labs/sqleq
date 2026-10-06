@@ -183,13 +183,22 @@ pairs where it runs out of time). Either way an `EQ` is a claim to be checked ag
 
 ### How it is checked
 
-`sqleq-solver/examples/phase2_gate.rs` runs the ladder over a job file and joins it row by row
-against `IrDriver`'s results and a file of fuzz verdicts (one `{name, fuzz: {verdict}}` per line),
-failing on any `EQ` over a pair the fuzz axis refutes. `sqleq-solver/examples/normalize_check.rs`
-evaluates each side before and after normalization, and both
-sides of every proved pair, on small random databases that respect the schemas' column types and
-constraints, using the crate's concrete evaluator. The crate's unit tests pin the three-valued truth
-tables against a reference evaluator.
+What gates a change in CI is the crate's tests and the pinned pairs. `cargo test -p sqleq-solver`
+runs the unit tests, which pin the three-valued truth tables against a reference evaluator and the
+ladder's answers on hand-written plans. The `sqleq-solver` job then drives the built binary through
+`sqleq-check`: its tests of the second opinion (`sqleq-check/tests/real_solver.rs`), and every pair
+under [`tests/pairs`](../tests/pairs/README.md) on the `sqleq-solver` axis, which fails on any pin
+that moves, a proof of a pair pinned `not-equivalent` included.
+
+The examples under `sqleq-solver/examples/` are manual tools, not gates. CI compiles them and runs
+none, because each needs inputs that are not in this repository: a job file (the `{name, ir,
+schema}` lines `sqleq-frontend --sqlsolver --ir` writes, one per pair), and for `phase2_gate` also
+results from the fork and from the fuzz axis. `phase2_gate.rs` runs the ladder over a job file and
+joins it row by row against `IrDriver`'s results and a file of fuzz verdicts (one `{name, fuzz:
+{verdict}}` per line), failing on any `EQ` over a pair the fuzz axis refutes.
+`normalize_check.rs` evaluates each side before and after normalization, and both sides of every
+proved pair, on small random databases that respect the schemas' column types and constraints,
+using the crate's concrete evaluator.
 
 ### Building
 

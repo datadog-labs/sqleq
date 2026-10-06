@@ -229,7 +229,7 @@ answers.
 
 ## Building
 
-Recent stable Rust (edition 2021; MSRV 1.85, set by the dependency tree). A bare
+Recent stable Rust (edition 2021; MSRV 1.88, set by the locked dependency tree). A bare
 `cargo build --release` builds the frontend and `sqleq-check`; the frontend depends only on
 `sqlparser`, `serde_json` and `csv`. `sqleq-check` builds no backend: it runs each one as a
 subprocess, and the heavier ones are opt-in workspace members, each built with `-p`:

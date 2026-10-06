@@ -86,7 +86,7 @@ in. What it rewrites, and where it deliberately differs from the original, is in
 | `sqleq-solver/src/{normalize,ic,alpha}.rs` | normalization, integrity-constraint rewrites, and the alpha-equivalence decision |
 | `sqleq-solver/src/{prove,setsolver}.rs` | the decision ladder, and the Z3 set solver as its last rung |
 | `sqleq-solver/src/eval.rs` | a concrete evaluator, so tests can check a rewrite against data |
-| `sqleq-solver/examples/` | gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks |
+| `sqleq-solver/examples/` | manual gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks. CI compiles them but runs none, since their inputs are not in the repository |
 
 ## The refuting axis (`sqleq-fuzz/`)
 
