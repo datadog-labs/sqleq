@@ -112,10 +112,11 @@ fn a_portfolio_asks_it_per_case() {
         ss_mem: None,
     };
     for (example, bucket, verdict) in [
-        ("in_vs_or.sql", solver::PROVED_LITERAL, portfolio::EQUIVALENT),
-        ("dropped_filter.sql", solver::NO_PROOF, portfolio::UNDECIDED),
+        ("examples/in_to_join.sql", solver::PROVED, portfolio::EQUIVALENT),
+        ("tests/pairs/booleans/in_list_as_or.sql", solver::PROVED_LITERAL, portfolio::EQUIVALENT),
+        ("examples/dropped_filter.sql", solver::NO_PROOF, portfolio::UNDECIDED),
     ] {
-        let item = Item { path: repo().join("examples").join(example), name: example.to_string(), row: None };
+        let item = Item { path: repo().join(example), name: example.to_string(), row: None };
         let case = portfolio::run_case(&item, &ctx);
         let o = case.portfolio.as_ref().unwrap();
         assert_eq!((case.s_bucket.as_deref(), o.verdict.as_str()), (Some(bucket), verdict), "{example}: {}", case.s_note);

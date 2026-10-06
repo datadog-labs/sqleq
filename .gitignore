@@ -10,15 +10,15 @@
 # qed-prover writes its verdict beside its input, as `<input>.result`
 *.fe.result
 
-# The scratch directory the README's quick start creates
-/out
-
 # Lean build output for the `lean/` package
 /lean/.lake
 
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Bytecode from the Python scripts in tools/ and docs/logo/
+__pycache__/
 
 # javac output for the SQLSolver IR bridge (tools/sqlsolver/*.java)
 tools/sqlsolver/out/
