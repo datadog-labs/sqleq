@@ -1024,9 +1024,9 @@ impl VisitorMut for StripOrder {
 /// Strip a top-level `ORDER BY … LIMIT … OFFSET …` that is **identical on both sides** of the pair.
 ///
 /// With the same pagination applied to both, the pair reduces to its inner queries: if those return
-/// the same bag then the same ordering over the same bag yields the same page. The prover has no
-/// `LIMIT` in its IR and the frontend refuses one, so without this the whole pair is unlowerable —
-/// which is why this is worth doing rather than refusing.
+/// the same bag then the same ordering over the same bag yields the same page. The prover's IR has
+/// no `LIMIT` of its own: `lower::apply_pagination` lowers one to a `sort` node over its source, and
+/// stripping an identical one hands the provers the inner queries without that node.
 ///
 /// # Why "identical" is load-bearing, and why it is not sufficient
 ///
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     /// Differing pagination is a real difference between the two queries, not noise to normalize
-    /// away — it stays, and the pair is refused downstream for carrying a `LIMIT`.
+    /// away — it stays, and each side is lowered with its own slice.
     #[test]
     fn keeps_pagination_that_differs() {
         pagination_kept("SELECT a FROM t ORDER BY a LIMIT 10", "SELECT a FROM t ORDER BY a LIMIT 20");

@@ -6,9 +6,15 @@
 //! CLI: `sqleq-frontend [--infer|--infer-seeded] <input.sql> [out.json]` — lower a SQL pair to the
 //! prover's `Input` JSON.
 //!
+//! This is the binary `sqleq-check` runs for its `frontend` axis, and the one it hands the provers'
+//! input from. To check pairs end to end, run `sqleq-check`; this is for driving the lowering
+//! alone.
+//!
 //! Writes the JSON to `out.json` (default: the input path with a `.fe.json` extension) and prints
 //! that path on success. On any lowering error it prints the reason to stderr and exits non-zero —
-//! the frontend never emits partial/best-effort IR.
+//! the frontend never emits partial/best-effort IR. When the two sides of a refused pair normalize
+//! to one query, the line [`sqleq_frontend::REFLEXIVE_NOTE`] comes first, so the refusal is still
+//! the last line a caller reads.
 //!
 //! By default the schema is read from the input's `CREATE TABLE`s. The two flags turn type inference
 //! on instead; see [`sqleq_frontend::CatalogSource`] for what each decides, and note that they also
@@ -18,18 +24,23 @@
 //! the input. It composes with the inference flags.
 //!
 //! `--csv <corpus.csv> -o <dir>` is the batch form: every row of the corpus is lowered directly,
-//! reading its DDL out of the row. No `.sql` intermediate is written, and nothing Python runs. See
-//! [`sqleq_frontend::corpus`].
+//! reading its DDL out of the row, and no `.sql` intermediate is written. `--report <report.json>`
+//! adds every row's outcome and the refusal histogram; `--limit N` stops after the first N rows.
+//! See [`sqleq_frontend::corpus`].
 //!
-//! `--sqlsolver --csv <corpus.csv> -o <jobs.jsonl>` is a different destination for the same corpus:
-//! one JSON job per row for the second prover, which reads SQL text and a schema instead of our IR.
-//! It lowers nothing and refuses nothing. See [`sqleq_frontend::sqlsolver`].
+//! `--sqlsolver --ir <input.json>` is the only mode whose input is an `Input` rather than SQL: it
+//! packages an *already lowered* plan as one job for a SQLSolver driver — `sqleq-solver`, or the
+//! JVM fork's `IrDriver` — deriving the DDL from the plan's own `schemas`. The job is named by
+//! `--name <id>` (default: the file stem) and written to `-o <job.jsonl>` (default: stdout). It
+//! lowers nothing — deliberately, so that `sqleq-check` can hand the SQLSolver axis the very bytes
+//! it handed the QED prover, with no second lowering between the two. See
+//! [`sqleq_frontend::sqlsolver::ir_job_from_input`].
 //!
-//! `--sqlsolver --ir <input.json>` is the single-case form of that destination, and the only mode
-//! whose input is an `Input` rather than SQL: it packages an *already lowered* plan as one bridge
-//! job, deriving the DDL from the plan's own `schemas`. It lowers nothing — deliberately, so that
-//! `sqleq-check` can hand the second prover the very bytes it handed the first, with no
-//! second lowering between the two axes. See [`sqleq_frontend::sqlsolver::ir_job_from_input`].
+//! `--sqlsolver --ir --csv <corpus.csv> -o <jobs.jsonl>` does the same for a whole corpus, lowering
+//! each row first; a row that refuses becomes a job with no plan and its refusal. Without `--ir`,
+//! `--sqlsolver [--normalized] --csv` writes SQL-text jobs instead, for the original SQLSolver's
+//! own SQL entry point: those lower nothing and refuse nothing, and nothing in this repository runs
+//! them. See [`sqleq_frontend::sqlsolver`].
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,8 +49,10 @@ use sqleq_frontend::{corpus, CatalogSource};
 
 const USAGE: &str = "usage: sqleq-frontend [--infer|--infer-seeded] [--ddl <schema.sql>] <input.sql> [out.json]
        sqleq-frontend [--infer|--infer-seeded] --csv <corpus.csv> -o <dir> [--report <report.json>] [--limit N]
-       sqleq-frontend --sqlsolver [--normalized|--ir] [--infer-seeded] --csv <corpus.csv> -o <jobs.jsonl> [--limit N]
-       sqleq-frontend --sqlsolver --ir <input.json> [--name <id>] [-o <job.jsonl>]";
+       sqleq-frontend --sqlsolver [--normalized|--ir] [--infer|--infer-seeded] --csv <corpus.csv> -o <jobs.jsonl> [--limit N]
+       sqleq-frontend --sqlsolver --ir <input.json> [--name <id>] [-o <job.jsonl>]
+
+Lowers a SQL pair to prover input. To check pairs end to end, run sqleq-check.";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -176,12 +189,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// Package one already-lowered `Input` JSON as a bridge job for the second prover.
+/// Package one already-lowered `Input` JSON as a bridge job for the SQLSolver axis.
 ///
 /// The only mode that reads an `Input` instead of SQL, and the asymmetry is the point: the caller
 /// has already lowered this case and fed the JSON to our own prover, so lowering it again here
-/// would put a second frontend pass between the two axes and let them drift. `IrDriver` gets the
-/// same bytes, plus the MySQL DDL those bytes imply.
+/// would put a second frontend pass between the two axes and let them drift. The SQLSolver driver
+/// (`sqleq-solver`, or the JVM fork's `IrDriver`) gets the same bytes, plus the MySQL DDL those
+/// bytes imply.
 ///
 /// Refusal follows the single-file convention rather than the corpus one -- a reason on stderr and
 /// a non-zero exit, not an `ir: null` job. A batch run needs every name present so the two runs
@@ -267,7 +281,7 @@ fn run_csv(
     for row in &rows {
         let outcome = corpus::lower(row, source);
         // Only on the refusal path: a row that lowers is already reported by its IR, and asking the
-        // question of the ~2k rows that do would be work for an answer nothing reads.
+        // question of the rows that do would be work for an answer nothing reads.
         let refl = outcome.is_err() && corpus::reflexive(row);
         reflexive += usize::from(refl);
         detail.push(corpus::record(row, &outcome, refl));
@@ -326,7 +340,7 @@ fn run_csv(
 
 /// Turn a whole corpus CSV into a SQLSolver work file, one JSON job per line.
 ///
-/// Exits 0 whatever the notes say: every row gets a job, and what the second prover makes of it is
+/// Exits 0 whatever the notes say: every row gets a job, and what SQLSolver makes of it is
 /// the measurement (see [`sqleq_frontend::sqlsolver`]).
 fn run_sqlsolver(
     csv: &Path,

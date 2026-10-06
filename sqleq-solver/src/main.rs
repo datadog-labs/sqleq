@@ -14,10 +14,12 @@
 //! is `{name, verdict, ms, killed, literal?, refused?, error?}` with `IrDriver`'s vocabulary:
 //! `NOIR` (the frontend built no IR), `EQ` (`literal: true` when the two IR trees are identical,
 //! tier 0, which is never a proof), `NEQ` (no proof found -- never a disproof), `UNKNOWN`,
-//! `NOTRANS` (the IR could not be translated), `ERROR`, `TIMEOUT`, `HANG`, and `TRANSLATED` under
-//! `--dry-run`. Progress goes to stderr as `name verdict Nms`.
+//! `NOTRANS` (the IR could not be translated), `ERROR`, `HANG`, and `TRANSLATED` under `--dry-run`.
+//! `IrDriver` also writes `TIMEOUT`; this binary never does. Progress goes to stderr as
+//! `name verdict Nms`.
 //!
-//! The per-row cap is enforced by running each row on its own thread. A thread cannot be killed,
+//! The per-row cap is enforced by running each row on its own thread. A row that answers after the
+//! cap but within `--grace-ms` keeps its verdict, with `killed: true`. A thread cannot be killed,
 //! so a row still running `--grace-ms` after the cap is written as `HANG` and the process exits
 //! with status 3 -- exactly `IrDriver`'s self-halt, which callers already answer by resuming on a
 //! fresh process over the rows not yet written. Z3's own per-query timeout is the primary cap; this

@@ -4,17 +4,17 @@
 
 A premise and four decisions shaped `sqleq-frontend`, and this is the only place the *arguments* for
 them are written down. That is the whole reason this file still exists. It does **not** describe the
-repo as it is — for that read [../README.md](../README.md), and for the running record
-the engineering log, which is not published.
+repo as it is — for that read [../README.md](../README.md) and [INTERNALS.md](INTERNALS.md).
 
 It is what survives of the original proposal, *A Rust Frontend for QED (retiring Java/Calcite +
-Python)*, trimmed on 2026-09-22; `git show 4295db5:DESIGN.md` is the full text. What was cut had
-stopped carrying information: a staged plan that is finished (the Java parser retired in `c47accf`,
-the Python preprocessor not long after), effort estimates spent, risks resolved, a "recommended next
-action" long since taken, and a coverage baseline several corpus revisions stale. The scope was
-narrower than what shipped, too — the proposal was a frontend for one prover, and `sqleq` now runs
-three axes over it: `qed` and `sqlsolver` (both through this IR) and `fuzz` (which reads no IR at
-all).
+Python)*, trimmed on 2026-09-22; the full text, like the rest of the project's early history,
+predates this repository. What was cut had stopped carrying information: a staged plan that is
+finished (the Java parser retired first, the Python preprocessor not long after), effort estimates
+spent, risks resolved, a "recommended next action" long since taken, and a coverage baseline several
+corpus revisions stale. The scope was narrower than what shipped, too — the proposal was a frontend
+for one prover. `sqleq` now hands this IR to the QED prover and to `sqleq-solver` (and to the JVM
+SQLSolver, its cross-check); `sqleq-fuzz` reads no IR at all, and the Lean axis, which proves one
+class of `INSERT` pair, reads the frontend's parse tree rather than its IR.
 
 ---
 
@@ -69,8 +69,7 @@ elimination — so raw-IR diffing flags spurious differences. The robust oracle 
 require the *prover* to agree (both provable, or both not), with raw-IR equality as a stricter,
 optional bonus check once the frontend implements pruning of its own.
 
-The oracle has since served its purpose and is closed; v34 records why its parity number is final
-rather than stale.
+The oracle has since served its purpose and is closed, with the Java parser it compared against.
 
 ## 4. Normalizations: "sound" is separate from "coping"
 

@@ -158,11 +158,11 @@ HTML = """<!doctype html>
 
 <section>
   <h2>Axis-coloured variant</h2>
-  <p class="sub">available &middot; not the default</p>
-  <div class="warn"><strong>This variant has an expiry date.</strong> Colouring the three bars
-    for qed, sqlsolver and fuzz makes the mark a legend for the portfolio &mdash; which means a
-    fourth tool makes it wrong, not merely dated. The mono mark carries no count and never
-    expires. Use this one only where the three axes are themselves the subject.</div>
+  <p class="sub">retired &middot; kept so the set stays reproducible</p>
+  <div class="warn"><strong>This variant is retired.</strong> Colouring the bars for qed,
+    sqlsolver and fuzz made the mark a legend for the portfolio &mdash; and the portfolio has
+    since grown, so the legend is wrong, not merely dated. The mono mark carries no count; use it
+    everywhere.</div>
   <div style="margin-top:1rem">%(axes)s</div>
   <div class="pair" style="margin-top:1rem">%(swatches)s</div>
   <p style="margin-top:.8rem">Hues are lifted from the project's generated reports; nothing here

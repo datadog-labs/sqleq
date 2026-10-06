@@ -1,24 +1,30 @@
 # SQLSolver: `sqleq-solver`, with the JVM fork as a cross-check
 
-[SQLSolver](https://github.com/SQLSolver/SQLSolver) (SIGMOD 2024, Apache 2.0) is a second SQL
-equivalence prover. This repository answers the `sqlsolver` axis with **`sqleq-solver`**, a Rust
-rewrite of SQLSolver's proof engine ([below](#sqleq-solver)): it reads the same `Input` JSON the QED
-prover gets, needs no JVM, and is what `sqleq-check --sqleq-solver` asks. The
-original, run as a JVM fork through `tools/sqlsolver/`, is kept as a **backup cross-check**
-([below](#the-jvm-fork)): `--sqlsolver-jvm` asks it instead, and running both on the same jobs
-shows where they disagree.
+[SQLSolver](https://github.com/SJTU-IPADS/SQLSolver) (SIGMOD 2024, Apache 2.0) is a SQL equivalence
+prover built independently of QED. **`sqleq-solver`** is a Rust rewrite of its proof engine
+([below](#sqleq-solver)) and the axis of the same name: it reads the same `Input` JSON the QED
+prover gets, needs no JVM, and is what `sqleq-check --sqleq-solver` asks. The original, run as a JVM
+fork through `tools/sqlsolver/`, is kept as a **backup cross-check** and is being deprecated
+([below](#the-jvm-fork)): `--sqlsolver-jvm` asks it instead, as the axis `sqlsolver-jvm`. A run asks
+one of the two, so comparing them takes two runs over the same pairs.
 
-Either way the axis is a **second opinion**: its answer is reported beside QED's and never changes a
-verdict or an exit code. The point of having it is that two provers of different construction,
-reading the same IR, check each other — see [VALIDATION.md](VALIDATION.md).
+Outside `--portfolio`, either one is a **second opinion**: its answer is reported beside QED's, and
+neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it.
+Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
+can make a case `equivalent`, and the combined verdict decides the exit code. Under `--expect
+pinned`, its pin is checked like every axis's, so a moved answer fails the run. The point of having
+it is that provers of different construction, reading the same IR, check each other — see
+[VALIDATION.md](VALIDATION.md).
 
-The fork is the cross-check rather than the axis because it proves some pairs that Postgres does not
-treat as equivalent, and because it cannot be rebuilt from public sources. The false proofs known so
+The fork is the backup rather than the primary SQLSolver axis because it proves some pairs that
+Postgres does not treat as equivalent, and because it cannot be rebuilt from public sources. The false proofs known so
 far, and what stands between each and a reported verdict:
 
-* **Any two `UPDATE`s of one table are `EQ`**
-  ([below](#the-update-unsoundness--why-unsupported-exists)). The harness buckets every row that is
-  not a query `unsupported`, whatever the fork answers.
+* **Any two `UPDATE`s of one table are `EQ`**, on the fork's SQL-text entry point
+  ([below](#the-update-unsoundness-on-the-sql-text-path)). The bridge never takes that path: the
+  frontend reduces a DML pair to the queries computing its effect before it lowers anything, so the
+  fork is only ever handed two queries, and the bridge's plan entry skips the check where the
+  collapse happens.
 * **`UNIQUE` is read as "no duplicate rows at all"**, while Postgres allows any number of NULLs
   ([below](#unique-means-something-different-here)). The schema declares `UNIQUE` only over `NOT
   NULL` columns.
@@ -39,56 +45,60 @@ to check against `sqleq-fuzz`.
 
 `sqleq-solver` is reproducible from this repository alone, Z3 included: `cargo build --release -p
 sqleq-solver`, and `--sqleq-solver` in `sqleq-check` finds it. The JVM fork is **not reproducible
-from this repository alone.** Neither of its two checkouts is vendored here, and only one of them is
-public:
-
-* The **SQL-text path** needs `$SQLEQ_SQLSOLVER_PRISTINE`, an unmodified upstream checkout, plus a
-  JDK. That checkout is public, so anything described here about that path can be re-checked.
-* The **IR bridge** and everything downstream of it — including `--sqlsolver-jvm`
-  in `sqleq-check` — need `$SQLEQ_SQLSOLVER`, a hand-modified fork with Calcite removed. **That
-  fork is not published.** The sections below state what the fork has to do, which is enough to redo
-  the work, but redoing it is a rebuild rather than a checkout.
+from this repository alone.** `sqleq-check --sqlsolver-jvm` needs `$SQLEQ_SQLSOLVER` (or
+`--sqlsolver-tree DIR`), a hand-modified fork with Calcite removed, its classes compiled into
+`build/classes-javac`; `$SQLEQ_SQLSOLVER_DEPS`, the upstream fat jar exploded with
+`org/apache/calcite` removed; and a JDK on `PATH`. **That fork is not published.** The sections
+below state what the fork has to do, which is enough to redo the work, but redoing it is a rebuild
+rather than a checkout.
 
 The Java sources that *are* in this repository — `tools/sqlsolver/` — are our side of the bridge.
-They compile against the fork and do nothing without it.
+`sqleq-check` compiles them against the fork with the system `javac`, into
+`tools/sqlsolver/out-fork/`, whenever they are newer than the classes there; they do nothing
+without the fork.
 
 ## Verdicts are not symmetric
 
-Both implementations answer with SQLSolver's four `VerificationResult` values, and only one of them
-is a claim:
+Both drivers answer each row with one raw verdict, and `sqleq-check` buckets it
+(`sqleq-check/src/axes/solver.rs`). Only `EQ` is a claim:
 
 | raw | means | bucket |
 |---|---|---|
 | `EQ` | proved equivalent | `proved` / `proved-literal` |
 | `NEQ` | **no proof found** | `no-proof` |
 | `UNKNOWN` | no proof found | `no-proof` |
-| `TIMEOUT` | no proof found | `timeout` |
+| `NOIR`, `NOTRANS` | the frontend built no plan, or the plan could not be translated — ours, not theirs | `unsupported` |
+| `TIMEOUT`, `HANG` | the per-row cap ran out; `HANG` is a worker that ignored its interrupt | `timeout` |
+| `ERROR` | the driver failed on the row, or died on it | `error` |
+| — | no answer came back for the row | `missing` |
+
+`EQ`, `NEQ`, `UNKNOWN` and `TIMEOUT` are SQLSolver's own `VerificationResult` values, and
+`sqleq-solver` never writes `TIMEOUT`. A row the cap cut off is marked `killed`, whatever it then
+answered, and that turns anything but an `EQ` into `timeout`: "we stopped asking" is not "they found
+no proof". After a `HANG` the driver halts its own process, and `sqleq-check` resumes it on the rows
+still unanswered. A driver killed on a row — out of memory under a cap, or a crash — has that row
+recorded as `ERROR` with `died: true`, and the pass goes on past it.
 
 **`NEQ` is not a counterexample.** SQLSolver is meant to be sound and is incomplete, and `NEQ` is
 what it returns when a proof attempt fails, not when it has refuted anything. The harness collapses
 `NEQ` and `UNKNOWN` into one bucket deliberately, so that no downstream reader can read `NEQ` as a
 refutation. `sqleq-fuzz` remains the only disprover in the system.
 
-`HANG` and `DIED` are this harness's labels rather than SQLSolver's: a worker that ignored its
-interrupt, and a driver process that never answered.
-
 ### Two kinds of `EQ`
 
-In the fork, `getVerifyResult` answers `EQ` on either of two grounds, and they are not worth the
-same. Before it solves anything it asks `PlanSupport.isLiteralEq`, which re-parses both sides and
-compares the assembled plan trees structurally. An `EQ` from there says the two queries are the same
-query — not that the prover related two different ones. Counting those as capability repeats the
-mistake the qed axis's own reflexivity check exists to avoid.
+An `EQ` can come from a proof or from the two sides being one plan already, and the two are not
+worth the same. On its SQL-text entry point the fork answers the second kind first: before it solves
+anything, `getVerifyResult` asks `PlanSupport.isLiteralEq`, which compares the plan trees assembled
+from the two texts. An `EQ` from there says the two queries are the same query — not that the prover
+related two different ones. Counting those as capability repeats the mistake the qed axis's own
+reflexivity check exists to avoid.
 
-So the driver asks the same question again, after verification and only on `EQ`, and emits
-`"literal":true|false` beside the verdict: `proved` means the solver proved it, `proved-literal`
-means the structural short-circuit matched and no solving happened. Asking afterwards costs one
-extra parse on the `EQ` rows alone and cannot perturb the verdict it explains. An `EQ` the driver
-could not label reads as a proof rather than being quietly downgraded, so the inflation this guards
-against cannot come back as an undercount.
-
-`sqleq-solver` makes the same split earlier: its tier 0 compares the two raw IR trees before
-anything is parsed, and labels an `EQ` from there `literal: true` in the same field.
+The bridge's plan entry skips `isLiteralEq`, so both drivers ask that question themselves, as a
+tier 0 before any solving: `sqleq-solver` and `IrDriver` alike compare the two raw IR trees and
+label an `EQ` from there `"literal": true`. `proved` means the solver proved it; `proved-literal`
+means the two sides were identical and no solving happened. An `EQ` with no label reads as a proof
+rather than being quietly downgraded, so the inflation this guards against cannot come back as an
+undercount.
 
 ## The second opinion in `sqleq-check`
 
@@ -97,15 +107,16 @@ anything is parsed, and labels an `EQ` from there `literal: true` in the same fi
 shaped it, all from the fork, and the pass keeps them for both so that the two implementations'
 answers stay comparable:
 
-1. **One driver process, at the end, sequentially.** A JVM start is a large fraction of what a
-   `.sql` pair costs, so paying it per case would swamp the run.
+1. **One pass, at the end, by one driver process.** A JVM start is a large fraction of what a
+   `.sql` pair costs, so paying it per case would swamp the run. `--sqleq-solver-jobs N` runs N
+   drivers side by side, each over its share of the rows, at the price of the third constraint.
 2. **The JVM self-halts** rather than unwinding, so something has to notice the missing answers and
    resume. A per-case call has nowhere to put that loop.
 3. **The per-row cap is load-sensitive.** Under `-j 8` a row near the cap decides differently than
    it does alone, and a second opinion that changes with `-j` is not a second opinion.
 
-So `run_case` does one sqlsolver-axis thing — it packages the plan, while the case's working
-directory still exists — and a single sequential pass at the end asks the driver about every job.
+So `run_case` does one SQLSolver-axis thing — it packages the plan, while the case's working
+directory still exists — and a single pass at the end asks the driver about every job.
 The packaging cost is discounted from the case wall time, so a second-opinion run's timings stay
 comparable to one without it.
 
@@ -172,9 +183,10 @@ pairs where it runs out of time). Either way an `EQ` is a claim to be checked ag
 
 ### How it is checked
 
-`examples/phase2_gate.rs` runs the ladder over a job file and joins it row by row against
-`IrDriver`'s results and the fuzz axis's verdicts, failing on any `EQ` over a pair the fuzz axis
-refutes. `examples/normalize_check.rs` evaluates each side before and after normalization, and both
+`sqleq-solver/examples/phase2_gate.rs` runs the ladder over a job file and joins it row by row
+against `IrDriver`'s results and a file of fuzz verdicts (one `{name, fuzz: {verdict}}` per line),
+failing on any `EQ` over a pair the fuzz axis refutes. `sqleq-solver/examples/normalize_check.rs`
+evaluates each side before and after normalization, and both
 sides of every proved pair, on small random databases that respect the schemas' column types and
 constraints, using the crate's concrete evaluator. The crate's unit tests pin the three-valued truth
 tables against a reference evaluator.
@@ -188,19 +200,18 @@ compiler.
 ## The JVM fork
 
 The original SQLSolver, run through `tools/sqlsolver/` over a fork with Calcite removed, kept as the
-backup cross-check described at the top. Two checkouts of it are involved, named throughout by the
-environment variables the harnesses read:
+backup cross-check described at the top, and being deprecated. `sqleq-check --sqlsolver-jvm` finds
+it through two environment variables:
 
-| variable | tree |
+| variable | what |
 | --- | --- |
-| `$SQLEQ_SQLSOLVER_PRISTINE` | an unmodified upstream checkout — the control, and what serves the SQL-text path |
-| `$SQLEQ_SQLSOLVER` | the fork with Calcite removed, which serves the IR bridge |
-| `$SQLEQ_SQLSOLVER_DEPS` | the fork's exploded dependency directory |
+| `$SQLEQ_SQLSOLVER` | the fork with Calcite removed, its classes compiled into `build/classes-javac`; `--sqlsolver-tree DIR` overrides it |
+| `$SQLEQ_SQLSOLVER_DEPS` | the upstream fat jar, exploded, with `org/apache/calcite` removed — the fork's classpath, and what keeps the removal honest, since a surviving reference could not resolve |
 
-Nothing in the pristine checkout is modified by any of this, and nothing is filed against it. Where
-the sections below say SQLSolver, they mean this Java implementation.
+Nothing upstream is modified by any of this, and nothing is filed against it. Where the sections
+below say SQLSolver, they mean this Java implementation.
 
-### The `UPDATE` unsoundness — why `unsupported` exists
+### The `UPDATE` unsoundness on the SQL-text path
 
 **Any two `UPDATE` statements against the same table are reported `EQ`, whatever they do.**
 
@@ -227,15 +238,22 @@ never silently truncates one. The single clause it drops is `FOR UPDATE`, which 
 not the returned rows. `LIMIT`, `OFFSET`, `DISTINCT`, `ORDER BY`, `UNION`/`UNION ALL` and `HAVING`
 were each checked and all survive.
 
-**What the harness does about it.** `sqlsolver::is_query` marks any row whose either side is not a
-`SELECT`/`WITH`/`VALUES`/`TABLE` query, and the axis buckets such a row `unsupported` **whatever
-SQLSolver answered**. The rule is the structural one — this prover does not model DML — rather than
-a list of the keywords that happen to be dangerous today, so `INSERT` and `DELETE` are quarantined
-too even though they currently answer safely. The row is still emitted and still run, and the raw
-verdict is kept beside the bucket, so a refused `EQ` stays visible in the record instead of
-disappearing.
+**Why it cannot reach a verdict here.** The collapse lives in `isLiteralEq`, which reads SQL text,
+and nothing in this repository asks the fork about SQL text. On the bridge, the frontend reduces a
+DML pair to the queries computing its effect before lowering it (`src/dml.rs`), so `IrDriver` only
+ever sees two queries, and its plan entry does not call `isLiteralEq` at all. The frontend's
+SQL-text jobs (`sqleq-frontend --sqlsolver` without `--ir`) still carry a `non-select-statement`
+note on any row whose either side is not a `SELECT`/`WITH`/`VALUES`/`TABLE` query
+(`sqlsolver::is_query`), for whoever runs them through the fork's own SQL entry point. The rule is
+the structural one — this prover does not model DML — rather than a list of the keywords that happen
+to be dangerous today, so `INSERT` and `DELETE` are marked too even though they currently answer
+safely.
 
-### Parameters: `$1` becomes `_DOLLAR_1()`
+### Parameters: `$1` becomes `_DOLLAR_1()` on the SQL-text path
+
+On the bridge a parameter arrives as the frontend's nullary carrier `qpN`, which `IrToRel` turns
+into an uninterpreted function like any other unknown operator, minted under one name on both sides.
+The SQL-text jobs need an encoding of their own, and this section is about them.
 
 `SqlSupport.parsePreprocess` rewrites `$` to `_DOLLAR_`, which turns `$1` into the bare identifier
 `_DOLLAR_1` and fails Calcite validation; there is no dynamic-parameter support anywhere in the
@@ -253,10 +271,10 @@ for all.
 
 **The encoding stops at `LIMIT` and `OFFSET`.** Calcite's grammar accepts only an unsigned integer
 literal in those positions, so `LIMIT _DOLLAR_1()` is a parse error — a function call is not a
-literal, whatever it returns. This is the largest single reason the axis never reads a query, and
-it is **not soundly fixable by substitution**, for the same reason as above. Lifting it needs
-either dynamic-parameter support in the grammar or a rewrite that moves the bound out of the
-syntactic slot, neither of which is ours to make.
+literal, whatever it returns. On the text path that alone keeps many parameterized queries from ever
+being read, and it is **not soundly fixable by substitution**, for the same reason as above. Lifting
+it needs either dynamic-parameter support in the grammar or a rewrite that moves the bound out of
+the syntactic slot, neither of which is ours to make.
 
 Binding is **by index** — `$1` on the left is `$1` on the right — the same choice the qed and fuzz
 axes make. See [SOUNDNESS.md](SOUNDNESS.md).
@@ -264,8 +282,10 @@ axes make. See [SOUNDNESS.md](SOUNDNESS.md).
 ### The schema must be MySQL-dialect DDL
 
 `CalciteSupport` hardcodes `DB_TYPE = MySQL`, so `-schema` is parsed by their MySQL ANTLR grammar.
-We render it from the catalog `pgddl::parse_provided_schema` already builds — nothing new parses
-Postgres — and `sqlsolver::emit_mysql` writes backticked identifiers, one `CREATE TABLE` per table.
+On the bridge the schema is rendered from the IR's own `schemas`, so the table a scan index names is
+the table Calcite resolves; on the text path, from the catalog `pgddl::parse_provided_schema`
+builds. Either way nothing new parses Postgres, and `sqlsolver::emit_mysql` writes backticked
+identifiers, one `CREATE TABLE` per table.
 
 The type vocabulary is closed and load-bearing. `pgddl::map_pg_type` yields five types plus the
 temporal ones, mapped as:
@@ -305,24 +325,26 @@ its qualified name does not transfer. The emitter strips qualifiers at the token
 
 Stripping is a renaming, and a renaming is only safe when it is injective: if `a.t` and `b.t` both
 reduce to `t`, two distinct relations become one and a non-equivalent pair could read as
-equivalent. `qualifier_conflict` detects that and leaves both sides qualified — they then fail to
-resolve, so no proof can come out either.
+equivalent. On the text path `qualifier_conflict` detects that and leaves both sides qualified —
+they then fail to resolve, so no proof can come out either. The bridge has no qualified spelling to
+fall back on, since a scan names its table by index, so a plan whose tables share a bare name is
+refused outright.
 
 ### The IR bridge — feeding it our plans instead of SQL text
 
-The axis normally re-derives a plan by parsing our emitted SQL with Calcite/Babel in MySQL dialect,
-and that parser, not the prover, is where it mostly loses. The bridge removes the round trip:
+Upstream SQLSolver re-derives a plan by parsing SQL text with Calcite/Babel in MySQL dialect, and
+on our SQL that parser, not the prover, is where it mostly lost. The bridge removes the round trip:
 `sqleq-frontend --sqlsolver --ir` emits `{name, ir, schema}`, where `ir` is the same `Input` JSON
 the qed axis consumes; `tools/sqlsolver/IrToRel.java` turns it into a Calcite `RelNode` pair
 directly, and `IrDriver` hands that pair to the `Verification.verify(RelNode, RelNode, Schema)`
-overload. No SQL text is on the path, and the same bytes reach both provers — which is the point:
-re-lowering the SQL for the second prover would put a second lowering between the two axes and
-reintroduce exactly the drift the cross-check exists to rule out.
+overload. No SQL text is on the path, and the QED prover and the fork read the same bytes — which is
+the point: re-lowering the SQL for another prover would put a second lowering between the two axes
+and reintroduce exactly the drift the cross-check exists to rule out.
 
 ### Operational constraints
 
-Three of these are load-bearing, and getting any one wrong looks like a wrong answer rather than an
-error.
+`sqleq-check` gets each of these right for you; they are written down because getting any one wrong
+looks like a wrong answer rather than an error.
 
 * **Classpath, not module path.** `api/module-info.java` exports `sqlsolver.api` but not
   `sqlsolver.api.entry`, so `Verification` is unreachable under JPMS. Classpath execution ignores
@@ -331,13 +353,14 @@ error.
   relatively.
 * **Both library paths.** `LD_LIBRARY_PATH=<repo>/lib` *and* `-Djava.library.path=<repo>/lib`.
 * **Not reentrant.** Process-global state (`TEMP_TABLE_NAME_SEQUENCE`, `TEMP_COL_NAME_SEQUENCE`,
-  `UMulImpl.useWeakEquals`, `USER_DEFINED_FUNCTIONS`) means parallelism must be process-level, and
-  each process is retired after a bounded number of pairs so nothing accumulates.
-* **Native Z3 can outrun a thread interrupt**, hence three nested caps: the `sqlsolver.z3.timeout`
-  property, the driver's per-row worker join, and the harness's wall clock. A worker that will not
-  stop gets `Runtime.halt(3)` — so `rc == 3` is an expected exit, not a failure, and whatever drives
-  the JVM has to re-read the results file and re-ask only the names still missing.
+  `UMulImpl.useWeakEquals`, `USER_DEFINED_FUNCTIONS`) means parallelism must be process-level:
+  `--sqleq-solver-jobs` runs separate driver processes, never threads in one.
+* **Native Z3 can outrun a thread interrupt**, hence nested caps: the `sqlsolver.z3.timeout`
+  property, and the driver's per-row worker join with its grace period. A worker that will not stop
+  gets `Runtime.halt(3)` — so `rc == 3` is an expected exit, not a failure, and whatever drives the
+  JVM has to re-read the results file and re-ask only the names still missing.
 * **Per-pair schema.** `Verification.verify(sql0, sql1, schema)` re-reads the schema per call, so
   the CLI's one-schema-per-batch mode is unusable for a corpus where rows carry their own DDL.
-* The jar runs under a system JDK 21; *rebuilding* SQLSolver needs JDK 17 — another reason not to
-  depend on patching it.
+* **No jar is run.** The fork's classes are compiled with `javac` into `build/classes-javac` and run
+  against the exploded dependency directory; the bridge itself is compiled with `javac --release
+  17`.

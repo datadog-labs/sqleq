@@ -18,38 +18,47 @@ Query equivalence is undecidable in general, so no tool decides every pair. What
 | a **prover** | equivalent | non-equivalent | nothing about the pair |
 | a **disprover** | non-equivalent | equivalent | nothing about the pair |
 
-`sqleq` runs both kinds over one frontend. Two proving axes — the
-[QED](https://github.com/qed-solver/prover) prover and `sqleq-solver`, a Rust rewrite of
-[SQLSolver](https://github.com/SQLSolver/SQLSolver), both reading IR this repo produces — and one
-refuting axis, `sqleq-fuzz`, which runs the pair against DuckDB on generated
-instances and reports the first divergence.
+`sqleq` runs both kinds. The proving axes are the [QED](https://github.com/qed-solver/prover)
+prover and `sqleq-solver`, a Rust rewrite of [SQLSolver](https://github.com/SJTU-IPADS/SQLSolver),
+both reading the IR the frontend produces, and the Lean axis, which proves one class of `INSERT`
+pair under a parameter rule of its own ([LEAN.md](LEAN.md)). The refuting axis is `sqleq-fuzz`,
+which runs the original SQL against DuckDB on generated instances and reports the first divergence.
+It reads no IR, so it checks the frontend's lowering as well as the provers.
 
 The single most important consequence: **"not proved" is not "not equivalent."** It is a statement
 about reach, not about the queries. Most pairs in any realistic corpus come back undecided, and that
 is the expected outcome rather than a failure.
 
-## Each axis is the other's control
+## Proofs and refutations control each other
 
-The axes are not two attempts at the same measurement. Each is sound in one direction only, so
-neither can check itself — but together they can, in exactly two places. Every pair is classified on
-both axes independently and cross-tabulated:
+The provers and the refuter are not attempts at the same measurement. Each is sound in one
+direction only, so none can check itself — but together they can, in exactly two places. Every pair
+is classified by each independently, and the two kinds of answer are cross-tabulated:
 
 |  | refuted | not refuted |
 |---|---|---|
-| **proved** | **soundness alarm** — one of the two is wrong | expected |
+| **proved** | **soundness alarm** — one of them is wrong | expected |
 | **not proved** | expected | undecided; the work queue |
 
 The `proved × refuted` cell must be empty. Anything in it is a bug in a prover, in the disprover, or
 in the frontend that feeds them, and every occurrence has been chased to a root cause — several are
 listed below.
 
+A proof and a counterexample contradict each other only when both answer the same question, which
+for a parameterized pair means the same parameter binding. A Lean proof holds under the gather rule
+and a `sqleq-fuzz` counterexample under index binding, so that combination is a non-equivalence,
+not an alarm. `sqleq-check --portfolio` runs every asked backend on each case, whether the cases are
+pair files or the rows of a corpus (`--corpus`), and reports the first cell as the verdict `alarm` — which fails the run
+whatever `--expect` says — and the second as `not-equivalent`.
+
 The `not proved × refuted` cell is what keeps the rest honest. It is the disprover demonstrating, on
 this very run, that it is awake and can still refute things. If it ever collapsed toward zero, every
 "no counterexample" in the run would be vacuous and the empty soundness cell would mean nothing.
 
 **A run is therefore its own control, and no separate control batch is used or should be added.**
-Earlier work paired each claim with a hand-built negative control; in a two-axis run that control
-set *is* a cell of the table, so it is reported as a first-class number instead.
+Earlier work paired each claim with a hand-built negative control; in a run that asks both a
+prover and the refuter, that control set *is* a cell of the table, so it is reported as a
+first-class number instead.
 
 The [pinned pairs](../tests/pairs/README.md) are not such a batch. They record what each axis said
 about pairs whose truth is already known — most of them defects found once, below — and fail when
@@ -82,15 +91,20 @@ disagreeing with another rather than by inspection. Those that can be stated as 
 minimized, under [`tests/pairs/`](../tests/pairs/README.md).
 
 **In the QED prover** (external, upstream). A scalar aggregate over an empty input returns one row;
-the prover's grouping model did not, making it unsound on that shape. Found by the concrete
-differential tester, root-caused, and fixed locally behind an empty-keys guard.
+the prover's grouping model did not, making it unsound on that shape. Found by `sqleq-fuzz`,
+root-caused, and fixed with an empty-keys guard in the prover itself, which is not part of this
+repository. Whether a given prover build carries the fix is checkable: one without it proves
+`tests/pairs/aggregates/scalar_agg_empty_group.sql`, and the pinned run fails there.
 
 **In the SQL parser we depend on.** `sqlparser`'s `IS DISTINCT FROM` parsed its right operand at
 precedence 0, so the operand swallowed every conjunct that followed it: `a IS DISTINCT FROM b AND c`
 became `a IS DISTINCT FROM (b AND c)`. A predicate that quietly means something else is precisely
 how a *sound* prover is made to emit a false proof, and a second instance of the same shape turned
-up later in JSON extraction. Both are corrected in the frontend before lowering, and pinned by tests
-that assert the precedence rather than the output.
+up later in JSON extraction. The first is fixed in `sqlparser` 0.63, which this repository uses, and
+the frontend still refuses the shapes the mis-parse produced rather than trust the fix
+(`normalize::fix_precedence`). The second is avoided by parsing with the Postgres dialect, which
+gives the JSON operators their Postgres precedence. Both are pinned by tests that assert the
+precedence rather than the output.
 
 **In our own normalizations.** `strip_in_exists_distinct` removed `DISTINCT` inside `IN`/`EXISTS`
 unconditionally. That is sound only in the absence of `LIMIT`/`OFFSET`: de-duplication changes which
@@ -102,7 +116,7 @@ worth a second rule.
 parameter names for different things, and a rewrite can renumber parameters across a pair. Treating
 the names as aligned is a false-proof channel; it is now detected and refused as
 `parameter-misaligned`. The tempting shortcuts here are refuted by real pairs rather than argued
-away — see [SOUNDNESS.md](SOUNDNESS.md), which sets out the one assumption that remains.
+away — see [SOUNDNESS.md](SOUNDNESS.md), which sets out what the frontend still assumes.
 
 **In the disprover, four times.** A disprover's failure mode is the mirror image: a *false
 refutation*, claiming non-equivalence that does not hold. Each of these was caught and closed.
@@ -125,7 +139,7 @@ its own kind of defect.
 * **"No counterexample found" is not a proof.** It is a finite search over small random instances,
   and it degrades with the generator's reach — a predicate comparing against a literal outside the
   generated value domain is satisfied by no row, and the pair looks equivalent when it may not be.
-  See `sqleq-fuzz/README.md`.
+  See [`sqleq-fuzz/README.md`](../sqleq-fuzz/README.md).
 * **A counterexample *is* a proof of non-equivalence**, provided the instance is valid and both
   queries are deterministic. Enforcing exactly that is most of what the disprover's code does.
 * **Numbers expire.** Coverage figures move with every frontend change and are tied to whichever
@@ -133,5 +147,5 @@ its own kind of defect.
 
 ## Reading further
 
-* [SOUNDNESS.md](SOUNDNESS.md) — what a verdict rests on, and the one assumption that remains.
+* [SOUNDNESS.md](SOUNDNESS.md) — what a verdict rests on, and what the frontend still assumes.
 * [DESIGN.md](DESIGN.md) — why the frontend is built the way it is.

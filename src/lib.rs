@@ -6,30 +6,33 @@
 //! `sqleq-frontend` — read a SQL equivalence pair, and lower it to a prover's input IR.
 //!
 //! This crate parses a SQL equivalence pair, resolves names and types, and lowers it to the
-//! `Relation`/`Expr` JSON both proving axes consume: the QED prover directly, and `sqleq-solver` (a
-//! Rust rewrite of SQLSolver) through the job files [`sqlsolver`] writes. It replaces the legacy Python preprocessor + Java/Calcite parser
-//! with a single Rust frontend (see `docs/DESIGN.md`). The third axis, `sqleq-fuzz`, does not read
-//! IR at all — it runs the two queries against DuckDB and looks for a counterexample.
+//! `Relation`/`Expr` JSON the IR-reading provers consume: the QED prover directly, and
+//! `sqleq-solver` (a Rust rewrite of SQLSolver), or the JVM SQLSolver it is cross-checked against,
+//! through the job files [`sqlsolver`] writes. It replaces the legacy Python preprocessor +
+//! Java/Calcite parser with a single Rust frontend (see `docs/DESIGN.md`). The refuting axis,
+//! `sqleq-fuzz`, does not read IR at all — it runs the two queries against DuckDB and looks for a
+//! counterexample — and the Lean axis reads this crate's parse of the pair, not its IR.
 //!
 //! ## Soundness
 //!
 //! The prover is sound: it only proves genuinely-equivalent pairs *given faithful IR*. So the one
 //! way to introduce a false positive is to lower SQL unfaithfully. The frontend therefore **refuses**
-//! (returns [`FrontendError`]) any construct it cannot lower faithfully — `LIMIT`/`OFFSET`, window
-//! functions, correlated columns it can't resolve, etc. — rather than emitting best-effort IR. It
+//! (returns [`FrontendError`]) any construct it cannot lower faithfully — window functions,
+//! `LATERAL`, correlated columns it can't resolve, etc. — rather than emitting best-effort IR. It
 //! never panics or `exit`s on bad input.
 //!
-//! It assumes exactly one thing it cannot check: that `$N` on one side is the same application value
-//! as `$N` on the other (`src/params.rs`). `docs/SOUNDNESS.md` is the full argument — what is
-//! refused and why refusing is the right trade, and what that one assumption does and does not
-//! license.
+//! It assumes two things it cannot check. That `$N` on one side is the same application value as
+//! `$N` on the other (`src/params.rs`); and that a row slice — `LIMIT`/`OFFSET`, or `DISTINCT ON`
+//! with no `ORDER BY` — takes the same rows from equal inputs, which is the prover's own reading of
+//! its `Sort` node. `docs/SOUNDNESS.md` is the full argument — what is refused and why refusing is
+//! the right trade, and what the two assumptions do and do not license.
 //!
 //! ## Entry point
 //!
 //! [`lower_sql`] takes the preprocessor `.sql` format (optional `CREATE TABLE`s, optional
 //! `declare ... function` lines, then exactly two queries) and returns the prover `Input` JSON. The
-//! two may also be a pair of `DELETE`s or a pair of `UPDATE`s, which `dml` reduces to the queries
-//! computing their effect before anything else runs.
+//! two may also be a pair of `DELETE`s, of `UPDATE`s or of `INSERT`s, which `dml` reduces to the
+//! queries computing their effect before anything else runs.
 
 mod catalog;
 mod casts;
@@ -42,15 +45,15 @@ mod error;
 mod infer;
 mod lower;
 mod normalize;
-/// Where the crate's one unstated assumption is checked: `$N` on one side is `$N` on the other.
+/// Where the parameter assumption is checked: `$N` on one side is `$N` on the other.
 mod params;
 /// Public because it is an entry point: it reads raw Postgres DDL -- possibly malformed, since a
 /// captured schema is not a schema anyone wrote by hand -- into a `Catalog`, and reports per
 /// statement what it could not read rather than dropping it silently.
 pub mod pgddl;
 mod scope;
-/// Public because it is an entry point: the `--sqlsolver` mode of the CLI turns corpus rows into
-/// work for the second (SQLSolver) prover, which reads SQL text rather than our IR.
+/// Public because it is an entry point: the `--sqlsolver` mode of the CLI turns a lowered plan, or
+/// a corpus of rows, into jobs for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
 pub mod sqlsolver;
 mod types;
 mod verify;
@@ -104,9 +107,10 @@ pub use error::{FrontendError, Result};
 /// [`normalize::demote_operators`] would then faithfully lower the wrong tree. `PostgreSqlDialect`
 /// assigns them `PG_OTHER_PREC`, above `=`, which is the Postgres grammar.
 ///
-/// This is the same failure mode as the `IS DISTINCT FROM` bug in [`normalize`], and the two are fixed
-/// differently for a reason: that one is in `parse_infix` and is there in every dialect, so it has to
-/// be repaired in the tree, while this one *is* the dialect and is fixed by naming the right one.
+/// This is the same failure mode as the `IS DISTINCT FROM` bug [`normalize`] guards against, and
+/// the two are handled differently for a reason: that one was in `parse_infix`, in every dialect,
+/// so it is guarded in the tree, while this one *is* the dialect and is fixed by naming the right
+/// one.
 ///
 /// `normalize`'s tests parse through this constant so the precedence it buys is pinned by a test
 /// rather than assumed.
@@ -165,7 +169,8 @@ impl CatalogSource {
 ///
 /// The input is the preprocessor `.sql` format: any `CREATE TABLE`s, any
 /// `declare {scalar,aggregate} function NAME(args) returns TYPE;` lines (a custom DSL, stripped
-/// before SQL parsing), and exactly two `SELECT` statements (the pair to compare).
+/// before SQL parsing), and exactly two statements, the pair to compare: two `SELECT`s, or a pair
+/// of `DELETE`s, `UPDATE`s or `INSERT`s.
 pub fn lower_sql(src: &str) -> Result<Value> {
     lower_with(src, CatalogSource::Declared)
 }

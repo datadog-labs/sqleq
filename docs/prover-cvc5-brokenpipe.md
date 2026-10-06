@@ -6,7 +6,7 @@ or pushed anywhere. Publishing it in this repository is disclosure, not a bug re
 upstream review, and it may be wrong about that project's intent.
 
 **Component:** `src/pipeline/unify.rs`, `fn smt`
-**Affects:** qed-prover 0.1.0 as built by the repo's flake (z3 4.12.2, cvc5 1.0.8)
+**Affects:** qed-prover 0.1.0 as built by the prover repository's own flake (z3 4.12.2, cvc5 1.0.8)
 **Impact:** any query pair whose SMT formula exceeds the pipe buffer can abort the whole run, discarding
 a verdict the other solver was in the middle of producing correctly.
 
@@ -94,7 +94,7 @@ and the same at `unify.rs:256` for z3. The `.unwrap()` at `unify.rs:287` is then
 cause; making it a recorded error rather than a panic would also stop a single racer from erasing a
 completed verdict.
 
-## Not the same as the two failures already on record
+## Not the same as two other prover failures we have seen
 
 | signature | how it shows |
 |---|---|

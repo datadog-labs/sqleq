@@ -3,15 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! A Rust rewrite of SQLSolver's equivalence-checking proof engine, and what the `sqlsolver` axis
-//! asks; the original, driven as a JVM fork through `tools/sqlsolver/`, is kept as its cross-check.
-//! The binary, `sqleq-solver`, speaks `IrDriver`'s command line and job/result JSONL, so a harness
-//! drives either one the same way.
+//! A Rust rewrite of SQLSolver's equivalence-checking proof engine, and what the `sqleq-solver`
+//! axis asks; the original, driven as a JVM fork through `tools/sqlsolver/`, is kept as its backup
+//! cross-check. The binary, `sqleq-solver`, speaks `IrDriver`'s command line and job/result JSONL,
+//! so a harness drives either one the same way.
 //!
 //! Deliberately excluded: SQLSolver's superoptimizer/rule-mining subsystem and all SQL-text
 //! parsing -- neither is reachable from the `Verification.verify(RelNode, RelNode, Schema)` entry
-//! point our harness actually calls, and our own frontend already produces the `Input` JSON this
-//! crate will deserialize instead of SQL text.
+//! point the JVM bridge calls, and our own frontend already produces the `Input` JSON this crate
+//! deserializes instead of SQL text.
 //!
 //! The pipeline, one module per stage: `ir` parses the `Input` JSON; `translate` turns each side
 //! into a U-expression (`uterm`), with SQL's three-valued logic kept explicit; `normalize` rewrites
@@ -19,7 +19,7 @@
 //! (`ic`); `alpha` compares them up to renaming of bound variables (SQLSolver's rung 2);
 //! `setsolver` hands set-shaped leftovers to Z3 (rung 3); `prove` is the ladder over all of it.
 //! `eval` evaluates a term on a small concrete database, which is how the tests check that a
-//! rewrite preserves meaning. SQLSolver's LIA* rung is not ported. What it adds is mostly
+//! rewrite preserves meaning. SQLSolver's LIA* rung is not rewritten. What it adds is mostly
 //! reasoning across summands (a disjoint `OR` against a `UNION ALL`), and its integer reading of
 //! dates and timestamps does not hold in Postgres: `'infinity'::date + 1` is `infinity`. The IR
 //! names every temporal operation and conversion (`q_arith_add_date_integer`,
