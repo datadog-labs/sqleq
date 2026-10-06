@@ -3,21 +3,24 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Emit verification jobs for the SQLSolver backend -- the `sqlsolver` axis.
+//! Emit verification jobs for SQLSolver -- the `sqleq-solver` axis, and the JVM fork behind
+//! `sqlsolver-jvm`.
 //!
-//! SQLSolver (SIGMOD 2024, Apache 2.0) is a second, independent prover. Unlike the QED path it takes
-//! **SQL text plus a schema** rather than our lowered IR, so it does not go through `lower` at all —
-//! which was the whole reason it looked worth wiring up. Every row the frontend refuses, or whose
-//! schema it cannot read, never reaches the QED prover, and the hope was that SQLSolver could be
-//! asked about all of them without us writing another lowering rule.
+//! SQLSolver (SIGMOD 2024, Apache 2.0) is an equivalence prover independent of QED. Two kinds of
+//! job are written here:
 //!
-//! **Measured, it cannot.** SQLSolver has a front end of its own — Calcite — with refusals of its
-//! own, and they are not the complement of ours: it assembles plans for both sides of a minority of
-//! rows, reaches its solver on fewer still, and on the rows the qed axis cannot use it almost never
-//! gets that far. Wiring this up buys a second opinion on rows we already lower, not coverage of the
-//! ones we refuse; see `docs/SQLSOLVER.md`.
+//! * **Plan jobs** (`--sqlsolver --ir`): the lowered `Input` the QED prover gets, plus the DDL it
+//!   implies ([`ir_job`](crate::sqlsolver::ir_job),
+//!   [`ir_job_from_input`](crate::sqlsolver::ir_job_from_input)). These are what `sqleq-check`
+//!   hands `sqleq-solver` (a Rust rewrite of SQLSolver's proof engine) or the JVM fork's
+//!   `IrDriver`, so the QED prover and the SQLSolver axis read the same bytes.
+//! * **SQL-text jobs** (`--sqlsolver` without `--ir`): the row's own SQL plus a schema, for the
+//!   original SQLSolver's SQL entry point, which re-derives a plan with Calcite. Nothing in this
+//!   repository runs them. That path was wired up first, in the hope of reaching the rows our
+//!   frontend refuses without writing another lowering rule; it does not, because Calcite has
+//!   refusals of its own and they are not the complement of ours. See `docs/SQLSOLVER.md`.
 //!
-//! This module is the adapter, and it does exactly three things to a corpus row:
+//! For a text job this module is the adapter, and it does exactly three things to a corpus row:
 //!
 //! 1. **Renders the schema as MySQL-dialect DDL.** `CalciteSupport` hardcodes `DB_TYPE = MySQL`, so
 //!    the schema SQLSolver is handed is parsed by their MySQL ANTLR grammar. We do not write a second
@@ -27,7 +30,7 @@
 //! 3. **Strips schema qualifiers from table references,** `app.foo` -> `foo`. Their Calcite root
 //!    schema is flat (`calciteSchema.add(table.name(), calciteTable)`, no sub-schemas), so a qualified
 //!    reference cannot resolve — and `pgddl` already keys the catalog on the bare name, so the bare
-//!    name is the one spelling both sides can agree on. A large minority of real rows need this.
+//!    name is the one spelling both sides can agree on.
 //!
 //! Everything else about the row is copied through byte for byte. Both rewrites are located by
 //! **token span** and applied by splicing the original text, the same discipline as
@@ -39,8 +42,8 @@
 //!
 //! ## Why `$1` becomes `_DOLLAR_1()`
 //!
-//! Parameter-free rows are a small minority of any real corpus, so without an encoding for `$N` this
-//! integration is worth almost nothing. SQLSolver has no dynamic-parameter support:
+//! Real rewrite pairs are usually parameterized, so without an encoding for `$N` the text path is
+//! worth almost nothing. SQLSolver has no dynamic-parameter support:
 //! `SqlSupport.parsePreprocess` rewrites
 //! `$` -> `_DOLLAR_`, which turns `$1` into the bare identifier `_DOLLAR_1`, which fails Calcite
 //! validation and yields `UNKNOWN`.
@@ -63,7 +66,7 @@
 //!
 //! Like the QED path, this is **index binding**: `$1` on the left is `$1` on the right. That is the
 //! assumption [`crate::params`] exists to police, so the same arity evidence is recorded here as a
-//! note (never a refusal — on a research axis the verdict is the measurement).
+//! note (never a refusal — on the text path the verdict is the measurement).
 //!
 //! ## What is deliberately not declared
 //!
@@ -71,17 +74,19 @@
 //! `UNIQUE` as "no duplicate rows at all", where Postgres allows any number of NULLs in a unique
 //! column, and the difference is not academic: with a nullable unique `a` it reports
 //! `SELECT DISTINCT a FROM t` == `SELECT a FROM t`, which is false in Postgres for a table holding two
-//! NULLs. Declaring the key would therefore hand it a premise our corpus does not support. Dropping
+//! NULLs. Declaring the key would therefore hand it a premise Postgres does not grant. Dropping
 //! it only costs proofs. `NOT NULL` itself is carried, and `PRIMARY KEY` is not distinguishable from
 //! `UNIQUE` once `pgddl` has read the DDL, so every key is emitted in the weaker `UNIQUE` spelling
 //! rather than a `PRIMARY KEY` that would silently imply `NOT NULL` on top.
 //!
-//! ## Refuses nothing
+//! ## The text path refuses nothing
 //!
-//! A row whose DDL yields no tables still gets a job with an empty schema, and a row whose queries do
-//! not tokenize still gets a job with its text unmodified. What SQLSolver does with them is the
-//! measurement. The notes on a [`Job`](crate::sqlsolver::Job) say which rewrites did not fire, so the harness can report
-//! that separately from the verdict.
+//! A row whose DDL yields no tables still gets a job with an empty schema, and a row whose queries
+//! do not tokenize still gets a job with its text unmodified. What SQLSolver does with them is the
+//! measurement. The notes on a [`Job`](crate::sqlsolver::Job) say which rewrites did not fire, so
+//! the harness can report that separately from the verdict. A plan job, by contrast, carries the
+//! frontend's refusal when the row did not lower, and is refused when two tables share a bare name
+//! (see [`ir_job_from_input`](crate::sqlsolver::ir_job_from_input)).
 
 // The prose above and below documents this adapter against the pipeline it adapts, and most
 // of that pipeline is private to the crate. The links are for whoever is reading these docs
@@ -173,8 +178,9 @@ fn build(row: &Row, normalized: bool) -> Job {
 
     // A row this note is on must never be read as proved, whatever SQLSolver answers for it — see
     // [`is_query`]. A side we could not tokenise counts as not-a-query, because we cannot show it is
-    // one. The harness quarantines on the note rather than the emitter dropping the row, so the
-    // verdict is still measured and an `EQ` we refused stays visible in the record.
+    // one. Whoever runs a text job (nothing in this repository does) must quarantine on the note;
+    // the emitter keeps the row, so the verdict is still measured and an `EQ` we refused stays
+    // visible in the record.
     if !a.as_ref().is_some_and(|a| a.query) || !b.as_ref().is_some_and(|b| b.query) {
         notes.push("non-select-statement");
     }

@@ -18,7 +18,8 @@ explained in https://github.com/datadog-labs/sqleq/blob/main/CONTRIBUTING.md.
 ## Checklist
 
 - [ ] A construct the frontend cannot lower faithfully is refused, not approximated.
-- [ ] If this grows the provable set, it was run against `sqleq-fuzz` on the same pairs, and none
+- [ ] If this grows the provable set, the same pairs were run through `sqleq-check --portfolio`
+      (the provers and `sqleq-fuzz` at once; a proof with a counterexample is an `alarm`), and none
       of the newly proven pairs has a counterexample.
 - [ ] If this fixes a defect that can be stated as a pair, the pair is pinned under `tests/pairs/`
       and was seen failing on a build from before the fix.

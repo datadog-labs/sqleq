@@ -15,8 +15,8 @@ horizontal bands (the identity sign) from a distance, a grid of table cells up c
 Cells group tighter horizontally (gap 2) than rows do vertically (gap 3), which is what
 keeps the identity reading dominant.
 
-Mono is primary. The axis-coloured variant stays available but is only honest while the
-portfolio is exactly qed / sqlsolver / fuzz -- a fourth tool makes it wrong.
+Mono is primary. The axis-coloured variant was honest only while the portfolio was exactly
+qed / sqlsolver / fuzz; it has grown since, so the variant is still generated but retired.
 """
 import io, os
 

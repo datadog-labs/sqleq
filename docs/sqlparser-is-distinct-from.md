@@ -12,7 +12,7 @@ tree rather than repairing it, so a release that brought the bug back would be r
 
 ## `IS [NOT] DISTINCT FROM` parses its right operand at precedence 0
 
-**Version:** 0.62.0 (present as written; not checked against `main`)
+**Version:** 0.62.0 (fixed in 0.63.0)
 
 ### What happens
 
@@ -89,10 +89,11 @@ let expr2 = self.parse_subexpr(precedence)?;
 ```
 
 `precedence` here is `Self::BETWEEN_PREC`-adjacent in the `IS` arm's caller; whichever value the
-neighbouring `IS NULL` / `IS TRUE` handling effectively binds at is the one that makes the family
-associate left, as the standard requires.
+neighbouring `IS NULL` / `IS TRUE` handling effectively binds at is the one that keeps the whole
+`IS` family at one precedence level.
 
-Suggested regression tests (all currently produce an `IsDistinctFrom` at the root):
+Suggested regression tests (under 0.62, every one but the parenthesized control produces an
+`IsDistinctFrom` at the root by swallowing what follows it):
 
 ```text
 a IS DISTINCT FROM 1 AND b = 2       ->  (a IS DISTINCT FROM 1) AND (b = 2)
@@ -100,18 +101,19 @@ a IS NOT DISTINCT FROM 1 OR b = 2    ->  (a IS NOT DISTINCT FROM 1) OR (b = 2)
 a IS DISTINCT FROM 1 AND b OR c      ->  ((a IS DISTINCT FROM 1) AND b) OR c
 a IS DISTINCT FROM 1 OR b AND c      ->  (a IS DISTINCT FROM 1) OR (b AND c)
 a IS DISTINCT FROM (1 AND b)         ->  unchanged (explicit parens)
-a IS DISTINCT FROM b IS NULL         ->  (a IS DISTINCT FROM b) IS NULL
+a IS DISTINCT FROM b IS NULL         ->  not IsDistinctFrom(a, IsNull(b))
 ```
 
-The last one is the `IS`-family left-associativity case and is a separate symptom of the same
-precedence-0 call.
+The last one is a separate symptom of the same precedence-0 call: the right operand swallows the
+trailing `IS NULL`. What it should parse to is a judgement call rather than a fix, because
+PostgreSQL declares the `IS` family non-associative (`%nonassoc IS` in its grammar), so the
+expression is a syntax error there. This frontend refuses it whichever way it is nested.
 
 ### Why it matters to us
 
 We lower SQL to an SMT-backed equivalence prover. The prover is sound given faithful IR, so a
 mis-parse is not a wrong answer we can shrug at — it hands the prover a *different predicate* than
-the query states, and two inequivalent queries can then lower to two equivalent formulas. On a
-corpus of real rewrite pairs a handful of cases were affected, and several of those proved
-equivalent only once the tree was repaired.
+the query states, and two inequivalent queries can then lower to two equivalent formulas. The
+shape occurs in real rewrite pairs, so this was not a hypothetical risk for us.
 
 [pg]: https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE

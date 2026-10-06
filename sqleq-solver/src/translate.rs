@@ -15,13 +15,13 @@
 //!
 //! Every value-producing translation returns a [`Value`]: a term that might be null (`is_null`,
 //! 0/1-valued) paired with a term that's only meaningful when it isn't (`value`). `value` must never
-//! be read directly -- always through [`value_eq`], the one place a `Value` is bound to a target
+//! be read directly -- always through `value_eq`, the one place a `Value` is bound to a target
 //! column/position. This is what makes `UConst::Null`-as-a-placeholder safe: a null literal's `value`
 //! is a dummy (`Const(Int(0))`), and that's fine because nothing ever looks at it without checking
 //! `is_null` first.
 //!
 //! A bare column reference is the only place nullness is *derived*, via equality with the `Null`
-//! sentinel (see [`column_value`]); everywhere else, `is_null` is tracked compositionally by each
+//! sentinel (see `column_value`); everywhere else, `is_null` is tracked compositionally by each
 //! operator's own formula, never re-derived after the fact.
 //!
 //! ## Three-valued logic
@@ -494,7 +494,7 @@ impl<'s> Translator<'s> {
         }
     }
 
-    /// The operators [`truth_call`] gives a three-valued meaning of their own; every other call is a
+    /// The operators [`Self::truth_call`] gives a three-valued meaning of their own; every other call is a
     /// value first and read as a boolean afterwards.
     fn truth_call(&mut self, operator: &str, operand: &[Expr], scope: &Scope) -> Result<Truth, TranslateError> {
         match operator {
@@ -829,7 +829,7 @@ fn close_output(t: Translated, widths: Vec<usize>) -> Query {
 /// Translates both sides of an `Input` independently -- each gets its own freshly-seeded `Translator`
 /// (var numbering starting at 0), since the two sides are never compared by raw var identity, only by
 /// alpha-equivalence, which treats bound vars as fully interchangeable. The one var they do
-/// share is the output var (see [`close_output`]).
+/// share is the output var (see `close_output`).
 pub fn translate_input(input: &crate::ir::Input) -> Result<[Query; 2], TranslateError> {
     let mut left = Translator::new(&input.schemas);
     let l = left.rel(&input.queries[0], 0)?;

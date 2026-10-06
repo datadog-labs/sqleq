@@ -1,10 +1,14 @@
 # sqleq-fuzz
 
-A **license-clean concrete differential tester** — the `fuzz` axis of `sqleq`, and the only one of
-its three axes that can *refute*. It is a SQL non-equivalence disprover, and so also an independent
-oracle/soundness check on the two proving axes: the [QED](https://github.com/qed-solver/prover)
-prover and `sqleq-solver`, a Rust rewrite of SQLSolver. The approach has already earned its keep: an earlier prototype of it found a
-genuine soundness bug in the QED prover.
+A **license-clean concrete differential tester** — the `fuzz` axis of `sqleq`, and the only axis
+that can *refute*. It is a SQL non-equivalence disprover, and so also an independent
+oracle/soundness check on the axes that prove under the same parameter binding it tests: the
+[QED](https://github.com/qed-solver/prover) prover, `sqleq-solver` (a Rust rewrite of SQLSolver)
+and the JVM SQLSolver kept as its cross-check. The approach has already earned its keep: an earlier
+prototype of it found a genuine soundness bug in the QED prover.
+
+It is normally run through [`sqleq-check`](../sqleq-check/README.md), as `--axes fuzz` or beside
+the provers under `--portfolio`; the [Usage](#usage) below is for running it on its own.
 
 ## What it does
 
@@ -19,7 +23,10 @@ For a query pair `(A, B)` under a schema, it repeatedly:
 3. freezes `now()` / `current_*` to constants and skips truly nondeterministic functions;
 4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install);
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
-   counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state.
+   counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state,
+   and the returned rows as well when both sides carry `RETURNING`. A pair with no one observable
+   to compare — a query against a mutation, `RETURNING` on one side only, or an `EXPLAIN` — is
+   reported `NOT-COMPARABLE` instead of run.
 
 Any difference on a valid, deterministic instance is a **sound counterexample** ⇒ the pair is
 **non-equivalent**. This is a disprover: it can show non-equivalence (with a witness), never prove
@@ -28,7 +35,7 @@ equivalence.
 ## Soundness rules (a false positive is a bug)
 
 A reported counterexample is only valid if the instance is valid *and* both queries are
-deterministic. The hard-won rules, all preserved from the Python original:
+deterministic. The rules:
 
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
   database admits. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over
@@ -65,7 +72,7 @@ deterministic. The hard-won rules, all preserved from the Python original:
   Postgres would have rejected. So the set-returning shims check the type and raise.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
-rather than a false counterexample; `../docs/SOUNDNESS.md` is that argument.
+rather than a false counterexample; [`docs/SOUNDNESS.md`](../docs/SOUNDNESS.md) is that argument.
 
 ## Parameter binding is an assumption, not a given
 
@@ -94,9 +101,7 @@ fatal in the other direction: a witness anywhere in the wider space need not lie
 diagonal. `WHERE a = $1` against `WHERE a = $2` shares no index, and drawing `1` for `$1` and `2` for
 `$2` fabricates a counterexample to an equivalent pair — which is what this crate did before the rule
 landed (pinned by `disjoint_parameter_sets_are_misaligned_too`). So the condition here is *any* index
-in one query and not the other. Real pairs have not forced it — every misalignment observed so far
-overlaps and the disjoint class has been empty — so it costs nothing measurable and exists for the
-argument, not the measurement.
+in one query and not the other. It exists for the argument, not for any measured yield.
 
 ### What the withdrawn claims actually were
 
@@ -106,31 +111,31 @@ its own numbering, rather than left in one lump:
 | what the pair shows | withdrawing the claim is |
 | --- | --- |
 | a shared `$N` provably compares against **disjoint columns** on the two sides | a **correction** — the claim was about the wrong pair |
-| one side's indices have a **gap**, so that side was not renumbered | probably a cost — but see below, the exemption is unsound |
+| one side's indices have a **gap**, so that side was not renumbered | probably a cost — but exempting it would be unsound, see below |
 | **pagination-shaped**: every orphan is a `LIMIT`/`OFFSET` count and shared roles agree | probably a cost |
 | no evidence either way | unknowable; refusing is the only sound move |
 
-The corrections are the ones that justify the rule on their own. They include a pair a prover had
-called equivalent and *this crate had corroborated* with `NO-COUNTEREXAMPLE` — neither axis could
-clear it, because both were answering the wrong question — and a pair whose `$4` is a boolean on one
-side and a row count on the other. Some of the corrections had been reporting `NOT-EQUIVALENT`.
+The corrections are the ones that justify the rule on their own. A shared `$N` that compares
+against disjoint columns on the two sides — or that is a boolean on one side and a row count on the
+other — was never one pair to begin with, so a prover's proof of it and this crate's
+`NO-COUNTEREXAMPLE` beside it would both answer the wrong question, and so would a
+`NOT-EQUIVALENT`.
 
 Two things this test does **not** cover, both stated rather than papered over:
 
 - A pure **permutation** — the same set on both sides with two indices swapped — is invisible to an
   *arity* test like this one, and index binding then compares the wrong diagonal with nothing to flag.
-  This is the residual hole. It is not invisible to a *role* test: one observed pair has
-  `first_name = $4 AND last_name = $5` against `last_name = $4 AND first_name = $5`, and had been
-  reporting `NO-COUNTEREXAMPLE` because two `text` columns rarely separate under a swap. The analogue
-  of the prover side's `check_roles`, built on per-query `param_cols` evidence, is the next step, and
-  the corrections above are its measured yield.
+  This is the residual hole. It is not invisible to a *role* test: a pair such as
+  `first_name = $4 AND last_name = $5` against `last_name = $4 AND first_name = $5` can report
+  `NO-COUNTEREXAMPLE`, because two `text` columns rarely separate under a swap. The analogue of the
+  prover side's `check_roles`, built on per-query `param_cols` evidence, is the next step.
 - A genuinely benign renumbering loses its verdict, and that is a real share of the withdrawn claims.
   The obvious rescue is the **gap** test: a side whose indices skip a number cannot have been
-  renumbered, since renumbering is contiguous. It is unsound, and the swapped pair above is why — its
-  `B` set is `{2,…,6}`, a gap at `$1` from `SELECT $1` becoming `SELECT 1`, and its `$4`/`$5` are
-  swapped anyway. A *leading* gap says nothing about the order of what follows. So the gap rows stay
-  refused, and the other tempting refinement ("the orphans all sit above every shared index") is
-  refuted by a real pair too.
+  renumbered, since renumbering is contiguous. It is unsound, because a pair can carry a gap and a
+  swap at once: `SELECT $1` rewritten as `SELECT 1` leaves `B`'s set `{2,…,6}`, gapped at `$1`, with
+  its `$4`/`$5` swapped all the same. A *leading* gap says nothing about the order of what follows.
+  So the gap rows stay refused, and the other tempting refinement ("the orphans all sit above every
+  shared index") falls to the same kind of pair.
 
 ## Usage
 
@@ -138,31 +143,51 @@ This crate is a workspace member but *not* a default one — its first build dow
 release library, so a bare `cargo build` at the workspace root skips it. Build it explicitly:
 
 ```
-cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 MB) into target/
+cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 MB)
 cargo test  -p sqleq-fuzz               # the self-contained suite below
 ```
 
+`sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
+the defaults below cannot move its answers. On its own:
+
 ```
 sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   # batch (rows are a,b,ddl); names are pairNNNN
-sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row, print the counterexample
+sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting from 0)
 sqleq-fuzz file <pair.sql>                            # CREATE TABLEs + exactly two statements
 
-options: --jobs N (csv workers)  --trials N (default 120)  --rows N (default 5)  --seed N (default 0)
+options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
+         --seed N (default 0)
 ```
 
-`csv` mode writes `{ "pairNNNN": { "verdict": "..." } }`, which is the output shape of the Python
-tester it replaced. Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`,
-`PARAM-MISALIGNED:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The two that carry a message after
+`row` and `file` print the verdict on the first line. A `NOT-EQUIVALENT` is followed by a
+`counterexample: …` line holding the instance, and a `NO-COUNTEREXAMPLE` that only some trials
+reached by a `partial: K trials compared both sides; last error: …` line. Those lines are what
+`sqleq-check` reads.
+
+`csv` mode takes each name in `names.txt` to the corpus row its digits number (`pairNNNN` is row
+`NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
+only some trials compared both sides), and writes `{ "pairNNNN": { "verdict": "...", "ms": ... } }`
+to `out.json` (default `/tmp/concrete_results.json`), adding `ok_trials` and `trial_error` for a
+partial run. A name whose digits number no row gets `NO-ROW`.
+
+Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
+`NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
 a `:` still bucket correctly for a consumer that splits on the first one.
+
+The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
+read or an argument is missing (a missing file, a row out of range, a file without exactly two
+statements, `row` without an index); `2` when the mode is missing or unknown, after printing the
+usage.
 
 ### The generated value domain (why a literal can make a pair look equivalent)
 
-Column values are drawn from a deliberately small domain — `0,1,2` for integers, `'a','b','c'` for
-strings, three dates and three timestamps — so that joins, `GROUP BY` and `DISTINCT` actually
-collide on small instances. Parameters are additionally biased toward a value the column really
-holds; a **literal is not**. A predicate against a literal outside the domain, `status = 'active'`,
-is therefore satisfied by no generated row: both sides return nothing on every trial and a
-non-equivalent pair reports `NO-COUNTEREXAMPLE`.
+Column values are drawn from a deliberately small domain — `0,1,2` for integers and doubles,
+`'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs and a few
+small JSON documents — so that joins, `GROUP BY` and `DISTINCT` actually collide on small instances.
+Parameters are additionally biased toward a value the column really holds; a **literal is not**. A
+predicate against a literal outside the domain, `status = 'active'`, is therefore satisfied by no
+generated row: both sides return nothing on every trial and a non-equivalent pair reports
+`NO-COUNTEREXAMPLE`.
 
 This bites `file` mode hardest, since a hand-written pair carries literals where a corpus row
 carries `$N`. Write self-contained pairs against the generated domain — the committed
@@ -170,23 +195,17 @@ carries `$N`. Write self-contained pairs against the generated domain — the co
 
 ## Validation
 
-This crate is a port of an earlier Python tester, and it was cross-checked against that tester on a
-sample of pairs under identical defaults before it replaced it:
-
-- **Identical `NOT-EQUIVALENT` set**, `UPDATE` DML included — **zero new false positives, zero power
-  regressions**. That set is the one to check: a port that refutes a pair the original did not is
-  exactly the failure this comparison exists to catch.
-- Class agreement everywhere else was near-total, and every disagreement was the Rust port being
-  *more* capable — schemas sqlglot rejected and it parses, pairs the Python tester errored on and it
-  runs. All of them resolve to a safe `NO-COUNTEREXAMPLE` or `ERROR`, never a spurious
-  `NOT-EQUIVALENT`.
-
 `cargo test` runs a self-contained suite (no corpus) covering the bag-semantics, uniqueness-recovery,
-time-freezing, and non-equivalence-detection rules.
+time-freezing, and non-equivalence-detection rules. Its answer on every pinned pair is pinned as
+well, and CI checks those pins with `sqleq-check --expect pinned --axes fuzz`
+([`tests/pairs/`](../tests/pairs/README.md)). How a counterexample is played against the provers'
+proofs, and what that cross-check has caught, is in [`docs/VALIDATION.md`](../docs/VALIDATION.md).
 
 ## Notes
 
-- Clean-room port; shares no code with the NonCommercial VeriEQL.
-- DuckDB is linked from its own release library (`duckdb` crate, MIT), which the build downloads
-  into `target/` and copies next to the executable; parsing uses `sqlparser` (the same parser as
-  `sqleq-frontend`); `regex`, `rand`, `csv` complete the dependency set — all permissive licenses.
+- Clean-room; shares no code with the NonCommercial VeriEQL.
+- DuckDB is linked from its own release library (`duckdb` crate, MIT). The build downloads it once
+  into `target/duckdb-download/`, or links the one `DUCKDB_LIB_DIR` names; `libduckdb-sys` copies it
+  into `target/<profile>/deps`, and the binary finds it there through an rpath relative to itself,
+  so a built tree can be moved. Parsing uses `sqlparser` (the same parser as `sqleq-frontend`);
+  `regex`, `rand`, `csv` and `serde_json` complete the dependency set — all permissive licenses.

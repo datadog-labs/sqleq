@@ -3,15 +3,18 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! CLI for the concrete differential tester.
+//! CLI for the concrete differential tester. `sqleq-check` normally runs it, as its `fuzz` axis.
 //!
 //! Modes:
 //!   * `sqleq-fuzz csv <corpus.csv> <names.txt> [out.json]` — batch a corpus (rows are `a,b,ddl`);
 //!     `names.txt` lists `pairNNNN` entries (the digits index a corpus row). Parallel with `--jobs`.
 //!   * `sqleq-fuzz row <corpus.csv> <index>` — test a single corpus row and print the verdict.
-//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE TABLEs + exactly two statements).
+//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE TABLEs + exactly two
+//!     statements).
 //!
-//! Options: `--jobs N`, `--trials N`, `--rows N`, `--seed N`.
+//! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`. Any verdict exits 0; an
+//! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
+//! usage and exits 2.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -22,14 +25,15 @@ use sqleq_fuzz::{test_pair, Config, Verdict};
 
 const USAGE: &str = "\
 usage:
-  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus
-  sqleq-fuzz row  <corpus.csv> <index>                  test one corpus row
-  sqleq-fuzz file <pair.sql>                             test a CREATE TABLEs + 2-statement file
+  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to
+                                                        /tmp/concrete_results.json)
+  sqleq-fuzz row  <corpus.csv> <index>                  test one corpus row (counting from 0)
+  sqleq-fuzz file <pair.sql>                            test a file: CREATE TABLEs, two statements
 options:
-  --jobs N     parallel workers (csv mode, default 1)
-  --trials N   random instances per pair (default 120)
-  --rows N     rows per table per instance (default 5)
-  --seed N     RNG seed (default 0)";
+  -j, --jobs N   parallel workers (csv mode, default 1)
+  --trials N     random instances per pair (default 120)
+  --rows N       rows per table per instance (default 5)
+  --seed N       RNG seed (default 0)";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();

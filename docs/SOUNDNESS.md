@@ -2,45 +2,57 @@
 
 `sqleq` answers "are these two queries equivalent?" — and a `provable` answer is only worth the
 argument behind it. This document is that argument: what the tool refuses to do rather than guess,
-why refusing is the right trade, what a proof leaves out, and the single place where it assumes
+why refusing is the right trade, what a proof leaves out, and the two places where it assumes
 something it cannot check.
 
 Read [VALIDATION.md](VALIDATION.md) first if you want the method — how the axes check each other,
-and the defects that has caught. This page is the narrower question of what any one verdict means.
+and the defects it has caught. This page is the narrower question of what any one verdict means.
 
 ## The frontend refuses rather than guess
 
-The prover is sound: it only proves genuinely-equivalent pairs **given faithful IR**. So a false
-positive can only come from unfaithful lowering. The frontend therefore **refuses** (returns an
-error) any construct it cannot lower faithfully — `LIMIT`/`OFFSET` and `DISTINCT ON` (both turn on
-an ordering the prover's IR has no `Sort` to express; `DISTINCT ON` keeps one row per key chosen by
-`ORDER BY`, so it drops *values*, not just duplicates), window functions, `HAVING` it can't express,
-correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`, `LIKE ... ESCAPE`, set-returning
-functions (they expand one row into many, so modelling the call as a scalar understates
-cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, etc. — rather than emitting best-effort
-IR. It never panics or exits on bad input.
+The provers are taken to be sound: each proves only genuinely equivalent pairs **given faithful IR**
+(the JVM SQLSolver has known exceptions, listed in [SQLSOLVER.md](SQLSOLVER.md)). So, short of the
+two assumptions below, a false positive can only come from unfaithful lowering. The frontend
+therefore **refuses** (returns an error) any construct it cannot lower faithfully — window
+functions, `HAVING` it can't express, correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`,
+`LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
+a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
+TIES`, etc. — rather than emitting best-effort IR. It never panics or exits on bad input.
+
+Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
+`OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause
+order (`src/lower.rs`, `apply_pagination`). `DISTINCT ON` becomes a group whose every output column
+is an uninterpreted aggregate over the candidate rows and the values that order them
+(`lower::distinct_on`); it keeps one row per key *chosen by* `ORDER BY`, so it drops values, not
+just duplicates, and an uninterpreted aggregate admits more behaviours than the real operator, never
+fewer. `DISTINCT ON` over an aggregate query or under a set operation is still refused. Both rest on
+one assumption the IR cannot avoid, and it is the one way either lowering can yield a proof the
+database does not license; see [below](#a-row-slice-is-taken-as-deterministic).
 
 Refusing has a price, and it is paid deliberately. The set-returning-function guard, for instance,
-gives up four pairs the frontend previously proved; all four are pairs whose two sides are textually
-identical, which is exactly why the understated cardinality cancelled and no unsound proof resulted.
-Losing a reflexive proof is the correct trade against leaving the hole open.
+gives up proofs the frontend once made, on pairs whose two sides are textually identical — which is
+exactly why the understated cardinality cancelled and no unsound proof resulted. Such a pair is not
+lost outright: when a refused pair's two sides normalize to one query, the frontend says so
+(`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
+many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
+`--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
+asks whether the QED prover proved the pair, still counts it as refused.
 
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs
-completeness, not soundness. Two such misses are known and measured: `pgddl` does not read keys
-declared by `CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`.
-Between them they account for nearly all the remaining functional-dependence refusals — completeness
-work, in the safe direction.
+completeness, not soundness. Two such misses are known: `pgddl` does not read keys declared by
+`CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`. Both cost
+functional-dependence refusals — completeness work, in the safe direction.
 
 ### Dates and timestamps are not one integer
 
 A DATE counts days, a TIMESTAMP counts microseconds, and an INTERVAL may count months. The frontend
-used to lower all of them as `INTEGER`, and both provers then accepted pairs that are not equivalent:
-`ts < d + 1` against `ts <= d` (over integers `x < y + 1` is `x <= y`, but `d + 1` is the next *day*),
-and `CAST(ts AS DATE) = d` against `ts = d` (the cast truncates, and it was dropped as an identity).
-One row with a mid-day `ts` separates each pair. Nothing in the pipeline disagreed about these; they
-were found by probing the lowering directly, and the disprover confirms each witness.
+used to lower all of them as `INTEGER`, and the provers then accepted pairs that are not equivalent:
+`ts < d + 1` against `ts <= d` (over integers `x < y + 1` is `x <= y`, but `d + 1` is the next
+*day*), and `CAST(ts AS DATE) = d` against `ts = d` (the cast truncates, and it was dropped as an
+identity). One row with a mid-day `ts` separates each pair. Nothing in the pipeline disagreed about
+these; they were found by probing the lowering directly, and the disprover confirms each witness.
 
 The rule now is that a comparison of two values of one temporal type stays native, and every
 *operation* on a temporal value is an uninterpreted function. Comparisons are exact: the values of
@@ -48,15 +60,15 @@ one type, `-infinity` and `infinity` included, form a bounded total order, so th
 order-preservingly into the integers a prover reads them as.
 
 Arithmetic is not exact there, because of the infinities. Postgres leaves `infinity` unchanged under
-`date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error for
-`infinity - date`. Read as integer addition, `d + 1 > d` would hold for every date, and
-`d >= $1 AND d < $1 + 1` would mean `d = $1`; at `d = $1 = 'infinity'` neither does. So
-`date ± integer`, `date - date` and all interval arithmetic (an interval may count months, and
-months have no fixed length) are functions named after their operand types (`q_arith_add_date_integer`).
-So is every crossing between two types — the promotion in `d < ts`, an explicit cast, a literal cast
-such as `'2024-01-01'::date` (`q_conv_date_timestamp`) — and never a `CAST`, because both provers erase
-casts they consider trivial. A function nobody interprets can only cost a proof; a prover that knows
-its Postgres meaning, infinities included, can interpret the name.
+`date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error for `infinity -
+date`. Read as integer addition, `d + 1 > d` would hold for every date, and `d >= $1 AND d < $1 + 1`
+would mean `d = $1`; at `d = $1 = 'infinity'` neither does. So `date ± integer`, `date - date` and
+all interval arithmetic (an interval may count months, and months have no fixed length) are
+functions named after their operand types (`q_arith_add_date_integer`). So is every crossing between
+two types — the promotion in `d < ts`, an explicit cast, a literal cast such as `'2024-01-01'::date`
+(`q_conv_date_timestamp`) — and never a `CAST`, because a prover may erase a cast it considers
+trivial (the JVM SQLSolver erases every one). A function nobody interprets can only cost a proof; a
+prover that knows its Postgres meaning, infinities included, can interpret the name.
 
 For the same reason a truncation is compared as it stands. `ts::date = $1` and the range written out
 by hand, `ts >= $1::date AND ts < $1::date + 1`, look like the same predicate and are not: at
@@ -64,9 +76,9 @@ by hand, `ts >= $1::date AND ts < $1::date + 1`, look like the same predicate an
 the other would have made the pair lower to one term and every prover call it equivalent.
 
 An `UPDATE` of a temporal column converts the assigned value to the column's type, as Postgres's
-assignment cast does, so `SET d = ts` and `SET d = ts::date` store the same thing. That is done where
-the value's type is evident from its shape (a column, a literal, a parameter, a cast); elsewhere the
-value keeps its own type, which costs exactness and not soundness. Where a relation
+assignment cast does, so `SET d = ts` and `SET d = ts::date` store the same thing. That is done
+where the value's type is evident from its shape (a column, a literal, a parameter, a cast);
+elsewhere the value keeps its own type, which costs exactness and not soundness. Where a relation
 would put two temporal types in one column with no comparison to hang a conversion on — a set
 operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 
@@ -75,14 +87,15 @@ operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 A few constructs read like a simpler one and compute something else, and each is either lowered as
 what it is or refused:
 
-- **A typmod is a computation.** `$1::varchar(2)` truncates and `$1::timestamp(0)` rounds, so only an
-  *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over a
-  parameter, a literal or anything else, is a function named after the full spelling of its target.
-- **An array is not its element type.** An array column is opaque whatever it holds, and a cast to an
-  array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
-  opaque operand is a function, not text concatenation, because array `||` is not strict
-  (`'{a}' || NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every
-  element is a scalar, since over `ARRAY[arr]` it ranges over the leaves.
+- **A typmod is a computation.** `$1::varchar(2)` truncates and `$1::timestamp(0)` rounds, so only
+  an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
+  a parameter, a literal or anything else, is a function named after the full spelling of its
+  target.
+- **An array is not its element type.** An array column is opaque whatever it holds, and a cast to
+  an array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
+  opaque operand is a function, not text concatenation, because array `||` is not strict (`'{a}' ||
+  NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every element is
+  a scalar, since over `ARRAY[arr]` it ranges over the leaves.
 - **A row against a parameter is a record comparison.** In `(a, b) IN ($1, ..)` each parameter
   stands for a composite value, and Postgres compares a row with one under record semantics, where
   two NULL fields are equal. Each such item is one opaque predicate, never per-field comparisons.
@@ -102,6 +115,16 @@ what it is or refused:
 - **The target of a `DELETE` or `UPDATE` always names the table.** A `WITH` binding of the same name
   would be inlined over it by the reduction, so `WITH t AS (…) DELETE FROM t`, which empties `t`, is
   refused rather than lowered as a filtered delete.
+- **An `INSERT` is compared by the bag it adds, so what it stores must be a function of the rows it
+  lists.** A pair of `INSERT`s into one table under one column list reduces to their two sources
+  (`dml::insert_pair`): bag addition is cancellative, so the final tables agree exactly when the
+  added bags do. That holds only if every column the list omits gets a value fixed by the row — no
+  default, a literal, or a clock function, which takes one value per statement and is read, as
+  everywhere in the pipeline, as one value shared by both sides. A `nextval()` default, `SERIAL`
+  included, numbers rows by *position*: the same two rows inserted in two orders have equal source
+  bags and leave different tables. So an `INSERT` omitting such a column is refused, and so are `ON
+  CONFLICT`, `DEFAULT VALUES`, an `INSERT` with no column list, two lists that differ in content or
+  order, and a `RETURNING` that is not the same list on both sides.
 - **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
   two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
   coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.
@@ -113,11 +136,13 @@ what it is or refused:
 
 ## A query that raises an error
 
-Neither prover models runtime errors: both assume every operation yields a value. So a proof says
-that the two queries return the same rows on every database on which both run without an error,
-and nothing about which databases make one of them fail. A stronger claim would not be well
-defined for Postgres, which does not fix the order in which it evaluates a query's conditions:
-whether `b <> 0 AND a / b > 1` raises a division by zero depends on the plan, not on the data.
+The provers that read the IR do not model runtime errors: each assumes every operation yields a
+value. So a proof from one of them says that the two queries return the same rows on every database
+on which both run without an error, and nothing about which databases make one of them fail. A
+stronger claim would not be well defined for Postgres, which does not fix the order in which it
+evaluates a query's conditions: whether `b <> 0 AND a / b > 1` raises a division by zero depends on
+the plan, not on the data. (The Lean axis states a claim of its own, about whole runs of the two
+statements; see [LEAN.md](LEAN.md).)
 
 Dates show this at the top of their range. A DATE reaches the year 5874897 and a TIMESTAMP only
 294276. Compared with a timestamp, a later date orders above every finite one and below
@@ -125,10 +150,29 @@ Dates show this at the top of their range. A DATE reaches the year 5874897 and a
 conversion, so `d < ts` and `d::timestamp < ts` lower alike, and they do return the same rows
 wherever the cast succeeds.
 
-## The one assumption: `$N` on one side is `$N` on the other
+## A row slice is taken as deterministic
 
-Everything above is the frontend declining to lower what it cannot lower faithfully. This section is
-the one place it **assumes** instead, because the fact it needs is not in the input at all.
+`LIMIT 10` with no `ORDER BY`, or with one that leaves ties, does not say which rows it returns:
+Postgres may return any of the candidates, and two runs may differ. The prover's `Sort` node cannot
+say that. It is a function of its source — equal sources give equal slices — so two sides that take
+the same slice of rows the prover can show equal are proved equal, as if the database made the same
+choice both times. `DISTINCT ON` with no `ORDER BY`, or with one that leaves ties within a key,
+keeps an arbitrary row per key and is read the same way (`src/lower.rs`, `apply_pagination` and
+`distinct_on`).
+
+That is the prover's abstraction and the standard one, and the frontend inherits it rather than
+widening it; `normalize::strip_identical_pagination`, which removes a top-level `ORDER BY … LIMIT …`
+identical on both sides, rests on the same reading. What it licenses is narrow. A proof over a slice
+that ties leave open says the two sides agree whenever the database settles the ties the same way
+for both — not that either returns the rows you meant. A difference in the pagination itself —
+another count, offset or ordering — lowers to a different term, and goes unproved unless the two are
+equal for a reason the prover can see (`LIMIT 0` is empty, `OFFSET 0` is no offset).
+
+## The parameter assumption: `$N` on one side is `$N` on the other
+
+Everything else in this document is the frontend declining to lower what it cannot lower faithfully,
+or, in the section above, reading a slice the way the prover does. This section is the other place
+it **assumes**, and the one where the fact it needs is not in the input at all.
 
 A parameterized pair arrives as two SQL strings with `$1, $2, …` in them, and a schema. The frontend
 lowers `$N` to a single shared symbol `qpN` — one value per execution, the same value everywhere it
@@ -141,9 +185,9 @@ numbered from the same call site. A rewrite that drops, adds, or reorders a plac
 every placeholder after it — and then `$2` on the left and `$2` on the right are two *different*
 application values that the frontend has collapsed into one symbol. Collapsing them makes the prover
 check only the diagonal of the space the real question ranges over, and report that as a general
-proof. This is the one soundness hole in the frontend that is not a lowering bug, and it cannot be
-closed here: a parameter mapping exists only in the application, and the frontend never sees the
-call site.
+proof. This is a soundness hole of the frontend's own — neither a lowering bug nor an abstraction it
+shares with the prover — and it cannot be closed here: a parameter mapping exists only in the
+application, and the frontend never sees the call site.
 
 So the frontend assumes the identity mapping and reports the misalignments it can detect, as
 `parameter-misaligned` with a sub-reason (`src/params.rs`):
@@ -153,11 +197,9 @@ So the frontend assumes the identity mapping and reports the misalignments it ca
   binding quantifies the two queries over *independent* values, which is a **stronger** statement
   than any correspondence the caller could have meant, so it can only fail to prove something true.
   That is what `LIMIT $1 OFFSET $2` against a side with no parameters is — the shape the crate's
-  `a_parameter_is_a_count` test pins, and the broad rule refuses it wrongly. Measured, the broad
-  rule costs very few rows, all of them already undecided, because most pagination rewrites keep a
-  filter parameter as well and so overlap anyway; the case for the condition is the argument, not
-  the row count. Overlap is what turns a difference into a hazard, because a shared index is the one
-  thing a renumbering would have moved.
+  `a_parameter_is_a_count` test pins, and the broad rule would refuse it wrongly. Overlap is what
+  turns a difference into a hazard, because a shared index is the one thing a renumbering would have
+  moved.
 * **`order`** — the same set on both sides, but some `$k` is compared against a disjoint set of base
   columns on the two sides. Read off inference's own attribution, not off the SQL text. **Best
   effort.**
@@ -182,12 +224,12 @@ The rule applies at both gates the held verdict creates, because both can be man
   The clearest is the `LIMIT`/`OFFSET` count guard: a pair comparing `is_deleted = $4 LIMIT $5`
   against `is_deleted = false LIMIT $4` puts a boolean filter value and a row count in one type
   class under index binding, and the count comes out `BOOLEAN`. Refusals about a *construct* are
-  almost every other row that reaches this gate with a verdict pending, and they all yield: no
-  renumbering invents or removes a window function. The counterfactual is a real re-run rather than
-  a list of type-dependent guards, so it cannot go stale when the next one is added.
+  the rest, and they all yield: no renumbering invents or removes a window function. The
+  counterfactual is a real re-run rather than a list of type-dependent guards, so it cannot go stale
+  when the next one is added.
 
-Nothing about a verdict turns on any of this — the pair is refused either way — only on which fact
-the caller is handed first, and therefore which bucket the row is counted in.
+None of this changes a verdict, since the pair is refused either way; it decides only which fact
+the caller is handed first, and so which bucket the row is counted in.
 
 **The detection is not complete. A misalignment it misses can yield a `provable` verdict for a pair
 that is not equivalent under the binding the caller intended.** `order` has evidence only where a
@@ -205,27 +247,25 @@ Two consequences worth stating plainly:
 
 * A `provable` verdict on a parameterized pair is a claim about **index binding**. It is a claim
   about the caller's pair only insofar as the caller's mapping is the identity.
-* This is not hypothetical. The worked example is a corpus pair with seven placeholders against two,
-  sharing `$1` and `$2`, with `$1` a `count()` argument on one side and `accounts.id` on the other. The
-  prover reported `provable`, and a two-row table refutes the pair under index binding. It now
-  reports `parameter-misaligned: arity` and is never lowered.
+* This is not hypothetical. The check was added after a real rewrite pair came out `provable`: one
+  side carried more placeholders than the other, the two shared the lowest indices, and the shared
+  `$1` stood for a different application value on each side. Such a pair now reports
+  `parameter-misaligned: arity` and is never lowered. `tests/pairs/params/arity_misaligned.sql`
+  pins that refusal on a small pair of the same kind, with a witness that separates its two sides.
 
-### What the check cost, and what it did not
+### What the check costs, and what it does not
 
-Adding the check moved rows out of the emitted set and into a refusal bucket. Three properties of
-that measurement are worth keeping here, because they are arguments rather than counts:
+The check only ever refuses, so it can move a pair out of the emitted set and never into it. Three
+properties follow, and they are arguments rather than counts:
 
-* **Most misaligned rows are rows nothing else would have refused.** That is what raising the
-  verdict *after* lowering buys: a construct the frontend cannot lower still outranks a
-  misalignment, so the bucket measures the exposure of this gap rather than reshuffling rows already
-  refused.
-* **No row's status changed in either direction.** The refused set came out the same set,
-  relabelled, and the emitted cases byte-identical — which is why the change needed no `sqleq-fuzz`
-  cross-check: nothing new reached the prover.
-* **`order` reporting nothing was checked, not assumed.** Thousands of pairs reach it with a shared
-  parameter carrying role evidence on both sides, and most shared parameter slots are doubly
-  evidenced. So the corpus contains no *detectable* permutation. That says nothing about the
-  undetectable ones, which is the hole above.
+* **It is raised last.** A construct the frontend cannot lower still outranks a misalignment, so the
+  bucket holds pairs nothing else would have refused: it measures the exposure of this gap rather
+  than relabelling refusals that were already there.
+* **It needs no `sqleq-fuzz` cross-check.** It changes no lowering, only withholds one, so nothing
+  new reaches the prover.
+* **`order` firing rarely is not evidence of absence.** It sees only a permutation that leaves role
+  evidence on both sides. A permutation between columns of one type, in positions the walk cannot
+  tell apart, leaves none, which is the hole above.
 
 There is also an ordering hazard worth naming, because it bit once: the `$N` sets must be
 snapshotted **before** the equivalence-preserving normalizations, not read off the trees they leave
@@ -239,20 +279,19 @@ manufactured itself.
 The cost is paid in the same direction as every other refusal here. `arity` is exact, so its cost is
 pairs whose extra `$3` occurs solely as `SELECT $3` inside an `EXISTS` where nothing observes it —
 genuinely equivalent, refused because *equivalent* is not something the check is in a position to
-know. One refinement that would keep those benign rows is tempting and the corpus refutes it: "the
-orphan indices all sit above every shared index, so dropping them cannot have renumbered the shared
-ones" also readmits the false proof above, whose orphans `$3..$7` all sit above the shared `$1` and
-`$2`. It is exactly wrong on the one case that matters. `order` can likewise fire on a legitimate
-rewrite that moves a comparison onto a join partner (`a.id = $1 AND a.id = b.a_id` against `b.a_id =
-$1` has genuinely disjoint role sets). Both lose proofs; neither invents one.
+know. One refinement that would keep those benign rows is tempting and wrong: "the orphan indices
+all sit above every shared index, so dropping them cannot have renumbered the shared ones" also
+readmits the false proof above, whose orphans all sit above the shared indices. It is exactly wrong
+on the one case that matters. `order` can likewise fire on a legitimate rewrite that moves a
+comparison onto a join partner (`a.id = $1 AND a.id = b.a_id` against `b.a_id = $1` has genuinely
+disjoint role sets). Both lose proofs; neither invents one.
 
 `parameter-misaligned` is deliberately **not** a claim of non-equivalence, even though a renumbered
 pair usually is non-equivalent under index binding. The benign rows above are the counterexample to
 that shortcut. Misalignment is evidence about the *question*, not about the answer, so it gets its
-own reason and its own bucket in every harness that reports refusals. It is also reported **last**, after both
-queries have lowered, so the bucket counts rows nothing else would have refused.
+own reason and its own bucket in every harness that reports refusals.
 
 ## Reading further
 
-* [VALIDATION.md](VALIDATION.md) — how the tool is validated, and the defects that has caught.
+* [VALIDATION.md](VALIDATION.md) — how the tool is validated, and the defects it has caught.
 * [DESIGN.md](DESIGN.md) — why the frontend is built this way.

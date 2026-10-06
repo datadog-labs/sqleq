@@ -10,8 +10,10 @@
 //! typed values consistently across A and B, freezes `now()`/`current_*` and skips nondeterministic
 //! functions, runs both statements on DuckDB, and compares outputs as **sorted multisets** (bag
 //! semantics — an ORDER BY-only difference never counts). SELECT pairs compare result sets;
-//! UPDATE/DELETE/INSERT pairs compare final table state. Any difference on a valid, deterministic
-//! instance is a **sound counterexample** ⇒ the pair is non-equivalent.
+//! UPDATE/DELETE/INSERT pairs compare final table state, and the returned rows too when both sides
+//! carry RETURNING. A pair with no one observable to compare — a query against a mutation,
+//! RETURNING on one side only, an EXPLAIN — is `NOT-COMPARABLE` instead. Any difference on a valid,
+//! deterministic instance is a **sound counterexample** ⇒ the pair is non-equivalent.
 //!
 //! Binding `$N` to one value for the pair is an assumption, not a given — the row does not record which
 //! of A's placeholders the application fills from the same value as which of B's. Where the two queries

@@ -10,7 +10,8 @@
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
 -- expect lean: unsupported
--- origin: the README's quick start: IN against the OR it abbreviates
+-- origin: an IN-list against the OR of equalities it abbreviates, which the frontend rewrites to
+--   one query before any prover runs
 -- argument: `tier IN (1, 2)` is defined as `tier = 1 OR tier = 2`
 
 -- Schema for the pair.

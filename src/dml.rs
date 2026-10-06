@@ -3,17 +3,17 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! `DELETE` and `UPDATE` reduced to the `SELECT` that computes their effect.
+//! `DELETE`, `UPDATE` and `INSERT` reduced to the `SELECT` that computes their effect.
 //!
 //! The prover's IR has relations and no statements: nothing in it mutates a table, so a pair of
-//! `DELETE`s or `UPDATE`s cannot be handed to it as written. What *can* be handed to it is a query
-//! computing the thing the two statements have to agree on, which turns "are these two statements
-//! equivalent" into "are these two queries bag-equivalent" — the question the prover already answers.
-//! Three shapes occur in practice and all three are handled: both sides a bare `DELETE`/`UPDATE`, one
-//! side wrapped in a `WITH`, and the two mixed across the pair.
+//! `DELETE`s, `UPDATE`s or `INSERT`s cannot be handed to it as written. What *can* be handed to it
+//! is a query computing the thing the two statements have to agree on, which turns "are these two
+//! statements equivalent" into "are these two queries bag-equivalent" — the question the prover
+//! already answers. Three shapes occur in practice and all three are handled: both sides a bare
+//! `DELETE`/`UPDATE`, one side wrapped in a `WITH`, and the two mixed across the pair.
 //!
 //! Like the rewrites in [`normalize`][crate::normalize] this is a rewrite whose verdict is reported
-//! for the *original* pair, so an unsound reduction does not fail, it lies. Each of the two carries
+//! for the *original* pair, so an unsound reduction does not fail, it lies. Each reduction carries
 //! its equivalence argument below and every precondition of that argument is a guard in the code.
 //!
 //! ## `DELETE`
@@ -95,6 +95,21 @@
 //! return different bags. (The preprocessor ignores the clause on both, and so gets this wrong.)
 //! The `UPDATE` reduction therefore emits **two** goals rather than one.
 //!
+//! ## `INSERT`
+//!
+//! ```text
+//! INSERT INTO T (c1, …, cm) S   ~>   S
+//! ```
+//!
+//! The effect is `T := T ⊎ σ(S)`, where `σ` fills in every column the list omits, and bag addition
+//! is cancellative, so two `INSERT`s into one table leave equal tables iff `σ(S₁) = σ(S₂)`. With
+//! one column list on both sides that is `S₁ = S₂` — provided `σ` is a function of the row, which a
+//! `nextval()` default is not: it numbers rows by position. So an `INSERT` that omits a column
+//! whose default is not row-determined is refused, as are the shapes whose effect is not bag
+//! addition (`ON CONFLICT`, `DEFAULT VALUES`, …). The argument and its guards are on
+//! [`insert_pair`]. `RETURNING` drops when both lists are the same, for the reason it drops on a
+//! `DELETE`.
+//!
 //! ## Two goals in one query: the tagged `UNION ALL`
 //!
 //! [`collect_queries`][crate::catalog::collect_queries] wants exactly two queries and [`reduce`]
@@ -134,7 +149,8 @@
 //!
 //! ## Both sides have to be the same kind of statement
 //!
-//! A `DELETE` is reduced only against another `DELETE` and an `UPDATE` only against another `UPDATE`.
+//! A `DELETE` is reduced only against another `DELETE`, an `UPDATE` only against another `UPDATE`,
+//! and an `INSERT` only against another `INSERT` into the same table.
 //! The preprocessor reduces a `DELETE` on its own and then compares it with whatever the other side
 //! is, so a `DELETE` paired with a plain `SELECT` becomes "deleted bag vs. query result" and a
 //! statement that mutates a table can be reported equivalent to one that reads it. The `UPDATE`

@@ -3,6 +3,12 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
+//! `sqleq-lean`: the Lean axis's command line. For each `INSERT ... VALUES` against
+//! `INSERT ... SELECT * FROM unnest(..)` pair it can state, it writes the claim and its proof as
+//! Lean, has the kernel check them, and reports a verdict (see the library docs and
+//! `docs/LEAN.md`). `sqleq-check --axes lean`, or `--lean`, runs it as one axis among the others;
+//! run it directly to check pair files or a corpus CSV on their own. `--help` lists the options.
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;

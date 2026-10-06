@@ -29,7 +29,7 @@ app-launcher icon.
 | `square-{light,dark}.svg` | the end-of-proof square, 54×54. Avatars, square frames |
 | `favicon-{light,dark}.svg` | 16×16, pixel-snapped. **Use below 32px** |
 | `lockup-{light,dark}.svg` | mark + wordmark. Read the caveat below before using it |
-| `mark-axes-*`, `square-axes-*` | axis-coloured. Conditional — see below |
+| `mark-axes-*`, `square-axes-*` | axis-coloured. Retired — see below |
 
 Pick `-light` for light grounds and `-dark` for dark ones; in Markdown, `<picture>` with a
 `prefers-color-scheme` source does it automatically, as at the top of this file.
@@ -45,11 +45,12 @@ in a browser — there is no SVG renderer in this repo's toolchain, so it is the
    its bars are deliberately solid, because cells there would be 2px wide with 1px gaps and read
    as noise.
 2. **Keep the turnstile.** Without it the mark is a hamburger icon.
-3. **The axis-coloured variant has an expiry date.** Colouring the three bars for `qed`,
-   `sqlsolver` and `fuzz` turns the mark into a legend for the portfolio, so a fourth tool makes
-   it *wrong*, not merely dated. The single-colour mark carries no count. Use the coloured one
-   only where the three axes are themselves the subject. Its hues are lifted from the generated
-   reports; nothing was invented for the logo.
+3. **The axis-coloured variant is retired.** Colouring the three bars for `qed`, `sqlsolver` and
+   `fuzz` turned the mark into a legend for the portfolio, and a legend goes *wrong*, not merely
+   dated, once the portfolio grows. It has grown: the SQLSolver axis is now `sqleq-solver`, with
+   the JVM fork beside it as `sqlsolver-jvm`, and there is a Lean axis. The single-colour mark carries no
+   count, so use it everywhere. The coloured files are still generated, so the set stays
+   reproducible, but they should not appear anywhere new.
 
 ## Caveat: the wordmark is live text
 

@@ -1,8 +1,8 @@
 # The Lean axis (`sqleq-lean`)
 
-`sqleq-lean` decides one class of pair that the other axes cannot even state. It proves the pair
-in Lean 4 and has the Lean kernel check the proof. The class is an `INSERT … VALUES` against an
-`INSERT … SELECT * FROM unnest(…)`:
+`sqleq-lean` proves one class of pair that the other axes cannot even state. It writes the proof in
+Lean 4 and has the Lean kernel check it. It proves and never refutes: a pair it cannot prove is left
+undecided. The class is an `INSERT … VALUES` against an `INSERT … SELECT * FROM unnest(…)`:
 
 ```sql
 INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4);
@@ -26,8 +26,8 @@ conflict clause and `RETURNING`.
 
 `run` is universally quantified, so the proof does not depend on how `ON CONFLICT`, defaults, NOT
 NULL, unique, CHECK and foreign-key constraints, sequences, clocks or triggers behave. Sources are
-compared as row *sequences*, never as bags, because serial ids, which duplicate `DO NOTHING` keeps,
-and `RETURNING` order all depend on row order.
+compared as row *sequences*, never as bags, because three things depend on row order: the serial
+ids the rows get, which of two duplicates `DO NOTHING` keeps, and the order `RETURNING` reports.
 
 ### Generated cells
 
@@ -39,8 +39,8 @@ INSERT INTO t (id, name) VALUES (DEFAULT, $1), (DEFAULT, $2);
 INSERT INTO t (id, name) SELECT * FROM unnest($1::int[], $2::text[]);
 ```
 
-There is no parameter to gather for such a cell, so such a pair is proved under a weaker claim
-with its own verdict, `proved-gather-generated`. The theorem (`EquivGatherGen`) adds one more
+There is no parameter to gather for such a cell, so the pair is proved under a weaker claim with
+its own verdict, `proved-gather-generated`. The theorem (`EquivGatherGen`) adds one more
 quantifier: for every value `g i j` that the generated cell in row `i`, column `j` could evaluate
 to, the `unnest` side, run under the gather binding with those cells' entries taken from `g`, gives
 the same result as the `VALUES` side whose generated cells evaluate to `g`.
@@ -84,8 +84,9 @@ everything else:
   inference, and the model cannot see that failure. Nor may a parameter number go unused, which
   would leave it with no type at all. With generated cells, which take a column but no number,
   the parameters must instead be `$1, $2, …` in reading order, each once.
-- **The tail.** The two tails are identical and mention no parameter. On one side `$k+1` may be a
-  `VALUES` cell, while on the other the same `$k+1` is the `DO UPDATE` value.
+- **The tail.** The two tails are identical and mention no parameter, because a parameter number
+  means different things on the two sides: on one side `$k+1` may be a `VALUES` cell, while on the
+  other the same `$k+1` is the `DO UPDATE` value.
 - **The `unnest` arguments.** They are `$1..$k` in order, one per column, with no `WITH
   ORDINALITY`, `WHERE`, `ORDER BY`, `LIMIT` or `DISTINCT`.
 
@@ -156,12 +157,22 @@ credit or withhold credit wrongly.
 | verdict | meaning |
 |---|---|
 | `proved-gather` | The kernel proved `EquivGather` and checked a witness. The credited verdict. |
-| `no-witness` | The kernel proved `EquivGather`, but the `VALUES` side fails every run with non-NULL parameters, or its table's DDL could not be read reliably enough to tell. The proof may be vacuous. Not credited. |
-| `proved-gather-generated` | The kernel proved `EquivGatherGen`, the weaker claim for generated cells, and checked a witness. Credited under its own name, beside `proved-gather`. |
-| `no-witness-generated` | The kernel proved `EquivGatherGen`, but no witness shows the `VALUES` side can succeed. Not credited. |
+| `no-witness` | The kernel proved `EquivGather`, but the `VALUES` side fails every run with non-NULL parameters, or its table's DDL could not be read reliably enough to tell. The proof may be vacuous, so it is not credited as evidence, though it is still a claim. |
+| `proved-gather-generated` | The kernel proved `EquivGatherGen`, the weaker claim for generated cells, and checked a witness. Credited under its own name, for a pair whose truth is stated in that weaker form. |
+| `no-witness-generated` | The kernel proved `EquivGatherGen`, but no witness shows the `VALUES` side can succeed. A claim, not credited, as `no-witness` is. |
 | `unsupported` | Outside the fragment above. Not a claim about the pair. |
 | `invalid-sql` | Postgres rejects the pair as written, e.g. a `VALUES` row narrower than the column list. |
 | `error`, `timeout` | Lean did not accept the proof, or did not finish. |
+
+How `sqleq-check` reads them follows from what each claims (`sqleq-check/src/suite.rs`). In the
+pinned suite a pair headed `-- binding: gather` is credited by `proved-gather` alone: a generated
+proof claims less than that truth. Under `-- binding: gather-generated` either proof counts, since a
+plain gather proof claims more. A proof the binding counts is a claim of equivalence whether or not
+a witness was found, so a `no-witness` pinned against a not-equivalent truth fails the run as a
+false proof would. Under `--portfolio` a Lean proof gives a verdict of its own rather than plain
+`equivalent`: `proved-gather` makes a case `equivalent-gather`, and `proved-gather-generated` makes
+it `equivalent-gather-generated`. A Lean proof and a `sqleq-fuzz` counterexample answer under
+different bindings, so together they make a case `not-equivalent`, not an alarm.
 
 A proof counts only if both of these checks pass:
 
@@ -184,10 +195,12 @@ Lean's own kernel is still trusted. Re-checking the proofs with an independent k
 
 ## Checking it against Postgres
 
-`tools/lean_replay.py` is an independent check that uses no Lean. `sqleq-lean --replay-plan
-plan.json` records, for each proved or no-witness pair, its DDL, both statements, the `VALUES`
-rows, and the target's column types and defaults. The script then replays each pair on a real
-Postgres:
+`tools/lean_replay.py` is an independent check that uses no Lean. Its input is a replay plan:
+`sqleq-check --axes lean --expect report-only --lean-replay-plan plan.json` over pair files or a
+`--corpus` has `sqleq-lean` record, for each pair the kernel proved (`proved-gather`, `no-witness`,
+or either one's `-generated` form), its DDL, both statements, the `VALUES` rows, and the target's
+column types and defaults. `--portfolio` does not pass the option on. The script then replays each
+pair on a real Postgres:
 
 - the `VALUES` side under the canonical binding, and the `unnest` side under the gather binding
   built from the same values;
@@ -219,20 +232,29 @@ was wrong, while a withheld one that succeeds only cost credit.
 
 ## Running it
 
-It needs a Lean toolchain (`elan`, which installs the version in `lean/lean-toolchain`):
+It needs a Lean toolchain (`elan`, which installs the version in `lean/lean-toolchain`), and runs
+through `sqleq-check` like every other axis:
 
 ```sh
-cargo build -p sqleq-lean
-./target/debug/sqleq-lean tests/pairs/insert_unnest # pair files, or directories of them
-./target/debug/sqleq-lean --csv corpus.csv --json out.json
+cargo build --release && cargo build --release -p sqleq-lean
+./target/release/sqleq-check --axes lean --expect report-only tests/pairs/insert_unnest
+./target/release/sqleq-check --axes lean --expect report-only --corpus corpus.csv --json out.json
 ```
 
+`sqleq-check` finds `sqleq-lean` in this repository's `target/` unless `--lean-bin`, `--bin-dir` or
+`$SQLEQ_LEAN` names one, and `--lean` adds the axis to any other run, `--portfolio` included.
 `$LAKE` overrides the `lake` found on `PATH`, and `$SQLEQ_LEAN_DIR` the Lean package. The checker's
-own positive and negative controls are `lake build SqleqTest` in `lean/`. `--translate-only` runs no
-Lean and reports, for each pair, its refusal or the claim it would be checked under.
+own positive and negative controls are `lake build SqleqTest` in `lean/`.
 
-The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/README.md), headed
-`-- binding: gather` because their truth is stated under the gather rule, or `-- binding:
-gather-generated` for a pair with generated cells. `cargo test -p
-sqleq-lean` checks every `-- expect lean:` pin under `tests/pairs/` against real Lean, and
-`sqleq-check --expect pinned --axes lean` does the same with the suite's other rules.
+`sqleq-lean` can also be run on its own, over pair files, directories of them, or `--csv
+<corpus.csv>`, writing its own per-pair record (`sqleq-lean --help` lists the options). A few
+options have no `sqleq-check` counterpart, among them `--batch` (pairs per Lean file) and
+`--translate-only`, which runs no Lean and reports, for each pair, its refusal or the claim it would
+be checked under.
+
+The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/insert_unnest/),
+headed `-- binding: gather` because their truth is stated under the gather rule, or `-- binding:
+gather-generated` for a pair with generated cells; [the pinned-pair README](../tests/pairs/README.md)
+describes the format. `cargo test -p sqleq-lean` checks every `-- expect lean:` pin under
+`tests/pairs/` against real Lean, and `sqleq-check --expect pinned --axes lean tests/pairs` does the
+same with the suite's other rules.
