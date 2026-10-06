@@ -594,15 +594,21 @@ impl<'s> Translator<'s> {
     /// Only numerically correct when at most one row of the inner query satisfies its own term (SQL
     /// raises an error otherwise). Java asserts that precondition globally, through a `ScalarTerm`
     /// constraint; this port does not model it yet.
+    ///
+    /// The value is NULL when no row satisfies the term *or* the one that does holds NULL in its
+    /// column: under that precondition, exactly when no row holds a non-NULL value. Reading it as
+    /// NULL only when there is no row would make `(SELECT y …) IS NULL` say `NOT EXISTS (…)`, never
+    /// let a scalar aggregate (which always has its one row) be NULL, and turn `x = (SELECT …)`
+    /// over a NULL value into FALSE where SQL says UNKNOWN -- which a `NOT` then makes TRUE.
     fn scalar_subquery_value(&mut self, query: &Relation, scope: &Scope) -> Result<Value, TranslateError> {
         let inner = self.rel(query, scope.base + scope.local.len())?;
         if inner.local.len() != 1 {
             return Err(TranslateError::ScalarSubqueryArity);
         }
         let col = UTerm::Var(inner.local[0].clone());
-        let exists = mk_squash(mk_sum(inner.exposed.clone(), inner.term.clone()));
+        let non_null_row = mk_squash(mk_sum(inner.exposed.clone(), mk_mul([inner.term.clone(), mk_neg(is_null_of(&col))])));
         let value = mk_sum(inner.exposed, mk_mul([inner.term, col]));
-        Ok(Value { is_null: mk_neg(exists), value })
+        Ok(Value { is_null: mk_neg(non_null_row), value })
     }
 
     fn translate_value(&mut self, e: &Expr, scope: &Scope) -> Result<Value, TranslateError> {
@@ -1163,5 +1169,72 @@ mod tests {
         let sides = [Box::new(wide), Box::new(narrow)];
         let err = t.set_op(SetOpKind::Union, &sides, 0).unwrap_err();
         assert_eq!(err, TranslateError::MalformedShape("set-op branches have different column counts".into()));
+    }
+
+    /// A scalar subquery's value is NULL when it has no row or its row holds NULL: checked on
+    /// concrete databases, against what Postgres answers.
+    mod scalar_subquery_nullness {
+        use super::*;
+
+        /// `t(id)`, `s(k, y)`, and the truth of `cond` on `t`'s one row `(1)` for each content of
+        /// `s`: (TRUE, UNKNOWN).
+        fn truths(cond: serde_json::Value, contents: &[Vec<UConst>]) -> Vec<(i64, i64)> {
+            let schemas = vec![
+                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![] },
+            ];
+            let e = Expr::parse(&cond, 2).unwrap();
+            let mut t = Translator::new(&schemas);
+            let src = t.scan(0).unwrap();
+            let truth = t.translate_truth(&e, &Scope { base: 0, local: src.local }).unwrap();
+            let widths: std::collections::HashMap<u32, usize> = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
+            let universe = vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2), UConst::Int(5)];
+            contents
+                .iter()
+                .map(|rows| {
+                    let s = rows.chunks(2).map(|r| r.to_vec()).collect();
+                    let db = Db::new([("s".to_string(), s)].into(), universe.clone(), widths.clone());
+                    let mut env = Env::from([(0, vec![UConst::Int(1)])]);
+                    let mut count = |t: &UTerm| db.count(t, &mut env).unwrap();
+                    (count(&truth.t), count(&truth.u()))
+                })
+                .collect()
+        }
+
+        fn scalar(query: serde_json::Value) -> serde_json::Value {
+            json!({ "operator": "$SCALAR_QUERY", "type": "INTEGER", "operand": [], "query": query })
+        }
+
+        /// `SELECT y FROM s WHERE k = 1`.
+        fn y_where_k_is_1() -> serde_json::Value {
+            json!({ "project": { "source": { "filter": { "source": { "scan": 1 }, "condition": call("=", vec![c(1), lit(1)]) } },
+                                 "target": [c(2)] } })
+        }
+
+        /// `SELECT sum(y) FROM s`.
+        fn sum_y() -> serde_json::Value {
+            json!({ "group": { "keys": [], "source": { "project": { "source": { "scan": 1 }, "target": [c(2)] } },
+                               "function": [{ "operator": "SUM", "type": "INTEGER", "operand": [c(1)] }] } })
+        }
+
+        #[test]
+        fn is_null_holds_for_no_row_and_for_a_row_holding_null() {
+            let (n, one, two, five) = (UConst::Null, UConst::Int(1), UConst::Int(2), UConst::Int(5));
+            let contents = [vec![], vec![one.clone(), n.clone()], vec![one.clone(), five.clone()], vec![two.clone(), five.clone()]];
+            let got = truths(call("IS NULL", vec![scalar(y_where_k_is_1())]), &contents);
+            assert_eq!(got, [(1, 0), (1, 0), (0, 0), (1, 0)]);
+            // sum over no rows, or over only NULLs, is NULL.
+            let got = truths(call("IS NULL", vec![scalar(sum_y())]), &contents[..3]);
+            assert_eq!(got, [(1, 0), (1, 0), (0, 0)]);
+        }
+
+        #[test]
+        fn a_comparison_with_a_null_subquery_is_unknown_and_stays_so_under_not() {
+            let (n, one, five) = (UConst::Null, UConst::Int(1), UConst::Int(5));
+            let contents = [vec![], vec![one.clone(), n.clone()], vec![one.clone(), five.clone()], vec![one.clone(), one.clone()]];
+            let eq = call("=", vec![c(0), scalar(sum_y())]);
+            assert_eq!(truths(eq.clone(), &contents), [(0, 1), (0, 1), (0, 0), (1, 0)]);
+            assert_eq!(truths(call("NOT", vec![eq]), &contents), [(0, 1), (0, 1), (1, 0), (0, 0)]);
+        }
     }
 }

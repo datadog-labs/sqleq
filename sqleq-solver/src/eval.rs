@@ -135,19 +135,24 @@ impl Db {
                 }
             }
             UTerm::Mul(ts) => {
-                let vals: Vec<UConst> = ts.iter().map(|c| self.eval(c, env)).collect::<Result<_, _>>()?;
-                if vals.contains(&UConst::Int(0)) {
-                    UConst::Int(0)
-                } else {
-                    let rest: Vec<UConst> = vals.into_iter().filter(|v| *v != UConst::Int(1)).collect();
-                    match rest.as_slice() {
-                        [] => UConst::Int(1),
-                        [one] => one.clone(),
-                        many => UConst::Int(many.iter().try_fold(1i64, |acc, v| match v {
-                            UConst::Int(n) => acc.checked_mul(*n).ok_or("overflow"),
-                            _ => Err("non-integer factor"),
-                        })?),
+                // A zero factor annihilates the rest unevaluated, so a guarded value (a CASE branch,
+                // a comparison under its operands' not-null guard) is read only where its guard
+                // holds; a scalar subquery's value, a sum, has no reading where it is NULL.
+                let mut vals: Vec<UConst> = Vec::with_capacity(ts.len());
+                for c in ts {
+                    match self.eval(c, env)? {
+                        UConst::Int(0) => return Ok(UConst::Int(0)),
+                        v => vals.push(v),
                     }
+                }
+                let rest: Vec<UConst> = vals.into_iter().filter(|v| *v != UConst::Int(1)).collect();
+                match rest.as_slice() {
+                    [] => UConst::Int(1),
+                    [one] => one.clone(),
+                    many => UConst::Int(many.iter().try_fold(1i64, |acc, v| match v {
+                        UConst::Int(n) => acc.checked_mul(*n).ok_or("overflow"),
+                        _ => Err("non-integer factor"),
+                    })?),
                 }
             }
             UTerm::Squash(c) => UConst::Int((self.count(c, env)? != 0) as i64),
