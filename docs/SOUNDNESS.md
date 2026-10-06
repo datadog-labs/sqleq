@@ -117,7 +117,9 @@ what it is or refused:
   the `bigint` range are `numeric`, not integers — and Postgres's spelling (`.5` is `0.5`). The QED
   prover reads a decimal constant through an `f32`, so one that is not exactly such an `f32`
   (`0.1`, `20000000.5`) is an uninterpreted function of its text, and so is a string constant cast
-  to a decimal type that the cast would round the same way.
+  to a decimal type that the cast would round the same way. A number run into a name, `0b101` or
+  `1x`, is refused: Postgres reads it as one token, an integer in base 2, 8 or 16 or a syntax error,
+  where the parser reads a number and an alias.
 - **Integer division truncates.** Postgres rounds `-7 / 2` toward zero and gives `-7 % 2` the sign
   of the dividend; a prover's integer division is Euclidean. So `/` and `%` on integers are
   functions named after their operand types (`q_arith_div_integer_integer`), never the native

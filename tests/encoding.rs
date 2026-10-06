@@ -363,3 +363,52 @@ mod depth {
         });
     }
 }
+
+mod prefixed_numbers {
+    use super::*;
+
+    const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, unique ("id"));"#;
+
+    fn refused(q0: &str, q1: &str) {
+        let m = refusal(&format!("{T}\n{q0};\n{q1};"), CatalogSource::Declared);
+        assert!(m.contains("numeric literal"), "{q0}: {m}");
+    }
+
+    #[test]
+    fn a_prefixed_integer_is_not_zero_and_an_alias() {
+        // Postgres reads 5, 15 and 31; sqlparser read `0` and a column alias.
+        refused(r#"SELECT 0b101 FROM "t""#, r#"SELECT 0 FROM "t""#);
+        refused(r#"SELECT 0o17 FROM "t""#, r#"SELECT 0 FROM "t""#);
+        refused(r#"SELECT 0X1F FROM "t""#, r#"SELECT 0 FROM "t""#);
+        // The lower-case hex spelling is a hex string to sqlparser, and refused as a literal.
+        let src = format!("{T}\nSELECT 0x1F FROM \"t\";\nSELECT 0 FROM \"t\";");
+        assert!(refusal(&src, CatalogSource::Declared).contains("literal"));
+    }
+
+    #[test]
+    fn it_is_refused_in_every_position() {
+        refused(r#"SELECT "id" FROM "t" WHERE "a" = 0b101"#, r#"SELECT "id" FROM "t""#);
+        refused(r#"SELECT "id" FROM "t" LIMIT 0b101"#, r#"SELECT "id" FROM "t""#);
+        refused(r#"SELECT "id" FROM "t" ORDER BY "a" + 0o17 LIMIT 1"#, r#"SELECT "id" FROM "t""#);
+        refused(r#"SELECT "id" FROM "t""#, r#"SELECT "id" FROM "t" WHERE "a" IN (SELECT 0b1 FROM "t")"#);
+    }
+
+    #[test]
+    fn trailing_junk_is_refused() {
+        // A syntax error in Postgres since 16, and `1 AS x` or `5` to sqlparser.
+        refused(r#"SELECT 1x FROM "t""#, r#"SELECT 1 FROM "t""#);
+        refused(r#"SELECT 1.5e FROM "t""#, r#"SELECT 1.5 FROM "t""#);
+        refused(r#"SELECT 5L FROM "t""#, r#"SELECT 5 FROM "t""#);
+        refused(r#"SELECT "id" FROM "t" LIMIT 1OFFSET 0"#, r#"SELECT "id" FROM "t" LIMIT 1"#);
+    }
+
+    #[test]
+    fn a_separate_name_is_still_an_alias() {
+        // Whitespace, a comment or quotes make two tokens in Postgres too: `0` named `b101`.
+        let ok = |q: &str| lower(T, q, q);
+        ok(r#"SELECT 0 b101 FROM "t""#);
+        ok(r#"SELECT 0/**/b101 FROM "t""#);
+        ok(r#"SELECT 0"b101" FROM "t""#);
+        ok(r#"SELECT 1::int, 1e5, .5, 5., "a"::text FROM "t""#);
+    }
+}
