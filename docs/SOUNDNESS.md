@@ -139,6 +139,14 @@ what it is or refused:
   `b RIGHT JOIN c ON p`, not `(a CROSS JOIN b) RIGHT JOIN c ON p`, which keeps `c`'s rows when `a`
   is empty. Each comma item is lowered as its own join tree, and its `ON` and `USING` see only that
   tree's tables.
+- **An `ORDER BY` or `DISTINCT ON` key is read as Postgres reads it.** An integer is a position in
+  the select list, a bare name is the output column of that name, and anything else, a qualified
+  name like `t.a` included, is an expression over the `FROM` clause. Output columns are named as
+  Postgres names them: a quoted alias keeps its case, and an unaliased column, call, or cast of one
+  is named after the column or function. A bare key that two output columns carry is refused, and
+  so is one that matches no output name while an output column's name is one the frontend cannot
+  tell. Above a `GROUP BY` or `DISTINCT` an input expression cannot be addressed, so such a key is
+  refused unless the select list writes the same expression.
 
 ## A query that raises an error
 

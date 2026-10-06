@@ -2233,7 +2233,7 @@ fn an_input_column_beats_a_select_list_alias() {
 }
 
 /// Two items sharing the alias is a resolution question with no right answer, declined exactly as
-/// `order_key_index` declines it for `ORDER BY`.
+/// `resolve_order_key` declines it for `ORDER BY`.
 #[test]
 fn group_by_declines_a_duplicated_alias() {
     let ddl = "create table d (x INTEGER, y INTEGER);";
