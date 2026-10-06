@@ -1188,6 +1188,11 @@ impl VisitorMut for ClearLocks {
 /// first and it becomes indistinguishable from a use of a CTE named `c`, which would substitute a
 /// definition for a reference to a real table.
 ///
+/// **A use names the binding under Postgres's folding.** An unquoted name folds to lower case and a
+/// quoted one keeps its case, so `c`, `C` and `"c"` all use `WITH c`, while `t` does not use
+/// `WITH "T"`: there it is still the base table `t`, and substituting the binding would read a
+/// different relation.
+///
 /// # What is not a precondition, and why
 ///
 /// **Multiple uses.** Inlining a binding used N times evaluates its body N times, and that is the
@@ -1245,7 +1250,7 @@ impl VisitorMut for InlineCtes {
             // A binding may use the ones before it in the same `WITH`, so each definition is closed
             // over its predecessors before being recorded as one itself.
             let _ = VisitMut::visit(&mut *cte.query, &mut ReplaceCteRefs(&defs));
-            defs.insert(cte.alias.name.value.to_lowercase(), cte);
+            defs.insert(crate::dml::fold_ident(&cte.alias.name), cte);
         }
         let _ = q.visit(&mut ReplaceCteRefs(&defs));
         ControlFlow::Continue(())
@@ -1290,7 +1295,10 @@ impl VisitorMut for ReplaceCteRefs<'_> {
         let Some(ident) = part.as_ident() else {
             return ControlFlow::Continue(());
         };
-        let Some(cte) = self.0.get(&ident.value.to_lowercase()) else {
+        // Postgres's identity for the name, not its lower-cased text: `"T"` and `t` are two names,
+        // so a binding `WITH "T"` must not capture the base table `t`, which the statement still
+        // reads (and which a `DELETE`'s target names, past `dml`'s shadowing check).
+        let Some(cte) = self.0.get(&crate::dml::fold_ident(ident)) else {
             return ControlFlow::Continue(());
         };
         // `AS b AT i` is a PartiQL index alias over a nested array, which is not what a `WITH` binding
@@ -1435,17 +1443,26 @@ fn order_determined_by_projection(q: &Query) -> bool {
     let OrderByKind::Expressions(keys) = &order_by.kind else { return false };
     let SetExpr::Select(select) = &*q.body else { return false };
 
-    let mut projected: Vec<String> = Vec::new();
+    // Two lists, because a key is matched against each differently. `exprs` holds every projected
+    // expression as text, which keeps its quoting, so a key spelled the same way is the same value.
+    // `names` holds every alias under Postgres's folding (an unquoted name lower-cased, a quoted one
+    // as written), and only a bare-name key is compared with it: Postgres looks `ORDER BY x` up among
+    // the output names before the input columns, but evaluates any other key over the input. Matching
+    // an alias by its text instead lets the unquoted key `A`, which is the input column `a`, meet the
+    // alias `"A"` (and the key `t.a` meet an alias `"t.a"`), and counts a column the projection drops
+    // as projected.
+    let mut exprs: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for item in &select.projection {
         match item {
             // A star projects everything the sources have, so any key over those sources is
             // recoverable — but working out *which* columns those are is name resolution, which has
             // not run yet. Refuse rather than guess.
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
-            SelectItem::UnnamedExpr(e) => projected.push(e.to_string()),
+            SelectItem::UnnamedExpr(e) => exprs.push(e.to_string()),
             SelectItem::ExprWithAlias { expr, alias } => {
-                projected.push(expr.to_string());
-                projected.push(alias.value.clone());
+                exprs.push(expr.to_string());
+                names.push(crate::dml::fold_ident(alias));
             }
             // A Spark multi-alias projection expands one expression into several output columns;
             // which key maps to which is not something this needs to work out to refuse.
@@ -1460,8 +1477,12 @@ fn order_determined_by_projection(q: &Query) -> bool {
                 return n.parse::<usize>().is_ok_and(|i| i >= 1 && i <= select.projection.len());
             }
         }
-        let text = key.expr.to_string();
-        projected.contains(&text)
+        if let Expr::Identifier(id) = &key.expr {
+            if names.contains(&crate::dml::fold_ident(id)) {
+                return true;
+            }
+        }
+        exprs.contains(&key.expr.to_string())
     })
 }
 

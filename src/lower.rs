@@ -1391,6 +1391,14 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 }
                 a.columns.iter().zip(out_cols).map(|(c, (_, t))| (c.name.value.to_lowercase(), t)).collect()
             };
+            // Every name here is lower-cased, quoted or not, and a reference finds the first column
+            // of its name. So `"b"` and `"B"`, two columns in Postgres, would become two `b`s, and
+            // `s."B"` would read the first. The case is lost by the time a name is stored here (a
+            // `*` reads it from the catalog, which folds every declaration), so this refuses any
+            // two columns that share a name, as `Catalog::check_case_collisions` does for a table's.
+            if let Some(i) = (1..cols.len()).find(|&i| cols[..i].iter().any(|(m, _)| *m == cols[i].0)) {
+                return Err(unsupported(format!("derived table with two columns named {} up to case", cols[i].0)));
+            }
             // No `table`: a derived table has no declared keys, so nothing it outputs can be shown
             // functionally dependent on a GROUP BY key.
             // A derived table's columns are its output, so all of them are visible.
