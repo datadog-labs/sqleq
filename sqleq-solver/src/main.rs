@@ -225,10 +225,8 @@ fn run(name: String, job: serde_json::Value, dry: bool, cap: Duration, grace: Du
     }
     // Tier 0 on the raw IR, before anything is parsed: two identical trees are equal whatever the
     // prover would say. Recorded as `literal` because a syntactic coincidence is not a proof.
-    if let Some([a, b]) = ir.get("queries").and_then(|q| q.as_array()).map(Vec::as_slice) {
-        if a == b {
-            return (Row { literal: Some(true), ms: t0.elapsed().as_millis(), ..row("EQ") }, false);
-        }
+    if prove::identical_sides(&ir) {
+        return (Row { literal: Some(true), ms: t0.elapsed().as_millis(), ..row("EQ") }, false);
     }
 
     let (tx, rx) = mpsc::channel();

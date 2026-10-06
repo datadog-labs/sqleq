@@ -289,7 +289,10 @@ pub enum UTerm {
     Mul(Vec<Rc<UTerm>>),
     /// Clamp to exactly 0 or 1 (used for OR-of-indicators and set semantics).
     Squash(Rc<UTerm>),
-    /// Boolean complement, `1 - x`, valid only where `x` is already 0/1-valued.
+    /// `[x = 0]`: 1 where `x` is 0 and 0 everywhere else, for any multiplicity `x` (a non-negative
+    /// count), as `eval` and rung 3 read it. It is the complement `1 - x` only where `x` is 0/1;
+    /// normalization relies on the general reading -- it pushes a negation into a sum of counts
+    /// (`¬(a + b)` is `¬a · ¬b`) and reads `¬Σ_v b` as "no row satisfies `b`".
     Neg(Rc<UTerm>),
     /// Existential quantification over `vars` (always `Base`-kind, by construction of every call
     /// site in `translate.rs`; not enforced by this type any more than Java enforces it on `USum`).

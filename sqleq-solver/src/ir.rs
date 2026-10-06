@@ -23,14 +23,12 @@
 //!   function name is only supported *relative to what the target prover accepts* -- both of which
 //!   need the same `base`/row-type threading `IrToRel.rel()`/`expr()` does. `TranslateError`
 //!   carries the variants those checks use (`Correlated`, `ColumnOutOfRange`, `Aggregate`,
-//!   `GroupKeyNonRef`, `AggArgNonRef`, `ScanUnknownTable`) so both stages report through one enum,
-//!   matching `IrToRel.java`'s single `Refused` exception spanning both jobs.
+//!   `GroupKeyNonRef`, `AggArgNonRef`) so both stages report through one enum, matching
+//!   `IrToRel.java`'s single `Refused` exception spanning both jobs.
 //!
-//! `ScanUnknownTable` is carried for taxonomy parity but should be unreachable from this crate: it
-//! exists in Java because `IrToRel`'s catalog is a name-based Calcite registration built from a
-//! reconstructed DDL string, which can fail to resolve a name Calcite parsed differently. We index
-//! tables by position straight out of `Input.schemas`, so there is no name lookup to fail -- only
-//! `scan-out-of-range` is reachable here.
+//! Java also refuses `scan-unknown-table`, when its name-based Calcite catalog fails to resolve a
+//! table. We index tables by position straight out of `Input.schemas`, so there is no name lookup
+//! to fail, and only `scan-out-of-range` exists here.
 //!
 //! `Input.help` (a per-query Calcite `explain()` string) and `Schema.guaranteed` (an integrity-
 //! constraint list *our* frontend always emits empty, and `IrToRel.java` never reads at all -- see
@@ -100,8 +98,6 @@ impl Type {
 pub enum TranslateError {
     RelNotObject,
     ScanOutOfRange,
-    /// Taxonomy parity only -- see the module doc; this crate cannot reach it.
-    ScanUnknownTable,
     DistinctNotARelation,
     /// `rel:<tag>` -- an object relation whose one key isn't one this bridge understands.
     UnknownRelation(String),
@@ -156,7 +152,6 @@ impl std::fmt::Display for TranslateError {
         match self {
             TranslateError::RelNotObject => write!(f, "rel-not-object"),
             TranslateError::ScanOutOfRange => write!(f, "scan-out-of-range"),
-            TranslateError::ScanUnknownTable => write!(f, "scan-unknown-table"),
             TranslateError::DistinctNotARelation => write!(f, "distinct-not-a-relation"),
             TranslateError::UnknownRelation(tag) => write!(f, "rel:{tag}"),
             TranslateError::SetOpArity(kind) => write!(f, "{kind}-arity"),
@@ -206,39 +201,15 @@ impl JoinKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Ascending,
-    Descending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NullOrder {
-    First,
-    Last,
-}
-
-/// A `[columnIndex, type, "ASCENDING NULLS LAST"]` triple. `IrToRel.collation()` never reads the
-/// middle element (Calcite's `RelFieldCollation` doesn't carry a type); we keep it anyway since a
-/// later stage may want it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Collation {
-    pub column: u32,
-    pub ty: Type,
-    pub direction: Direction,
-    pub nulls: NullOrder,
-}
-
-impl Collation {
-    fn parse(v: &Value) -> Result<Collation, TranslateError> {
-        let arr = v.as_array().filter(|a| a.len() >= 3).ok_or(TranslateError::CollationShape)?;
-        let column = arr[0].as_u64().ok_or(TranslateError::CollationShape)? as u32;
-        let ty = Type::parse(arr[1].as_str().ok_or(TranslateError::CollationShape)?)?;
-        let how = arr[2].as_str().ok_or(TranslateError::CollationShape)?;
-        let direction = if how.starts_with("DESC") { Direction::Descending } else { Direction::Ascending };
-        let nulls = if how.ends_with("NULLS FIRST") { NullOrder::First } else { NullOrder::Last };
-        Ok(Collation { column, ty, direction, nulls })
-    }
+/// Checks one `[columnIndex, type, "ASCENDING NULLS LAST"]` sort key's shape, which is all that is
+/// done with it: a sort is translated only when it has no `offset` or `limit`, and then its order
+/// is erased (bag semantics), so nothing reads the key itself.
+fn check_collation(v: &Value) -> Result<(), TranslateError> {
+    let arr = v.as_array().filter(|a| a.len() >= 3).ok_or(TranslateError::CollationShape)?;
+    arr[0].as_u64().ok_or(TranslateError::CollationShape)?;
+    Type::parse(arr[1].as_str().ok_or(TranslateError::CollationShape)?)?;
+    arr[2].as_str().ok_or(TranslateError::CollationShape)?;
+    Ok(())
 }
 
 /// One `GROUP BY`/global aggregate function call. `distinct` and `operand` are both optional on the
@@ -281,7 +252,8 @@ pub enum Relation {
     Project { source: Box<Relation>, target: Vec<Expr> },
     Join { left: Box<Relation>, right: Box<Relation>, kind: JoinKind, condition: Expr },
     Group { source: Box<Relation>, keys: Vec<Expr>, function: Vec<AggCall> },
-    Sort { source: Box<Relation>, collation: Vec<Collation>, offset: Option<Expr>, limit: Option<Expr> },
+    /// A sort's keys are checked when parsed (see `check_collation`) and not kept.
+    Sort { source: Box<Relation>, offset: Option<Expr>, limit: Option<Expr> },
     Values { schema: Vec<Type>, content: Vec<Vec<Expr>> },
     Union([Box<Relation>; 2]),
     Except([Box<Relation>; 2]),
@@ -343,13 +315,10 @@ impl Relation {
         }
         if let Some(x) = o.get("sort") {
             let source = Relation::parse(field(x, "source")?, schema_count)?;
-            let collation = array(field(x, "collation")?)?
-                .iter()
-                .map(Collation::parse)
-                .collect::<Result<_, _>>()?;
+            array(field(x, "collation")?)?.iter().try_for_each(check_collation)?;
             let offset = opt_expr(x, "offset", schema_count)?;
             let limit = opt_expr(x, "limit", schema_count)?;
-            return Ok(Relation::Sort { source: Box::new(source), collation, offset, limit });
+            return Ok(Relation::Sort { source: Box::new(source), offset, limit });
         }
         if let Some(x) = o.get("values") {
             let schema = array(field(x, "schema")?)?

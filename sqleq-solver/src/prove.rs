@@ -62,14 +62,17 @@ impl std::fmt::Display for Verdict {
     }
 }
 
-/// One job row's `ir` value, end to end. Tier 0 runs on the raw JSON before anything is parsed,
-/// exactly as `IrDriver.java:128-136` does, so an identical pair is answered even when its shape
-/// would be refused.
+/// Tier 0: whether the two queries of an `ir` value are the same JSON tree. Run on the raw JSON
+/// before anything is parsed, exactly as `IrDriver.java:128-136` does, so an identical pair is
+/// answered even when its shape would be refused.
+pub fn identical_sides(ir: &serde_json::Value) -> bool {
+    matches!(ir.get("queries").and_then(|q| q.as_array()).map(Vec::as_slice), Some([a, b]) if a == b)
+}
+
+/// One job row's `ir` value, end to end: tier 0 ([`identical_sides`]), then [`prove`].
 pub fn verify(ir: &serde_json::Value) -> Verdict {
-    if let Some([a, b]) = ir.get("queries").and_then(|q| q.as_array()).map(Vec::as_slice) {
-        if a == b {
-            return Verdict::Eq { literal: true };
-        }
+    if identical_sides(ir) {
+        return Verdict::Eq { literal: true };
     }
     match Input::parse(ir) {
         Ok(input) => prove(&input),
