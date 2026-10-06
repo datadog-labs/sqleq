@@ -5,7 +5,7 @@
 
 //! That a run reports what its backends said in that run, over stand-in backends: a proof and a
 //! counterexample on one pair fail every mode, a `--keep` re-run never reads a previous run's
-//! answers, and a frontend crash is not a refusal.
+//! answers, a frontend crash is not a refusal, and `-t` takes only budgets it can honour.
 
 mod common;
 
@@ -319,4 +319,41 @@ fn bless_will_not_pin_a_frontend_crash_as_a_refusal() {
     let ran = c.run(&["--expect", "pinned", "--bless", "--axes", "frontend"]);
     assert_eq!(ran.code, 1, "{}{}", ran.out, ran.err);
     assert_eq!(std::fs::read_to_string(&f.case).unwrap(), text, "a crash is no answer to pin");
+}
+
+// --- #67: -t -------------------------------------------------------------------------------------
+
+#[test]
+fn a_timeout_it_cannot_honour_is_a_usage_error() {
+    let f = neq_case();
+    let c = Check::new(&f);
+    let bad: [&[&str]; 6] =
+        [&["-t", "nan"], &["-t", "0"], &["--timeout=-1"], &["--timeout=-inf"], &["--retry-timeout", "nan"], &["--retry-timeout", "0"]];
+    for bad in bad {
+        let ran = c.run(&[&["--axes", "frontend,qed", "--expect", "report-only"][..], bad].concat());
+        assert_eq!(ran.code, 2, "{bad:?}: {}{}", ran.out, ran.err);
+        assert!(ran.err.contains("expected a positive number of seconds"), "{bad:?}: {}", ran.err);
+    }
+}
+
+#[test]
+fn an_infinite_or_huge_timeout_is_no_deadline_in_every_mode() {
+    let f = neq_case();
+    let mut c = Check::new(&f);
+    c.set("FAKE_QED", "proved").set("FAKE_SS", "EQ").set("FAKE_LEAN", "proved-gather");
+    let every = "frontend,qed,sqleq-solver,fuzz,lean";
+    for t in ["inf", "1e300"] {
+        for mode in [&["--portfolio"][..], &[][..]] {
+            let args = [mode, &["--axes", every, "--expect", "report-only", "-t", t][..]].concat();
+            let (ran, case, _) = c.case(&args);
+            assert_eq!(ran.code, 0, "{args:?}: {}{}", ran.out, ran.err);
+            assert_eq!(
+                (case["status"].as_str(), case["s_bucket"].as_str(), case["f_verdict"].as_str(), case["l_verdict"].as_str()),
+                (Some("provable"), Some("proved"), Some("no-counterexample"), Some("proved-gather")),
+                "{args:?}: {}{}",
+                ran.out,
+                ran.err
+            );
+        }
+    }
 }

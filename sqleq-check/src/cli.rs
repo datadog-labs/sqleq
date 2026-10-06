@@ -55,6 +55,18 @@ pub enum Expect {
     Pinned,
 }
 
+/// A wall-clock budget in seconds, as `-t` and `--retry-timeout` take it: a positive number, or
+/// `inf` for none. A budget too large for a deadline to be set is none as well. NaN, zero and a
+/// negative number are usage errors: no case can run within them, and under --portfolio a NaN
+/// deadline had passed before a case started, so every case came back `timeout` unrun.
+fn seconds(text: &str) -> Result<f64, String> {
+    let t: f64 = text.parse().map_err(|e| format!("{e}"))?;
+    if t.is_nan() || t <= 0.0 {
+        return Err("expected a positive number of seconds, or inf for no deadline".into());
+    }
+    Ok(t)
+}
+
 fn default_jobs() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get()).min(8)
 }
@@ -111,8 +123,8 @@ pub struct Args {
     pub sqleq_solver_mem_gib: Option<f64>,
 
     /// The retry pass's own wall-clock budget per case, in seconds (default: --timeout): a second,
-    /// longer tier for the cases the first one ran out of time or crashed on.
-    #[arg(long, value_name = "S")]
+    /// longer tier for the cases the first one ran out of time or crashed on. Positive, or `inf`.
+    #[arg(long, value_name = "S", value_parser = seconds)]
     pub retry_timeout: Option<f64>,
 
     /// The retry pass's QED_SMT_TIMEOUT, in ms (default: --smt-timeout).
@@ -146,9 +158,9 @@ pub struct Args {
     #[arg(short = 'j', long, default_value_t = default_jobs())]
     pub jobs: usize,
 
-    /// Per-case wall-clock timeout in seconds. Under --portfolio, the one deadline every backend
-    /// on the case shares.
-    #[arg(short = 't', long, default_value_t = 60.0)]
+    /// Per-case wall-clock timeout in seconds: positive, or `inf` for no deadline. Under
+    /// --portfolio, the one deadline every backend on the case shares.
+    #[arg(short = 't', long, default_value_t = 60.0, value_parser = seconds)]
     pub timeout: f64,
 
     /// Run every asked backend on each case at once, within the one --timeout, and report one

@@ -82,7 +82,7 @@ sqleq-check --keep ./work rewrites/
 | Flag | Meaning |
 |------|---------|
 | `-j, --jobs N` | Parallel cases (default `min(8, ncpu)`). Each case runs z3+cvc5, so don't oversubscribe heavily. |
-| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60). On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. |
+| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60): a positive number, or `inf` for no deadline. On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. NaN, zero or a negative number is a usage error. |
 | `--portfolio` | Run every asked backend on each case at once, within `-t`, and report one combined verdict per case — see [Portfolio](#portfolio-every-backend-at-once). |
 | `--smt-timeout MS` | Sets `QED_SMT_TIMEOUT` per SMT request (prover default is 10000 ms). |
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable` — a policy on the qed axis, so `--axes` must ask `qed`. Under `--portfolio`, unless every case's verdict is `equivalent`. |
@@ -97,7 +97,7 @@ sqleq-check --keep ./work rewrites/
 | `--json FILE` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs: each case's in `DIR/<name>`, with every `/` in the name as `__`. That directory is emptied when the case starts, so a re-run never reads the answers a previous run left there. |
 | `--no-retry` | Don't re-run transient failures at the end. |
-| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism, a second, longer tier (defaults: `--timeout`, `--smt-timeout`, and 1 — serially). |
+| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism, a second, longer tier (defaults: `--timeout`, `--smt-timeout`, and 1 — serially). `--retry-timeout` takes what `-t` takes. |
 | `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Outside `--portfolio` and `--expect pinned`, it never changes the exit code, unless its proof is half of an [alarm](#alarms). |
 | `--sqleq-solver-bin PATH` | The `sqleq-solver` binary ([lookup order](#requirements)). |
 | `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. Under `--portfolio` it is also capped by what is left of the case's deadline. |
