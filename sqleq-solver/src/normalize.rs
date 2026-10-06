@@ -45,11 +45,48 @@ pub struct Normalizer {
     /// Integrity constraints to rewrite with; empty for none. An explicit parameter, where Java
     /// selects them through static state (`QueryUExprICRewriter.selectIC`).
     ics: Ics,
+    /// Set once a step of a round has produced a term past `max_tree`; the round then stops where
+    /// it is, and [`Normalizer::normalize`] answers `TooLarge`.
+    too_large: std::cell::Cell<bool>,
+    /// The tree size of the whole term while [`Normalizer::eliminate_bound`] rewrites it one sum at
+    /// a time: each sum's new body is charged its growth here, so many sums that each grow a little
+    /// cannot together outgrow the budget unnoticed.
+    size_now: std::cell::Cell<usize>,
 }
 
 impl Normalizer {
     pub fn new(widths: HashMap<u32, usize>, max_tree: usize) -> Self {
-        Normalizer { widths, max_tree, ics: Ics::default() }
+        Normalizer {
+            widths,
+            max_tree,
+            ics: Ics::default(),
+            too_large: std::cell::Cell::new(false),
+            size_now: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Whether `t`, read as a tree, is past the size budget -- and if so, remembers it. Checked after
+    /// every step that can grow a term, not only between rounds: distributing a product over a
+    /// sum multiplies sizes within one bottom-up pass, and each later step walks the tree, so a
+    /// term that has outgrown the budget must not reach the next step.
+    fn over_budget(&self, t: &UTerm) -> bool {
+        if !self.too_large.get() && t.tree_size(self.max_tree + 1) > self.max_tree {
+            self.too_large.set(true);
+        }
+        self.too_large.get()
+    }
+
+    /// Replacing a sum's body `old` with `new` inside the term [`Normalizer::eliminate_bound`] is
+    /// rewriting: charges the difference to the whole term's size, and whether that is now past the
+    /// budget.
+    fn charge(&self, old: &UTerm, new: &UTerm) -> bool {
+        let cap = self.max_tree + 1;
+        let now = (self.size_now.get() + new.tree_size(cap)).saturating_sub(old.tree_size(cap));
+        self.size_now.set(now);
+        if now > self.max_tree {
+            self.too_large.set(true);
+        }
+        self.too_large.get()
     }
 
     /// Rewrites with these constraints as well. The result is then only equivalent to the input
@@ -61,10 +98,13 @@ impl Normalizer {
 
     pub fn normalize(&mut self, t: &UTerm) -> Result<UTerm, NormalizeError> {
         let t = if self.ics.keys.is_empty() { t.clone() } else { mark_set_tables(t, &self.ics) };
+        if self.over_budget(&t) {
+            return Err(NormalizeError::TooLarge);
+        }
         let mut cur = self.rename_apart(&t);
         for _ in 0..MAX_ROUNDS {
             let next = self.round(&cur);
-            if next.tree_size(self.max_tree + 1) > self.max_tree {
+            if self.over_budget(&next) {
                 return Err(NormalizeError::TooLarge);
             }
             if next == cur {
@@ -76,9 +116,13 @@ impl Normalizer {
     }
 
     /// One round: local rules, bound-var elimination, renaming apart. Public so tooling can trace
-    /// how a term evolves; [`Normalizer::normalize`] is the entry point.
+    /// how a term evolves; [`Normalizer::normalize`] is the entry point. A step whose result is past
+    /// the size budget ends the round early, with that result, which is still equivalent to `t`.
     pub fn round(&mut self, t: &UTerm) -> UTerm {
         let mut next = simplify(t);
+        if self.over_budget(&next) {
+            return next;
+        }
         if !self.ics.not_null.is_empty() {
             next = self.remove_not_null(&next);
         }
@@ -86,9 +130,19 @@ impl Normalizer {
             next = self.drop_key_squash(&next);
         }
         let next = canonicalize_congruence(&next);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.contradict_neg_sum(&next);
+        self.size_now.set(next.tree_size(self.max_tree + 1));
         let next = self.eliminate_bound(&next);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.merge_complements(&next, false);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.rename_apart(&next);
         // Squash spines strip set markers (`‖T(x)‖` inside a squash is `T(x)`), and removing a
         // squash can expose such an atom again; re-marking every round keeps one canonical form.
@@ -198,6 +252,9 @@ impl Normalizer {
     /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`), and single columns so
     /// fixed (`removeDeterminedBoundedColumnByConst`). Inner sums first.
     fn eliminate_bound(&mut self, t: &UTerm) -> UTerm {
+        if self.too_large.get() {
+            return t.clone();
+        }
         match t {
             UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
             UTerm::Pred { .. } | UTerm::Func { .. } => pass_args(t, &mut |x| self.eliminate_bound(x)),
@@ -256,7 +313,8 @@ impl Normalizer {
                 if let Some(b) = cols.and_then(|cols| subst_cols(body, xid, &cols)) {
                     // Folded now, while the copies of each substituted term are still identical:
                     // the defining `[x.i = e]` has become `[e = e]`.
-                    return Some((pos, None, simplify(&b)));
+                    let b = simplify(&b);
+                    return (!self.charge(body, &b)).then_some((pos, None, b));
                 }
                 // By column: one column x.i equals a term e that does not mention x.i (other
                 // columns of x may occur in it). For each choice of the other columns exactly one
@@ -273,8 +331,12 @@ impl Normalizer {
                         let Some(e) = subst_cols(&e, xid, &cols) else { continue };
                         cols[i] = e;
                         if let Some(b) = subst_cols(body, xid, &cols) {
+                            let b = simplify(&b);
+                            if self.charge(body, &b) {
+                                return None;
+                            }
                             self.widths.insert(z, width - 1);
-                            return Some((pos, Some(UVar::Base(z)), simplify(&b)));
+                            return Some((pos, Some(UVar::Base(z)), b));
                         }
                     }
                 }
@@ -489,10 +551,15 @@ impl Normalizer {
     /// normalized one reaches the form its neighbours already have. Every rule preserves meaning.
     /// Runs on a copy of the widths, since elimination may mint vars, and returns them with it.
     fn local_rules(&self, t: &UTerm) -> (UTerm, HashMap<u32, usize>) {
-        let mut scratch = Normalizer { widths: self.widths.clone(), max_tree: self.max_tree, ics: self.ics.clone() };
+        let mut scratch = Normalizer::new(self.widths.clone(), self.max_tree).with_ics(self.ics.clone());
         let mut cur = t.clone();
         for _ in 0..MAX_LOCAL_PASSES {
             let mut next = simplify(&cur);
+            if scratch.over_budget(&next) {
+                // Too large to be the summand it is compared with; the caller's own budget check
+                // decides what happens to the round.
+                break;
+            }
             if !scratch.ics.not_null.is_empty() {
                 next = scratch.remove_not_null(&next);
             }
@@ -500,8 +567,9 @@ impl Normalizer {
                 next = scratch.drop_key_squash(&next);
             }
             let next = scratch.contradict_neg_sum(&canonicalize_congruence(&next));
+            scratch.size_now.set(next.tree_size(scratch.max_tree + 1));
             let next = scratch.eliminate_bound(&next);
-            if next == cur {
+            if next == cur || scratch.too_large.get() {
                 break;
             }
             cur = next;
@@ -1744,5 +1812,44 @@ mod tests {
         let key = |c: UTerm| simplify(&UTerm::Func { name: NUMERIC_EQ_KEY.into(), args: vec![c] });
         assert_eq!(simplify_pred(PredKind::Eq, &[key(one_dec.clone()), key(one.clone())]), int(1));
         assert_eq!(simplify_pred(PredKind::Eq, &[UTerm::Const(UConst::Decimal("1.5".into())), one]), int(0));
+    }
+
+    /// The size budget is charged inside a round, where a term grows, not only between rounds.
+    mod budget_within_a_round {
+        use super::*;
+
+        fn atom(name: String) -> UTerm {
+            UTerm::Table { name, var: UVar::Base(OUT_VAR_ID) }
+        }
+
+        #[test]
+        fn a_product_of_sums_that_doubles_per_level_in_one_pass_is_too_large() {
+            // `(a39 + b39) · ((a38 + b38) · (… · (a0 + b0)))`: one bottom-up pass distributes every
+            // level, each doubling the tree, so the first pass's result is far past the budget
+            // though its input is a few hundred nodes. Every later step would walk that tree.
+            let mut t = UTerm::Add(vec![Rc::new(atom("a0".into())), Rc::new(atom("b0".into()))]);
+            for i in 1..40 {
+                let sum = UTerm::Add(vec![Rc::new(atom(format!("a{i}"))), Rc::new(atom(format!("b{i}")))]);
+                t = UTerm::Mul(vec![Rc::new(sum), Rc::new(t)]);
+            }
+            let widths = HashMap::from([(OUT_VAR_ID, 1)]);
+            let started = std::time::Instant::now();
+            assert_eq!(Normalizer::new(widths, 1_000_000).normalize(&t), Err(NormalizeError::TooLarge));
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
+        }
+
+        /// `count` products of `each` distinct table atoms, summed.
+        fn sum_of_products(count: usize, each: usize) -> UTerm {
+            let product = |k: usize| UTerm::Mul((0..each).map(|j| Rc::new(atom(format!("s{k}_{j}")))).collect());
+            UTerm::Add((0..count).map(|k| Rc::new(product(k))).collect())
+        }
+
+        #[test]
+        fn a_term_within_the_budget_is_still_normalized() {
+            // Ten thousand nodes: the checks inside the round charge growth, not size.
+            let t = sum_of_products(200, 50);
+            let widths = HashMap::from([(OUT_VAR_ID, 1)]);
+            assert!(Normalizer::new(widths, 1_000_000).normalize(&t).is_ok());
+        }
     }
 }

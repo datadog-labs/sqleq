@@ -145,6 +145,10 @@ pub enum TranslateError {
     /// Translation-stage-only: a scalar subquery (`$SCALAR_QUERY`) whose inner relation doesn't have
     /// exactly one output column.
     ScalarSubqueryArity,
+    /// Not part of `IrToRel`'s taxonomy: a plan nested deeper than [`MAX_DEPTH`]. Every stage
+    /// recurses over the plan, so a bound is what keeps a deep plan a refusal instead of a stack
+    /// overflow, which aborts the whole process.
+    TooDeep,
 }
 
 impl std::fmt::Display for TranslateError {
@@ -173,6 +177,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::UnsupportedSort => write!(f, "unsupported-sort"),
             TranslateError::DistinctAggregateUnsupported => write!(f, "aggregate-distinct-unsupported"),
             TranslateError::ScalarSubqueryArity => write!(f, "scalar-subquery-arity"),
+            TranslateError::TooDeep => write!(f, "nesting-too-deep"),
         }
     }
 }
@@ -589,8 +594,38 @@ pub struct Input {
     pub queries: [Relation; 2],
 }
 
+/// The deepest an `Input` may nest, counting every JSON object and array. Real plans stay far below
+/// it -- the frontend writes `AND`/`OR` chains flat -- and the binary runs each row on a thread
+/// whose stack takes every stage through a plan this deep.
+pub const MAX_DEPTH: usize = 2_000;
+
+/// The nesting depth of `v` (objects and arrays), walked without recursion so that measuring a
+/// pathological value cannot overflow the stack it is meant to protect. Stops counting past
+/// `cap`.
+pub fn depth(v: &Value, cap: usize) -> usize {
+    let mut deepest = 0;
+    let mut stack: Vec<(&Value, usize)> = vec![(v, 1)];
+    while let Some((v, d)) = stack.pop() {
+        let children: Box<dyn Iterator<Item = &Value>> = match v {
+            Value::Array(a) => Box::new(a.iter()),
+            Value::Object(o) => Box::new(o.values()),
+            _ => continue,
+        };
+        deepest = deepest.max(d);
+        if deepest > cap {
+            return deepest;
+        }
+        stack.extend(children.map(|c| (c, d + 1)));
+    }
+    deepest
+}
+
 impl Input {
+    /// Refuses a plan nested deeper than [`MAX_DEPTH`] (`nesting-too-deep`) before reading it.
     pub fn parse(v: &Value) -> Result<Input, TranslateError> {
+        if depth(v, MAX_DEPTH) > MAX_DEPTH {
+            return Err(TranslateError::TooDeep);
+        }
         let schemas: Vec<Schema> = v
             .get("schemas")
             .and_then(Value::as_array)
