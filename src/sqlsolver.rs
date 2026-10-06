@@ -421,12 +421,9 @@ pub fn emit_mysql(cat: &Catalog) -> (String, bool) {
             let not_null = if t.nullable[i] { "" } else { " NOT NULL" };
             lines.push(format!("  {} {}{}", ident(name), mysql_type(ty), not_null));
         }
-        for k in &t.keys {
-            // See the module docs: a key with a nullable column is a premise Postgres does not give
-            // us, so it is dropped rather than weakened.
-            if k.is_empty() || k.iter().any(|&i| t.nullable.get(i).copied().unwrap_or(true)) {
-                continue;
-            }
+        // See the module docs: a key with a nullable column is a premise Postgres does not give us,
+        // so it is dropped rather than weakened.
+        for k in t.not_null_keys() {
             let cols: Vec<String> = k.iter().map(|&i| ident(&t.cols[i].0)).collect();
             lines.push(format!("  UNIQUE ({})", cols.join(", ")));
         }

@@ -329,7 +329,8 @@ fn emit(
                 // no `deny_unknown_fields` (checked), so QED discards the field without noticing it.
                 "name": t.name.clone(),
                 "types": t.cols.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
-                "key": t.keys.clone(),
+                // Only the keys Postgres enforces on every row: see `Table::not_null_keys`.
+                "key": t.not_null_keys().cloned().collect::<Vec<_>>(),
                 "nullable": t.nullable.clone(),
                 "guaranteed": Vec::<Value>::new(),
             })

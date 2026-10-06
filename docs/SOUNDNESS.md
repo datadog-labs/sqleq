@@ -43,7 +43,10 @@ of instances the prover quantifies over, so inventing one could turn a non-equiv
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs
 completeness, not soundness. Two such misses are known: `pgddl` does not read keys declared by
 `CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`. Both cost
-functional-dependence refusals — completeness work, in the safe direction.
+functional-dependence refusals — completeness work, in the safe direction. And a key reaches a prover
+only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
+columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
+`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query.
 
 ### Dates and timestamps are not one integer
 
