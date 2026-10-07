@@ -141,7 +141,7 @@ fn alter_pair(dir: &Path) -> PathBuf {
     pair
 }
 
-/// With no `--engine` the pair runs on Postgres, which says so; `$SQLEQ_FUZZ_ENGINE` picks DuckDB.
+/// With no `--engine` the pair runs on Postgres; `$SQLEQ_FUZZ_ENGINE` picks DuckDB. Each says which.
 #[test]
 fn the_engine_is_postgres_unless_told_otherwise() {
     if !engines().contains(&"postgres") {
@@ -165,5 +165,5 @@ fn the_engine_is_postgres_unless_told_otherwise() {
         "{default}"
     );
     let duck = run(Some("duckdb"));
-    assert!(!duck.lines().any(|l| l.starts_with("engine:")), "{duck}");
+    assert!(duck.lines().any(|l| l.starts_with("engine: duckdb ")), "{duck}");
 }

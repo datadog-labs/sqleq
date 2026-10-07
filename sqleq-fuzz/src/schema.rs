@@ -38,10 +38,8 @@ pub enum VType {
     Integer,
     /// `real`, `double precision`, `float`: binary floating point in both engines.
     Double,
-    /// `numeric`/`decimal`, as DuckDB `DECIMAL(width, scale)`. Postgres `numeric` arithmetic is exact,
-    /// and so is DuckDB's DECIMAL wherever it does not raise instead -- which a DOUBLE is not: there
-    /// `x + 0.1 + 0.2 <> x + 0.3`. A `numeric(p,s)` keeps its scale, since Postgres rounds a stored
-    /// value to it; a bare `numeric` (no typmod) gets [`BARE_NUMERIC`].
+    /// `numeric`/`decimal`, as DuckDB `DECIMAL(width, scale)`: a `numeric(p,s)` keeps its precision and
+    /// scale, and a bare `numeric` (no typmod) is DuckDB's own bare `DECIMAL`, [`BARE_NUMERIC`].
     Decimal(u8, u8),
     Boolean,
     Date,
@@ -63,20 +61,13 @@ pub enum VType {
     /// [`crate::gen::JSONS`].
     Json,
     /// `interval`, as DuckDB `INTERVAL`. Its name contains `INT`, which is how it used to become an
-    /// INTEGER filled with `0`, `1` and `2`. DuckDB's interval arithmetic is not Postgres's either
-    /// (under `integer_division` it has no `/` at all), so a pair that reads such a column gets no
-    /// verdict ([`crate::pair::test_pair`]); the type only has to hold the values of a table the pair
-    /// does not read.
+    /// INTEGER filled with `0`, `1` and `2`.
     Interval,
 }
 
-/// The DuckDB type a bare `numeric` (no typmod) is materialized as, as a column or as a cast target
-/// (`rewrite::wide_numerics`). Postgres keeps every digit of such a value; DuckDB needs a fixed scale,
-/// and on its own reads a bare `DECIMAL` as `DECIMAL(18,3)`, which rounds `0.0002` to `0.000`. Eighteen
-/// fractional digits keep every value this crate generates or a query is likely to compute exact, and
-/// leave room for the product of two such values (scale 36): DuckDB raises rather than rounds when a
-/// product needs more than 38, which costs a trial and never invents a difference.
-pub const BARE_NUMERIC: (u8, u8) = (38, 18);
+/// The DuckDB type a bare `numeric` (no typmod) is materialized as: DuckDB's own reading of a bare
+/// `DECIMAL`.
+pub const BARE_NUMERIC: (u8, u8) = (18, 3);
 
 impl VType {
     /// The DuckDB column type used in generated `CREATE TABLE`s.
@@ -122,11 +113,6 @@ pub struct Column {
     /// produce describes a database the declared schema forbids. Postgres multi-dimensional arrays
     /// are not modelled — the corpus declares none — so this is a flag rather than a rank.
     pub array: bool,
-    /// Declared `char(n)` / `character(n)` / `bpchar`: a blank-padded type. Postgres pads the stored
-    /// value and ignores trailing blanks when comparing two of them, so `c = 'a'` and `c = 'a  '`
-    /// agree, while `c LIKE 'a'` is false. Materialized as a DuckDB VARCHAR it has none of that, and a
-    /// pair that reads such a column gets no verdict ([`crate::pair::test_pair`]).
-    pub padded: bool,
     /// Filled from a sequence: a `serial` (`serial2/4/8`, `smallserial`, `bigserial`) or an identity
     /// column (`GENERATED … AS IDENTITY`). Both are NOT NULL in Postgres, which [`Column::notnull`]
     /// carries, and a fresh table's sequence never repeats a value, so the generator draws distinct
@@ -217,13 +203,12 @@ pub fn clean_ddl(s: &str) -> String {
         .replace("\\t", "\t")
 }
 
-/// How a declared column type is materialized: its generation domain, whether it is an array, whether
-/// it is blank-padded, and -- when DuckDB has no faithful type for it -- why not.
+/// How a declared column type is materialized: its generation domain, whether it is an array, and --
+/// when DuckDB has no type for it -- why not.
 #[derive(Clone, Debug, PartialEq)]
 struct ColType {
     vt: VType,
     array: bool,
-    padded: bool,
     /// A serial type: NOT NULL, and filled from a sequence ([`Column::sequenced`]).
     serial: bool,
     problem: Option<String>,
@@ -248,7 +233,6 @@ fn map_vtype(dt: &DataType) -> ColType {
         DataType::Array(A::None) => ColType {
             vt: VType::Varchar,
             array: true,
-            padded: false,
             serial: false,
             problem: None,
         },
@@ -273,7 +257,6 @@ fn decimal_col(p: Option<i64>, s: Option<i64>) -> ColType {
     let ok = |w: i64, s: i64| ColType {
         vt: VType::Decimal(w as u8, s as u8),
         array: false,
-        padded: false,
         serial: false,
         problem: None,
     };
@@ -317,8 +300,6 @@ fn col_type(raw: &str) -> ColType {
         .unwrap_or(elem);
     let upper = elem.to_uppercase();
     let word = base.trim_matches('"').to_uppercase();
-    let padded = matches!(word.as_str(), "CHAR" | "CHARACTER" | "NCHAR" | "BPCHAR")
-        && !upper.contains("VARYING");
     if matches!(word.as_str(), "NUMERIC" | "DECIMAL" | "DEC") {
         let args: Vec<i64> = elem
             .find('(')
@@ -350,7 +331,6 @@ fn col_type(raw: &str) -> ColType {
     ColType {
         vt,
         array,
-        padded,
         serial,
         problem: None,
     }
@@ -708,7 +688,6 @@ fn recover_body(body: &str) -> Option<Table> {
                         vt: ct.vt,
                         notnull,
                         array,
-                        padded: ct.padded,
                         sequenced,
                     });
                 }
@@ -841,7 +820,6 @@ fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<Stri
             vt: ct.vt,
             notnull,
             array: ct.array,
-            padded: ct.padded,
             sequenced,
         },
         problem,

@@ -20,13 +20,10 @@ use crate::gen::{
     array_element_type, cast_target, lit, randval, randval_cast, randval_col, randval_need,
     CastTarget, Val,
 };
-use crate::lex::significant;
 use crate::limits::{self, Count};
 use crate::patterns as pat;
-use crate::pgtype;
 use crate::rewrite;
 use crate::schema::{parse_schema, Schema, VType};
-use crate::shim;
 use crate::typing;
 
 /// Test configuration.
@@ -84,10 +81,9 @@ pub enum Verdict {
     /// The two sides cannot be compared soundly, so no verdict is given either way (carries why).
     /// Either they have no shared observable -- a side is an `EXPLAIN`, which has query plans rather
     /// than query results (see [`crate::patterns::has_explain`]), or one side is a query and the
-    /// other a mutation -- or DuckDB cannot be made to compute what Postgres computes on them: a
-    /// `char(n)` or `interval` column, `SIMILAR TO`, a division of a `numeric`, a float printed as
-    /// text, a constraint that could not be read, a table spelled two ways in a mutation pair (see
-    /// [`test_pair`] and [`crate::pgtype`]).
+    /// other a mutation -- or the generated instances cannot stand for the DDL: a constraint that
+    /// could not be read, a table spelled two ways in a mutation pair (see [`test_pair`]). The
+    /// Postgres engine adds its own reasons ([`crate::pg`]).
     NotComparable(String),
     /// No parseable table schema.
     NoSchema,
@@ -254,42 +250,15 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     if schema.is_empty() {
         return Verdict::NoSchema;
     }
-    // `unqualify_stars` runs on the pristine text, ahead of every text-level rewrite, so it never
-    // depends on one of them leaving the statement parseable. `double_precision_floats` and then
-    // `parenthesize_json_ops` run on its output rather than on the pristine text: all three read
-    // their edits off a Postgres parse, `unqualify_stars` only ever shortens a qualifier and
-    // `double_precision_floats` only respells a type, so each later pass still parses the statement
-    // the caller wrote — and if it somehow does not, that pass returns its input unchanged and we
-    // merely lose its edit on this row. None of them can add or remove a `$N`, so the misalignment
-    // check below still sees the parameter numbering the caller actually wrote.
-    //
-    // One closure, applied to both sides, so the two sides cannot drift apart in how they are
-    // prepared — which is the shape the `is_query` defect took.
-    //
-    // `wide_numerics` respells a type like `double_precision_floats` does, and `strip_public` only
-    // drops a qualifier, so neither changes what the later passes find. The passes after them can
-    // refuse. `postgres_operators` makes a zero divisor raise, a regex match partial, a `LIKE` escape
-    // with a backslash and `power`/`exp` raise as Postgres's do, and where it cannot do that
-    // faithfully the pair gets no verdict. `pgtype::unmodelled` and `pgtype::jsonb_literals` read
-    // types off the statement as it stands before that pass wraps operands in macros of no known
-    // type: the first refuses what DuckDB computes in another type (a `numeric` division, a float
-    // printed as text), and the second respells the string literals that meet a `jsonb` value, or
-    // refuses. None of these adds or removes a `$N` either.
+    // What DuckDB needs to run the statement at all, and nothing that changes what it means: a
+    // `s.t.*` wildcard its parser rejects becomes `t.*`, a `public.` qualifier it has no schema for is
+    // dropped, and the clock is frozen. One closure, applied to both sides, so the two sides cannot
+    // drift apart in how they are prepared. Neither rewrite adds or removes a `$N`, so the
+    // misalignment check below sees the numbering the caller wrote.
     let prep = |sql: &str| -> Result<String, String> {
-        if let Some(why) = pat::odd_number(sql) {
-            return Err(why);
-        }
         let unqualified = rewrite::unqualify_stars(sql);
-        let doubled = rewrite::double_precision_floats(&unqualified);
-        let widened = rewrite::wide_numerics(&doubled);
-        let parenthesized = rewrite::parenthesize_json_ops(&widened);
-        let stripped = rewrite::strip_public(&parenthesized);
-        if let Some(why) = pgtype::unmodelled(&stripped, &schema) {
-            return Err(why);
-        }
-        let respelled = pgtype::jsonb_literals(&stripped, &schema)?;
-        let guarded = rewrite::postgres_operators(&respelled)?;
-        Ok(pat::freeze_time(&guarded))
+        let stripped = rewrite::strip_public(&unqualified);
+        Ok(pat::freeze_time(&stripped))
     };
     let (a, b) = match (prep(a), prep(b)) {
         (Ok(a), Ok(b)) => (a, b),
@@ -425,7 +394,7 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             if ret_b { "returning" } else { "none" },
         ));
     }
-    if let Some(why) = unfaithful(&a, &b, &finals, &forms, &schema, is_query_a && is_query_b) {
+    if let Some(why) = unfaithful(&finals, &forms, &schema, is_query_a && is_query_b) {
         return Verdict::NotComparable(why);
     }
 
@@ -439,12 +408,6 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         Ok(c) => c,
         Err(e) => return Verdict::Error(err_msg(&e)),
     };
-    // Postgres functions DuckDB has no name for, defined as macros before anything runs — only the
-    // ones this pair actually mentions, and identically for both sides. Without them both sides
-    // fail to bind and the pair is never tried at all.
-    if let Err(e) = shim::install(&con, &[&a, &b]) {
-        return Verdict::Error(err_msg(&e));
-    }
 
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
     let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
@@ -661,96 +624,19 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     }
 }
 
-/// Why DuckDB cannot be trusted to compute what Postgres computes on this pair's tables, if it
-/// cannot: then no verdict is given, in either direction.
+/// Why the instances generated for this pair cannot stand for the DDL, if they cannot: then no
+/// verdict is given, in either direction.
 ///
 /// * A table whose constraints could not all be read ([`crate::schema::Table::unreadable`]): the rows
-///   generated for it may be rows Postgres would reject.
-/// * A `char(n)` column the pair reads. Postgres pads it with blanks and ignores trailing blanks in
-///   comparisons, so `c = 'a'` and `c = 'a  '` agree there and not on a VARCHAR, while `c LIKE 'a'`
-///   is false there and true on one. A query reads such a column when it names it, selects `*` over
-///   its table, or joins `NATURAL`ly; a mutation pair writes it however the statement is spelled
-///   (`INSERT ... VALUES` names no column), so any `char(n)` column in a table it touches counts.
-/// * An `interval` column the pair reads, in the same sense. DuckDB's INTERVAL does not compute
-///   what Postgres's does: under `integer_division` it has no `/`, and its products and text differ
-///   (`1 month` where Postgres prints `1 mon`).
+///   generated for it may be rows the schema forbids.
 /// * A table spelled two ways in a mutation pair, `s.t` beside `t`. Each spelling is a table of its
 ///   own here, loaded from the same rows, and a mutation through one leaves the other as it was;
-///   both are one table in Postgres only if they resolve to it, which the DDL does not say. (`public.t`
-///   and `t` are one table, and `rewrite::strip_public` has already made them one spelling.)
-fn unfaithful(
-    a: &str,
-    b: &str,
-    finals: &[String],
-    forms: &Forms,
-    schema: &Schema,
-    queries: bool,
-) -> Option<String> {
+///   both are one table only if they resolve to it, which the DDL does not say. (`public.t` and `t`
+///   are one table, and `rewrite::strip_public` has already made them one spelling.)
+fn unfaithful(finals: &[String], forms: &Forms, schema: &Schema, queries: bool) -> Option<String> {
     for t in finals {
         if let Some(why) = &schema[t].unreadable {
             return Some(format!("table {t}: {why}"));
-        }
-    }
-    // The columns DuckDB cannot read as Postgres does, with what they are.
-    let padded: Vec<(&String, &String, &str)> = finals
-        .iter()
-        .flat_map(|t| {
-            schema[t].cols.iter().filter_map(move |c| {
-                let kind = if c.padded {
-                    "char(n)"
-                } else if c.vt == VType::Interval {
-                    "interval"
-                } else {
-                    return None;
-                };
-                Some((t, &c.name, kind))
-            })
-        })
-        .collect();
-    if let Some((t, c, kind)) = padded.first() {
-        if !queries {
-            return Some(format!("{kind} column {t}.{c} in a table a mutation writes"));
-        }
-        for sql in [a, b] {
-            let Some(toks) = significant(sql) else {
-                return Some(format!("{kind} column {t}.{c}"));
-            };
-            for (i, tok) in toks.iter().enumerate() {
-                use sqlparser::keywords::Keyword;
-                use sqlparser::tokenizer::Token;
-                let reads = match &tok.token {
-                    Token::Word(w) if w.quote_style.is_none() && w.keyword == Keyword::NATURAL => {
-                        Some(format!("{kind} column {t}.{c} under a NATURAL join"))
-                    }
-                    Token::Word(w) => padded
-                        .iter()
-                        .find(|(_, name, _)| w.value.to_lowercase() == **name)
-                        .map(|(t, c, kind)| format!("{kind} column {t}.{c}")),
-                    // `*` right after SELECT/DISTINCT/RETURNING, a comma or a qualifier's dot is a
-                    // wildcard; anywhere else it is a product or `count(*)`.
-                    Token::Mul if i > 0 => match &toks[i - 1].token {
-                        Token::Comma | Token::Period => Some(()),
-                        Token::Word(w)
-                            if w.quote_style.is_none()
-                                && matches!(
-                                    w.keyword,
-                                    Keyword::SELECT
-                                        | Keyword::DISTINCT
-                                        | Keyword::ALL
-                                        | Keyword::RETURNING
-                                ) =>
-                        {
-                            Some(())
-                        }
-                        _ => None,
-                    }
-                    .map(|()| format!("{kind} column {t}.{c} under a wildcard")),
-                    _ => None,
-                };
-                if reads.is_some() {
-                    return reads;
-                }
-            }
         }
     }
     if !queries {

@@ -236,56 +236,6 @@ pub fn has_hard_nondet(a: &str, b: &str) -> bool {
     })
 }
 
-/// A numeric literal DuckDB and Postgres read differently, if `sql` has one: Postgres 16's
-/// non-decimal integers (`0b101`, `0o17`, `0x1F`), which DuckDB -- and sqlparser -- read as `0`
-/// followed by a column alias, and any other number run straight into a word (`1L`, `2days`), which
-/// Postgres 15 and later reject as trailing junk while DuckDB again reads an alias. Evaluating such a
-/// side would compare a value Postgres never computes, so the pair gets no verdict.
-///
-/// Read off the tokens: a number token and a bare word token with nothing between them, the number
-/// sqlparser marks with an `L` suffix, or the `0x…` it reads as a hex string. The one glued spelling both engines read alike, digits
-/// grouped by underscores (`1_000`), is let through.
-pub fn odd_number(sql: &str) -> Option<String> {
-    let toks = lex(sql)?;
-    for (i, t) in toks.iter().enumerate() {
-        // sqlparser reads `0x1F` as the hex string `X'1F'`; DuckDB as `0` and an alias.
-        if matches!(t.token, Token::HexStringLiteral(_))
-            && sql
-                .get(t.start..t.start + 2)
-                .is_some_and(|p| p.eq_ignore_ascii_case("0x"))
-        {
-            return Some(format!(
-                "the numeric literal `{}`, which DuckDB reads as a number and an alias",
-                &sql[t.start..t.end]
-            ));
-        }
-        let Token::Number(n, long) = &t.token else {
-            continue;
-        };
-        let next = toks.get(i + 1).filter(|next| next.start == t.end);
-        let glued = match next.map(|next| &next.token) {
-            Some(Token::Word(w)) => {
-                let grouped = w.value.starts_with('_')
-                    && w.value[1..].bytes().all(|b| b.is_ascii_digit() || b == b'_')
-                    && n.bytes().all(|b| b.is_ascii_digit());
-                w.quote_style.is_none() && !grouped
-            }
-            _ => false,
-        };
-        if *long || glued {
-            let end = match next {
-                Some(next) if glued => next.end,
-                _ => t.end,
-            };
-            return Some(format!(
-                "the numeric literal `{}`, which DuckDB reads as a number and an alias",
-                &sql[t.start..end]
-            ));
-        }
-    }
-    None
-}
-
 /// The one instant every frozen clock reads, as a naive timestamp in the UTC session `open_db`
 /// sets. Every clock is derived from it -- the time of day and the date as well as the timestamp --
 /// so `now()::time = localtime` and `now()::date = current_date` hold as they do in Postgres, where
