@@ -5,25 +5,25 @@ start at the [README](../README.md).
 
 `sqleq-check` sits on top and runs every backend as a subprocess. `src/` is the frontend: it parses
 a SQL pair, resolves names and types, and lowers it to the `Relation`/`Expr` IR the provers read —
-the QED prover directly, and `sqleq-solver`, a Rust rewrite of SQLSolver, through the jobs
-`src/sqlsolver.rs` packages that IR into. The other backends read the pair themselves:
-`sqleq-fuzz` runs the two statements against DuckDB looking for a counterexample and uses no part
-of the frontend, and `sqleq-lean` parses with the frontend's parser but builds its own Lean terms.
-See [DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
+the QED prover directly, and `sqleq-solver`, a Rust rewrite of SQLSolver, through the job files
+`src/sqlsolver.rs` writes. The other backends read the pair themselves: `sqleq-fuzz` runs the two
+statements against DuckDB looking for a counterexample and uses no part of the frontend, and
+`sqleq-lean` parses with the frontend's parser but builds its own Lean terms. See
+[DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
 
 ## The frontend (`src/`)
 
 | path | what |
 |---|---|
 | `src/lib.rs` | public API: `lower_sql`, and `lower_with`/`lower_with_ddl` over a `CatalogSource`; the reflexivity check (`reflexive`); the opt-in `internals` module that `sqleq-lean` and the benchmark harness link |
-| `src/main.rs` | the `sqleq-frontend` CLI: one pair, a corpus CSV (`--csv`), or one lowered plan packaged as a SQLSolver job (`--sqlsolver --ir`) |
+| `src/main.rs` | the `sqleq-frontend` CLI: one pair, a corpus CSV (`--csv`), or SQLSolver job files (`--sqlsolver`) |
 | `src/{catalog,scope,types,casts,lower,error}.rs` | catalog, de-Bruijn scope, type mapping/coercion, cast rules, lowering, errors |
 | `src/{normalize,dml}.rs` | equivalence-preserving rewrites; `DELETE`, `UPDATE` and `INSERT` pairs reduced to queries computing their effect |
 | `src/{infer,pgddl}.rs` | type inference (the `--infer`/`--infer-seeded` modes) and the raw-Postgres-DDL reader |
 | `src/params.rs` | `$N` handling and the misalignment check ([SOUNDNESS.md](SOUNDNESS.md)) |
 | `src/verify.rs` | re-derives the de-Bruijn invariants on every lowering — a second net under the soundness argument |
 | `src/corpus.rs` | the corpus CSV reader and `--csv` batch driver: row *n* is case `pair{n:04}`, lowered against its own DDL; `sqleq-check --corpus` reads rows through it |
-| `src/sqlsolver.rs` | packages a lowered plan as the job both SQLSolver implementations read, `sqleq-solver` and the JVM fork, with the schema as MySQL DDL ([SQLSOLVER.md](SQLSOLVER.md)) |
+| `src/sqlsolver.rs` | the job files both SQLSolver implementations read, `sqleq-solver` and the JVM fork ([SQLSOLVER.md](SQLSOLVER.md)) |
 
 | test | what |
 |---|---|
@@ -86,7 +86,7 @@ in. What it rewrites, and where it deliberately differs from the original, is in
 | `sqleq-solver/src/{normalize,ic,alpha}.rs` | normalization, integrity-constraint rewrites, and the alpha-equivalence decision |
 | `sqleq-solver/src/{prove,setsolver}.rs` | the decision ladder, and the Z3 set solver as its last rung |
 | `sqleq-solver/src/eval.rs` | a concrete evaluator, so tests can check a rewrite against data |
-| `sqleq-solver/examples/` | manual gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks. CI compiles them but runs none, since their inputs are not in the repository |
+| `sqleq-solver/examples/` | gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks |
 
 ## The refuting axis (`sqleq-fuzz/`)
 
