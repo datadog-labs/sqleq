@@ -46,7 +46,10 @@
 //! values -- the reading that lets normalization substitute one side for the other -- only between
 //! two values of one type on which `=` *is* identity; anywhere else (two decimals, an integer
 //! against a decimal, two intervals, two opaque values) it compares the values' images under a key
-//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`).
+//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`). Deduplication
+//! (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) binds its output to its input by
+//! identity too, so it is translated only over columns whose `=` is identity, and refused over any
+//! other (see `dedup_by_identity`).
 
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
@@ -110,6 +113,30 @@ fn sql_equality(kind: PredKind, a: UTerm, ta: Option<Type>, b: UTerm, tb: Option
         Some(k) => vec![UTerm::Func { name: k.clone(), args: vec![a] }, UTerm::Func { name: k, args: vec![b] }],
     };
     UTerm::Pred { kind, args }
+}
+
+/// Whether SQL's `=` between two values of the IR type `ty` is identity of the values, the reading
+/// [`eq_key`] gives it. `None`, a set-operation column whose two branches disagree on the type, is
+/// not known to be.
+fn eq_is_identity(ty: Option<Type>) -> bool {
+    ty.is_some_and(|t| eq_key(t, t).is_none())
+}
+
+/// Refuses a deduplication -- `DISTINCT`, a `GROUP BY` key, `UNION`, `INTERSECT`, `EXCEPT` -- over a
+/// column whose `=` is not identity ([`eq_is_identity`]). Postgres keeps one row per class of
+/// `=`-equal values, and this translation, which binds each output column to its source by
+/// identity, keeps one per value: over `0` and `-0`, `2.0` and `2.00`, or `'1 day'` and
+/// `'24 hours'` it has two rows where Postgres has one. That makes `f(DISTINCT x)` have the rows of
+/// `DISTINCT f(x)` for every `f`, a cast to text or `scale()` included, which Postgres does not
+/// promise. Deduplicating on [`eq_key`]'s key instead would leave the output column to be one value
+/// of its class, and which one Postgres keeps depends on its plan and the input order, not on the
+/// class alone: an uninterpreted representative shared by two deduplications would claim they keep
+/// the same one. So the plan is refused.
+fn dedup_by_identity(types: impl IntoIterator<Item = Option<Type>>) -> Result<(), TranslateError> {
+    match types.into_iter().find(|t| !eq_is_identity(*t)) {
+        None => Ok(()),
+        Some(t) => Err(TranslateError::DedupNotIdentity(t.map_or("unresolved", Type::name).to_string())),
+    }
 }
 
 /// A value that might be null. See the module doc for the invariant governing `value`.
@@ -374,8 +401,10 @@ impl<'s> Translator<'s> {
     }
 
     /// `Distinct` = `Squash` of an identity projection: reuses `project_values`'s shape with each
-    /// source column passed through unchanged, then clamps the result to 0/1.
+    /// source column passed through unchanged, then clamps the result to 0/1. Refused over a column
+    /// whose `=` is not identity ([`dedup_by_identity`]).
     fn distinct(&mut self, source: &Relation, base: usize) -> Result<Translated, TranslateError> {
+        dedup_by_identity(source.output_types(self.schemas))?;
         let src = self.rel(source, base)?;
         let values: Vec<Value> = src.local.iter().cloned().map(column_value).collect();
         let projected = self.project_values(src, values);
@@ -432,6 +461,8 @@ impl<'s> Translator<'s> {
                 _ => return Err(TranslateError::GroupKeyNonRef),
             }
         }
+        // A group is one class of `=`-equal keys, and `SELECT DISTINCT` arrives as a keys-only group.
+        dedup_by_identity(keys.iter().map(|k| Some(k.ty())))?;
 
         let out = self.fresh_var(key_vars.len() + function.len());
         let key_out: Vec<UVar> = (0..key_vars.len() as u32).map(|i| UVar::proj(i, out.clone())).collect();
@@ -530,7 +561,14 @@ impl<'s> Translator<'s> {
         }
     }
 
+    /// `UNION ALL` adds the two sides; `INTERSECT` and `EXCEPT` deduplicate, and are refused over a
+    /// column whose `=` is not identity ([`dedup_by_identity`]). `UNION` arrives as a `Distinct` over
+    /// a `UNION ALL`.
     fn set_op(&mut self, kind: SetOpKind, sides: &[Box<Relation>; 2], base: usize) -> Result<Translated, TranslateError> {
+        if !matches!(kind, SetOpKind::Union) {
+            let (lt, rt) = (sides[0].output_types(self.schemas), sides[1].output_types(self.schemas));
+            dedup_by_identity(lt.into_iter().zip(rt).map(|(a, b)| if a == b { a } else { None }))?;
+        }
         let l = self.rel(&sides[0], base)?;
         let r = self.rel(&sides[1], base)?;
         if l.local.len() != r.local.len() {

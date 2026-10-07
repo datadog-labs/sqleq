@@ -141,6 +141,12 @@ pub enum TranslateError {
     /// Translation-stage-only: a scalar subquery (`$SCALAR_QUERY`) whose inner relation doesn't have
     /// exactly one output column.
     ScalarSubqueryArity,
+    /// Translation-stage-only: `dedup-not-identity:<type>` -- a `DISTINCT`, `GROUP BY` key,
+    /// `UNION`, `INTERSECT` or `EXCEPT` over a column whose `=` is not identity of the values (see
+    /// `translate::eq_is_identity`). Postgres keeps one row per class of `=`-equal values, and which
+    /// of them it keeps is not modelled; `unresolved` names a set-operation column whose two branches
+    /// have different IR types.
+    DedupNotIdentity(String),
     /// Not part of `IrToRel`'s taxonomy: a plan nested deeper than [`MAX_DEPTH`]. Every stage
     /// recurses over the plan, so a bound is what keeps a deep plan a refusal instead of a stack
     /// overflow, which aborts the whole process.
@@ -172,6 +178,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::UnsupportedSort => write!(f, "unsupported-sort"),
             TranslateError::DistinctAggregateUnsupported => write!(f, "aggregate-distinct-unsupported"),
             TranslateError::ScalarSubqueryArity => write!(f, "scalar-subquery-arity"),
+            TranslateError::DedupNotIdentity(ty) => write!(f, "dedup-not-identity:{ty}"),
             TranslateError::TooDeep => write!(f, "nesting-too-deep"),
         }
     }
