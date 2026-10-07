@@ -6,10 +6,10 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 206 + 10 + 7 + 2 + 190 + 19 + 11 + 11; sqleq-check: 59 + 16 + 12 + 5 + 2 + 12 + 12
-cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
-cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (compiles Z3, see below)
-cargo test -p sqleq-lean   # the Lean axis: 34 + 6 (needs Lean, see below)
+cargo test                 # the frontend: 197 + 10 + 7 + 2 + 23 + 25 + 16 + 190 + 14 + 19 + 4 + 3 + 11 + 11 + 23 + 3; sqleq-check: 59 + 16 + 12 + 5 + 2 + 12 + 12
+cargo test -p sqleq-fuzz   # the disprover: 62 + 7 + 3 + 5 + 11 + 9 + 8 + 53
+cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 2 + 4 + 11 (compiles Z3, see below)
+cargo test -p sqleq-lean   # the Lean axis: 41 + 1 + 6 (needs Lean, see below)
 cargo build -p sqleq-fuzz -p sqleq-solver
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
@@ -20,8 +20,7 @@ resolves to nothing; among `sqleq-check`'s is the hygiene gate over every commit
 (`sqleq-check/tests/real_cases.rs`). The last line runs the
 [pinned pairs](tests/pairs/README.md) on the frontend, fuzz and sqleq-solver axes, the ones CI runs
 through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries;
-`cargo test -p sqleq-solver` builds no binary (that crate has no integration test), so the
-`cargo build` line before it makes sure of both opt-in ones. The Lean pins are checked by
+the `cargo build` line before it makes sure of both opt-in ones. The Lean pins are checked by
 `cargo test -p sqleq-lean`, and the `qed` and `sqlsolver-jvm` pins only where those tools are
 installed.
 
