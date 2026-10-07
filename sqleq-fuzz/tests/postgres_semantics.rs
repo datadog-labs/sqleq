@@ -41,11 +41,12 @@ fn integer_division_truncates_like_postgres() {
 
 #[test]
 fn integer_division_is_told_apart_from_numeric_division() {
-    // At a = 1 Postgres gives 0 for A and 0.5 for B; DuckDB's default gave 0.5 for both.
+    // At a = 1 Postgres gives 0 for A and 0.5 for B; DuckDB's default gave 0.5 for both. (B is a
+    // product: a numeric *division* is a DOUBLE in DuckDB, so a pair with one gets no verdict.)
     assert_eq!(
         label(
             r#"SELECT "id", "a" / 2 AS "h" FROM "t""#,
-            r#"SELECT "id", "a" / 2.0 AS "h" FROM "t""#,
+            r#"SELECT "id", "a" * 0.5 AS "h" FROM "t""#,
             T
         ),
         "NOT-EQUIVALENT"
@@ -101,11 +102,12 @@ fn a_timestamptz_converts_to_local_time_like_postgres() {
 #[test]
 fn a_zero_divisor_raises_on_both_sides() {
     // At a = 0 Postgres raises on both sides, so that trial compares nothing; DuckDB answered
-    // inf and -inf.
+    // inf and -inf. (A double precision dividend: a numeric one, `1.0 / a`, is a division DuckDB
+    // computes in a DOUBLE, and a pair with one gets no verdict at all.)
     assert_eq!(
         label(
-            r#"SELECT "id", 1.0 / "a" AS "x" FROM "t""#,
-            r#"SELECT "id", -1.0 / -"a" AS "x" FROM "t""#,
+            r#"SELECT "id", CAST(1 AS DOUBLE PRECISION) / "a" AS "x" FROM "t""#,
+            r#"SELECT "id", -CAST(1 AS DOUBLE PRECISION) / -"a" AS "x" FROM "t""#,
             T
         ),
         "NO-COUNTEREXAMPLE"
