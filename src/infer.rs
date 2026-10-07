@@ -1393,6 +1393,8 @@ pub fn build_inferred(
             n_declared: n,
             cols,
             nullable: vec![true; n],
+            // No DDL was read, so no column is known to be of a type whose `=` is identity.
+            opaque_identity: vec![false; n],
             // No DDL was read, so no column's default is known. The synthesized table holds only
             // the columns the queries name, so an `INSERT` here cannot omit one anyway.
             row_determined: vec![false; n],

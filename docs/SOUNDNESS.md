@@ -120,6 +120,15 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
   inference, read every name from one table, so `uuid` and `money` are opaque in both.
+- **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
+  where two values `=` calls equal are the same value, and for `double precision`, `jsonb` and
+  `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the
+  first kind in `opaque_identity`, from an allowlist checked on Postgres 17 (`src/types.rs`,
+  `opaque_identity`); a type not on it, an enum, a domain or an extension's type included, is of
+  the second kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque
+  value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
+  only columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it
+  reads `=` and deduplication as identity on every type.
 - **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
   over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`

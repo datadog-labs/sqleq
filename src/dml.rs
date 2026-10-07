@@ -1161,6 +1161,7 @@ mod tests {
                 name: name.to_string(),
                 cols: cols.iter().map(|c| (c.to_string(), "INTEGER".to_string())).collect(),
                 nullable: vec![true; cols.len()],
+                opaque_identity: vec![false; cols.len()],
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),
                 keys: Vec::new(),
                 n_declared: cols.len(),

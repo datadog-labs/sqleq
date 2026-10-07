@@ -180,8 +180,13 @@ Each difference is there for soundness:
   values of one type on which it is identity; between two decimals, an integer and a decimal, two
   intervals, or two values of the opaque VARBINARY (which stands for `double precision`, where
   `0 = -0`, and for arrays, whose `=` is their elements') it compares the values through a key.
-  Deduplication (`DISTINCT`, `GROUP BY`, set operations) still keeps values apart by identity.
-  Two string constants are not ordered by
+  The exception is an opaque column the schema lists in `opaque_identity`: the frontend lists
+  those whose Postgres type has an identity `=` (`bytea`, `uuid`, `money`, the discrete ranges,
+  arrays of integers or strings; `src/types.rs`, `opaque_identity`), and on a bare reference to one
+  `=` is identity again. Deduplication (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
+  binds its output to its input by identity, so over a column whose `=` is not identity, where
+  Postgres keeps one row of each class of `=`-equal values and a cast to text can tell which, it is
+  refused (`dedup-not-identity`). Two string constants are not ordered by
   bytes, which only the `C` collation does. The two sides' output columns must have the same types,
   since `TRUE` and `1` are one term. A literal that does not denote a value of its IR type (an
   INTEGER `1e-5`) is refused.

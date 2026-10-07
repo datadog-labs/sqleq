@@ -325,7 +325,7 @@ fn emit(
         .tables
         .iter()
         .map(|t| {
-            json!({
+            let mut schema = json!({
                 // The prover addresses tables positionally -- `{"scan": i}` indexes this array -- so
                 // it never reads the name. The SQLSolver bridge does: Calcite's root schema is
                 // name-keyed, so `RelBuilder::scan` needs the spelling that `emit_mysql` printed into
@@ -339,7 +339,14 @@ fn emit(
                 "key": t.not_null_keys().cloned().collect::<Vec<_>>(),
                 "nullable": t.nullable.clone(),
                 "guaranteed": Vec::<Value>::new(),
-            })
+            });
+            // Which opaque columns have an identity `=` (`Table::opaque_identity`), for
+            // `sqleq-solver`. Only where there is one, so that every other schema is emitted as it
+            // always was; and free for the qed axis and the JVM bridge, which read no such key.
+            if t.opaque_identity.iter().any(|&b| b) {
+                schema["opaque_identity"] = json!(t.opaque_identity);
+            }
+            schema
         })
         .collect();
     let q0 = lower::lower_query(catalog, decls, &queries[0])?;

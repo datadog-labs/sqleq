@@ -15,7 +15,7 @@ use sqlparser::ast::{
 use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
-use crate::types::map_type;
+use crate::types::{map_type, opaque_identity};
 
 /// Columns Postgres puts on every table and no DDL ever declares.
 ///
@@ -49,6 +49,15 @@ pub struct Table {
     /// Nullable is therefore the default, and this is set `false` only for an explicit `NOT NULL`
     /// or a `PRIMARY KEY` (which implies it). Missing the constraint merely costs completeness.
     pub nullable: Vec<bool>,
+    /// Parallel to `cols`: `true` only where the column is the opaque VARBINARY and its declared
+    /// Postgres type has an `=` that is identity ([`opaque_identity`]), as `bytea` and `uuid` do and
+    /// `double precision` and `jsonb` do not. Emitted in the schema for `sqleq-solver`, which then
+    /// reads `=` on the column as identity.
+    ///
+    /// Direction matters for soundness, as for [`Table::nullable`]: a false `true` licenses
+    /// substituting values that `=` calls equal and a cast tells apart, while a false `false`
+    /// merely costs proofs. So it is `false` for a catalog built without DDL to read.
+    pub opaque_identity: Vec<bool>,
     /// Column sets the DDL declares unique: every `PRIMARY KEY` and `UNIQUE` constraint that holds
     /// at every statement (see [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is
     /// not here.
@@ -239,6 +248,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let tname = obj_name(&ct.name).to_lowercase();
         let mut cols = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
+        let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
         let mut collations: Vec<Collation> = Vec::new();
@@ -246,6 +256,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             let cname = crate::dml::fold_ident(&c.name);
             let (cty, collation) = crate::collation::column(&c.options, map_type(&c.data_type), &created);
             let idx = cols.len();
+            identity.push(cty == "VARBINARY" && opaque_identity(&c.data_type.to_string()));
             cols.push((cname, cty));
             collations.push(collation);
             nullable.push(true);
@@ -306,6 +317,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             n_declared: cols.len(),
             cols,
             nullable,
+            opaque_identity: identity,
             row_determined: determined,
             keys,
             collations,
@@ -420,6 +432,7 @@ pub fn add_system_columns(cat: &mut Catalog, queries: &[Query]) {
             }
             t.cols.push((s.to_string(), Ty::Opaque.sql().to_string()));
             t.nullable.push(true);
+            t.opaque_identity.push(false);
             // A system column is never written, so no `INSERT` can omit it; the value is the
             // conservative one either way.
             t.row_determined.push(false);

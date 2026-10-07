@@ -46,7 +46,10 @@
 //! values -- the reading that lets normalization substitute one side for the other -- only between
 //! two values of one type on which `=` *is* identity; anywhere else (two decimals, an integer
 //! against a decimal, two intervals, two opaque values) it compares the values' images under a key
-//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`).
+//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`). Deduplication
+//! (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) binds its output to its input by
+//! identity too, so it is translated only over columns whose `=` is identity, and refused over any
+//! other (see `dedup_by_identity`).
 
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
@@ -70,21 +73,53 @@ fn types_of(operand: &[Expr]) -> Vec<Type> {
     operand.iter().map(Expr::ty).collect()
 }
 
+/// A value's IR type as SQL's `=` reads it: the type, and whether `=` between two values of it is
+/// identity of the values. That is the type's own answer ([`EqType::of`]) except on the opaque
+/// VARBINARY, which stands for many Postgres types: there it is identity only on a column the
+/// frontend vouched for (`Schema::opaque_identity`, `bytea` or `uuid` say), read through a bare
+/// reference to it, and kept through projections, filters, joins, groups and set operations whose
+/// two branches are both vouched for. Any other expression, a cast or a `CASE` over such a column
+/// included, is what its IR type says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EqType {
+    ty: Type,
+    identity: bool,
+}
+
+impl EqType {
+    /// What `ty` alone says: identity on every type but REAL (`2.0 = 2.00`), INTERVAL (`'1 day' =
+    /// '24 hours'`) and VARBINARY (see [`eq_key`]).
+    fn of(ty: Type) -> EqType {
+        EqType { ty, identity: !matches!(ty, Type::Real | Type::Interval | Type::Varbinary) }
+    }
+
+    /// A set-operation column, from its two branches' columns: the type both have, with an identity
+    /// `=` only if both do; `None` when the branches disagree on the type.
+    fn meet(a: Option<EqType>, b: Option<EqType>) -> Option<EqType> {
+        match (a, b) {
+            (Some(a), Some(b)) if a.ty == b.ty => Some(EqType { ty: a.ty, identity: a.identity && b.identity }),
+            _ => None,
+        }
+    }
+}
+
 /// The key function through which SQL's `=` between a value of type `a` and one of type `b` is
 /// read, or `None` when it is identity of the two values. It is identity only between two values of
 /// one type whose `=` holds exactly when the values are the same: integers, strings (under a
-/// deterministic collation, which compares bytes), booleans, dates, times and timestamps. It is not
-/// between two decimals (`2.0 = 2.00`, yet they print, cast and divide differently), an integer and
-/// a decimal, two intervals (`'1 day' = '24 hours'`), or two values of the opaque VARBINARY, which
-/// stands for types whose `=` is not identity either: `double precision` (`0 = -0`), and arrays,
-/// which compare elements with the element type's `=` (`'{2.0}' = '{2.00}'`). There the two sides
-/// are compared through a key, which a substitution cannot see through, so an equality never
-/// licenses putting one value where the other was.
-fn eq_key(a: Type, b: Type) -> Option<String> {
-    let numeric = |t: Type| matches!(t, Type::Integer | Type::Real);
-    if a == b && !matches!(a, Type::Real | Type::Interval | Type::Varbinary) {
+/// deterministic collation, which compares bytes), booleans, dates, times and timestamps, and an
+/// opaque value the frontend vouched for ([`EqType`]). It is not between two decimals (`2.0 =
+/// 2.00`, yet they print, cast and divide differently), an integer and a decimal, two intervals
+/// (`'1 day' = '24 hours'`), or two other values of the opaque VARBINARY, which stands for types
+/// whose `=` is not identity either: `double precision` (`0 = -0`), and arrays, which compare
+/// elements with the element type's `=` (`'{2.0}' = '{2.00}'`). There the two sides are compared
+/// through a key, which a substitution cannot see through, so an equality never licenses putting one
+/// value where the other was.
+fn eq_key(a: EqType, b: EqType) -> Option<String> {
+    if a.ty == b.ty && a.identity && b.identity {
         return None;
     }
+    let (a, b) = (a.ty, b.ty);
+    let numeric = |t: Type| matches!(t, Type::Integer | Type::Real);
     if numeric(a) && numeric(b) {
         return Some(NUMERIC_EQ_KEY.to_string());
     }
@@ -92,15 +127,15 @@ fn eq_key(a: Type, b: Type) -> Option<String> {
     Some(if x == y { format!("eq:{}", x.name()) } else { format!("eq:{}|{}", x.name(), y.name()) })
 }
 
-/// SQL's `a = b` on two non-NULL values of the IR types `ta` and `tb`, as a 0/1 term: identity of
-/// the values where that is what `=` means, their images under [`eq_key`]'s key otherwise. `None`
-/// for a type the IR could not resolve, which is compared through a key of its own.
-fn sql_eq(a: UTerm, ta: Option<Type>, b: UTerm, tb: Option<Type>) -> UTerm {
+/// SQL's `a = b` on two non-NULL values of the types `ta` and `tb`, as a 0/1 term: identity of the
+/// values where that is what `=` means, their images under [`eq_key`]'s key otherwise. `None` for a
+/// type the IR could not resolve, which is compared through a key of its own.
+fn sql_eq(a: UTerm, ta: Option<EqType>, b: UTerm, tb: Option<EqType>) -> UTerm {
     sql_equality(PredKind::Eq, a, ta, b, tb)
 }
 
 /// [`sql_eq`], or with `kind` `Ne` its negation, SQL's `<>`.
-fn sql_equality(kind: PredKind, a: UTerm, ta: Option<Type>, b: UTerm, tb: Option<Type>) -> UTerm {
+fn sql_equality(kind: PredKind, a: UTerm, ta: Option<EqType>, b: UTerm, tb: Option<EqType>) -> UTerm {
     let key = match (ta, tb) {
         (Some(ta), Some(tb)) => eq_key(ta, tb),
         _ => Some("eq:unresolved".to_string()),
@@ -110,6 +145,30 @@ fn sql_equality(kind: PredKind, a: UTerm, ta: Option<Type>, b: UTerm, tb: Option
         Some(k) => vec![UTerm::Func { name: k.clone(), args: vec![a] }, UTerm::Func { name: k, args: vec![b] }],
     };
     UTerm::Pred { kind, args }
+}
+
+/// Whether SQL's `=` between two values of the type `ty` is identity of the values, the reading
+/// [`eq_key`] gives it. `None`, a set-operation column whose two branches disagree on the type, is
+/// not known to be.
+fn eq_is_identity(ty: Option<EqType>) -> bool {
+    ty.is_some_and(|t| eq_key(t, t).is_none())
+}
+
+/// Refuses a deduplication -- `DISTINCT`, a `GROUP BY` key, `UNION`, `INTERSECT`, `EXCEPT` -- over a
+/// column whose `=` is not identity ([`eq_is_identity`]). Postgres keeps one row per class of
+/// `=`-equal values, and this translation, which binds each output column to its source by
+/// identity, keeps one per value: over `0` and `-0`, `2.0` and `2.00`, or `'1 day'` and
+/// `'24 hours'` it has two rows where Postgres has one. That makes `f(DISTINCT x)` have the rows of
+/// `DISTINCT f(x)` for every `f`, a cast to text or `scale()` included, which Postgres does not
+/// promise. Deduplicating on [`eq_key`]'s key instead would leave the output column to be one value
+/// of its class, and which one Postgres keeps depends on its plan and the input order, not on the
+/// class alone: an uninterpreted representative shared by two deduplications would claim they keep
+/// the same one. So the plan is refused.
+fn dedup_by_identity(types: &[Option<EqType>]) -> Result<(), TranslateError> {
+    match types.iter().find(|t| !eq_is_identity(**t)) {
+        None => Ok(()),
+        Some(t) => Err(TranslateError::DedupNotIdentity(t.map_or("unresolved", |t| t.ty.name()).to_string())),
+    }
 }
 
 /// A value that might be null. See the module doc for the invariant governing `value`.
@@ -250,15 +309,21 @@ fn pred_kind(op: &str) -> PredKind {
     }
 }
 
-/// Column-resolution scope: `local[i]` is the `UVar` standing for logical column `base + i`.
-/// `base` is constant across a non-subquery-crossing relation subtree and only advances when
-/// translation descends into a nested subquery.
+/// Column-resolution scope: `local[i]` is the `UVar` standing for logical column `base + i`, and
+/// `types[i]` its [`EqType`]. `base` is constant across a non-subquery-crossing relation subtree and
+/// only advances when translation descends into a nested subquery.
 struct Scope {
     base: usize,
     local: Vec<UVar>,
+    types: Vec<Option<EqType>>,
 }
 
 impl Scope {
+    /// The scope a relation's output makes for the expressions over it.
+    fn over(src: &Translated, base: usize) -> Scope {
+        Scope { base, local: src.local.clone(), types: src.types.clone() }
+    }
+
     fn resolve(&self, index: u32) -> Result<UVar, TranslateError> {
         let index = index as usize;
         if index < self.base {
@@ -266,14 +331,30 @@ impl Scope {
         }
         self.local.get(index - self.base).cloned().ok_or(TranslateError::ColumnOutOfRange)
     }
+
+    /// The [`EqType`] of `e` here: a bare column reference has its column's, when the two agree on
+    /// the IR type; anything else has what its IR type says.
+    fn eq_type(&self, e: &Expr) -> EqType {
+        let own = EqType::of(e.ty());
+        match e {
+            Expr::Column { index, ty } => (*index as usize)
+                .checked_sub(self.base)
+                .and_then(|i| self.types.get(i).copied().flatten())
+                .filter(|t| t.ty == *ty)
+                .unwrap_or(own),
+            _ => own,
+        }
+    }
 }
 
 /// The result of translating one `Relation`: its indicator term, the vars its output columns are
-/// bound to (`local`), and the existential vars a parent must sum over to consume it (`exposed`).
+/// bound to (`local`) and their [`EqType`]s (`types`), and the existential vars a parent must sum
+/// over to consume it (`exposed`).
 #[derive(Debug)]
 struct Translated {
     term: UTerm,
     local: Vec<UVar>,
+    types: Vec<Option<EqType>>,
     exposed: Vec<UVar>,
 }
 
@@ -319,8 +400,18 @@ impl<'s> Translator<'s> {
         let schema = self.schemas.get(i).ok_or(TranslateError::ScanOutOfRange)?;
         let var = self.fresh_var(schema.types.len());
         let local: Vec<UVar> = (0..schema.types.len() as u32).map(|idx| UVar::proj(idx, var.clone())).collect();
+        let vouched = |idx: usize| schema.opaque_identity.get(idx).copied().unwrap_or(false);
+        let types = schema
+            .types
+            .iter()
+            .enumerate()
+            .map(|(idx, &ty)| match ty {
+                Type::Varbinary if vouched(idx) => Some(EqType { ty, identity: true }),
+                _ => Some(EqType::of(ty)),
+            })
+            .collect();
         let term = UTerm::Table { name: schema.name.clone(), var: var.clone() };
-        Ok(Translated { term, local, exposed: vec![var] })
+        Ok(Translated { term, local, types, exposed: vec![var] })
     }
 
     fn values(&mut self, schema: &[Type], content: &[Vec<Expr>]) -> Result<Translated, TranslateError> {
@@ -343,19 +434,21 @@ impl<'s> Translator<'s> {
             }
             rows.push(mk_mul(factors));
         }
-        Ok(Translated { term: mk_add(rows), local, exposed: vec![var] })
+        let types = schema.iter().map(|&t| Some(EqType::of(t))).collect();
+        Ok(Translated { term: mk_add(rows), local, types, exposed: vec![var] })
     }
 
     fn filter(&mut self, source: &Relation, condition: &Expr, base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope { base, local: src.local.clone() };
+        let scope = Scope::over(&src, base);
         let cond = self.translate_predicate(condition, &scope)?;
-        Ok(Translated { term: mk_mul([src.term, cond]), local: src.local, exposed: src.exposed })
+        Ok(Translated { term: mk_mul([src.term, cond]), local: src.local, types: src.types, exposed: src.exposed })
     }
 
     /// Shared tail for `Project` and `Distinct`: mint a fresh output var, existentially close over
-    /// the source's exposed vars, bind each output column via [`value_eq`].
-    fn project_values(&mut self, src: Translated, values: Vec<Value>) -> Translated {
+    /// the source's exposed vars, bind each output column via [`value_eq`]. `types` are the output
+    /// columns' [`EqType`]s.
+    fn project_values(&mut self, src: Translated, values: Vec<Value>, types: Vec<Option<EqType>>) -> Translated {
         let out = self.fresh_var(values.len());
         let local: Vec<UVar> = (0..values.len() as u32).map(|i| UVar::proj(i, out.clone())).collect();
         let mut factors = vec![src.term];
@@ -363,23 +456,27 @@ impl<'s> Translator<'s> {
             factors.push(value_eq(&UTerm::Var(col.clone()), v));
         }
         let term = mk_sum(src.exposed, mk_mul(factors));
-        Translated { term, local, exposed: vec![out] }
+        Translated { term, local, types, exposed: vec![out] }
     }
 
     fn project(&mut self, source: &Relation, target: &[Expr], base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope { base, local: src.local.clone() };
+        let scope = Scope::over(&src, base);
         let values: Vec<Value> = target.iter().map(|e| self.translate_value(e, &scope)).collect::<Result<_, _>>()?;
-        Ok(self.project_values(src, values))
+        let types = target.iter().map(|e| Some(scope.eq_type(e))).collect();
+        Ok(self.project_values(src, values, types))
     }
 
     /// `Distinct` = `Squash` of an identity projection: reuses `project_values`'s shape with each
-    /// source column passed through unchanged, then clamps the result to 0/1.
+    /// source column passed through unchanged, then clamps the result to 0/1. Refused over a column
+    /// whose `=` is not identity ([`dedup_by_identity`]).
     fn distinct(&mut self, source: &Relation, base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
+        dedup_by_identity(&src.types)?;
         let values: Vec<Value> = src.local.iter().cloned().map(column_value).collect();
-        let projected = self.project_values(src, values);
-        Ok(Translated { term: mk_squash(projected.term), local: projected.local, exposed: projected.exposed })
+        let types = src.types.clone();
+        let projected = self.project_values(src, values, types);
+        Ok(Translated { term: mk_squash(projected.term), ..projected })
     }
 
     fn join(
@@ -393,7 +490,8 @@ impl<'s> Translator<'s> {
         let l = self.rel(left, base)?;
         let r = self.rel(right, base)?;
         let local: Vec<UVar> = l.local.iter().chain(r.local.iter()).cloned().collect();
-        let scope = Scope { base, local: local.clone() };
+        let types: Vec<Option<EqType>> = l.types.iter().chain(r.types.iter()).copied().collect();
+        let scope = Scope { base, local: local.clone(), types: types.clone() };
         let cond = self.translate_predicate(condition, &scope)?;
 
         let matched = mk_mul([l.term.clone(), r.term.clone(), cond.clone()]);
@@ -412,7 +510,7 @@ impl<'s> Translator<'s> {
 
         let term = mk_add(branches);
         let exposed: Vec<UVar> = l.exposed.into_iter().chain(r.exposed).collect();
-        Ok(Translated { term, local, exposed })
+        Ok(Translated { term, local, types, exposed })
     }
 
     fn group(
@@ -423,7 +521,7 @@ impl<'s> Translator<'s> {
         base: usize,
     ) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope { base, local: src.local.clone() };
+        let scope = Scope::over(&src, base);
 
         let mut key_vars = Vec::with_capacity(keys.len());
         for k in keys {
@@ -432,6 +530,9 @@ impl<'s> Translator<'s> {
                 _ => return Err(TranslateError::GroupKeyNonRef),
             }
         }
+        // A group is one class of `=`-equal keys, and `SELECT DISTINCT` arrives as a keys-only group.
+        let mut types: Vec<Option<EqType>> = keys.iter().map(|k| Some(scope.eq_type(k))).collect();
+        dedup_by_identity(&types)?;
 
         let out = self.fresh_var(key_vars.len() + function.len());
         let key_out: Vec<UVar> = (0..key_vars.len() as u32).map(|i| UVar::proj(i, out.clone())).collect();
@@ -454,9 +555,10 @@ impl<'s> Translator<'s> {
             let col = UVar::proj(local.len() as u32, out.clone());
             conjuncts.push(self.agg_eq(call, &group_by_term, &src.exposed, &scope, &col)?);
             local.push(col);
+            types.push(Some(EqType::of(call.ty)));
         }
 
-        Ok(Translated { term: mk_mul(conjuncts), local, exposed: vec![out] })
+        Ok(Translated { term: mk_mul(conjuncts), local, types, exposed: vec![out] })
     }
 
     /// An aggregate's lone operand, required to be a bare column reference (matching the Java
@@ -530,11 +632,18 @@ impl<'s> Translator<'s> {
         }
     }
 
+    /// `UNION ALL` adds the two sides; `INTERSECT` and `EXCEPT` deduplicate, and are refused over a
+    /// column whose `=` is not identity ([`dedup_by_identity`]). `UNION` arrives as a `Distinct` over
+    /// a `UNION ALL`.
     fn set_op(&mut self, kind: SetOpKind, sides: &[Box<Relation>; 2], base: usize) -> Result<Translated, TranslateError> {
         let l = self.rel(&sides[0], base)?;
         let r = self.rel(&sides[1], base)?;
         if l.local.len() != r.local.len() {
             return Err(TranslateError::MalformedShape("set-op branches have different column counts".into()));
+        }
+        let types: Vec<Option<EqType>> = l.types.iter().zip(&r.types).map(|(a, b)| EqType::meet(*a, *b)).collect();
+        if !matches!(kind, SetOpKind::Union) {
+            dedup_by_identity(&types)?;
         }
         let out = self.fresh_var(l.local.len());
         let out_local: Vec<UVar> = (0..l.local.len() as u32).map(|i| UVar::proj(i, out.clone())).collect();
@@ -545,7 +654,7 @@ impl<'s> Translator<'s> {
             SetOpKind::Except => mk_squash(mk_mul([l_term, mk_neg(r_term)])),
             SetOpKind::Intersect => mk_squash(mk_mul([l_term, r_term])),
         };
-        Ok(Translated { term, local: out_local, exposed: vec![out] })
+        Ok(Translated { term, local: out_local, types, exposed: vec![out] })
     }
 
     // -- predicate/value context dispatch --------------------------------------------------------
@@ -597,7 +706,7 @@ impl<'s> Translator<'s> {
             "=" | "<>" | "<" | "<=" | ">" | ">=" => {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
-                let (ta, tb) = (Some(operand[0].ty()), Some(operand[1].ty()));
+                let (ta, tb) = (Some(scope.eq_type(&operand[0])), Some(scope.eq_type(&operand[1])));
                 let holds = match pred_kind(operator) {
                     kind @ (PredKind::Eq | PredKind::Ne) => sql_equality(kind, a.value, ta, b.value, tb),
                     // An order comparison is never read as identity, so it needs no key: values
@@ -613,7 +722,7 @@ impl<'s> Translator<'s> {
                 let b = self.translate_value(&operand[1], scope)?;
                 let both_null = mk_mul([a.is_null.clone(), b.is_null.clone()]);
                 let both_nonnull = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null)]);
-                let eq = sql_eq(a.value, Some(operand[0].ty()), b.value, Some(operand[1].ty()));
+                let eq = sql_eq(a.value, Some(scope.eq_type(&operand[0])), b.value, Some(scope.eq_type(&operand[1])));
                 Ok(Truth::two_valued(mk_neg(mk_add([both_null, mk_mul([both_nonnull, eq])]))))
             }
             "IS NOT TRUE" => Ok(Truth::two_valued(mk_neg(self.translate_truth(&operand[0], scope)?.t))),
@@ -658,13 +767,12 @@ impl<'s> Translator<'s> {
         if inner.local.len() != lhs.len() {
             return Err(TranslateError::MalformedShape("IN operand arity does not match subquery width".into()));
         }
-        let inner_types = query.output_types(self.schemas);
         let mut eqs = Vec::with_capacity(lhs.len());
         let mut nulls = Vec::with_capacity(lhs.len());
         for (i, (l, col)) in lhs.iter().zip(inner.local.iter()).enumerate() {
             let rhs = column_value(col.clone());
             let null = mk_or(l.is_null.clone(), rhs.is_null);
-            let eq = sql_eq(l.value.clone(), Some(operand[i].ty()), rhs.value, inner_types.get(i).copied().flatten());
+            let eq = sql_eq(l.value.clone(), Some(scope.eq_type(&operand[i])), rhs.value, inner.types.get(i).copied().flatten());
             eqs.push(mk_mul([mk_neg(null.clone()), eq]));
             nulls.push(null);
         }
@@ -769,7 +877,7 @@ impl<'s> Translator<'s> {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
                 let both_nonnull = mk_neg(mk_or(a.is_null.clone(), b.is_null.clone()));
-                let eq = sql_eq(a.value.clone(), Some(operand[0].ty()), b.value, Some(operand[1].ty()));
+                let eq = sql_eq(a.value.clone(), Some(scope.eq_type(&operand[0])), b.value, Some(scope.eq_type(&operand[1])));
                 Ok(Value { is_null: mk_or(a.is_null, mk_mul([both_nonnull, eq])), value: a.value })
             }
             "||" if operand.len() == 2 => self.strict_value(&typed_symbol("concat", &types_of(operand), ty), operand, scope),
@@ -959,7 +1067,7 @@ mod tests {
     use serde_json::json;
 
     fn one_table(types: Vec<Type>) -> Vec<Schema> {
-        vec![Schema { name: "t0".to_string(), types, key: vec![], nullable: vec![] }]
+        vec![Schema { name: "t0".to_string(), types, key: vec![], nullable: vec![], opaque_identity: vec![] }]
     }
 
     #[test]
@@ -968,8 +1076,8 @@ mod tests {
         // the derived table's filter names `t.x` as column 0, from the enclosing base, not as
         // column 2 after `s`; the join condition sees `s ++ t`.
         let schemas = vec![
-            Schema { name: "s".to_string(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![] },
-            Schema { name: "t".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+            Schema { name: "s".to_string(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
         ];
         let col = |index| Expr::Column { index, ty: Type::Integer };
         let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
@@ -1003,8 +1111,8 @@ mod tests {
         // the filter's `t.c` is column 2 from the enclosing base. Numbering the right input from
         // after `s` would not refuse this one: it would read column 2 as `t.b`.
         let schemas = vec![
-            Schema { name: "s".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
-            Schema { name: "t".to_string(), types: vec![Type::Integer; 3], key: vec![], nullable: vec![] },
+            Schema { name: "s".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer; 3], key: vec![], nullable: vec![], opaque_identity: vec![] },
         ];
         let col = |index| Expr::Column { index, ty: Type::Integer };
         let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
@@ -1054,7 +1162,7 @@ mod tests {
         let schemas = one_table(vec![Type::Integer]);
         let mut t = Translator::new(&schemas);
         let src = t.scan(0).unwrap();
-        let scope = Scope { base: 0, local: src.local.clone() };
+        let scope = Scope::over(&src, 0);
         let e = Expr::Call {
             operator: "IS NULL".to_string(),
             ty: Type::Boolean,
@@ -1194,7 +1302,7 @@ mod tests {
             let e = Expr::parse(json, 1).unwrap();
             let mut t = Translator::new(&schemas);
             let src = t.scan(0).unwrap();
-            let truth = t.translate_truth(&e, &Scope { base: 0, local: src.local }).unwrap();
+            let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
             let db = Db::new(Default::default(), values.to_vec(), Default::default());
             for a in &values {
                 for b in &values {
@@ -1216,8 +1324,8 @@ mod tests {
     #[test]
     fn in_is_unknown_when_only_a_null_could_match() {
         let schemas = vec![
-            Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
-            Schema { name: "s".into(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+            Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "s".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
         ];
         let e = Expr::Subquery {
             operator: "IN".into(),
@@ -1227,7 +1335,7 @@ mod tests {
         };
         let mut t = Translator::new(&schemas);
         let src = t.scan(0).unwrap();
-        let truth = t.translate_truth(&e, &Scope { base: 0, local: src.local }).unwrap();
+        let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
         let widths = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
         let (n, one, two, three) = (UConst::Null, UConst::Int(1), UConst::Int(2), UConst::Int(3));
         // (contents of s, the operand, expected (TRUE, UNKNOWN))
@@ -1287,13 +1395,13 @@ mod tests {
         /// `s`: (TRUE, UNKNOWN).
         fn truths(cond: serde_json::Value, contents: &[Vec<UConst>]) -> Vec<(i64, i64)> {
             let schemas = vec![
-                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
-                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![] },
+                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
             ];
             let e = Expr::parse(&cond, 2).unwrap();
             let mut t = Translator::new(&schemas);
             let src = t.scan(0).unwrap();
-            let truth = t.translate_truth(&e, &Scope { base: 0, local: src.local }).unwrap();
+            let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
             let widths: std::collections::HashMap<u32, usize> = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
             let universe = vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2), UConst::Int(5)];
             contents
