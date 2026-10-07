@@ -500,18 +500,18 @@ fn apply_pagination(
     q: &Query,
     rel: Value,
     out_cols: &OutCols,
-    sortable: Option<&Scope>,
+    sortable: Option<&SortScope>,
 ) -> Result<Value> {
     let Some((limit, offset)) = row_slice(cat, fns, q)? else { return Ok(rel) };
-    let collation = match collation(q, out_cols)? {
+    let collation = match collation(q, out_cols, sortable.is_none())? {
         CollationPlan::Direct(c) => c,
-        // At least one key is not an output column, so the `Sort` has nothing to point at until the
-        // projection is widened. Only a plain select can be widened; see [`sort_sandwich`].
+        // At least one key is an input expression, so the `Sort` has nothing to point at until it
+        // is lowered in the select's FROM scope; only a select has one. See [`sort_sandwich`].
         CollationPlan::NeedsExtension => {
-            let Some(scope) = sortable else {
+            let Some(sortable) = sortable else {
                 return Err(unsupported("ORDER BY key is not an output column"));
             };
-            return sort_sandwich(cat, fns, scope, q, rel, out_cols, limit, offset);
+            return sort_sandwich(cat, fns, sortable, q, rel, out_cols, limit, offset);
         }
     };
     Ok(json!({
@@ -527,21 +527,25 @@ fn apply_pagination(
 /// append it to the projection, point the collation at the new position, and trim it back off above
 /// the `Sort` so the query's output is unchanged.
 ///
-/// # Why this needs the select's scope, and why only a plain select gets one
+/// # Why this needs the select's scope, and why only a plain select is widened
 ///
 /// The key is an arbitrary expression over the FROM bindings, which only [`lower_select_ctx`] has.
-/// It passes its [`Scope`] up for exactly this, and only when its result is a projection directly
-/// over the FROM relation. A `GROUP BY`, a `DISTINCT`, or a `DISTINCT ON` puts a `Group` in between,
-/// and a FROM-scope expression cannot be addressed through one — appending it there would silently
-/// order by whatever column happens to sit at that index. Those keep the refusal, as do set
-/// operations and `VALUES`, which have no single FROM scope to resolve against.
+/// It passes its [`Scope`] up for exactly this ([`SortScope`]). Only a result that is a projection
+/// directly over the FROM relation can be widened. A `DISTINCT` or a `DISTINCT ON` puts a `Group`
+/// in between, and a FROM-scope expression cannot be addressed through one — appending it there
+/// would silently order by whatever column happens to sit at that index — so there the key must
+/// already be the value of an output column, which is Postgres's own rule for `SELECT DISTINCT`
+/// (its `ORDER BY` expressions must appear in the select list), and is refused otherwise. A
+/// `GROUP BY` gets no scope at all, nor do set operations and `VALUES`, which have no single FROM
+/// scope to resolve against; those keep the refusal.
 ///
-/// Ambiguity is still refused rather than resolved: see [`order_key_value`].
+/// Keys are resolved by [`resolve_order_key`], so an output name or position here means what it
+/// means in [`collation`], and ambiguity is still refused rather than resolved.
 #[allow(clippy::too_many_arguments)]
 fn sort_sandwich(
     cat: &Catalog,
     fns: &Fns,
-    scope: &Scope,
+    sortable: &SortScope,
     q: &Query,
     rel: Value,
     out_cols: &OutCols,
@@ -558,17 +562,33 @@ fn sort_sandwich(
         return Err(unsupported("ORDER BY ALL"));
     };
 
+    let scope = &sortable.scope;
     let base = scope.base;
-    let (mut targets, source) = split_projection(&rel, out_cols, base);
+    let (mut targets, source) = match &sortable.outputs {
+        Some(outputs) => (outputs.clone(), Value::Null),
+        None => split_projection(&rel, out_cols, base),
+    };
     let mut collation = Vec::with_capacity(keys.len());
     for key in keys {
         if key.with_fill.is_some() {
             return Err(unsupported("ORDER BY ... WITH FILL"));
         }
-        let v = order_key_value(cat, scope, fns, &key.expr, &targets, out_cols)?;
+        let v = order_key_value(cat, scope, fns, &key.expr, &targets, out_cols, "ORDER BY")?;
+        if sortable.outputs.is_some() && !targets.contains(&v) {
+            return Err(unsupported("ORDER BY key is not an output column"));
+        }
         let ty = ty_of(&v);
         let idx = push_unique(&mut targets, v);
         collation.push(json!([idx, ty, ord_string(&key.options)?]));
+    }
+
+    // Every key was already an output value (`ORDER BY t.a` over `SELECT t.a`): nothing was
+    // appended, so the trim would be the identity and the `Sort` can stand on the body directly —
+    // the shape [`collation`] gives the same ordering spelled as an output name or position.
+    if targets.len() == out_cols.len() {
+        return Ok(json!({
+            "sort": { "collation": collation, "limit": limit, "offset": offset, "source": rel }
+        }));
     }
 
     let extended = json!({ "project": { "target": targets, "source": source } });
@@ -666,7 +686,11 @@ fn count(cat: &Catalog, fns: &Fns, e: &Expr) -> Result<Value> {
 /// The collation for a sliced query: one entry per `ORDER BY` key, in clause order.
 ///
 /// Empty is legal and meaningful — `LIMIT 5` with no `ORDER BY` lowers to a bare `limit` HOp.
-fn collation(q: &Query, out_cols: &OutCols) -> Result<CollationPlan> {
+///
+/// An input-expression key asks for [`sort_sandwich`], which lowers it in the select's FROM scope.
+/// Only when there is no such scope to go to (`by_tree`: a grouped select) is the key matched here,
+/// against a select-list item written the same way ([`projected_as`]).
+fn collation(q: &Query, out_cols: &OutCols, by_tree: bool) -> Result<CollationPlan> {
     use sqlparser::ast::OrderByKind;
 
     let Some(order_by) = &q.order_by else { return Ok(CollationPlan::Direct(Vec::new())) };
@@ -681,8 +705,12 @@ fn collation(q: &Query, out_cols: &OutCols) -> Result<CollationPlan> {
         if key.with_fill.is_some() {
             return Err(unsupported("ORDER BY ... WITH FILL"));
         }
-        let Some(idx) = order_key_index(&key.expr, out_cols)? else {
-            return Ok(CollationPlan::NeedsExtension);
+        let idx = match resolve_order_key(&key.expr, out_cols, "ORDER BY")? {
+            OrderKey::Output(i) => i,
+            OrderKey::Input(e) => match by_tree.then(|| projected_as(q, e)).flatten() {
+                Some(i) => i,
+                None => return Ok(CollationPlan::NeedsExtension),
+            },
         };
         out.push(json!([idx, out_cols[idx].1, ord_string(&key.options)?]));
     }
@@ -698,46 +726,94 @@ enum CollationPlan {
     NeedsExtension,
 }
 
-/// Resolve one `ORDER BY` key to a position in the query's own output columns, or `None` if it is
-/// not one of them.
+/// What one `ORDER BY` or `DISTINCT ON` key refers to, as Postgres reads it.
+enum OrderKey<'e> {
+    /// The query's own output column at this (0-based) position.
+    Output(usize),
+    /// An expression over the FROM clause, to be lowered in its scope.
+    Input(&'e Expr),
+}
+
+/// Resolve one `ORDER BY` or `DISTINCT ON` key by Postgres's rules (`findTargetlistEntrySQL92`,
+/// which `DISTINCT ON` shares with `ORDER BY`), in this order:
 ///
-/// SQL also lets the key be an expression (`ORDER BY lower(n)`) or name a column the projection
-/// *drops* (`SELECT a FROM t ORDER BY b`). Neither has a position here, and both are handled a level
-/// up by [`sort_sandwich`], which widens the projection until they do. `None` asks for that; `Err`
-/// is reserved for keys that are wrong rather than merely absent.
+/// 1. an integer is a 1-based position in the select list;
+/// 2. a *bare* name is the output column of that name, if there is one;
+/// 3. anything else — a qualified name like `t.a` included, always — is an expression over the
+///    FROM clause.
+///
+/// The parser drops parentheses before Postgres looks, so `(1)` is still a position and `(a)` still
+/// a bare name. Names compare as Postgres folds them (see [`fold_name`]): `A` is `a`, and neither is
+/// the output column `"A"`.
+///
+/// Every caller shares this, and what each does with [`OrderKey::Input`] is its own business:
+/// [`sort_sandwich`] and [`distinct_on`] lower it in the FROM scope, while [`collation`], which has
+/// no FROM scope, can only use a select-list item written the same way ([`projected_as`]), and
+/// does so only for a grouped select, which passes no scope up.
+///
+/// Refused rather than resolved, because there is no answer that is right whichever way the
+/// query meant it:
+///
+/// - a bare name that two output columns carry (Postgres accepts it only when the two are the
+///   same expression, and raises otherwise);
+/// - a bare name that matches no output column whose name is known, when one of the output columns
+///   is an expression whose Postgres name this frontend cannot tell ([`expr_name`]): Postgres would
+///   read the key as that column if the name were the same, and as an input column otherwise.
 ///
 /// A wildcard needs no special case: `expand_projection` has already resolved `*` into named
 /// columns by the time `out_cols` exists, so `SELECT * FROM t ORDER BY b` resolves like any other.
-fn order_key_index(e: &Expr, out_cols: &OutCols) -> Result<Option<usize>> {
-    // `ORDER BY 2` is a 1-based position in the select list.
-    if let Expr::Value(v) = e {
-        if let SqlValue::Number(n, _) = &v.value {
-            let pos: usize =
-                n.parse().map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
-            if pos >= 1 && pos <= out_cols.len() {
-                return Ok(Some(pos - 1));
+fn resolve_order_key<'e>(e: &'e Expr, out_cols: &OutCols, clause: &str) -> Result<OrderKey<'e>> {
+    match crate::casts::unwrap_nested(e) {
+        Expr::Value(v) => {
+            if let SqlValue::Number(n, _) = &v.value {
+                let pos: usize = n.parse().map_err(|_| unsupported(format!("{clause} position {n}")))?;
+                return match pos.checked_sub(1).filter(|&i| i < out_cols.len()) {
+                    Some(i) => Ok(OrderKey::Output(i)),
+                    None => Err(schema(format!("{clause} position {pos} out of range"))),
+                };
             }
-            return Err(schema(format!("ORDER BY position {pos} out of range")));
         }
+        Expr::Identifier(id) => {
+            let name = fold_name(id);
+            let mut found =
+                out_cols.iter().enumerate().filter(|(_, (n, _))| !is_unnamed(n) && *n == name);
+            match (found.next(), found.next()) {
+                (Some((i, _)), None) => return Ok(OrderKey::Output(i)),
+                // Which one the key means is a resolution question we decline rather than answer
+                // arbitrarily. Widening the projection would not help: the ambiguity is in the name.
+                (Some(_), Some(_)) => return Err(schema(format!("ambiguous {clause} key {name}"))),
+                (None, _) => {}
+            }
+            if out_cols.iter().any(|(n, _)| is_unnamed(n)) {
+                return Err(unsupported(format!(
+                    "{clause} key {name} beside an output column whose name is not known"
+                )));
+            }
+        }
+        _ => {}
     }
+    Ok(OrderKey::Input(e))
+}
 
-    let name = match e {
-        Expr::Identifier(id) => id.value.to_lowercase(),
-        Expr::CompoundIdentifier(p) => p.last().unwrap().value.to_lowercase(),
-        // An expression key: no output position, but `sort_sandwich` can give it one.
-        _ => return Ok(None),
-    };
-
-    let mut found = out_cols.iter().enumerate().filter(|(_, (n, _))| *n == name);
-    match (found.next(), found.next()) {
-        (Some((i, _)), None) => Ok(Some(i)),
-        // Two output columns of the same name: which one the key means is a resolution question we
-        // decline rather than answer arbitrarily. Widening the projection would not help — the
-        // ambiguity is in the name, not in what the query happens to output.
-        (Some(_), Some(_)) => Err(schema(format!("ambiguous ORDER BY key {name}"))),
-        // A source column the projection drops.
-        _ => Ok(None),
+/// The output position of a select-list item written exactly as the key `e`, if there is one.
+///
+/// For a key that is not an output name, Postgres lowers it in the FROM scope and then looks for a
+/// select-list item that is the same expression (`findTargetlistEntrySQL99`). This is that rule
+/// cut down to what can be checked without lowering: the same tree, in the same select, over the
+/// same scope, is the same expression. Postgres also matches trees that differ only in spelling
+/// (`t.a` against `a`); those find nothing here and are refused a level up, which is the
+/// conservative side.
+///
+/// A wildcard item makes the item index stop being the output position, so a select carrying one
+/// matches nothing.
+fn projected_as(q: &Query, e: &Expr) -> Option<usize> {
+    use crate::casts::unwrap_nested;
+    let SetExpr::Select(s) = q.body.as_ref() else { return None };
+    if s.projection.iter().any(|it| item_expr(it).is_none()) {
+        return None;
     }
+    let e = unwrap_nested(e);
+    s.projection.iter().position(|it| item_expr(it).is_some_and(|x| unwrap_nested(x) == e))
 }
 
 /// The direction tag for one collation entry.
@@ -783,10 +859,16 @@ enum OrderCtx<'a> {
     Unknown,
 }
 
-/// A select whose output columns are plain expressions over its own FROM scope, paired with that
-/// scope — which is what lets an enclosing `Sort` order by a value the projection does not expose.
-/// See [`sort_sandwich`] for why nothing else qualifies.
-type SortScope = Option<Scope>;
+/// What an enclosing `Sort` can do with an `ORDER BY` key that is an input expression rather than
+/// an output column: the select's own FROM scope to lower it in, and, where the select's result
+/// cannot be widened, the values its output columns hold over that scope. See [`sort_sandwich`].
+struct SortScope {
+    scope: Scope,
+    /// `None` for a plain select, whose projection sits directly on the FROM relation and is
+    /// widened with the key. `Some` for a `DISTINCT` or `DISTINCT ON` select, whose key has to be
+    /// one of these values already.
+    outputs: Option<Vec<Value>>,
+}
 
 /// Lower a set-expression body: a plain SELECT, a set operation, a parenthesized query, or VALUES.
 fn lower_setexpr_ctx(
@@ -795,7 +877,7 @@ fn lower_setexpr_ctx(
     body: &SetExpr,
     outer: &[Binding],
     ord: OrderCtx,
-) -> Result<(Value, OutCols, SortScope)> {
+) -> Result<(Value, OutCols, Option<SortScope>)> {
     match body {
         SetExpr::Select(s) => lower_select_ctx(cat, fns, s, outer, ord),
         // A parenthesized query carries its own ORDER BY; `ord` belongs to the enclosing one, and
@@ -899,7 +981,7 @@ fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select, outer: &[Binding]
     for (idx, item) in s.projection.iter().enumerate() {
         let (e, name) = match item {
             SelectItem::UnnamedExpr(e) => (e, expr_name(e, idx)),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.to_lowercase()),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, fold_name(alias)),
             // A wildcard needs a FROM to expand against, so this is not valid SQL to begin with.
             other => return Err(unsupported(format!("FROM-less SELECT projection {other:?}"))),
         };
@@ -939,7 +1021,7 @@ fn lower_select_ctx(
     s: &Select,
     outer: &[Binding],
     ord: OrderCtx,
-) -> Result<(Value, OutCols, SortScope)> {
+) -> Result<(Value, OutCols, Option<SortScope>)> {
     // SOUNDNESS GUARDS: refuse result-changing clauses we don't faithfully lower.
     if s.top.is_some() {
         return Err(unsupported("TOP"));
@@ -984,11 +1066,16 @@ fn lower_select_ctx(
         (json!({ "project": { "target": targets, "source": rel } }), cols)
     };
 
-    let (rel, cols) = apply_distinct(cat, fns, &scope, s, result, out_cols, ord, aggregated)?;
     // Only a projection sitting directly on the FROM relation can be widened with an ORDER BY key;
-    // a `Group` in between makes the FROM scope unaddressable from above. See [`sort_sandwich`].
-    let plain = !aggregated && matches!(s.distinct, None | Some(Distinct::All));
-    Ok((rel, cols, plain.then_some(scope)))
+    // above a `DISTINCT`'s `Group` the key can only be an output value, and an aggregate's output
+    // values are not over the FROM scope at all. See [`sort_sandwich`].
+    let outputs = match &s.distinct {
+        _ if aggregated => None,
+        None | Some(Distinct::All) => Some(None),
+        Some(_) => Some(Some(split_projection(&result, &out_cols, scope.base).0)),
+    };
+    let (rel, cols) = apply_distinct(cat, fns, &scope, s, result, out_cols, ord, aggregated)?;
+    Ok((rel, cols, outputs.map(|outputs| SortScope { scope, outputs })))
 }
 
 /// `SELECT DISTINCT` -> Group keyed on all output columns (matches Calcite's canonical form, where
@@ -1147,9 +1234,12 @@ fn distinct_on(
     // Extend the projection with anything the operator depends on that the outputs do not already
     // carry: the DISTINCT ON keys, then the ORDER BY keys. `push_unique` reuses an existing column
     // when the lowered expression is already there, so the common case appends nothing.
+    //
+    // A key resolves as an `ORDER BY` key does (see [`resolve_order_key`]): `DISTINCT ON (1)` is
+    // the first output column, not the constant 1, and a bare name is an output name first.
     let mut gkeys = Vec::with_capacity(keys.len());
     for k in keys {
-        let v = lower_expr(cat, scope, fns, k)?;
+        let v = order_key_value(cat, scope, fns, k, &targets, &out_cols, "DISTINCT ON")?;
         let ty = ty_of(&v);
         let idx = push_unique(&mut targets, v);
         gkeys.push(json!({ "column": base + idx, "type": ty }));
@@ -1271,22 +1361,19 @@ fn order_digest(
         if key.with_fill.is_some() {
             return Err(unsupported("ORDER BY ... WITH FILL"));
         }
-        let v = order_key_value(cat, scope, fns, &key.expr, targets, out_cols)?;
+        let v = order_key_value(cat, scope, fns, &key.expr, targets, out_cols, "ORDER BY")?;
         let pos = push_unique(targets, v);
         out.push_str(&format!("{pos}:{};", ord_string(&key.options)?));
     }
     Ok(out)
 }
 
-/// The value one `ORDER BY` key orders by, lowered.
+/// The value one `ORDER BY` or `DISTINCT ON` key orders or groups by, lowered: the output value it
+/// names, or the expression it is lowered in the FROM scope. See [`resolve_order_key`] for which;
+/// getting the precedence backwards would silently order by the wrong value in
+/// `SELECT b AS a FROM t ORDER BY a`, or in `... ORDER BY t.a`.
 ///
-/// Postgres resolves an `ORDER BY` key against the select list before the FROM scope, and this
-/// follows that order: an integer literal is a 1-based select-list position, a bare identifier naming
-/// exactly one output column is that column, and anything else is an ordinary expression over the
-/// input. Getting the precedence backwards would silently order by the wrong value in
-/// `SELECT b AS a FROM t ORDER BY a`.
-///
-/// `targets` is read for the first two cases and is *not* extended here; the caller records the
+/// `targets` is read for an output column and is *not* extended here; the caller records the
 /// position.
 fn order_key_value(
     cat: &Catalog,
@@ -1295,35 +1382,19 @@ fn order_key_value(
     e: &Expr,
     targets: &[Value],
     out_cols: &OutCols,
+    clause: &str,
 ) -> Result<Value> {
-    if let Expr::Value(v) = e {
-        if let SqlValue::Number(n, _) = &v.value {
-            let pos: usize = n.parse().map_err(|_| unsupported(format!("ORDER BY position {n}")))?;
-            return match pos.checked_sub(1).and_then(|i| targets.get(i)) {
-                Some(t) if pos <= out_cols.len() => Ok(t.clone()),
-                _ => Err(schema(format!("ORDER BY position {pos} out of range"))),
-            };
-        }
+    match resolve_order_key(e, out_cols, clause)? {
+        OrderKey::Output(i) => Ok(targets[i].clone()),
+        OrderKey::Input(e) => lower_expr(cat, scope, fns, e),
     }
-    if let Expr::Identifier(id) = e {
-        let name = id.value.to_lowercase();
-        let mut found = out_cols.iter().enumerate().filter(|(_, (n, _))| *n == name);
-        match (found.next(), found.next()) {
-            (Some((i, _)), None) => return Ok(targets[i].clone()),
-            // Two output columns of the same name: which one the key means is a resolution question
-            // we decline rather than answer arbitrarily.
-            (Some(_), Some(_)) => return Err(schema(format!("ambiguous ORDER BY key {name}"))),
-            _ => {}
-        }
-    }
-    lower_expr(cat, scope, fns, e)
 }
 
-/// A join step in a FROM clause. With both `on` and `precomputed` `None` this is an unrestricted
-/// join (a comma-separated item or a `CROSS JOIN`), lowered to a join on `TRUE`. `on` borrows the
-/// condition from the FROM AST (lifetime `'a`); `precomputed` carries one we built ourselves, which
-/// is how `USING` arrives — its equalities are resolved against the two sides of that one join
-/// rather than the finished scope. `upto` is how many bindings the FROM clause has once this
+/// A join step in a FROM item's join tree. With both `on` and `precomputed` `None` this is an
+/// unrestricted join (a `CROSS JOIN`, or the item's first factor), lowered to a join on `TRUE`. `on`
+/// borrows the condition from the FROM AST (lifetime `'a`); `precomputed` carries one we built
+/// ourselves, which is how `USING` arrives — its equalities are resolved against the two sides of
+/// that one join rather than the finished scope. `upto` is how many bindings the tree has once this
 /// step's factor is in: a parenthesized join brings several, so the step's index does not say
 /// where its row ends.
 struct Step<'a> {
@@ -1349,14 +1420,79 @@ impl Factor {
     }
 }
 
-/// Build the resolution scope and relation tree for a whole FROM clause (comma items become cross
-/// joins; each item may carry joins; factors may be base tables or derived tables). `outer` are the
+/// Build the resolution scope and relation tree for a whole FROM clause. `outer` are the
 /// enclosing-query bindings; this query's own bindings are offset past them so de-Bruijn indices stay
 /// absolute across nesting.
-fn build_from_clause<'a>(
+///
+/// A comma binds looser than any `JOIN`. Postgres reads `FROM a, b RIGHT JOIN c ON p` as `a`
+/// crossed with `b RIGHT JOIN c ON p`, and `p` — or a `USING` there — sees `b` and `c` but not `a`.
+/// Folding every item and join into one left-deep chain instead would give
+/// `(a CROSS JOIN b) RIGHT JOIN c ON p`, which keeps `c`'s rows when `a` is empty, and would let
+/// `p` and `USING` reach `a`. So each comma item is lowered as its own join tree, exactly as a
+/// parenthesized join is ([`join_tree_factor`]), and the items' trees are then cross-joined left
+/// to right.
+fn build_from_clause(
     cat: &Catalog,
     fns: &Fns,
-    from: &'a [TableWithJoins],
+    from: &[TableWithJoins],
+    outer: &[Binding],
+) -> Result<(Scope, Value)> {
+    let base = Scope::outer_width(outer);
+    let mut binds: Vec<Binding> = Vec::new();
+    let mut offset = base;
+    let mut merged: Vec<String> = Vec::new();
+    let mut merged_outer = false;
+    let mut coalesced: Vec<String> = Vec::new();
+    let mut rel: Option<Value> = None;
+
+    for item in from {
+        let f = join_tree_factor(cat, fns, item, offset, outer)?;
+        offset += f.width();
+        merged.extend(f.merged);
+        merged_outer |= f.merged_outer;
+        coalesced.extend(f.coalesced);
+        binds.extend(f.binds);
+        rel = Some(match rel {
+            None => f.rel,
+            Some(left) => {
+                let cond = json!({ "operator": "TRUE", "operand": [], "type": "BOOLEAN" });
+                json!({ "join": { "condition": cond, "left": left, "right": f.rel, "kind": "INNER" } })
+            }
+        });
+    }
+    let inner_count = binds.len();
+    binds.extend(outer.iter().cloned()); // outer appended for correlated resolution only
+    let scope = Scope { binds, inner_count, base, merged, merged_outer, coalesced };
+    Ok((scope, rel.expect("non-empty FROM")))
+}
+
+/// One FROM item's join tree (a factor and the joins that follow it), lowered on its own against
+/// the enclosing context, as a factor whose row starts at `offset`.
+///
+/// Its `ON` conditions and `USING` lists may name only its own tables, since Postgres hides the
+/// item's FROM siblings from them, and its relation numbers its columns from the enclosing width,
+/// like every other join input. Its bindings then move to where its columns sit in the enclosing
+/// row. Both a comma item and a parenthesized join are lowered this way.
+fn join_tree_factor(
+    cat: &Catalog,
+    fns: &Fns,
+    item: &TableWithJoins,
+    offset: usize,
+    outer: &[Binding],
+) -> Result<Factor> {
+    let (inner, rel) = build_join_tree(cat, fns, item, outer)?;
+    let shift = offset - Scope::outer_width(outer);
+    let binds = inner.inner().iter().map(|b| Binding { offset: b.offset + shift, ..b.clone() }).collect();
+    Ok(Factor { binds, rel, merged: inner.merged, merged_outer: inner.merged_outer, coalesced: inner.coalesced })
+}
+
+/// The scope and relation of one FROM item's join tree, numbered from the enclosing width: its
+/// first factor, then each join in turn, as a left-deep chain (factors may be base tables, derived
+/// tables or parenthesized joins).
+fn build_join_tree<'a>(
+    cat: &Catalog,
+    fns: &Fns,
+    item: &'a TableWithJoins,
     outer: &[Binding],
 ) -> Result<(Scope, Value)> {
     let base = Scope::outer_width(outer);
@@ -1368,49 +1504,46 @@ fn build_from_clause<'a>(
     let mut merged_outer = false;
     let mut coalesced: Vec<String> = Vec::new();
 
-    for item in from {
-        let f = from_factor(cat, fns, &item.relation, offset, outer)?;
+    let f = from_factor(cat, fns, &item.relation, offset, outer)?;
+    offset += f.width();
+    merged.extend(f.merged);
+    merged_outer |= f.merged_outer;
+    coalesced.extend(f.coalesced);
+    binds.extend(f.binds);
+    leaves.push(f.rel);
+    steps.push(Step { on: None, kind: "INNER", precomputed: None, upto: binds.len() });
+    for j in &item.joins {
+        let f = from_factor(cat, fns, &j.relation, offset, outer)?;
         offset += f.width();
+        let (kind, cond) = join_op(&j.join_operator)?;
+        // `USING` is resolved here, against the bindings as they stand: its names are looked up
+        // on the left of this join and on the factor being added, not through the whole scope.
+        let (on, precomputed) = match cond {
+            JoinCond::On(e) => (Some(e), None),
+            JoinCond::Always => (None, None),
+            JoinCond::Using(cols) => {
+                // A name a `RIGHT` or `FULL` join has merged is a coalesce of its two sides,
+                // which `using_condition` would read as whichever binding has the name first.
+                if cols.iter().any(|c| coalesced.contains(c) || f.coalesced.contains(c)) {
+                    return Err(unsupported("JOIN ... USING a column a RIGHT or FULL join already merged"));
+                }
+                let c = using_condition((&binds, &merged), (&f.binds, &f.merged), &cols)?;
+                if kind != "INNER" {
+                    merged_outer = true;
+                }
+                if matches!(kind, "RIGHT" | "FULL") {
+                    coalesced.extend(cols.iter().cloned());
+                }
+                merged.extend(cols);
+                (None, Some(c))
+            }
+        };
         merged.extend(f.merged);
         merged_outer |= f.merged_outer;
         coalesced.extend(f.coalesced);
         binds.extend(f.binds);
         leaves.push(f.rel);
-        // First of item: a cross join, unless it is the very first.
-        steps.push(Step { on: None, kind: "INNER", precomputed: None, upto: binds.len() });
-        for j in &item.joins {
-            let f = from_factor(cat, fns, &j.relation, offset, outer)?;
-            offset += f.width();
-            let (kind, cond) = join_op(&j.join_operator)?;
-            // `USING` is resolved here, against the bindings as they stand: its names are looked up
-            // on the left of this join and on the factor being added, not through the whole scope.
-            let (on, precomputed) = match cond {
-                JoinCond::On(e) => (Some(e), None),
-                JoinCond::Always => (None, None),
-                JoinCond::Using(cols) => {
-                    // A name a `RIGHT` or `FULL` join has merged is a coalesce of its two sides,
-                    // which `using_condition` would read as whichever binding has the name first.
-                    if cols.iter().any(|c| coalesced.contains(c) || f.coalesced.contains(c)) {
-                        return Err(unsupported("JOIN ... USING a column a RIGHT or FULL join already merged"));
-                    }
-                    let c = using_condition(&binds, &f.binds, &cols)?;
-                    if kind != "INNER" {
-                        merged_outer = true;
-                    }
-                    if matches!(kind, "RIGHT" | "FULL") {
-                        coalesced.extend(cols.iter().cloned());
-                    }
-                    merged.extend(cols);
-                    (None, Some(c))
-                }
-            };
-            merged.extend(f.merged);
-            merged_outer |= f.merged_outer;
-            coalesced.extend(f.coalesced);
-            binds.extend(f.binds);
-            leaves.push(f.rel);
-            steps.push(Step { on, kind, precomputed, upto: binds.len() });
-        }
+        steps.push(Step { on, kind, precomputed, upto: binds.len() });
     }
     let inner_count = binds.len();
     binds.extend(outer.iter().cloned()); // outer appended for correlated resolution only
@@ -1432,16 +1565,14 @@ fn build_from_clause<'a>(
             }
         });
     }
-    Ok((scope, rel.expect("non-empty FROM")))
+    Ok((scope, rel.expect("a join tree has a first factor")))
 }
 
 /// One FROM factor, lowered.
 ///
-/// A parenthesized join is lowered on its own, against the enclosing context. Its `ON` conditions
-/// may name only its own tables, since Postgres hides the factor's FROM siblings from them, and its
-/// relation numbers its columns from the enclosing width, like every other join input. Its
-/// bindings then move to where its columns sit in this row. The parentheses cannot simply be
-/// dropped: `a LEFT JOIN (b JOIN c ON p) ON q` is not `(a LEFT JOIN b ON q) JOIN c ON p`.
+/// A parenthesized join is lowered on its own, as [`join_tree_factor`] describes. The parentheses
+/// cannot simply be dropped: `a LEFT JOIN (b JOIN c ON p) ON q` is not
+/// `(a LEFT JOIN b ON q) JOIN c ON p`.
 fn from_factor(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, outer: &[Binding]) -> Result<Factor> {
     let TableFactor::NestedJoin { table_with_joins, alias } = tf else {
         let (b, rel) = factor_instance(cat, fns, tf, offset, outer)?;
@@ -1453,10 +1584,7 @@ fn from_factor(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, outer:
     if alias.is_some() {
         return Err(unsupported("parenthesized join with an alias"));
     }
-    let (inner, rel) = build_from_clause(cat, fns, std::slice::from_ref(table_with_joins.as_ref()), outer)?;
-    let shift = offset - Scope::outer_width(outer);
-    let binds = inner.inner().iter().map(|b| Binding { offset: b.offset + shift, ..b.clone() }).collect();
-    Ok(Factor { binds, rel, merged: inner.merged, merged_outer: inner.merged_outer, coalesced: inner.coalesced })
+    join_tree_factor(cat, fns, table_with_joins, offset, outer)
 }
 
 /// A single FROM relation factor -> (binding with output columns, leaf relation Value).
@@ -1553,8 +1681,11 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             }
             let (rel, out_cols) = lower_query_ctx(cat, fns, subquery, outer)?;
             let a = alias.as_ref().ok_or_else(|| schema("derived table requires an alias"))?;
-            let cols = if a.columns.is_empty() {
-                out_cols
+            let cols: OutCols = if a.columns.is_empty() {
+                // Output names keep a quoted alias's case (see [`fold_name`]), but a reference into
+                // the binding is looked up lower-cased ([`Scope::try_resolve`]), so the binding
+                // takes them lower-cased, as it did before output names kept their case.
+                out_cols.into_iter().map(|(n, t)| (n.to_lowercase(), t)).collect()
             } else {
                 if a.columns.len() != out_cols.len() {
                     return Err(schema("derived table column-alias count mismatch"));
@@ -1619,19 +1750,36 @@ fn join_op(op: &JoinOperator) -> Result<(&'static str, JoinCond<'_>)> {
 }
 
 /// The `ON` equalities a `USING (c, ...)` stands for: `left.c = right.c` for each name, where
-/// `left` is everything joined so far and `right` is the factor being joined in (several bindings,
-/// for a parenthesized join).
-fn using_condition(left: &[Binding], right: &[Binding], cols: &[String]) -> Result<Value> {
+/// `left` is everything joined so far in this join tree and `right` is the factor being joined in
+/// (several bindings, for a parenthesized join). Each side comes with the names `USING` merged
+/// inside it.
+///
+/// Postgres requires the name to be present on each side exactly once, and raises "common column
+/// name … appears more than once" otherwise: `a JOIN b ON TRUE JOIN c USING (x)` with `x` in `a`
+/// and in `b` has no one left column to compare. A side's copies of a name are its bindings'
+/// columns of that name less one for each `USING` inside it that merged two of them into one, so
+/// `a JOIN b USING (x) JOIN c USING (x)` has one `x` on the left. When there is one, the first
+/// binding that has the name holds its value: the merge of an inner join equals both sides, and
+/// a `LEFT` join's is its left side's (a `RIGHT` or `FULL` join's coalesce is refused by the caller).
+fn using_condition(
+    (left, left_merged): (&[Binding], &[String]),
+    (right, right_merged): (&[Binding], &[String]),
+    cols: &[String],
+) -> Result<Value> {
     let mut terms: Vec<Value> = Vec::new();
     for c in cols {
-        // SQL requires the name to be present and unambiguous on each side.
-        let find = |bs: &[Binding]| -> Option<(usize, String)> {
-            bs.iter().find_map(|b| {
-                b.cols.iter().position(|(n, _)| n == c).map(|i| (b.offset + i, b.cols[i].1.clone()))
-            })
+        let find = |bs: &[Binding], merged: &[String], side: &str| -> Result<(usize, String)> {
+            let present: usize = bs.iter().map(|b| b.cols.iter().filter(|(n, _)| n == c).count()).sum();
+            let copies = present.saturating_sub(merged.iter().filter(|m| *m == c).count());
+            if copies > 1 {
+                return Err(schema(format!("common USING column {c} appears more than once on the {side}")));
+            }
+            bs.iter()
+                .find_map(|b| b.cols.iter().position(|(n, _)| n == c).map(|i| (b.offset + i, b.cols[i].1.clone())))
+                .ok_or_else(|| schema(format!("USING column {c} not on the {side}")))
         };
-        let (li, lt) = find(left).ok_or_else(|| schema(format!("USING column {c} not on the left")))?;
-        let (ri, rt) = find(right).ok_or_else(|| schema(format!("USING column {c} not on the right")))?;
+        let (li, lt) = find(left, left_merged, "left")?;
+        let (ri, rt) = find(right, right_merged, "right")?;
         terms.push(make_cmp("=", json!({ "column": li, "type": lt }), json!({ "column": ri, "type": rt })));
     }
     Ok(match terms.len() {
@@ -1653,7 +1801,7 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
         match item {
             SelectItem::UnnamedExpr(e) => out.push((expr_name(e, idx), lower_expr(cat, scope, fns, e)?)),
             SelectItem::ExprWithAlias { expr, alias } => {
-                out.push((alias.value.to_lowercase(), lower_expr(cat, scope, fns, expr)?))
+                out.push((fold_name(alias), lower_expr(cat, scope, fns, expr)?))
             }
             SelectItem::Wildcard(_) => {
                 // `USING` merges each named pair into one output column, so a bare `*` here has
@@ -1700,11 +1848,107 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
     Ok(out)
 }
 
+/// The output name of the unaliased select-list item `e` at position `idx`: the name Postgres gives
+/// it, or, where this frontend cannot tell what that is, a `$col` placeholder no key ever matches
+/// (see [`is_unnamed`]).
+///
+/// Postgres names such an item with `FigureColname`: a column reference after the column, a call
+/// after the function, a cast after what it casts when that is a column or a call (and after the
+/// type otherwise), and an operator or a constant `?column?`. The names are not decoration. A bare
+/// `ORDER BY` key is an output column when one has its name ([`resolve_order_key`]), so
+/// `SELECT x::int FROM t ORDER BY x` orders by the cast, not by `t.x`.
+///
+/// By the time this runs the tree has been through the normalizations and the cast rules, which
+/// rename some calls (`now()` is `q_op_now`, `ceiling` is `ceil`, a cast may be `qcastN(..)` or gone)
+/// and drop or rewrite some type names. Only shapes those passes leave recognisable are named; any
+/// other is a placeholder, and a key that could have meant it is refused.
 fn expr_name(e: &Expr, idx: usize) -> String {
+    implicit_name(e).unwrap_or_else(|| format!("$col{idx}"))
+}
+
+/// Whether an output column's name is [`expr_name`]'s placeholder for a name not known (or one of
+/// `VALUES`' columns, which Postgres names `column1`, … and this frontend does not).
+fn is_unnamed(name: &str) -> bool {
+    name.starts_with("$col")
+}
+
+/// Postgres's identity for a name: an unquoted identifier folds to lower case, a quoted one is kept
+/// as written, so `A`, `a` and `"a"` are one name and `"A"` is another. The fold is ASCII-only, as
+/// Postgres's is under a multibyte server encoding.
+fn fold_name(id: &sqlparser::ast::Ident) -> String {
+    match id.quote_style {
+        Some(_) => id.value.clone(),
+        None => id.value.to_ascii_lowercase(),
+    }
+}
+
+/// [`expr_name`]'s `FigureColname`, for the shapes it can still read; `None` for the rest.
+fn implicit_name(e: &Expr) -> Option<String> {
+    use BinaryOperator::*;
+    const OPERATOR: &str = "?column?";
     match e {
-        Expr::Identifier(id) => id.value.to_lowercase(),
-        Expr::CompoundIdentifier(p) => p.last().unwrap().value.to_lowercase(),
-        _ => format!("$col{idx}"),
+        Expr::Nested(x) => implicit_name(x),
+        Expr::Value(v) => matches!(
+            v.value,
+            SqlValue::Number(..) | SqlValue::SingleQuotedString(_) | SqlValue::Boolean(_) | SqlValue::Null
+        )
+        .then(|| OPERATOR.to_string()),
+        // `OVERLAPS` is a call to `overlaps` in Postgres's grammar, so it is not in this list.
+        Expr::BinaryOp {
+            op: Plus | Minus | Multiply | Divide | Modulo | StringConcat | Gt | Lt | GtEq | LtEq | Eq | NotEq | And | Or,
+            ..
+        }
+        | Expr::UnaryOp { op: UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus, .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::IsDistinctFrom(..)
+        | Expr::IsNotDistinctFrom(..)
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::AnyOp { .. }
+        | Expr::AllOp { .. } => Some(OPERATOR.to_string()),
+        _ => call_or_column_name(e),
+    }
+}
+
+/// The name of a column reference or a call — what Postgres calls a strong name, the kind a cast
+/// passes through. A cast over anything else is named after its type, which the cast rules may have
+/// rewritten, so it has no name here.
+fn call_or_column_name(e: &Expr) -> Option<String> {
+    use sqlparser::ast::CastKind;
+    match e {
+        Expr::Nested(x) => call_or_column_name(x),
+        Expr::Identifier(id) => Some(fold_name(id)),
+        Expr::CompoundIdentifier(p) => p.last().map(fold_name),
+        Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr, .. } => call_or_column_name(expr),
+        Expr::Function(f) => {
+            let [.., last] = &f.name.0[..] else { return None };
+            let name = fold_name(last.as_ident()?);
+            // Cast rule 5b's wrapper (`casts.rs`): the cast it stands for, over its one operand.
+            if name.strip_prefix("qcast").is_some_and(|n| n.parse::<u32>().is_ok()) {
+                let FunctionArguments::List(l) = &f.args else { return None };
+                return match &l.args[..] {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))] => call_or_column_name(x),
+                    _ => None,
+                };
+            }
+            // Symbols the normalizations and the parameter substitution introduce, which do not
+            // say what the query called; and `ceil`, which may have been written `ceiling`.
+            let invented = name.starts_with("q_")
+                || name.strip_prefix("qp").is_some_and(|n| n.parse::<u32>().is_ok())
+                || name == "ceil";
+            (!invented).then_some(name)
+        }
+        _ => None,
     }
 }
 
@@ -2433,7 +2677,7 @@ fn extend_with_determined(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select, k
 ///
 /// * a **qualified** name (`t.x`) never denotes an output column, so the fallback is not taken;
 /// * **two select items sharing the alias** is a resolution question with no right answer, refused
-///   exactly as [`order_key_index`] refuses the same ambiguity for `ORDER BY`;
+///   exactly as [`resolve_order_key`] refuses the same ambiguity for `ORDER BY`;
 /// * an alias over an **aggregate** is rejected by Postgres itself, so lowering it would be
 ///   lowering a query that does not run;
 /// * when the alias path also fails, the **original** error is what is reported — the fallback
@@ -2507,7 +2751,7 @@ fn lower_aggregate(cat: &Catalog, scope: &Scope, fns: &Fns, rel: Value, s: &Sele
         let e = item_expr(it).ok_or_else(|| unsupported(format!("aggregate projection item {it:?}")))?;
         let v = ag.lower_post(e)?;
         let name = match it {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.to_lowercase(),
+            SelectItem::ExprWithAlias { alias, .. } => fold_name(alias),
             _ => expr_name(e, idx),
         };
         out_cols.push((name, ty_of(&v)));

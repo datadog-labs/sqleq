@@ -380,17 +380,8 @@ const MUTANTS: &[Mutant] = &[
 
 /// Each mutant that fails today, and the issue that tracks it. See the module doc.
 const KNOWN_OPEN: &[(&str, &str)] = &[
-    ("order-by/qualify-a-key-named-like-an-output", "#46"),
-    ("order-by/requalify-a-key-across-a-join", "#46"),
-    ("order-by/qualify-a-key-named-like-a-computed-output", "#46"),
-    ("distinct-on/swap-two-output-aliases", "#46"),
-    ("distinct-on/qualify-a-key-named-like-an-output", "#46"),
-    ("from/a-comma-before-a-right-join", "#47"),
-    ("from/a-comma-before-a-full-join", "#47"),
-    ("from/a-comma-item-is-not-in-scope-of-a-later-on", "#47"),
     ("select/a-quoted-column-against-the-folded-name", "#57"),
     ("from/a-quoted-alias-against-the-folded-name", "#57"),
-    ("order-by/a-quoted-output-name-against-the-folded-key", "#57"),
 ];
 
 const CONTROLS: &[Control] = &[

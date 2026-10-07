@@ -221,11 +221,25 @@ what it is or refused:
 - **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
   two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
   coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.
+  A `USING (k)` whose left or right side has two `k` columns that no earlier `USING` merged is
+  refused, as Postgres rejects it, rather than compared with the first.
 - **An alias's column list renames by position.** In `t AS x(b, a)`, `x.b` is `t`'s first column,
   whatever that column is called. A list that leaves two columns with one name is refused.
 - **Parentheses in a `FROM` clause group.** `a LEFT JOIN (b JOIN c ON p) ON q` is lowered with its
   grouping, since it is not `(a LEFT JOIN b ON q) JOIN c ON p`, and the inner `ON` sees only the
   inner join's own tables. An aliased one, `(b JOIN c) AS x`, is refused.
+- **A comma groups too, loosest of all.** `FROM a, b RIGHT JOIN c ON p` is `a` crossed with
+  `b RIGHT JOIN c ON p`, not `(a CROSS JOIN b) RIGHT JOIN c ON p`, which keeps `c`'s rows when `a`
+  is empty. Each comma item is lowered as its own join tree, and its `ON` and `USING` see only that
+  tree's tables.
+- **An `ORDER BY` or `DISTINCT ON` key is read as Postgres reads it.** An integer is a position in
+  the select list, a bare name is the output column of that name, and anything else, a qualified
+  name like `t.a` included, is an expression over the `FROM` clause. Output columns are named as
+  Postgres names them: a quoted alias keeps its case, and an unaliased column, call, or cast of one
+  is named after the column or function. A bare key that two output columns carry is refused, and
+  so is one that matches no output name while an output column's name is one the frontend cannot
+  tell. Above a `GROUP BY` or `DISTINCT` an input expression cannot be addressed, so such a key is
+  refused unless the select list writes the same expression.
 
 ## A query that raises an error
 
