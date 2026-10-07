@@ -9,8 +9,9 @@ fork through `tools/sqlsolver/`, is kept as a **backup cross-check** and is bein
 one of the two, so comparing them takes two runs over the same pairs.
 
 Outside `--portfolio`, either one is a **second opinion**: its answer is reported beside QED's, and
-neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it.
-Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
+neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it,
+except that its proof against a `sqleq-fuzz` counterexample on the same pair is an alarm, which
+fails every run. Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
 can make a case `equivalent`, and the combined verdict decides the exit code. Under `--expect
 pinned`, its pin is checked like every axis's, so a moved answer fails the run. The point of having
 it is that provers of different construction, reading the same IR, check each other — see

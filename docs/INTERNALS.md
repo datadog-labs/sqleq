@@ -33,6 +33,7 @@ statements against DuckDB looking for a counterexample and uses no part of the f
 | `tests/temporal.rs` | DATE/TIME/TIMESTAMP/TIMESTAMPTZ/INTERVAL kept apart in the IR, and every crossing between them named |
 | `tests/depth.rs` | long and deeply nested predicates stay within a prover's nesting limit |
 | `tests/reflexive.rs` | the reflexivity check: that it reaches past a lowering refusal, and never widens one into a proof |
+| `tests/resolution.rs` | name resolution, metamorphically: seed queries and mutants that change what a name resolves to must not meet, and mutants that keep it must still lower |
 | `tests/doc_links.rs` | every relative link in every Markdown file resolves |
 | `tests/pairs/` | pinned pairs: known truth, each axis's last answer, run by `sqleq-check --expect pinned` ([README](../tests/pairs/README.md)) |
 

@@ -14,19 +14,26 @@
 //! A rewrite here is a no-op whenever the statement does not parse or the construct is absent. That
 //! fallback is what makes the module safe to sit in the hot path: a pair we cannot rewrite is left
 //! exactly as it arrived, which is the behaviour it had before.
+//!
+//! The one exception is [`postgres_operators`], whose rewrite is what keeps a comparison sound rather
+//! than merely runnable: where it cannot place its edit it says so, and the pair gets no verdict.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, ObjectName, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, Spanned, Statement, Visit, VisitMut, Visitor,
-    VisitorMut,
+    ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Spanned, Statement, UnaryOperator, Value, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
+use sqlparser::tokenizer::{Location, Span, Token};
+
+use crate::lex::{is_literal_token, lex, significant, Tok};
+use crate::schema::BARE_NUMERIC;
 
 /// Byte offset of a 1-based (line, char-column) [`Location`].
 ///
@@ -211,8 +218,8 @@ impl Visitor for JsonOps {
 /// This is neither hypothetical nor a hygiene nit. Pairs with the shape on one side and not the
 /// other have been observed as refutations, and among them pairs a prover independently calls
 /// equivalent — the soundness-alarm cell of the cross-tab, reached from the disproving side. So it
-/// is a false-refutation channel. The pass is not wired into `test_pair` yet; doing so changes
-/// verdicts and needs the cross-check re-run.
+/// is a false-refutation channel, and `test_pair` runs this pass on both sides before anything
+/// reaches DuckDB.
 ///
 /// The parenthesization is read off the **Postgres** parse, not guessed: the span of a
 /// [`BinaryOperator::Arrow`] / [`BinaryOperator::LongArrow`] node is by construction the operand
@@ -325,87 +332,102 @@ impl VisitorMut for Denest {
 /// cast target the token scan missed, so the scan can stay simple — and a statement the check rejects
 /// keeps the single-precision reading it had before, which costs a verdict at worst.
 pub fn double_precision_floats(sql: &str) -> String {
+    respell_cast_targets(sql, &[Keyword::FLOAT], "DOUBLE", double_the_float)
+}
+
+/// Rewrite every bare `numeric` / `decimal` cast target to a wide DECIMAL: `x::numeric` →
+/// `x::DECIMAL(38,18)`, and likewise under `CAST(.. AS ..)` and with `[]`.
+///
+/// **Postgres's `numeric` with no typmod keeps every digit; DuckDB reads a bare `DECIMAL` as
+/// `DECIMAL(18,3)`,** so `CAST(a * 0.0001 AS numeric) > 0` is false at `a = 2` in DuckDB and true in
+/// Postgres. [`BARE_NUMERIC`] is the width the generated columns use for the same type, and why it is
+/// wide enough is documented there. `numeric(p, s)` already means the same in both engines and is
+/// left alone. Found and checked exactly as [`double_precision_floats`] is.
+pub fn wide_numerics(sql: &str) -> String {
+    let wide = format!("DECIMAL({},{})", BARE_NUMERIC.0, BARE_NUMERIC.1);
+    respell_cast_targets(
+        sql,
+        &[Keyword::NUMERIC, Keyword::DECIMAL, Keyword::DEC],
+        &wide,
+        widen_the_numeric,
+    )
+}
+
+/// Replace every unquoted cast-target word in `words` -- one right after `::` or `AS`, with no
+/// `(precision)` after it -- by `replacement`, and keep the result only if it parses to exactly the
+/// input's tree with `retype` applied to every cast's type.
+fn respell_cast_targets(
+    sql: &str,
+    words: &[Keyword],
+    replacement: &str,
+    retype: fn(&mut DataType),
+) -> String {
     let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
         return sql.to_string();
     };
-    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location() else {
+    let Some(toks) = significant(sql) else {
         return sql.to_string();
     };
-    let words: Vec<_> = tokens
-        .iter()
-        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
-        .collect();
-    // An unquoted `FLOAT` right after `::` or `AS`, with no `(precision)` after it.
-    let mut starts = Vec::new();
-    for (i, t) in words.iter().enumerate() {
+    let mut spans = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
         let Token::Word(w) = &t.token else { continue };
-        if w.keyword != Keyword::FLOAT || w.quote_style.is_some() {
+        if !words.contains(&w.keyword) || w.quote_style.is_some() {
             continue;
         }
         let cast_target = i > 0
-            && match &words[i - 1].token {
+            && match &toks[i - 1].token {
                 Token::DoubleColon => true,
                 Token::Word(prev) => prev.keyword == Keyword::AS,
                 _ => false,
             };
-        let precision = matches!(words.get(i + 1).map(|n| &n.token), Some(Token::LParen));
+        let precision = matches!(toks.get(i + 1).map(|n| &n.token), Some(Token::LParen));
         if cast_target && !precision {
-            let Some(b) = byte_of(sql, t.span.start) else {
-                return sql.to_string();
-            };
-            starts.push(b);
+            spans.push((t.start, t.end));
         }
     }
-    if starts.is_empty() {
+    if spans.is_empty() {
         return sql.to_string();
     }
 
-    let mut out = String::with_capacity(sql.len() + starts.len());
+    let mut out = String::with_capacity(sql.len() + spans.len() * replacement.len());
     let mut cur = 0;
-    for &b in &starts {
-        let e = b + "float".len();
-        if b < cur
-            || !sql
-                .get(b..e)
-                .is_some_and(|w| w.eq_ignore_ascii_case("float"))
-        {
-            return sql.to_string();
-        }
+    for &(b, e) in &spans {
         out.push_str(&sql[cur..b]);
-        out.push_str("DOUBLE");
+        out.push_str(replacement);
         cur = e;
     }
     out.push_str(&sql[cur..]);
 
     match Parser::parse_sql(&PostgreSqlDialect {}, &out) {
-        Ok(after) if after == retyped(&stmts) => out,
+        Ok(after) if after == retyped(&stmts, retype) => out,
         _ => sql.to_string(),
     }
 }
 
-/// The parse with every bare-`float` cast target made `DOUBLE` — what [`double_precision_floats`]
-/// claims its output parses to. `float(p)` is left alone, as the rewrite leaves it.
-fn retyped(stmts: &[Statement]) -> Vec<Statement> {
+/// The parse with `retype` applied to every cast's type — what [`respell_cast_targets`] claims its
+/// output parses to.
+fn retyped(stmts: &[Statement], retype: fn(&mut DataType)) -> Vec<Statement> {
     let mut out = stmts.to_vec();
     for st in &mut out {
-        let _ = VisitMut::visit(st, &mut Retype);
+        let _ = VisitMut::visit(st, &mut Retype(retype));
     }
     out
 }
 
-struct Retype;
+struct Retype(fn(&mut DataType));
 
 impl VisitorMut for Retype {
     type Break = ();
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
         if let Expr::Cast { data_type, .. } = expr {
-            double_the_float(data_type);
+            (self.0)(data_type);
         }
         ControlFlow::Continue(())
     }
 }
 
+/// `float` → `DOUBLE`, through any array wrapping. `float(p)` is left alone, as the rewrite leaves it.
 fn double_the_float(t: &mut DataType) {
     match t {
         DataType::Float(ExactNumberInfo::None) => *t = DataType::Double(ExactNumberInfo::None),
@@ -417,6 +439,488 @@ fn double_the_float(t: &mut DataType) {
         ) => double_the_float(inner),
         _ => {}
     }
+}
+
+/// A bare `numeric`/`decimal`/`dec` → `DECIMAL(38,18)`, through any array wrapping.
+fn widen_the_numeric(t: &mut DataType) {
+    match t {
+        DataType::Numeric(ExactNumberInfo::None)
+        | DataType::Decimal(ExactNumberInfo::None)
+        | DataType::Dec(ExactNumberInfo::None) => {
+            *t = DataType::Decimal(ExactNumberInfo::PrecisionAndScale(
+                BARE_NUMERIC.0 as u64,
+                BARE_NUMERIC.1 as i64,
+            ))
+        }
+        DataType::Array(
+            ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::Parenthesis(inner)
+            | ArrayElemTypeDef::Qualified(inner, _),
+        ) => widen_the_numeric(inner),
+        _ => {}
+    }
+}
+
+/// Drop a leading `public.` from every qualified name: `public.t` → `t`, `public.t.c` → `t.c`.
+///
+/// Under Postgres's default `search_path` (`"$user", public`) a bare `t` *is* `public.t`, so a pair
+/// may spell one table both ways. DuckDB has no `public` schema to resolve either to; creating one
+/// beside `main` would make the two spellings two tables, and in a mutation pair the side that wrote
+/// through one of them would leave the other untouched -- a difference Postgres does not have. With
+/// the qualifier gone both spellings are the table `t`, which is what they meant.
+///
+/// Found on the token stream, so `'public.t'` in a literal stays, and only where `public` is the
+/// first part of a dotted name (not `x.public.t`). Kept only if the statement still parses.
+pub fn strip_public(sql: &str) -> String {
+    let Some(toks) = significant(sql) else {
+        return sql.to_string();
+    };
+    let is_public = |t: &Tok| match &t.token {
+        Token::Word(w) => match w.quote_style {
+            None => w.value.eq_ignore_ascii_case("public"),
+            Some('"') => w.value == "public",
+            Some(_) => false,
+        },
+        _ => false,
+    };
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for i in 0..toks.len() {
+        let after_dot = i > 0 && matches!(toks[i - 1].token, Token::Period);
+        if !after_dot
+            && is_public(&toks[i])
+            && matches!(toks.get(i + 1).map(|t| &t.token), Some(Token::Period))
+            && matches!(toks.get(i + 2).map(|t| &t.token), Some(Token::Word(_)))
+        {
+            cuts.push((toks[i].start, toks[i + 1].end));
+        }
+    }
+    if cuts.is_empty() || Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err() {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut cur = 0;
+    for (b, e) in cuts {
+        out.push_str(&sql[cur..b]);
+        cur = e;
+    }
+    out.push_str(&sql[cur..]);
+    match Parser::parse_sql(&PostgreSqlDialect {}, &out) {
+        Ok(_) => out,
+        Err(_) => sql.to_string(),
+    }
+}
+
+/// The macro a divisor is wrapped in so that a zero raises (see [`postgres_operators`]).
+pub const NONZERO: &str = "sqleq_nonzero";
+/// The macros a regular expression is wrapped in so that DuckDB's full match finds it anywhere in the
+/// string, as Postgres's `~` does; the second also makes it case-insensitive, for `~*`.
+pub const PARTIAL: &str = "sqleq_partial";
+pub const IPARTIAL: &str = "sqleq_ipartial";
+
+/// Make DuckDB evaluate the operators whose meaning it does not share with Postgres as Postgres does,
+/// or say why it cannot: `Err` carries the reason the pair gets no verdict.
+///
+/// * **A zero divisor raises.** Postgres raises `division by zero` for `/`, `%` and `mod()` on every
+///   numeric type; DuckDB answers NULL, `inf` or `NaN`. A trial in which one side raises is skipped,
+///   so it never takes part in a comparison -- but only if it raises. So every divisor that is not a
+///   non-zero literal is wrapped in [`NONZERO`], a macro that returns its argument unchanged (type
+///   included) and raises on a zero.
+/// * **`~` matches anywhere.** Postgres's `~`, `~*`, `!~` and `!~*` search for the pattern; DuckDB's
+///   `~` is a full match and it has no `~*` at all. The pattern is wrapped in [`PARTIAL`] (or
+///   [`IPARTIAL`], with `~*` becoming `~`), which turns `p` into `(?s).*(?:p).*`: a full match of that
+///   is a match of `p` anywhere, with `.` matching a newline as in Postgres's default mode.
+/// * **`SIMILAR TO` is refused**, and so is a regex operator under `ANY`/`ALL`. DuckDB reads a
+///   `SIMILAR TO` pattern as a bare regular expression, with no `%` or `_` wildcards; translating it
+///   the way Postgres does (`similar_to_escape`) is a translation of the pattern language, not a
+///   rename, so a pair using it is withheld.
+///
+/// Each edit wraps an operand in a call. The operand is found by parsing it again, with sqlparser's
+/// own grammar, from the token after its operator at that operator's precedence -- sqlparser's spans
+/// do not cover a cast's type, so they cannot say where an operand like `b::int` ends. The result
+/// must then parse to exactly the input's tree with each such operand wrapped; anything else, and a
+/// statement that does not parse but whose tokens show one of these operators, withholds the pair.
+pub fn postgres_operators(sql: &str) -> Result<String, String> {
+    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return match significant(sql) {
+            Some(toks) if toks.iter().any(|t| risky_token(&t.token)) => {
+                Err("a division or a regex match in a statement that does not parse".to_string())
+            }
+            _ => Ok(sql.to_string()),
+        };
+    };
+    let mut found = Operands::default();
+    for st in &stmts {
+        let _ = st.visit(&mut found);
+    }
+    if let Some(why) = found.refused {
+        return Err(why);
+    }
+    if found.sites == 0 {
+        return Ok(sql.to_string());
+    }
+    let unplaced = || "a divisor or regex pattern whose extent could not be found".to_string();
+    let toks = lex(sql).ok_or_else(unplaced)?;
+
+    let mut edits: Vec<Edit> = Vec::new();
+    for i in 0..toks.len() {
+        let kind = match &toks[i].token {
+            Token::Div | Token::Mod => Kind::Divisor,
+            Token::Tilde | Token::ExclamationMarkTilde => Kind::Pattern { insensitive: false },
+            Token::TildeAsterisk | Token::ExclamationMarkTildeAsterisk => {
+                Kind::Pattern { insensitive: true }
+            }
+            Token::Word(w) if w.value.eq_ignore_ascii_case("mod") && w.quote_style.is_none() => {
+                if let Some(e) = mod_divisor(&toks, i).map_err(|_| unplaced())? {
+                    edits.extend(e);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        // A prefix `~` is bitwise NOT, not a regex match: it follows no operand.
+        if matches!(kind, Kind::Pattern { .. }) && !follows_operand(&toks, i) {
+            continue;
+        }
+        let prec = Parser::new(&PostgreSqlDialect {})
+            .with_tokens_with_locations(toks[i..].iter().map(Tok::with_span).collect())
+            .get_next_precedence()
+            .map_err(|_| unplaced())?;
+        let (operand, first, last) = parse_operand(&toks, i + 1, Some(prec)).ok_or_else(unplaced)?;
+        if matches!(kind, Kind::Divisor) && nonzero_literal(&operand) {
+            continue;
+        }
+        let wrapper = match kind {
+            Kind::Divisor => NONZERO,
+            Kind::Pattern { insensitive: false } => PARTIAL,
+            Kind::Pattern { insensitive: true } => IPARTIAL,
+        };
+        if let Kind::Pattern { insensitive: true } = kind {
+            let plain = if toks[i].token == Token::TildeAsterisk { "~" } else { "!~" };
+            edits.push(Edit::new(toks[i].start, toks[i].end, plain, 1));
+        }
+        edits.push(Edit::new(toks[first].start, toks[first].start, &format!("{wrapper}("), 2));
+        edits.push(Edit::new(toks[last].end, toks[last].end, ")", 0));
+    }
+    let out = splice(sql, edits).ok_or_else(unplaced)?;
+    let expected: Vec<Statement> = {
+        let mut e = stmts.clone();
+        for st in &mut e {
+            let _ = VisitMut::visit(st, &mut Wrap);
+        }
+        e
+    };
+    match Parser::parse_sql(&PostgreSqlDialect {}, &out) {
+        Ok(after) if denested(&after) == denested(&expected) => Ok(out),
+        _ => Err(unplaced()),
+    }
+}
+
+/// Parse one operand starting at token `from`: at `prec` (the right operand of a binary operator) or,
+/// with `None`, as a whole expression (a function argument). Returns it with the indices of its first
+/// and last tokens.
+fn parse_operand(toks: &[Tok], from: usize, prec: Option<u8>) -> Option<(Expr, usize, usize)> {
+    let mut p = Parser::new(&PostgreSqlDialect {})
+        .with_tokens_with_locations(toks.get(from..)?.iter().map(Tok::with_span).collect());
+    let e = match prec {
+        Some(prec) => p.parse_subexpr(prec).ok()?,
+        None => p.parse_expr().ok()?,
+    };
+    let first = (from..toks.len()).find(|&k| !toks[k].is_blank())?;
+    let last = (first..from + p.index()).rev().find(|&k| !toks[k].is_blank())?;
+    Some((e, first, last))
+}
+
+/// For a `mod` token at `i`: if it is a call `mod(n, d)`, the edits that guard `d` (none when `d` is a
+/// non-zero literal); `Ok(None)` when it is not a call; `Err` when it is one whose arguments cannot be
+/// read.
+fn mod_divisor(toks: &[Tok], i: usize) -> Result<Option<Vec<Edit>>, ()> {
+    let next = |k: usize| (k..toks.len()).find(|&j| !toks[j].is_blank());
+    let Some(open) = next(i + 1).filter(|&k| toks[k].token == Token::LParen) else {
+        return Ok(None);
+    };
+    let (_, _, n_last) = parse_operand(toks, open + 1, None).ok_or(())?;
+    let comma = next(n_last + 1).filter(|&k| toks[k].token == Token::Comma);
+    let Some(comma) = comma else {
+        return Ok(None); // not the two-argument form; the parse check settles the rest
+    };
+    let (d, first, last) = parse_operand(toks, comma + 1, None).ok_or(())?;
+    if nonzero_literal(&d) {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![
+        Edit::new(toks[first].start, toks[first].start, &format!("{NONZERO}("), 2),
+        Edit::new(toks[last].end, toks[last].end, ")", 0),
+    ]))
+}
+
+/// Whether the token before `i` ends an operand, so that a `~` at `i` is the binary regex operator
+/// rather than prefix bitwise NOT.
+fn follows_operand(toks: &[Tok], i: usize) -> bool {
+    let Some(prev) = toks[..i].iter().rev().find(|t| !t.is_blank()) else {
+        return false;
+    };
+    match &prev.token {
+        Token::RParen | Token::RBracket | Token::Number(..) | Token::Placeholder(_) => true,
+        Token::Word(w) => {
+            w.quote_style.is_some()
+                || !matches!(
+                    w.keyword,
+                    Keyword::SELECT
+                        | Keyword::WHERE
+                        | Keyword::AND
+                        | Keyword::OR
+                        | Keyword::NOT
+                        | Keyword::WHEN
+                        | Keyword::THEN
+                        | Keyword::ELSE
+                        | Keyword::ON
+                        | Keyword::HAVING
+                        | Keyword::BY
+                        | Keyword::SET
+                        | Keyword::RETURNING
+                        | Keyword::IN
+                        | Keyword::IS
+                        | Keyword::LIKE
+                        | Keyword::CASE
+                        | Keyword::VALUES
+                )
+        }
+        t => is_literal_token(t),
+    }
+}
+
+/// The tokens that betray one of [`postgres_operators`]'s operators in a statement that did not parse.
+fn risky_token(t: &Token) -> bool {
+    match t {
+        Token::Div
+        | Token::Mod
+        | Token::Tilde
+        | Token::TildeAsterisk
+        | Token::ExclamationMarkTilde
+        | Token::ExclamationMarkTildeAsterisk => true,
+        Token::Word(w) => {
+            w.quote_style.is_none()
+                && (w.keyword == Keyword::SIMILAR || w.value.eq_ignore_ascii_case("mod"))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Divisor,
+    Pattern { insensitive: bool },
+}
+
+/// What [`postgres_operators`] finds on the parse: how many operands it has to wrap, and a reason
+/// to withhold the pair instead.
+#[derive(Default)]
+struct Operands {
+    sites: usize,
+    refused: Option<String>,
+}
+
+/// A literal the divisor is known to be non-zero for, which needs no guard.
+fn nonzero_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => nonzero_literal(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => nonzero_literal(expr),
+        Expr::Value(v) => {
+            matches!(&v.value, Value::Number(n, _) if n.parse::<f64>().is_ok_and(|x| x != 0.0))
+        }
+        _ => false,
+    }
+}
+
+/// The bare (last-part, lower-cased) name of a function call, if `e` is one.
+fn call_name(e: &Expr) -> Option<String> {
+    let Expr::Function(f) = e else { return None };
+    f.name.0.last().and_then(|p| match p {
+        ObjectNamePart::Identifier(id) => Some(id.value.to_lowercase()),
+        _ => None,
+    })
+}
+
+/// The plain positional arguments of a call, if it has nothing but those.
+fn plain_args(e: &Expr) -> Option<Vec<&Expr>> {
+    let Expr::Function(f) = e else { return None };
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    list.args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Some(x),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_regex(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::PGRegexMatch
+            | BinaryOperator::PGRegexIMatch
+            | BinaryOperator::PGRegexNotMatch
+            | BinaryOperator::PGRegexNotIMatch
+    )
+}
+
+impl Visitor for Operands {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        match e {
+            Expr::SimilarTo { .. } => {
+                self.refused
+                    .get_or_insert("SIMILAR TO (its pattern language has no DuckDB counterpart)".into());
+            }
+            Expr::AnyOp { compare_op, .. } | Expr::AllOp { compare_op, .. }
+                if is_regex(compare_op) =>
+            {
+                self.refused
+                    .get_or_insert("a regex operator under ANY/ALL".into());
+            }
+            Expr::BinaryOp { op, right, .. } => {
+                let divides = matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo);
+                if (divides && !nonzero_literal(right)) || is_regex(op) {
+                    self.sites += 1;
+                }
+            }
+            e if call_name(e).as_deref() == Some("mod") => {
+                if let Some([_, d]) = plain_args(e).as_deref() {
+                    if !nonzero_literal(d) {
+                        self.sites += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// A call `name(arg)`, as the parser builds one from that text.
+fn call(name: &str, arg: Expr) -> Expr {
+    let template = format!("SELECT {name}(1)");
+    let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, &template).expect("a call parses");
+    let Statement::Query(q) = &mut stmts[0] else {
+        unreachable!("a SELECT is a query")
+    };
+    let sqlparser::ast::SetExpr::Select(sel) = &mut *q.body else {
+        unreachable!("a SELECT has a select body")
+    };
+    let SelectItem::UnnamedExpr(Expr::Function(f)) = &mut sel.projection[0] else {
+        unreachable!("the projection is the call")
+    };
+    if let FunctionArguments::List(list) = &mut f.args {
+        list.args[0] = FunctionArg::Unnamed(FunctionArgExpr::Expr(arg));
+    }
+    sel.projection.remove(0).into_expr()
+}
+
+trait IntoExpr {
+    fn into_expr(self) -> Expr;
+}
+
+impl IntoExpr for SelectItem {
+    fn into_expr(self) -> Expr {
+        match self {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => unreachable!("only called on an unnamed expression"),
+        }
+    }
+}
+
+/// The parse [`postgres_operators`] claims its output has: each guarded operand wrapped, in the same
+/// places its token walk wraps them. Post-order, so an inner operand is wrapped before the operator
+/// that contains it is looked at.
+struct Wrap;
+
+impl VisitorMut for Wrap {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if call_name(e).as_deref() == Some("mod") {
+            if let Expr::Function(f) = e {
+                if let FunctionArguments::List(list) = &mut f.args {
+                    if list.args.len() == 2 && list.duplicate_treatment.is_none() && list.clauses.is_empty() {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(d)) = &mut list.args[1] {
+                            if !nonzero_literal(d) {
+                                *d = call(NONZERO, d.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        if let Expr::BinaryOp { op, right, .. } = e {
+            match op {
+                BinaryOperator::Divide | BinaryOperator::Modulo if !nonzero_literal(right) => {
+                    **right = call(NONZERO, (**right).clone());
+                }
+                BinaryOperator::PGRegexMatch | BinaryOperator::PGRegexNotMatch => {
+                    **right = call(PARTIAL, (**right).clone());
+                }
+                BinaryOperator::PGRegexIMatch => {
+                    *op = BinaryOperator::PGRegexMatch;
+                    **right = call(IPARTIAL, (**right).clone());
+                }
+                BinaryOperator::PGRegexNotIMatch => {
+                    *op = BinaryOperator::PGRegexNotMatch;
+                    **right = call(IPARTIAL, (**right).clone());
+                }
+                _ => {}
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// A replacement of `start..end` with `text`; an insertion when the range is empty. `rank` orders
+/// edits that start at one offset: closing insertions (0), then replacements (1), then opening
+/// insertions (2) -- an operand that ends where another begins encloses neither.
+struct Edit {
+    start: usize,
+    end: usize,
+    text: String,
+    rank: u8,
+}
+
+impl Edit {
+    fn new(start: usize, end: usize, text: &str, rank: u8) -> Self {
+        Edit {
+            start,
+            end,
+            text: text.to_string(),
+            rank,
+        }
+    }
+}
+
+/// Apply non-overlapping edits; `None` if two replacements overlap or an edit is out of bounds.
+fn splice(sql: &str, mut edits: Vec<Edit>) -> Option<String> {
+    edits.sort_by_key(|e| (e.start, e.rank));
+    let mut out = String::with_capacity(sql.len() + 16 * edits.len());
+    let mut cur = 0;
+    for e in edits {
+        if e.start < cur || e.end > sql.len() || !sql.is_char_boundary(e.start) {
+            return None;
+        }
+        out.push_str(&sql[cur..e.start]);
+        out.push_str(&e.text);
+        cur = e.end;
+    }
+    out.push_str(&sql[cur..]);
+    Some(out)
 }
 
 #[cfg(test)]

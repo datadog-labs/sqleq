@@ -17,8 +17,8 @@ pair at once, under one deadline, and gives one combined verdict.
 
 A proof and a counterexample are different claims, reached by different machinery, so the paths are
 independent — which is what lets them check each other. Any pair a prover calls equivalent *and*
-`sqleq-fuzz` refutes is a bug in one of them: `--portfolio` reports it as an `alarm` and fails the
-run. See [`docs/VALIDATION.md`](docs/VALIDATION.md).
+`sqleq-fuzz` refutes is a bug in one of them: `sqleq-check` reports it as an `alarm` and fails the
+run, with or without `--portfolio`. See [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 The provers are the [QED](https://github.com/qed-solver/prover) prover, an external binary, and
 **`sqleq-solver`**, a Rust rewrite of [SQLSolver](https://github.com/SJTU-IPADS/SQLSolver)'s proof
@@ -141,8 +141,8 @@ Two consequences worth internalizing before you read any output:
   only because `sqleq-fuzz` independently refuted it. A prover's silence is a statement about its
   reach, not about your queries.
 
-Exit codes: `0` the `--expect` policy is satisfied, `1` it is not (and under `--portfolio`, any
-`alarm`), `2` a usage or setup error such as a missing backend, `130`/`143` interrupted.
+Exit codes: `0` the `--expect` policy is satisfied, `1` it is not (and any `alarm`, whatever the
+policy), `2` a usage or setup error such as a missing backend, `130`/`143` interrupted.
 
 ## What it supports
 
