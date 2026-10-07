@@ -325,7 +325,7 @@ fn demoted(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
 /// whether two queries agree for every database state, the clock is part of that state, and a
 /// constant symbol shared by both sides asks exactly that. `clock_timestamp()` and `random()` fail the
 /// test — they move during one query — and stay refused by [`lower`][crate::lower]'s
-/// `NONDETERMINISTIC`, which is why they are absent here.
+/// `VOLATILE_FUNCTIONS`, which is why they are absent here.
 ///
 /// Spellings share a symbol only where Postgres makes them the same value. `now()`,
 /// `current_timestamp` and `transaction_timestamp()` are one value under three names and are unified;
@@ -1192,8 +1192,10 @@ impl VisitorMut for ClearLocks {
 ///
 /// **Multiple uses.** Inlining a binding used N times evaluates its body N times, and that is the
 /// same value each time: [`lower`][crate::lower] refuses every function whose result can differ
-/// between two calls with equal arguments (`random`, `nextval`, `clock_timestamp` — see its
-/// `NONDETERMINISTIC`). With those gone, "how many times" is not an observable.
+/// between two calls with equal arguments (`random`, `nextval`, `clock_timestamp` — see
+/// [`VOLATILE_FUNCTIONS`][crate::VOLATILE_FUNCTIONS]). With those gone, "how many times" is not an
+/// observable. [`reflexive`][crate::reflexive] compares trees without lowering them, so it declines
+/// a pair where this would duplicate such a call.
 ///
 /// **`MATERIALIZED`.** Same argument. The hint controls whether the planner evaluates the body once
 /// into a temporary or folds it into each use; for a body whose value is a function of the input
