@@ -41,8 +41,10 @@ equivalence.
 `--engine postgres`, the default, runs both statements on PostgreSQL itself, so there is nothing
 to emulate: what Postgres computes is the answer. `--engine duckdb` runs them on DuckDB instead,
 made to compute as Postgres does by the rules [below](#soundness-rules-a-false-positive-is-a-bug).
-The Postgres engine starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, or the
-`postgres` on `PATH`; any other major version is refused — serves it on a unix socket in a fresh
+The Postgres engine starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, else
+the PostgreSQL the build fetched (a digest-pinned prebuilt PostgreSQL 17 for Linux and macOS on
+x86_64 and arm64, unless `SQLEQ_PG_DOWNLOAD=0`) if it runs there, else the `postgres` on `PATH`; any
+other major version is refused — serves it on a unix socket in a fresh
 temp directory, and stops and removes it when the run ends (or when the process is killed). The
 first run builds a template cluster under `$SQLEQ_PG_CACHE` (default `~/.cache/sqleq`); every later
 one copies it. `$SQLEQ_FUZZ_ENGINE` sets the default, which is how `sqleq-check` picks the engine.
@@ -249,8 +251,8 @@ cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 M
 cargo test  -p sqleq-fuzz               # the self-contained suite below
 ```
 
-Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says; `--engine duckdb` needs
-nothing installed.
+Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says — the build fetches one for
+the common platforms; `--engine duckdb` needs none.
 
 `sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
 the defaults below cannot move its answers. On its own:

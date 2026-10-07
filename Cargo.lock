@@ -1489,11 +1489,15 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "duckdb",
+ "flate2",
  "postgres",
  "rand",
  "regex",
  "serde_json",
+ "sha2",
  "sqlparser",
+ "tar",
+ "ureq",
 ]
 
 [[package]]

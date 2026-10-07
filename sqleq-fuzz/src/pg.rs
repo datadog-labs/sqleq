@@ -69,21 +69,53 @@ pub const MAJOR: u32 = 17;
 /// Bumped whenever what the cached template holds changes, so an old template is never reused.
 const TEMPLATE_FORMAT: u32 = 1;
 
-/// Where the Postgres binaries are: `$SQLEQ_PG_BIN`, else the directory of the `postgres` on `PATH`.
+/// Where the Postgres binaries are: `$SQLEQ_PG_BIN` when it is set, else the PostgreSQL the build
+/// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
+///
+/// The fetched one sits under `target/<profile>/postgresql/`, which this executable finds from its
+/// own directory: `target/<profile>/` for a binary, `target/<profile>/deps/` for a test harness, or
+/// wherever a binary was copied together with that `postgresql/` directory. A Linux build of it uses
+/// the system's own OpenSSL, libxml2, Kerberos, zstd and lz4, so on a machine without one of them
+/// it cannot start, and `PATH` is tried instead.
 pub fn bin_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("SQLEQ_PG_BIN") {
         return Ok(PathBuf::from(dir));
     }
+    let mut fetched_fails = None;
+    if let Some(dir) = fetched() {
+        match version(&dir) {
+            Ok(_) => return Ok(dir),
+            Err(e) => fetched_fails = Some(e),
+        }
+    }
     std::env::var_os("PATH")
         .and_then(|path| {
-            std::env::split_paths(&path).find(|d| d.join("postgres").is_file() && d.join("initdb").is_file())
+            std::env::split_paths(&path)
+                .find(|d| d.join("postgres").is_file() && d.join("initdb").is_file())
         })
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| match fetched_fails {
+            Some(e) => format!(
+                "the PostgreSQL the build fetched cannot run here ({e}), and none is on PATH: \
+                 install the libraries it needs, or set SQLEQ_PG_BIN to a PostgreSQL {MAJOR}"
+            ),
+            None => format!(
                 "no PostgreSQL {MAJOR} found: set SQLEQ_PG_BIN to the directory holding its \
                  `postgres` and `initdb`"
-            )
+            ),
         })
+}
+
+/// The `bin` directory of the PostgreSQL the build fetched, if it can be found from here.
+fn fetched() -> Option<PathBuf> {
+    let rel = option_env!("SQLEQ_PG_FETCHED")?;
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let found = [Some(dir), dir.parent()]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join(rel))
+        .find(|b| b.join("postgres").is_file());
+    found
 }
 
 /// The server's version (`17.11`), refusing any major but [`MAJOR`]: a verdict is a claim about one
@@ -93,6 +125,14 @@ pub fn version(bin: &Path) -> Result<String, String> {
         .arg("--version")
         .output()
         .map_err(|e| format!("cannot run {}: {e}", bin.join("postgres").display()))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "{} does not start: {}",
+            bin.join("postgres").display(),
+            why.lines().next().unwrap_or("").trim()
+        ));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let ver = text
         .split_whitespace()
@@ -274,7 +314,14 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
             .ok_or("no cache directory: set SQLEQ_PG_CACHE")?
             .join("sqleq"),
     };
-    let dir = cache.join(format!("pg-template-{ver}-v{TEMPLATE_FORMAT}"));
+    // Keyed by where the binaries are too: two builds of one version can be configured differently.
+    let place = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf()).hash(&mut h);
+        h.finish()
+    };
+    let dir = cache.join(format!("pg-template-{ver}-v{TEMPLATE_FORMAT}-{place:016x}"));
     if dir.join("PG_VERSION").is_file() {
         return Ok(dir);
     }
@@ -551,6 +598,11 @@ static CREATE_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static MISSING_TYPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^type "([^"]+)" does not exist"#).unwrap());
+/// An ICU collation: a provider named `icu`, a predefined `...-x-icu` collation, or an `icu_`
+/// function.
+static ICU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)provider\s*=\s*['"]?icu\b|-x-icu\b|\bicu_[a-z]"#).unwrap()
+});
 static MISSING_FUNCTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^function ([A-Za-z0-9_$.]+)\(\) does not exist").unwrap());
 
@@ -1049,6 +1101,14 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     }
     if pat::has_hard_nondet(a, b) {
         return Verdict::NondetSkip;
+    }
+    // Not every PostgreSQL 17 is built with ICU -- the one the build fetches is not -- so a pair that
+    // needs an ICU collation would get a verdict on one machine and an error on another. It gets
+    // neither, on any.
+    if [a, b, ddl].iter().any(|s| ICU.is_match(s)) {
+        return Verdict::NotComparable(
+            "an ICU collation, which not every PostgreSQL build has".to_string(),
+        );
     }
     let schema = parse_schema(ddl);
     if schema.is_empty() {
@@ -1680,6 +1740,25 @@ mod tests {
             pg_lit(&Val::List(vec![Val::Str("a\"b".into()), Val::Int(2)])),
             r#"'{"a\"b","2"}'"#
         );
+    }
+
+    #[test]
+    fn an_icu_collation_is_recognised() {
+        for s in [
+            "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+            "CREATE COLLATION c2 (PROVIDER = 'icu', LOCALE = 'de')",
+            r#"SELECT a FROM t ORDER BY a COLLATE "und-x-icu""#,
+            "SELECT icu_unicode_version()",
+        ] {
+            assert!(ICU.is_match(s), "{s}");
+        }
+        for s in [
+            "CREATE COLLATION c3 (provider = libc, locale = 'C')",
+            "SELECT unicode FROM t",
+            r#"SELECT a FROM t ORDER BY a COLLATE "C""#,
+        ] {
+            assert!(!ICU.is_match(s), "{s}");
+        }
     }
 
     #[test]
