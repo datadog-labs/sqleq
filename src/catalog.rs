@@ -12,7 +12,6 @@ use sqlparser::ast::{
     ObjectNamePart, Query, Statement, TableConstraint,
 };
 
-use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
 use crate::types::map_type;
@@ -73,10 +72,6 @@ pub struct Table {
     ///
     /// Equal to `cols.len()` on every catalog until `add_system_columns` runs.
     pub n_declared: usize,
-    /// Parallel to `cols`: each column's declared collation, [`Collation::Default`] where the DDL
-    /// names none. A column under a collation the IR cannot carry has the type
-    /// [`COLLATED`][crate::collation::COLLATED] instead; see [`crate::collation`].
-    pub collations: Vec<Collation>,
 }
 
 impl Table {
@@ -204,7 +199,6 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
 /// queries they reduce to.
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
     let mut catalog = Catalog { tables: Vec::new() };
-    let created = crate::collation::created(statements);
     for st in statements {
         let Statement::CreateTable(ct) = st else { continue };
         let tname = obj_name(&ct.name).to_lowercase();
@@ -212,13 +206,11 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let mut nullable: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
-        let mut collations: Vec<Collation> = Vec::new();
         for c in &ct.columns {
             let cname = c.name.value.to_lowercase();
-            let (cty, collation) = crate::collation::column(&c.options, map_type(&c.data_type), &created);
+            let cty = map_type(&c.data_type);
             let idx = cols.len();
             cols.push((cname, cty));
-            collations.push(collation);
             nullable.push(true);
             determined.push(row_determined(c));
             for opt in &c.options {
@@ -266,7 +258,6 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             nullable,
             row_determined: determined,
             keys,
-            collations,
         });
     }
     catalog
@@ -381,7 +372,6 @@ pub fn add_system_columns(cat: &mut Catalog, queries: &[Query]) {
             // A system column is never written, so no `INSERT` can omit it; the value is the
             // conservative one either way.
             t.row_determined.push(false);
-            t.collations.push(Collation::Default);
         }
     }
 }
