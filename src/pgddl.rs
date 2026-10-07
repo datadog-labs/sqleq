@@ -407,13 +407,17 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
 
         let mut cols: Vec<(String, String)> = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
+        let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
         let mut collations = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
-            let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
+            let rendered = format!("{}", c.data_type);
+            let ty = map_pg_type(&rendered).unwrap_or(OPAQUE);
             let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
+            // After the collation: a collated opaque column is `COLLATED`, never identity.
+            identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
             // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
             cols.push((crate::dml::fold_ident(&c.name), ty));
             collations.push(collation);
@@ -490,6 +494,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             n_declared: cols.len(),
             cols,
             nullable,
+            opaque_identity: identity,
             row_determined: determined,
             keys: seen,
             collations,
