@@ -276,7 +276,9 @@ fn insert_checked(con: &Connection, qn: &str, row: &str, unindexed: &[&Vec<Strin
 ///   one zone is a session Postgres can have, so a difference found under it is a real one.
 ///
 /// What no setting fixes is handled in the query text instead (`crate::rewrite`): a zero divisor
-/// is made to raise, a regex match is made a partial one, and a bare `numeric` cast is widened.
+/// is made to raise, a regex match is made a partial one, a `LIKE` is given Postgres's escape
+/// character, `power` and `exp` are made to raise where Postgres's do, and a bare `numeric` cast is
+/// widened. What no rewrite fixes either withholds the pair (`crate::pgtype`).
 pub fn open_db() -> duckdb::Result<Connection> {
     let config = Config::default().threads(1)?.enable_autoload_extension(false)?;
     let con = Connection::open_in_memory_with_flags(config)?;
@@ -475,8 +477,22 @@ fn ensure_types(con: &Connection, stmt: &str) {
 /// field order and drops its field names (a Postgres record has none to compare, and DuckDB names
 /// an anonymous one's fields after their expressions); a MAP is a set of entries; a fixed-size
 /// ARRAY is a LIST; a UNION is the value it holds.
+///
+/// An interval is rendered by the span Postgres's `=` compares (`interval_cmp`), a month counting as
+/// 30 days and a day as 24 hours, not by its three fields: `INTERVAL '1 day' = INTERVAL '24 hours'`
+/// in Postgres, so the two are one cell, however differently they print. Like the numbers, this can
+/// only merge cells.
 fn canon(v: &DVal) -> String {
     match v {
+        DVal::Interval {
+            months,
+            days,
+            nanos,
+        } => {
+            const DAY_NS: i128 = 86_400 * 1_000_000_000;
+            let span = (*months as i128 * 30 + *days as i128) * DAY_NS + *nanos as i128;
+            format!("Interval({span})")
+        }
         DVal::List(items) | DVal::Array(items) => {
             let mut cs: Vec<String> = items.iter().map(canon).collect();
             cs.sort();

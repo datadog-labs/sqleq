@@ -62,6 +62,12 @@ pub enum VType {
     /// unrunnable rather than merely unselective. The domain it generates from is
     /// [`crate::gen::JSONS`].
     Json,
+    /// `interval`, as DuckDB `INTERVAL`. Its name contains `INT`, which is how it used to become an
+    /// INTEGER filled with `0`, `1` and `2`. DuckDB's interval arithmetic is not Postgres's either
+    /// (under `integer_division` it has no `/` at all), so a pair that reads such a column gets no
+    /// verdict ([`crate::pair::test_pair`]); the type only has to hold the values of a table the pair
+    /// does not read.
+    Interval,
 }
 
 /// The DuckDB type a bare `numeric` (no typmod) is materialized as, as a column or as a cast target
@@ -86,6 +92,7 @@ impl VType {
             VType::Varchar => "VARCHAR".to_string(),
             VType::Uuid => "UUID".to_string(),
             VType::Json => "JSON".to_string(),
+            VType::Interval => "INTERVAL".to_string(),
         }
     }
 
@@ -366,6 +373,9 @@ fn vtype_word(base: &str) -> VType {
         VType::Timestamp
     } else if base == "DATE" {
         VType::Date
+    } else if base == "INTERVAL" {
+        // Ahead of the `INT` test below, which its name would otherwise pass.
+        VType::Interval
     } else if base.contains("INT") || base.contains("SERIAL") {
         VType::Integer
     } else if ["REAL", "DOUBLE", "FLOAT"].iter().any(|k| base.contains(k)) {

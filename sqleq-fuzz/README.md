@@ -70,25 +70,49 @@ deterministic. The rules:
   differences (which stay deterministic) are trusted — unless the cut's `ORDER BY` is provably a
   total order (it determines a row of every table through a NOT NULL key, the join's equalities and
   the columns `WHERE` pins), in which case the rows it keeps are determined and are compared whole.
+- **Ties in `DISTINCT ON` and in a window `ORDER BY`.** These choose among tied rows too: the row a
+  `DISTINCT ON` keeps per key, and the order an order-sensitive window function (`row_number`,
+  `lag`, `first_value`, a `ROWS` frame, ...) numbers or reads them in. Postgres chooses by physical
+  order, so it can choose differently on the two sides of an equivalent pair. A choice is compared
+  whole when the tied rows cannot be told apart in the result -- its order is total, or every
+  column the level's select list reads is one the tied rows agree on. Otherwise a `DISTINCT ON` at
+  the top level (or in a `UNION ALL` branch of it) is compared by cardinality, which is its number
+  of keys, and anything else makes the pair `NONDET-SKIP`.
 - **Evaluate as Postgres does, or not at all.** DuckDB's session runs with `integer_division`
   (integer `/` truncates), `default_null_order = 'postgres'` (NULLs first under `DESC`) and
   `TimeZone = 'UTC'` (not the host's), and `timestamptz` columns are DuckDB `TIMESTAMPTZ`. A divisor
   of `/`, `%` or `mod()` that is not a non-zero literal is wrapped so that a zero raises, as in
   Postgres, rather than answering `inf` or NULL: a trial in which a side raises is skipped. `~`,
-  `~*`, `!~` and `!~*` match anywhere, as Postgres's do, where DuckDB's `~` is a full match.
-  `numeric(p,s)` is `DECIMAL(p,s)`, and a bare `numeric`, as a column or a cast, is `DECIMAL(38,18)`
-  rather than a `DOUBLE` or DuckDB's `DECIMAL(18,3)`. What has no faithful rendering is withheld as
-  `NOT-COMPARABLE`: a `char(n)` column the pair reads (blank-padded comparison), `SIMILAR TO`, a
-  regex operator under `ANY`/`ALL`, and a numeric literal DuckDB reads as a number and an alias
-  (Postgres 16's `0b101`, `0o17`, `0x1F`, or `1L`). Division of a `numeric` is still a `DOUBLE` in DuckDB, so two
-  divisions Postgres computes exactly can differ in the last digits.
+  `~*`, `!~` and `!~*` match anywhere, as Postgres's do, where DuckDB's `~` is a full match. A
+  `LIKE`, `ILIKE` or `NOT` either with no `ESCAPE` clause gets `ESCAPE '\'`: Postgres's escape
+  character is a backslash, DuckDB's is none. `power`, `pow` and `exp` are renamed to macros that
+  raise where Postgres's `double precision` versions do (a zero base with a negative exponent, a
+  negative base with a fractional one, an overflow or underflow) instead of answering `inf`, `NaN`
+  or `0`. `numeric(p,s)` is `DECIMAL(p,s)`, and a bare `numeric`, as a column or a cast, is
+  `DECIMAL(38,18)` rather than a `DOUBLE` or DuckDB's `DECIMAL(18,3)`. A string literal that meets a
+  `jsonb` value -- compared with one, in an `IN` list, cast to `jsonb`, or written into a json
+  column -- is respelled the one way the generated documents are spelled (keys sorted as `jsonb`
+  sorts them, the last of duplicate keys kept, no whitespace), since DuckDB compares JSON as text.
+  What has no faithful rendering is withheld as `NOT-COMPARABLE`: a `char(n)` or `interval` column
+  the pair reads (blank-padded comparison; interval arithmetic and text DuckDB does not share),
+  `SIMILAR TO`, a regex operator under `ANY`/`ALL`, the operator spellings `~~`, `~~*`, `!~~` and
+  `!~~*` (unless their pattern escapes nothing), a numeric literal DuckDB reads as a number and an
+  alias (Postgres 16's `0b101`, `0o17`, `0x1F`, or `1L`), a division of a `numeric` (DuckDB divides a
+  `DECIMAL` into a `DOUBLE`, and Postgres's result scale can need more digits than its 38),
+  `power`, `pow` or `exp` of a `numeric` and the `^` operator, a `double precision` turned into
+  text by a cast, `||` or `concat` (DuckDB prints `2.0` and `1000000000000000.0` where Postgres
+  prints `2` and `1e+15`), a `jsonb` literal whose value has no exact spelling (a non-integer
+  number), an ordering comparison of json values, and a JSON object or array literal not in that
+  spelling where it may meet a `jsonb`. Types are read conservatively: a name the DDL and the
+  statement's aliases do not settle counts as whichever type is being guarded against.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
 - **Compare numbers by value, not by type.** A declared `bigint` is materialized as DuckDB `INTEGER`,
   so `c` and `c::bigint` come back as different DuckDB types carrying the same number, and a
   `numeric` of another scale does the same. Cells are compared by numeric value, which can only merge
   them, never split them — inside a record, a map or an array as well, where a record's field names
-  are not compared either.
+  are not compared either. An interval is compared by the span Postgres's `=` compares (a month as
+  30 days, a day as 24 hours), so `'1 day'` and `'24 hours'` are one cell.
 - **A bare `float` is `double precision`.** Postgres reads `float` as `double precision`; DuckDB
   reads it as single-precision `REAL`, so a `::float` cast would compute a different value from the
   same cast spelled `::double precision`. Bare `float` cast targets are rewritten to `DOUBLE` before
