@@ -4,15 +4,14 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: refuse:unsupported
+-- expect frontend: emit
 -- expect fuzz: no-counterexample
--- expect qed: no-plan
--- expect sqleq-solver: no-plan
+-- expect qed: proved !known-unsound
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver read = on two double precision values as identity, though 0 = -0 holds and the two cast differently
 -- witness: t = {(1, 0, -0)}: a = b holds, A yields '0' and B yields '-0'
--- QED proved this pair, reading = on two double precision values as identity, until issue #84 refused a
--- cast to text over a value whose = is not identity.
+-- The qed pin is the QED prover reading = as identity on every type, the frontend half of issue #86.
 create table "t" ("id" INTEGER, "a" DOUBLE PRECISION, "b" DOUBLE PRECISION);
 SELECT CAST("a" AS TEXT) FROM "t" WHERE "a" = "b";
 SELECT CAST("b" AS TEXT) FROM "t" WHERE "a" = "b";

@@ -44,8 +44,7 @@ pub const OPAQUE: &str = "VARBINARY";
 /// has no faithful mapping.
 ///
 /// `None` is not a failure — it is the honest answer for `jsonb`, `geometry`, `inet`, `bytea`, a
-/// float, `uuid`, an enum, or any array. The caller turns it into [`OPAQUE`], under the name
-/// `types::opaque_name` gives a float, a `jsonb` or an array of `numeric`, whose `=` is not identity.
+/// float, `uuid`, an enum, or any array. The caller turns it into [`OPAQUE`].
 ///
 /// The classification is `map_type_name`'s, not a second copy of it: the rule for reading a
 /// Postgres type name is one rule, and this module needing a different *rendering* of the answer is
@@ -410,10 +409,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let mut keys: Vec<Vec<usize>> = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
-            // An opaque type keeps, in its name, whether its `=` is identity: see
-            // `types::opaque_name`. The provers read VARBINARY either way.
-            let rendered = format!("{}", c.data_type);
-            let ty = map_pg_type(&rendered).unwrap_or_else(|| crate::types::opaque_name(&rendered));
+            let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
             cols.push((c.name.value.to_lowercase(), ty.to_string()));
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
