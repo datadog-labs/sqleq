@@ -703,19 +703,36 @@ impl<'a> Attributor<'a> {
                             }
                         }
                     }
-                    _ => return Err(schema("ambiguous unqualified column")),
+                    _ => {
+                        let by = bindings(top.base.iter().filter(|(_, t)| declares(cat, t, &col)));
+                        return Err(schema(format!(
+                            "ambiguous unqualified column {col} (declared by {by})"
+                        )));
+                    }
                 }
             }
             None => {
                 if let (0, Some(t)) = (nderiv, sole) {
                     self.record(e, &t, &col);
                 } else if nbase > 1 {
-                    return Err(schema("ambiguous unqualified column"));
+                    let of = bindings(top.base.iter());
+                    return Err(schema(format!(
+                        "ambiguous unqualified column {col} (no catalog says which of {of} declares it)"
+                    )));
                 }
             }
         }
         Ok(())
     }
+}
+
+/// In-scope base tables as the FROM clause binds them (`orders o`, or `orders` unaliased), sorted,
+/// for a refusal that has to say which tables it could not choose between.
+fn bindings<'a>(it: impl Iterator<Item = (&'a String, &'a String)>) -> String {
+    let mut v: Vec<String> =
+        it.map(|(alias, t)| if alias == t { t.clone() } else { format!("{t} {alias}") }).collect();
+    v.sort();
+    v.join(", ")
 }
 
 impl Visitor for Attributor<'_> {

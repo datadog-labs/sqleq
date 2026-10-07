@@ -810,7 +810,7 @@ impl<'s> Translator<'s> {
     /// trailing `ELSE` is always present). Guards accumulate the negation of every prior condition so
     /// exactly one branch's guard is 1 for any input, making a plain sum over `guard * branch` correct.
     fn case_value(&mut self, operand: &[Expr], scope: &Scope) -> Result<Value, TranslateError> {
-        if operand.is_empty() || operand.len() % 2 == 0 {
+        if operand.is_empty() || operand.len().is_multiple_of(2) {
             return Err(TranslateError::MalformedShape("CASE operand must be [cond, then, ..., else]".into()));
         }
         let n = (operand.len() - 1) / 2;

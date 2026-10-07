@@ -52,8 +52,8 @@ mod params;
 /// statement what it could not read rather than dropping it silently.
 pub mod pgddl;
 mod scope;
-/// Public because it is an entry point: the `--sqlsolver` mode of the CLI turns a lowered plan, or
-/// a corpus of rows, into jobs for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
+/// Public because it is an entry point: the `--sqlsolver --ir` mode of the CLI turns a lowered plan
+/// into a job for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
 pub mod sqlsolver;
 mod types;
 mod verify;
@@ -377,13 +377,6 @@ fn lowers_with_split_params(
 type ParsedInput =
     (HashMap<String, FnDecl>, catalog::Catalog, Vec<sqlparser::ast::Query>, Vec<BTreeSet<u32>>);
 
-/// Split the preprocessor `.sql` format into its function declarations, its declared catalog and its
-/// two queries. The `declare ... function` lines are a custom DSL, not SQL, so they come out first.
-///
-/// `ddl_catalog` is the caller's own schema, from [`lower_with_ddl`]; when it is given, the input's own
-/// `CREATE TABLE`s are ignored. It is resolved *here* rather than by the caller because the DML
-/// reduction needs the catalog the pair will actually be lowered against, and it runs inside this
-/// function.
 /// The head of [`parse_input`]: the `declare ... function` DSL lines split off, the rest parsed.
 ///
 /// Its own function because [`reflexive`] needs exactly this much and nothing below it. Two copies
@@ -611,6 +604,13 @@ fn normalized_pair(
     Some((it.next()?, it.next()?))
 }
 
+/// Split the preprocessor `.sql` format into its function declarations, its declared catalog and its
+/// two queries. The `declare ... function` lines are a custom DSL, not SQL, so they come out first.
+///
+/// `ddl_catalog` is the caller's own schema, from [`lower_with_ddl`]; when it is given, the input's own
+/// `CREATE TABLE`s are ignored. It is resolved *here* rather than by the caller because the DML
+/// reduction needs the catalog the pair will actually be lowered against, and it runs inside this
+/// function.
 fn parse_input(
     src: &str,
     ddl_catalog: Option<catalog::Catalog>,
@@ -619,6 +619,9 @@ fn parse_input(
     // Before anything reads the tree: sqlparser mis-parses `IS [NOT] DISTINCT FROM`, and lowering
     // the mis-parse is a false-proof channel. See `normalize`.
     normalize::fix_precedence(&mut statements)?;
+    // Also before anything reads the tree: sqlparser gives `TRY_CAST`/`SAFE_CAST` a `CAST`'s node,
+    // and every rewrite and lowering below would treat it as one.
+    casts::refuse_foreign_kinds(&statements)?;
     // Before the shape check and the placeholder passes, which see a `$N` only in an expression
     // position, and a typed literal's `DATE $1` is not one.
     normalize::desugar_special_forms(&mut statements);

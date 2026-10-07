@@ -91,6 +91,9 @@ what it is or refused:
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
   target.
+- **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
+  where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
+  it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.
 - **An array is not its element type.** An array column is opaque whatever it holds, and a cast to
   an array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
   opaque operand is a function, not text concatenation, because array `||` is not strict (`'{a}' ||
