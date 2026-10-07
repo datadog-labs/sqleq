@@ -4,15 +4,15 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: reflexive !known-unsound
+-- expect frontend: emit
 -- expect fuzz: counterexample
--- expect qed: no-plan
--- expect sqleq-solver: no-plan
+-- expect qed: no-proof
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz loaded s1.t and s2.t from one generated table, so two different tables always held the same rows
 -- witness: s1.t = {(1)}, s2.t = {(2)}: A yields 1, B yields 2
--- The frontend strips each side's schema before comparing, so it finds the two sides one query
--- (issue #48); that line stays marked until the frontend keeps the schemas apart.
+-- The frontend stripped each side's schema before comparing, so it found the two sides one query,
+-- until issue #48's fix kept the schemas apart.
 create table "s1"."t" ("a" INTEGER);
 create table "s2"."t" ("a" INTEGER);
 SELECT "a" FROM "s1"."t";

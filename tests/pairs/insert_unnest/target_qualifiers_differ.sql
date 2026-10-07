@@ -5,7 +5,7 @@
 
 -- truth: not-equivalent
 -- expect frontend: refuse:parameter-misaligned
--- expect fuzz: error
+-- expect fuzz: not-comparable
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported

@@ -388,20 +388,9 @@ const KNOWN_OPEN: &[(&str, &str)] = &[
     ("from/a-comma-before-a-right-join", "#47"),
     ("from/a-comma-before-a-full-join", "#47"),
     ("from/a-comma-item-is-not-in-scope-of-a-later-on", "#47"),
-    ("from/a-different-schema-per-side", "#48"),
-    ("from/a-different-schema-per-side-both-declared", "#48"),
     ("select/a-quoted-column-against-the-folded-name", "#57"),
     ("from/a-quoted-alias-against-the-folded-name", "#57"),
     ("order-by/a-quoted-output-name-against-the-folded-key", "#57"),
-    ("from/a-quoted-derived-column-against-the-folded-name", "#57"),
-    ("with/a-quoted-binding-name-against-the-folded-name", "#57"),
-    ("update/the-keyword-default-against-a-column-named-default", "#57"),
-    // #74. `strip_identical_pagination` drops an `ORDER BY a LIMIT 1` whose text is the same
-    // on both sides once each side's key is one of its own outputs, but `a` is the second output of
-    // one side and the first of the other: the two sides return the same bag and page it by
-    // different columns.
-    ("select/swap-two-output-aliases-under-order-by", "#74"),
-    ("select/swap-two-output-aliases-under-offset", "#74"),
 ];
 
 const CONTROLS: &[Control] = &[
@@ -466,9 +455,11 @@ const CONTROLS: &[Control] = &[
         "SELECT d.r FROM (SELECT a, b FROM t) AS d(r, q)",
         Expect::Identical,
     ),
+    // `public.t` against a bare `t` is refused, not stripped: which table a bare name reads depends on
+    // the search path (docs/SOUNDNESS.md). One qualifier spelled two ways is still one table.
     Control {
         ddl: BARE_T,
-        ..control("from/the-public-schema-against-none", "SELECT a FROM public.t", "SELECT a FROM t", Expect::Identical)
+        ..control("from/a-schema-against-its-folded-spelling", "SELECT a FROM public.t", "SELECT a FROM PUBLIC.t", Expect::Identical)
     },
     control(
         "select/a-quoted-lower-case-name-against-the-folded-name",
@@ -489,10 +480,11 @@ const CONTROLS: &[Control] = &[
         Expect::Identical,
     ),
     // A LEFT join's left side is kept whole, so it commutes with the cross join; RIGHT and FULL do not.
+    // The outputs are aliased apart: a derived table with two columns of one name is refused.
     control(
         "from/a-comma-before-a-left-join",
-        "SELECT t.id, w.id FROM t, u LEFT JOIN w ON u.a = w.x",
-        "SELECT t.id, w.id FROM (t CROSS JOIN u) LEFT JOIN w ON u.a = w.x",
+        "SELECT t.id AS tid, w.id AS wid FROM t, u LEFT JOIN w ON u.a = w.x",
+        "SELECT t.id AS tid, w.id AS wid FROM (t CROSS JOIN u) LEFT JOIN w ON u.a = w.x",
         Expect::Lowers,
     ),
     control(
