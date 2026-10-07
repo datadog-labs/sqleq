@@ -13,7 +13,8 @@
 //!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE and ALTER statements + exactly
 //!     two statements).
 //!
-//! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`. Any verdict exits 0; an
+//! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`, and `--engine duckdb|postgres`
+//! (default `$SQLEQ_FUZZ_ENGINE`, else `duckdb`; see `sqleq_fuzz::pg`). Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
 //! usage and exits 2. A panic while testing one pair is that pair's `ERROR:panic: …` verdict, and in
 //! `csv` mode the worker goes on to the next row.
@@ -25,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sqleq_fuzz::{test_pair, Config, Verdict};
+use sqleq_fuzz::{pg, test_pair, Config, Verdict};
 
 const USAGE: &str = "\
 usage:
@@ -37,12 +38,15 @@ options:
   -j, --jobs N   parallel workers (csv mode, default 1)
   --trials N     random instances per pair (default 120)
   --rows N       rows per table per instance (default 5)
-  --seed N       RNG seed (default 0)";
+  --seed N       RNG seed (default 0)
+  --engine E     where the statements run: duckdb (default; $SQLEQ_FUZZ_ENGINE overrides) or
+                 postgres, a private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = Config::default();
     let mut jobs = 1usize;
+    let mut engine = std::env::var("SQLEQ_FUZZ_ENGINE").unwrap_or_else(|_| "duckdb".to_string());
     let mut pos: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -63,6 +67,10 @@ fn main() -> ExitCode {
                 i += 1;
                 cfg.nrows = raw.get(i).and_then(|v| v.parse().ok()).unwrap_or(cfg.nrows);
             }
+            "--engine" => {
+                i += 1;
+                engine = raw.get(i).cloned().unwrap_or_default();
+            }
             "--seed" => {
                 i += 1;
                 cfg.seed = raw.get(i).and_then(|v| v.parse().ok()).unwrap_or(cfg.seed);
@@ -76,10 +84,14 @@ fn main() -> ExitCode {
         i += 1;
     }
 
+    if engine != "duckdb" && engine != "postgres" {
+        eprintln!("unknown engine {engine:?}: expected duckdb or postgres\n{USAGE}");
+        return ExitCode::from(2);
+    }
     let result = match pos.first().map(String::as_str) {
-        Some("csv") => run_csv(&pos[1..], cfg, jobs.max(1)),
-        Some("row") => run_row(&pos[1..], cfg),
-        Some("file") => run_file(&pos[1..], cfg),
+        Some("csv") => run_csv(&pos[1..], cfg, jobs.max(1), &engine),
+        Some("row") => run_row(&pos[1..], cfg, &engine),
+        Some("file") => run_file(&pos[1..], cfg, &engine),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -132,6 +144,64 @@ fn guarded(f: impl FnOnce() -> Verdict) -> Verdict {
     })
 }
 
+/// Where the pairs run: in-process DuckDB, or a private Postgres cluster with a database per worker.
+enum Runner {
+    Duck,
+    Pg(pg::Server),
+}
+
+impl Runner {
+    fn start(engine: &str, workers: usize) -> Result<Runner, String> {
+        match engine {
+            "postgres" => Ok(Runner::Pg(pg::Server::start(workers)?)),
+            _ => Ok(Runner::Duck),
+        }
+    }
+
+    /// `postgres 17.11`, for the record a verdict is a claim about; none for DuckDB, whose output is
+    /// as it always was.
+    fn engine(&self) -> Option<String> {
+        match self {
+            Runner::Duck => None,
+            Runner::Pg(s) => Some(format!("postgres {}", s.version())),
+        }
+    }
+
+    fn worker(&self, i: usize) -> Result<Worker, String> {
+        match self {
+            Runner::Duck => Ok(Worker::Duck),
+            Runner::Pg(s) => Ok(Worker::Pg(Box::new(s.worker(i)?))),
+        }
+    }
+}
+
+enum Worker {
+    Duck,
+    Pg(Box<postgres::Client>),
+}
+
+impl Worker {
+    /// The pair's verdict, and what it rests on beyond the DDL as written ([`pg::Timing::caveat`]).
+    fn test(&mut self, a: &str, b: &str, ddl: &str, cfg: Config) -> (Verdict, Option<String>) {
+        match self {
+            Worker::Duck => (guarded_test(a, b, ddl, cfg), None),
+            Worker::Pg(client) => {
+                let mut caveat = None;
+                let v = guarded(|| {
+                    let o = pg::test_pair_pg(client, a, b, ddl, cfg);
+                    caveat = o.timing.caveat();
+                    o.verdict
+                });
+                if v.label().starts_with("ERROR:panic") {
+                    // A panic can leave the pair's transaction open.
+                    let _ = client.batch_execute("ROLLBACK");
+                }
+                (v, caveat)
+            }
+        }
+    }
+}
+
 /// Where `csv` mode writes when no `out.json` is given: beside the corpus, as `<corpus>.fuzz.json`.
 /// A fixed path elsewhere would let two runs overwrite each other.
 fn default_out(corpus_path: &str) -> String {
@@ -141,7 +211,7 @@ fn default_out(corpus_path: &str) -> String {
         .into_owned()
 }
 
-fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
+fn run_csv(args: &[String], cfg: Config, jobs: usize, engine: &str) -> Result<(), String> {
     let corpus_path = args.first().ok_or("csv mode needs <corpus.csv>")?;
     let names_path = args.get(1).ok_or("csv mode needs <names.txt>")?;
     let out_path = args
@@ -150,6 +220,8 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
         .unwrap_or_else(|| default_out(corpus_path));
 
     let corpus = Arc::new(load_corpus(corpus_path)?);
+    let runner = Arc::new(Runner::start(engine, jobs)?);
+    let engine_tag = runner.engine();
     let names_txt = std::fs::read_to_string(names_path)
         .map_err(|e| format!("cannot read {names_path}: {e}"))?;
     // Each name maps to a corpus row via its trailing digits: `pairNNNN` is row NNNN.
@@ -164,17 +236,19 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
         .collect();
     let work = Arc::new(work);
 
-    // name -> (verdict label, Some((ok trials, last error)) when only some trials ran, wall ms)
-    type Row = (String, Option<(usize, String)>, u128);
+    // name -> (verdict label, Some((ok trials, last error)) when only some trials ran, wall ms,
+    // what the verdict rests on beyond the DDL)
+    type Row = (String, Option<(usize, String)>, u128, Option<String>);
     let results: Arc<Mutex<BTreeMap<String, Row>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let next = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::new();
-    for _ in 0..jobs {
+    for w in 0..jobs {
         let corpus = Arc::clone(&corpus);
         let work = Arc::clone(&work);
         let results = Arc::clone(&results);
         let next = Arc::clone(&next);
+        let mut worker = runner.worker(w)?;
         handles.push(std::thread::spawn(move || loop {
             let idx = next.fetch_add(1, Ordering::Relaxed);
             if idx >= work.len() {
@@ -182,13 +256,13 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             }
             let (name, row) = &work[idx];
             let started = std::time::Instant::now();
-            let (label, partial) = match row.and_then(|r| corpus.get(r)) {
+            let (label, partial, caveat) = match row.and_then(|r| corpus.get(r)) {
                 Some((a, b, ddl)) => {
-                    let v = guarded_test(a, b, ddl, cfg);
+                    let (v, caveat) = worker.test(a, b, ddl, cfg);
                     let p = v.partial().map(|(ok, e)| (ok, e.to_string()));
-                    (v.label(), p)
+                    (v.label(), p, caveat)
                 }
-                None => ("NO-ROW".to_string(), None),
+                None => ("NO-ROW".to_string(), None, None),
             };
             let ms = started.elapsed().as_millis();
             match &partial {
@@ -200,7 +274,7 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             results
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(name.clone(), (label, partial, ms));
+                .insert(name.clone(), (label, partial, ms, caveat));
         }));
     }
     // A worker can only die now through a defect outside `test_pair`; its unfinished rows would be
@@ -213,10 +287,16 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     let map = results.lock().unwrap_or_else(|e| e.into_inner());
     let json: serde_json::Map<String, serde_json::Value> = map
         .iter()
-        .map(|(k, (label, partial, ms))| {
+        .map(|(k, (label, partial, ms, caveat))| {
             let mut o = serde_json::Map::new();
             o.insert("verdict".to_string(), serde_json::json!(label));
             o.insert("ms".to_string(), serde_json::json!(ms));
+            if let Some(e) = &engine_tag {
+                o.insert("engine".to_string(), serde_json::json!(e));
+            }
+            if let Some(c) = caveat {
+                o.insert("caveat".to_string(), serde_json::json!(c));
+            }
             if let Some((ok, err)) = partial {
                 o.insert("ok_trials".to_string(), serde_json::json!(ok));
                 o.insert("trial_error".to_string(), serde_json::json!(err));
@@ -240,7 +320,7 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn run_row(args: &[String], cfg: Config) -> Result<(), String> {
+fn run_row(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
     let corpus_path = args.first().ok_or("row mode needs <corpus.csv>")?;
     let idx: usize = args
         .get(1)
@@ -251,11 +331,10 @@ fn run_row(args: &[String], cfg: Config) -> Result<(), String> {
     let (a, b, ddl) = corpus
         .get(idx)
         .ok_or(format!("row {idx} out of range (len {})", corpus.len()))?;
-    report(&guarded_test(a, b, ddl, cfg));
-    Ok(())
+    test_one(a, b, ddl, cfg, engine)
 }
 
-fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
+fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
     let path = args.first().ok_or("file mode needs <pair.sql>")?;
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // Drop the frontend's `declare ... function` DSL lines (not runnable SQL), then split into
@@ -286,8 +365,7 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
         ));
     }
     let ddl = ddl_parts.join(";\n");
-    report(&guarded_test(&queries[0], &queries[1], &ddl, cfg));
-    Ok(())
+    test_one(&queries[0], &queries[1], &ddl, cfg, engine)
 }
 
 /// Split a file into statements on top-level `;`, skipping semicolons inside string literals,
@@ -358,7 +436,15 @@ fn push_statement(out: &mut Vec<String>, raw: &str) {
     }
 }
 
-fn report(v: &Verdict) {
+/// Test one pair on `engine` and print its report.
+fn test_one(a: &str, b: &str, ddl: &str, cfg: Config, engine: &str) -> Result<(), String> {
+    let runner = Runner::start(engine, 1)?;
+    let (v, caveat) = runner.worker(0)?.test(a, b, ddl, cfg);
+    report(&v, runner.engine().as_deref(), caveat.as_deref());
+    Ok(())
+}
+
+fn report(v: &Verdict, engine: Option<&str>, caveat: Option<&str>) {
     println!("{}", v.label());
     if let Verdict::NotEquivalent(ce) = v {
         println!("counterexample: {ce}");
@@ -368,6 +454,12 @@ fn report(v: &Verdict) {
     // first line sees what it always saw.
     if let Some((ok, err)) = v.partial() {
         println!("partial: {ok} trials compared both sides; last error: {err}");
+    }
+    if let Some(e) = engine {
+        println!("engine: {e}");
+    }
+    if let Some(c) = caveat {
+        println!("caveat: {c}");
     }
 }
 

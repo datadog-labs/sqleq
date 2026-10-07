@@ -46,11 +46,11 @@ pub struct Config {
 }
 
 /// Seeds the small-instance trials' stream, apart from the full-size trials' own.
-const SMALL_STREAM: u64 = 0x5eed_0fe3_177a_b100;
+pub(crate) const SMALL_STREAM: u64 = 0x5eed_0fe3_177a_b100;
 
 /// The size of one table in a small-instance trial: 0 or 1 rows three times in ten each, otherwise
 /// anything from 2 to `nrows`.
-fn small_size(rng: &mut StdRng, nrows: usize) -> usize {
+pub(crate) fn small_size(rng: &mut StdRng, nrows: usize) -> usize {
     match rng.random_range(0..10) {
         0..=2 => 0,
         3..=5 => nrows.min(1),
@@ -150,7 +150,7 @@ impl Verdict {
 /// wrapper, but the statement is still a `DELETE` and still has no rows to read. A leading `WITH`
 /// therefore has to be parsed before it can be believed; the other prefixes are unambiguous, so
 /// they keep the cheap path and an unparseable `WITH` falls back to the old reading.
-fn is_query(stmt: &str) -> bool {
+pub(crate) fn is_query(stmt: &str) -> bool {
     let t = stmt.trim_start();
     if t.starts_with('(') {
         return true; // `(SELECT ...) UNION ...`

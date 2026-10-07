@@ -35,6 +35,40 @@ Any difference on a valid, deterministic instance is a **sound counterexample** 
 **non-equivalent**. This is a disprover: it can show non-equivalence (with a witness), never prove
 equivalence.
 
+## Engines
+
+`--engine duckdb`, the default, runs both statements on DuckDB as described here. `--engine
+postgres` runs them on PostgreSQL itself, so there is nothing to emulate: what Postgres computes is
+the answer. It starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, or the
+`postgres` on `PATH`; any other major version is refused — serves it on a unix socket in a fresh
+temp directory, and stops and removes it when the run ends (or when the process is killed). The
+first run builds a template cluster under `$SQLEQ_PG_CACHE` (default `~/.cache/sqleq`); every later
+one copies it. `$SQLEQ_FUZZ_ENGINE` sets the default, which is how `sqleq-check` picks the engine.
+
+What changes with the Postgres engine:
+
+- **The DDL runs as written**, once per pair, inside a transaction rolled back at the end, so every
+  constraint it declares — `CHECK` and `FOREIGN KEY` included, which the DuckDB engine does not
+  read — is Postgres's to enforce, and a generated row Postgres refuses is not in the instance.
+  Captured DDL is made to run only in ways that add no constraint: a schema it names is created, an
+  unqualified table that the rest of the DDL names by one schema is created there, a table the
+  queries name by one other schema is moved there, a type nothing declares is read as `text`, and a
+  column default that calls a function nothing declares is dropped. The last two are reported as a
+  `caveat`, since a verdict then rests on more than the DDL says.
+- **Each `$N` is typed as Postgres types it.** Both statements are prepared, and each placeholder
+  gets the type Postgres infers for it — with the column the heuristics link it to declared as a
+  hint where Postgres cannot infer one — and one type across the pair: a side that leaves `$N`
+  untyped, or that Postgres merely reads as `text` (`SELECT $1 AS x`), takes the other side's type;
+  a side that casts it keeps its cast. A `$N` that is an array on one side and a scalar on the
+  other is `NOT-COMPARABLE`. Values are still written into the statement, cast to that type, rather
+  than bound as parameters: captured SQL writes a `$N` where no parameter may stand
+  (`interval $1`).
+- **Rows are compared under Postgres `=`.** Bags whose text is the same are the same; two bags of
+  one size whose text differs are compared again in Postgres, so `1.0` and `1.00` are one value
+  while their text is not. A column type with no `=` (`json`) leaves such a trial undecided.
+- `now()` is one instant for the whole pair (its transaction's start), and each sequence is reset
+  before each side that can write.
+
 ## Soundness rules (a false positive is a bug)
 
 A reported counterexample is only valid if the instance is valid *and* both queries are
@@ -221,19 +255,21 @@ sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting
 sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER) + exactly two statements
 
 options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
-         --seed N (default 0)
+         --seed N (default 0)  --engine duckdb|postgres (default $SQLEQ_FUZZ_ENGINE, else duckdb)
 ```
 
 `row` and `file` print the verdict on the first line. A `NOT-EQUIVALENT` is followed by a
 `counterexample: …` line holding the instance, and a `NO-COUNTEREXAMPLE` that only some trials
 reached by a `partial: K trials compared both sides; last error: …` line. Those lines are what
-`sqleq-check` reads.
+`sqleq-check` reads. The Postgres engine adds an `engine: postgres 17.N` line, and a `caveat: …`
+line when the verdict rests on a stood-in type or a dropped default.
 
 `csv` mode takes each name in `names.txt` to the corpus row its digits number (`pairNNNN` is row
 `NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
 only some trials compared both sides), and writes `{ "pairNNNN": { "verdict": "...", "ms": ... } }`
 to `out.json` (default: beside the corpus, its extension replaced by `.fuzz.json`), adding
-`ok_trials` and `trial_error` for a partial run. A name whose digits number no row gets `NO-ROW`. A
+`ok_trials` and `trial_error` for a partial run, and with the Postgres engine `engine` and, where
+there is one, `caveat`. A name whose digits number no row gets `NO-ROW`. A
 panic while testing one row is that row's `ERROR:panic: …`, and the run goes on to the next one.
 
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
