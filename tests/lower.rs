@@ -2176,8 +2176,13 @@ fn a_pair_naming_no_system_column_is_untouched() {
 fn an_appended_system_column_carries_no_key_and_no_not_null() {
     let v = ok(&same(r#"SELECT "t"."ctid" FROM "t""#));
     assert_eq!(v["schemas"][0]["nullable"], serde_json::json!([true, true, true, true]));
-    // The declared UNIQUE(a) is still there, and still index 0 — appending at the end is what keeps
-    // the existing key indices valid.
+    // The declared UNIQUE(a) is not sent at all, because `a` may be NULL.
+    assert_eq!(v["schemas"][0]["key"], serde_json::json!([]));
+    // With `a` NOT NULL it is, and still index 0 — appending at the end is what keeps the existing
+    // key indices valid.
+    let ddl = r#"create table "t" ("a" INTEGER NOT NULL, "b" VARCHAR, "c" VARBINARY, unique ("a"));"#;
+    let q = r#"SELECT "t"."ctid" FROM "t""#;
+    let v = ok(&format!("{ddl}\n{q};\n{q};"));
     assert_eq!(v["schemas"][0]["key"], serde_json::json!([[0]]));
 }
 

@@ -13,13 +13,17 @@
 //! Unlike Java, applicability is not "translation happened not to throw": Java refuses every term
 //! with a parameter carrier, a column inside a function, or an `IS NULL`, which rules out most real
 //! queries. The encoding here:
-//! * **one uninterpreted sort `Val`** for every value. Each canonical constant is its own `Val`
-//!   constant, all pairwise distinct (distinct canonical constants are distinct values), `Null`
-//!   among them. `Eq` is identity, `Ne` its negation, `Lt` an uninterpreted relation, and `Le` its
-//!   complement with the operands swapped (`a <= b` is `¬(b < a)`). That is the one order fact
-//!   encoded, and it holds wherever it is used: the translator puts every order comparison under
-//!   its operands' not-null guard, and the non-NULL values of one type are totally ordered
-//!   (preordered, under a collation that ties distinct strings).
+//! * **one uninterpreted sort `Val`** for every value. Each constant is its own `Val` constant, one
+//!   per value (`1`, `1.0` and `1.00` are three, see [`UConst::same_value`]), `Null` among them.
+//!   Two constants that are certainly different values are asserted distinct: two different
+//!   numbers, two different strings, a number and a string, `Null` and anything else. Equal numbers
+//!   of different types or scales are left free to be one value or two, since neither holds in
+//!   every place they meet. `Eq` is identity, `Ne` its negation, `Lt` an uninterpreted relation,
+//!   and `Le` its complement with the operands swapped (`a <= b` is `¬(b < a)`). That is the one
+//!   order fact encoded, and it holds wherever it is used: the translator puts every order
+//!   comparison under its operands' not-null guard, and the non-NULL values of one type are totally
+//!   ordered (preordered, under a collation that ties distinct strings, or a type whose `=` ties
+//!   distinct values, as `numeric`'s does `2.0` and `2.00`).
 //!   Functions and value-position arithmetic are uninterpreted `Val` functions -- sound, since the
 //!   real ones are among their interpretations, and ours already take (null flag, value) pairs.
 //! * **a table** `T` of width `w` is an uninterpreted `Val^w → Int`: its value at a tuple is the
@@ -37,7 +41,7 @@ use z3::ast::{self, Ast, Bool, Dynamic, Int};
 use z3::{FuncDecl, Params, SatResult, Solver, Sort, Symbol};
 
 use crate::translate::OUT_VAR_ID;
-use crate::uterm::{PredKind, UConst, UTerm, UVar};
+use crate::uterm::{Number, PredKind, UConst, UTerm, UVar};
 
 /// Z3's own per-query limit. Running out is "not proved", which is sound.
 pub const TIMEOUT_MS: u32 = 3_000;
@@ -85,8 +89,8 @@ pub fn prove(a: &UTerm, widths_a: &HashMap<u32, usize>, b: &UTerm, widths_b: &Ha
     params.set_u32("timeout", TIMEOUT_MS);
     params.set_u32("random_seed", 9876);
     solver.set_params(&params);
-    if let Some(distinct) = enc.distinct_constants() {
-        solver.assert(&distinct);
+    for fact in enc.distinct_constants() {
+        solver.assert(&fact);
     }
     solver.assert(ea.eq(&eb).not());
     Some(solver.check() == SatResult::Unsat)
@@ -98,39 +102,31 @@ enum Side {
     B,
 }
 
-/// The canonical spelling of a constant's value, or `None` when there is no exact one: then the
-/// constant is left out of the distinctness assertion, since declaring two equal values distinct
-/// would let the solver prove false equalities. Integers and plain decimals share one spelling
-/// (`1.0` is `1`), matching `eval::identical`.
-fn canonical(c: &UConst) -> Option<String> {
-    Some(match c {
-        UConst::Int(n) => format!("n:{n}"),
-        UConst::Decimal(s) => format!("n:{}", canonical_decimal(s)?),
-        UConst::Str(s) => format!("s:{s}"),
-        UConst::Null => "null".to_string(),
-    })
+/// The class of values a constant certainly belongs to, such that two constants in different classes
+/// are certainly different values: its exact number for an INTEGER or REAL (so `1`, `1.0` and
+/// `1.00` share one), its text for a string, NULL alone. `None` when there is no exact reading, and
+/// then the constant is left out of every distinctness assertion, since declaring two equal values
+/// distinct would let the solver prove false equalities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ValueClass {
+    Number(Number),
+    Str(String),
+    Null,
 }
 
-fn canonical_decimal(s: &str) -> Option<String> {
-    let (neg, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
-    if int.is_empty() && frac.is_empty() || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
-        return None;
+fn value_class(c: &UConst) -> Option<ValueClass> {
+    match c {
+        UConst::Int(_) | UConst::Decimal(_) => c.number().map(ValueClass::Number),
+        UConst::Str(s) => Some(ValueClass::Str(s.clone())),
+        UConst::Null => Some(ValueClass::Null),
     }
-    let int = int.trim_start_matches('0');
-    let frac = frac.trim_end_matches('0');
-    let int = if int.is_empty() { "0" } else { int };
-    let body = if frac.is_empty() { int.to_string() } else { format!("{int}.{frac}") };
-    Some(if neg && body != "0" { format!("-{body}") } else { body })
 }
 
 struct Encoder {
     val: Sort,
-    /// Constants by canonical spelling (or, for one without, by a spelling of its own).
-    consts: HashMap<String, (Dynamic, bool)>,
+    /// One `Val` constant per value (`UConst` is its own identity, see [`UConst::same_value`]), with
+    /// its value class.
+    consts: HashMap<UConst, (Dynamic, Option<ValueClass>)>,
     /// The `Val` constants standing for each base var's columns. The output var is shared by both
     /// sides; every other var belongs to one side.
     vars: HashMap<(Option<Side>, u32), Vec<Dynamic>>,
@@ -147,9 +143,25 @@ impl Encoder {
         }
     }
 
-    fn distinct_constants(&self) -> Option<Bool> {
-        let vals: Vec<&Dynamic> = self.consts.values().filter(|(_, exact)| *exact).map(|(v, _)| v).collect();
-        (vals.len() >= 2).then(|| Dynamic::distinct(&vals))
+    /// That constants of different value classes are different values, as `class(k) = i` with one
+    /// integer `i` per class: congruence then keeps every two classes apart, and leaves the members
+    /// of one class free.
+    fn distinct_constants(&self) -> Vec<Bool> {
+        let mut index: HashMap<&ValueClass, i64> = HashMap::new();
+        for (_, class) in self.consts.values() {
+            if let Some(c) = class {
+                let next = index.len() as i64;
+                index.entry(c).or_insert(next);
+            }
+        }
+        if index.len() < 2 {
+            return Vec::new();
+        }
+        let class_of = FuncDecl::new("value-class", &[&self.val], &Sort::int());
+        self.consts
+            .values()
+            .filter_map(|(k, class)| Some(class_of.apply(&[k]).as_int()?.eq(Int::from_i64(index[class.as_ref()?]))))
+            .collect()
     }
 
     /// Applies the function `name` (declared on first use with this signature) to `args`.
@@ -177,12 +189,8 @@ impl Encoder {
     }
 
     fn constant(&mut self, c: &UConst) -> Dynamic {
-        let (spelling, exact) = match canonical(c) {
-            Some(s) => (s, true),
-            None => (format!("raw:{c:?}"), false),
-        };
         let val = &self.val;
-        self.consts.entry(spelling).or_insert_with(|| (Dynamic::fresh_const("k", val), exact)).0.clone()
+        self.consts.entry(c.clone()).or_insert_with(|| (Dynamic::fresh_const("k", val), value_class(c))).0.clone()
     }
 
     fn table(&mut self, name: &str, var: &UVar, side: Side, widths: &HashMap<u32, usize>) -> Option<Int> {
@@ -324,11 +332,16 @@ mod tests {
     }
 
     #[test]
-    fn decimals_share_the_integer_spelling() {
-        assert_eq!(canonical_decimal("001.500"), Some("1.5".into()));
-        assert_eq!(canonical_decimal("2.0"), Some("2".into()));
-        assert_eq!(canonical_decimal("-0.0"), Some("0".into()));
-        assert_eq!(canonical_decimal("1e3"), None);
+    fn equal_numbers_share_a_value_class_but_not_a_constant() {
+        // `2` and `2.0` are equal numbers, so they are never asserted distinct, but they are two
+        // values: a cast or a division tells them apart.
+        let (two, two_dec) = (UConst::Int(2), UConst::decimal("2.0").unwrap());
+        assert_eq!(value_class(&two), value_class(&two_dec));
+        assert_eq!(value_class(&UConst::decimal("001.500").unwrap()), value_class(&UConst::decimal("1.5").unwrap()));
+        assert_ne!(value_class(&two), value_class(&UConst::decimal("2.5").unwrap()));
+        let mut enc = Encoder::new();
+        assert_ne!(enc.constant(&two), enc.constant(&two_dec));
+        assert_eq!(enc.constant(&two), enc.constant(&UConst::Int(2)));
     }
 
     #[test]

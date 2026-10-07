@@ -1,0 +1,17 @@
+-- Unless explicitly stated otherwise all files in this repository are licensed under the
+-- Apache License Version 2.0.
+-- This product includes software developed at Datadog (https://www.datadoghq.com/).
+-- Copyright 2026-Present Datadog, Inc.
+
+-- truth: not-equivalent
+-- expect frontend: emit
+-- expect fuzz: no-counterexample
+-- expect qed: no-proof
+-- expect sqleq-solver: no-proof
+-- expect lean: unsupported
+-- origin: issue #56: a string constant compared with a NUMERIC column was cast to REAL as a
+--   constant, which the QED prover parses through f32, where 20000000.5 is 20000000
+-- witness: t = {(20000000.5)}: A yields the row, B yields none
+create table "t" ("x" NUMERIC);
+SELECT "x" FROM "t" WHERE "x" = '20000000.5';
+SELECT "x" FROM "t" WHERE "x" = '20000000.0';

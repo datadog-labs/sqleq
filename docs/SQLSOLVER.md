@@ -9,8 +9,9 @@ fork through `tools/sqlsolver/`, is kept as a **backup cross-check** and is bein
 one of the two, so comparing them takes two runs over the same pairs.
 
 Outside `--portfolio`, either one is a **second opinion**: its answer is reported beside QED's, and
-neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it.
-Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
+neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it,
+except that its proof against a `sqleq-fuzz` counterexample on the same pair is an alarm, which
+fails every run. Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
 can make a case `equivalent`, and the combined verdict decides the exit code. Under `--expect
 pinned`, its pin is checked like every axis's, so a moved answer fails the run. The point of having
 it is that provers of different construction, reading the same IR, check each other — see
@@ -170,6 +171,20 @@ Each difference is there for soundness:
 * **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
   fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
   types is not treated as an identity either, since the frontend drops the ones that are.
+* **A value keeps its type.** Postgres picks a function by its name and argument types, so every
+  uninterpreted symbol (a cast, `/`, any function) is named after its operand and result types:
+  `/` on two integers truncates and on a decimal does not, and `CAST(1 AS TEXT)` is `'1'` where
+  `CAST(1.0 AS TEXT)` is `'1.0'`. A constant is a value of its own type, compared exactly and never
+  through a float, so `1`, `1.0` and `1.00` are three values that `=` calls equal. SQL's `=` is read
+  as identity, which lets normalization put one side in place of the other, only between two
+  values of one type on which it is identity; between two decimals, an integer and a decimal, two
+  intervals, or two values of the opaque VARBINARY (which stands for `double precision`, where
+  `0 = -0`, and for arrays, whose `=` is their elements') it compares the values through a key.
+  Deduplication (`DISTINCT`, `GROUP BY`, set operations) still keeps values apart by identity.
+  Two string constants are not ordered by
+  bytes, which only the `C` collation does. The two sides' output columns must have the same types,
+  since `TRUE` and `1` are one term. A literal that does not denote a value of its IR type (an
+  INTEGER `1e-5`) is refused.
 * **Functions are not assumed strict.** Only functions known to be `NULL` exactly when an argument
   is derive their nullness; any other function — parameter carriers included, since a parameter
   may be bound to `NULL` — gets an uninterpreted nullness of its own.
@@ -183,13 +198,22 @@ pairs where it runs out of time). Either way an `EQ` is a claim to be checked ag
 
 ### How it is checked
 
-`sqleq-solver/examples/phase2_gate.rs` runs the ladder over a job file and joins it row by row
-against `IrDriver`'s results and a file of fuzz verdicts (one `{name, fuzz: {verdict}}` per line),
-failing on any `EQ` over a pair the fuzz axis refutes. `sqleq-solver/examples/normalize_check.rs`
-evaluates each side before and after normalization, and both
-sides of every proved pair, on small random databases that respect the schemas' column types and
-constraints, using the crate's concrete evaluator. The crate's unit tests pin the three-valued truth
-tables against a reference evaluator.
+What gates a change in CI is the crate's tests and the pinned pairs. `cargo test -p sqleq-solver`
+runs the unit tests, which pin the three-valued truth tables against a reference evaluator and the
+ladder's answers on hand-written plans. The `sqleq-solver` job then drives the built binary through
+`sqleq-check`: its tests of the second opinion (`sqleq-check/tests/real_solver.rs`), and every pair
+under [`tests/pairs`](../tests/pairs/README.md) on the `sqleq-solver` axis, which fails on any pin
+that moves, a proof of a pair pinned `not-equivalent` included.
+
+The examples under `sqleq-solver/examples/` are manual tools, not gates. CI compiles them and runs
+none, because each needs inputs that are not in this repository: a job file (the `{name, ir,
+schema}` lines `sqleq-frontend --sqlsolver --ir` writes, one per pair), and for `phase2_gate` also
+results from the fork and from the fuzz axis. `phase2_gate.rs` runs the ladder over a job file and
+joins it row by row against `IrDriver`'s results and a file of fuzz verdicts (one `{name, fuzz:
+{verdict}}` per line), failing on any `EQ` over a pair the fuzz axis refutes.
+`normalize_check.rs` evaluates each side before and after normalization, and both sides of every
+proved pair, on small random databases that respect the schemas' column types and constraints,
+using the crate's concrete evaluator.
 
 ### Building
 
@@ -241,40 +265,24 @@ were each checked and all survive.
 **Why it cannot reach a verdict here.** The collapse lives in `isLiteralEq`, which reads SQL text,
 and nothing in this repository asks the fork about SQL text. On the bridge, the frontend reduces a
 DML pair to the queries computing its effect before lowering it (`src/dml.rs`), so `IrDriver` only
-ever sees two queries, and its plan entry does not call `isLiteralEq` at all. The frontend's
-SQL-text jobs (`sqleq-frontend --sqlsolver` without `--ir`) still carry a `non-select-statement`
-note on any row whose either side is not a `SELECT`/`WITH`/`VALUES`/`TABLE` query
-(`sqlsolver::is_query`), for whoever runs them through the fork's own SQL entry point. The rule is
-the structural one — this prover does not model DML — rather than a list of the keywords that happen
-to be dangerous today, so `INSERT` and `DELETE` are marked too even though they currently answer
-safely.
+ever sees two queries, and its plan entry does not call `isLiteralEq` at all. Anyone driving the
+fork's own SQL entry point has to quarantine every pair with a side that is not a query, by the
+structural rule — this prover does not model DML — rather than by a list of the keywords that happen
+to be dangerous today: `INSERT` and `DELETE` currently answer safely only by accident.
 
-### Parameters: `$1` becomes `_DOLLAR_1()` on the SQL-text path
+### Parameters
 
 On the bridge a parameter arrives as the frontend's nullary carrier `qpN`, which `IrToRel` turns
-into an uninterpreted function like any other unknown operator, minted under one name on both sides.
-The SQL-text jobs need an encoding of their own, and this section is about them.
+into an uninterpreted function like any other unknown operator, minted under one name on both sides,
+and which the fork's translator turns into a `UFunc` term. A 0-ary uninterpreted function is a free
+constant, and a free constant shared by both sides is exactly parameter semantics: the obligation
+becomes `∀ params. Q₁(params) ≡ Q₂(params)`. It must never degrade to substituting a literal, which
+would prove equivalence at one value and claim it for all.
 
+The fork's own SQL entry point has no dynamic-parameter support anywhere in the tree:
 `SqlSupport.parsePreprocess` rewrites `$` to `_DOLLAR_`, which turns `$1` into the bare identifier
-`_DOLLAR_1` and fails Calcite validation; there is no dynamic-parameter support anywhere in the
-tree. The encoding that works instead is a **0-ary unresolved function**:
-
-* `CalciteSupport.addUserDefinedFunctions` auto-registers any unknown operator as a UDF.
-* An unresolved call becomes `UFunc(NON_INT, name, [])` — an uninterpreted function term.
-* `LiaStarTranslator` maps it through `uTermToLiaVar.computeIfAbsent(exp, …)`, keyed on the UTerm,
-  so structurally-equal terms on the two sides collapse to the **same** LIA variable.
-
-A 0-ary uninterpreted function is a free constant, and a free constant shared by both sides is
-exactly parameter semantics: the obligation becomes `∀ params. Q₁(params) ≡ Q₂(params)`. It must
-never degrade to substituting a literal, which would prove equivalence at one value and claim it
-for all.
-
-**The encoding stops at `LIMIT` and `OFFSET`.** Calcite's grammar accepts only an unsigned integer
-literal in those positions, so `LIMIT _DOLLAR_1()` is a parse error — a function call is not a
-literal, whatever it returns. On the text path that alone keeps many parameterized queries from ever
-being read, and it is **not soundly fixable by substitution**, for the same reason as above. Lifting
-it needs either dynamic-parameter support in the grammar or a rewrite that moves the bound out of
-the syntactic slot, neither of which is ours to make.
+`_DOLLAR_1`, and that fails Calcite validation. It is one more reason nothing here hands the fork
+SQL text.
 
 Binding is **by index** — `$1` on the left is `$1` on the right — the same choice the qed and fuzz
 axes make. See [SOUNDNESS.md](SOUNDNESS.md).
@@ -282,13 +290,12 @@ axes make. See [SOUNDNESS.md](SOUNDNESS.md).
 ### The schema must be MySQL-dialect DDL
 
 `CalciteSupport` hardcodes `DB_TYPE = MySQL`, so `-schema` is parsed by their MySQL ANTLR grammar.
-On the bridge the schema is rendered from the IR's own `schemas`, so the table a scan index names is
-the table Calcite resolves; on the text path, from the catalog `pgddl::parse_provided_schema`
-builds. Either way nothing new parses Postgres, and `sqlsolver::emit_mysql` writes backticked
+The schema is rendered from the IR's own `schemas`, so the table a scan index names is the table
+Calcite resolves, and nothing new parses Postgres; `sqlsolver::emit_mysql` writes backticked
 identifiers, one `CREATE TABLE` per table.
 
-The type vocabulary is closed and load-bearing. `pgddl::map_pg_type` yields five types plus the
-temporal ones, mapped as:
+The type vocabulary is closed and load-bearing. An IR schema's types are the prover's: five plus
+the temporal ones, mapped as:
 
 | ours | emitted |
 |---|---|
@@ -314,29 +321,28 @@ in one unit and falls through to `varbinary(255)`.
 SQLSolver models `UNIQUE` as "no duplicate rows at all". Postgres allows any number of NULLs in a
 unique column. With a nullable unique `a`, SQLSolver reports `SELECT DISTINCT a FROM t` ≡ `SELECT a
 FROM t` — **false in Postgres**. So the emitter declares `UNIQUE` only when every column of the key
-is `NOT NULL`.
+is `NOT NULL`. The QED prover reads a key the same way, and the IR's schemas carry the same filter
+(`catalog::Table::not_null_keys`, which both emitters use).
 
-#### Schema qualifiers must come off
+#### Schema qualifiers
 
 Calcite's root schema here is flat — `calciteSchema.add(table.name(), calciteTable)`, no
 sub-schemas — so `public.t` cannot resolve, and `sqleq-fuzz`'s trick of creating the table under
-its qualified name does not transfer. The emitter strips qualifiers at the token level, anchored on
-"the first part that names a declared table".
+its qualified name does not transfer. The bridge resolves nothing from SQL text: `IrToRel` scans
+each table under the name the IR's `schemas` carry, which is the name the DDL declares.
 
-Stripping is a renaming, and a renaming is only safe when it is injective: if `a.t` and `b.t` both
-reduce to `t`, two distinct relations become one and a non-equivalent pair could read as
-equivalent. On the text path `qualifier_conflict` detects that and leaves both sides qualified —
-they then fail to resolve, so no proof can come out either. The bridge has no qualified spelling to
-fall back on, since a scan names its table by index, so a plan whose tables share a bare name is
-refused outright.
+That name is only safe when it is unique: if `a.t` and `b.t` both reach the plan as `t` (the
+raw-DDL reader keys tables on the bare name), two distinct relations become one and a
+non-equivalent pair could read as equivalent. A scan names its table by index, so there is no other
+spelling to fall back on, and a plan whose tables share a name is refused outright.
 
 ### The IR bridge — feeding it our plans instead of SQL text
 
 Upstream SQLSolver re-derives a plan by parsing SQL text with Calcite/Babel in MySQL dialect, and
 on our SQL that parser, not the prover, is where it mostly lost. The bridge removes the round trip:
-`sqleq-frontend --sqlsolver --ir` emits `{name, ir, schema}`, where `ir` is the same `Input` JSON
-the qed axis consumes; `tools/sqlsolver/IrToRel.java` turns it into a Calcite `RelNode` pair
-directly, and `IrDriver` hands that pair to the `Verification.verify(RelNode, RelNode, Schema)`
+`sqleq-frontend --sqlsolver --ir <input.json>` emits `{name, ir, schema}`, where `ir` is the same
+`Input` JSON the qed axis consumes; `tools/sqlsolver/IrToRel.java` turns it into a Calcite `RelNode`
+pair directly, and `IrDriver` hands that pair to the `Verification.verify(RelNode, RelNode, Schema)`
 overload. No SQL text is on the path, and the QED prover and the fork read the same bytes — which is
 the point: re-lowering the SQL for another prover would put a second lowering between the two axes
 and reintroduce exactly the drift the cross-check exists to rule out.

@@ -81,14 +81,16 @@ fn setup() -> Fakes {
 fn the_backends_run_at_once() {
     let f = setup();
     let mut p = Portfolio::new(&f);
-    p.set("FAKE_QED_SLEEP", "1.5").set("FAKE_SS_SLEEP", "1.5").set("FAKE_FUZZ_SLEEP", "1.5");
+    p.set("FAKE_QED_SLEEP", "3").set("FAKE_SS_SLEEP", "3").set("FAKE_FUZZ_SLEEP", "3");
     let t0 = Instant::now();
     let (ran, case) = p.case(&["--expect", "report-only"]);
     let wall = t0.elapsed().as_secs_f64();
     assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
     assert_eq!(verdict(&case), "undecided");
-    // Three 1.5s backends one after another would take 4.5s.
-    assert!(wall < 3.0, "the backends ran one after another: {wall:.2}s");
+    // Three 3s backends one after another take 9s, and any two of them back to back 6s, so under 6s
+    // all three overlapped. That leaves 3s for everything else the run does, which is what keeps a
+    // loaded machine from failing it.
+    assert!(wall < 6.0, "the backends did not all run at once: {wall:.2}s");
     let done = case["portfolio"]["done"].as_object().unwrap();
     for axis in ["frontend", "qed", "sqleq-solver", "fuzz"] {
         assert!(done.contains_key(axis), "{axis} has no answer time: {done:?}");
@@ -102,8 +104,10 @@ fn the_deadline_is_shared_and_kills_what_is_left() {
     let mut p = Portfolio::new(&f);
     p.set("FAKE_QED_SLEEP", "30").set("FAKE_SS", "EQ").set("FAKE_PIDS", &pids.to_string_lossy());
     let t0 = Instant::now();
-    let (ran, case) = p.case(&["-t", "2", "--no-retry"]);
-    assert!(t0.elapsed().as_secs_f64() < 6.0, "the run outlived its deadline");
+    // A 3s deadline, generous enough for the fakes that do answer to answer on a loaded machine; the
+    // prover sleeps 30s, so finishing in under 15s still says the deadline cut it off.
+    let (ran, case) = p.case(&["-t", "3", "--no-retry"]);
+    assert!(t0.elapsed().as_secs_f64() < 15.0, "the run outlived its deadline");
     // sqleq-solver's proof decides the case even though the prover never answered.
     assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
     assert_eq!(verdict(&case), "equivalent");
@@ -123,7 +127,9 @@ fn nothing_decisive_by_the_deadline_is_a_timeout() {
     let f = setup();
     let mut p = Portfolio::new(&f);
     p.set("FAKE_QED_SLEEP", "30").set("FAKE_SS_SLEEP", "30");
-    let (ran, case) = p.case(&["-t", "1", "--no-retry", "--expect", "report-only"]);
+    // 3s, not less: the frontend and the fuzz fake must still answer inside it for `pending` to be
+    // exactly the two that sleep.
+    let (ran, case) = p.case(&["-t", "3", "--no-retry", "--expect", "report-only"]);
     assert_eq!(ran.code, 0);
     assert_eq!(verdict(&case), "timeout");
     assert_eq!(strings(&case["portfolio"]["pending"]), ["qed", "sqleq-solver"]);
@@ -183,7 +189,9 @@ fn a_case_left_undecided_by_the_deadline_is_retried_serially() {
     let once = f.path().join("slept");
     let mut p = Portfolio::new(&f);
     p.set("FAKE_QED", "proved").set("FAKE_QED_ONCE", &once.to_string_lossy());
-    let (ran, case) = p.case(&["-t", "1"]);
+    // The first attempt sleeps 30s and misses any deadline; the retry has the same 3s, enough for the
+    // frontend and the prover fake to answer on a loaded machine.
+    let (ran, case) = p.case(&["-t", "3"]);
     assert_eq!((ran.code, verdict(&case)), (0, "equivalent"), "{}{}", ran.out, ran.err);
     assert_eq!(case["portfolio"]["retried"], true);
     assert!(ran.out.contains("re-running 1 undecided case(s)"), "{}", ran.out);

@@ -433,6 +433,12 @@ pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<Value> {
 /// returning the relation and its output columns. The output columns are needed when the query is a
 /// derived table or subquery so the enclosing query can resolve its columns.
 fn lower_query_ctx(cat: &Catalog, fns: &Fns, q: &Query, outer: &[Binding]) -> Result<(Value, OutCols)> {
+    // `normalize::inline_ctes` replaces every binding it can with its definition and leaves the
+    // `WITH` in place when one is recursive or writes. Nothing here reads a binding, so lowering past
+    // it would resolve its name as whatever base table has that name, and drop its effect.
+    if q.with.is_some() {
+        return Err(unsupported("WITH clause that is not inlined (RECURSIVE, or a data-modifying binding)"));
+    }
     // Every query node passes through here, so this is the one place a lock clause can be caught.
     // Identical ones were already dropped by `normalize::strip_identical_locks`; any left differ
     // between the sides, and the prover has no concurrency to tell them apart.
@@ -3191,16 +3197,13 @@ fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     }
 }
 
+/// A literal. Numbers and strings are emitted as `types` encodes constants: see
+/// [`number_literal`] and [`string_literal`].
 fn lower_value(v: &SqlValue) -> Result<Value> {
     use SqlValue::*;
     Ok(match v {
-        Number(n, _) => {
-            let ty = if n.contains('.') { "REAL" } else { "INTEGER" };
-            json!({ "operator": n, "operand": [], "type": ty })
-        }
-        SingleQuotedString(s) | DoubleQuotedString(s) | NationalStringLiteral(s) => {
-            json!({ "operator": s, "operand": [], "type": "VARCHAR" })
-        }
+        Number(n, _) => number_literal(n).map_err(unsupported)?,
+        SingleQuotedString(s) | DoubleQuotedString(s) | NationalStringLiteral(s) => string_literal(s),
         Boolean(b) => {
             json!({ "operator": if *b { "TRUE" } else { "FALSE" }, "operand": [], "type": "BOOLEAN" })
         }

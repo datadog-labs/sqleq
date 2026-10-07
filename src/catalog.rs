@@ -74,6 +74,21 @@ pub struct Table {
     pub n_declared: usize,
 }
 
+impl Table {
+    /// The keys a prover may be told about: those whose every column is `NOT NULL`.
+    ///
+    /// A key tells a prover that two rows agreeing on its columns are the same row. Postgres allows
+    /// any number of rows whose `UNIQUE` columns hold a NULL, so a key with a nullable column is a
+    /// premise Postgres does not grant: with a nullable unique `u`, `SELECT u` would be
+    /// `SELECT DISTINCT u`, and on two NULL rows it is not. Such a key is dropped, not weakened, which
+    /// costs only proofs. A `PRIMARY KEY`'s columns are `NOT NULL` by definition, so it always stays.
+    pub fn not_null_keys(&self) -> impl Iterator<Item = &Vec<usize>> {
+        self.keys
+            .iter()
+            .filter(|k| !k.is_empty() && k.iter().all(|&i| !self.nullable.get(i).copied().unwrap_or(true)))
+    }
+}
+
 /// All tables declared by the input's `CREATE TABLE`s, in declaration order (the scan index).
 pub struct Catalog {
     pub tables: Vec<Table>,
