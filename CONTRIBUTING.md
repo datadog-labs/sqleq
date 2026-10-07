@@ -6,7 +6,7 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 206 + 10 + 7 + 2 + 190 + 19 + 11 + 11; sqleq-check: 59 + 16 + 12 + 5 + 2 + 12
+cargo test                 # the frontend: 206 + 10 + 7 + 2 + 190 + 19 + 11 + 11; sqleq-check: 59 + 16 + 12 + 5 + 2 + 12 + 12
 cargo test -p sqleq-fuzz   # the disprover: 53 + 52 + 5
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 61 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 34 + 6 (needs Lean, see below)
@@ -67,7 +67,12 @@ lines of each:
 `cargo clippy --workspace --all-targets -- -D warnings` must be clean, and CI enforces it per
 crate. So must `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps`, which is the only thing that checks
 intra-doc links: CI builds the frontend's docs as published, with `--features internals`, and with
-`--document-private-items`, and `sqleq-lean`'s as published and with private items.
+`--document-private-items`, and every other crate's as published and with private items.
+
+The code must also compile with the oldest Rust the manifests declare, their `rust-version`, which
+CI's `msrv` job checks. The lockfile sets that floor: a dependency bump that needs a newer Rust
+has to raise `rust-version` in every `Cargo.toml` and `MSRV` in `.github/workflows/ci.yml`
+together.
 
 **`cargo fmt` is not used and must not be added to CI.** There is no `rustfmt.toml`, over a
 thousand source lines already run past 100 columns, and `src/dml.rs` has never been formatted — a

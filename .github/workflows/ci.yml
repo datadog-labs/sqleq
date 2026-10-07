@@ -3,7 +3,7 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
 # Copyright 2026-Present Datadog, Inc.
 
-# Five jobs, split on build cost rather than on subject.
+# Six jobs, split on build cost rather than on subject.
 #
 # `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
 # cache than anything else here -- `sqleq-solver` compiles Z3, and `sqleq-lean` needs a Lean
@@ -20,6 +20,18 @@
 # `licenses` builds nothing. It checks that every dependency is under a permissive licence and
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
 # attribution changing with it.
+#
+# `msrv` is apart for its toolchain rather than its cost: it compiles the default members and
+# sqleq-lean with the oldest Rust that every Cargo.toml's `rust-version` names, so the declared
+# floor is one that builds.
+#
+# Every other job uses the runner's preinstalled stable, unpinned, and runs clippy with
+# `-D warnings`, so a lint added in a new Rust release can fail a pull request that changed nothing
+# it flags. That is accepted on purpose. A pinned toolchain lints with a compiler contributors no
+# longer have installed until someone bumps it, and meets each new lint in that bump instead of in
+# the pull request that hits it; the fix is the same either way, a commit that satisfies the lint
+# or allows it with the reason. The one thing a pin would hold still is the floor, and `msrv`
+# checks that.
 #
 # Deliberately absent: `cargo fmt`. There is no `rustfmt.toml`, over a thousand source lines
 # already run past 100 columns, and `src/dml.rs` has never been formatted, so a format gate would
@@ -68,7 +80,7 @@ jobs:
 
       # The runner's preinstalled stable toolchain, on purpose: a third-party toolchain action is
       # one more thing an organisation has to allowlist, and this workspace pins no nightly
-      # features. `rust-version = "1.85"` is the floor; an MSRV job can be added later.
+      # features. The `msrv` job checks the floor; the header says why stable is not pinned.
       - run: rustc --version && cargo --version
 
       # The prefix names the build settings in the job's `env`. A `target/` built under other
@@ -183,6 +195,15 @@ jobs:
 
       - run: cargo test -p sqleq-fuzz
       - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
+      # As in the frontend job: intra-doc links are checked only when the docs are built. The
+      # public build is the only one that reports a public item's doc linking to a private one, and
+      # the private build the only one that renders private items' docs.
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p sqleq-fuzz
+          cargo doc --no-deps -p sqleq-fuzz --document-private-items
 
       # The pinned pairs on the only axis that refutes. It reads each pair file itself, so it needs
       # no frontend.
@@ -193,6 +214,56 @@ jobs:
           test -x target/debug/sqleq-fuzz
           target/debug/sqleq-check --expect pinned --axes fuzz \
             --fuzz-bin target/debug/sqleq-fuzz tests/pairs examples/*.sql
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    env:
+      # The `rust-version` every Cargo.toml declares; the first step checks that they all agree.
+      # Bump the version and those fields together.
+      MSRV: "1.88"
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup is on the runner already, so no toolchain action is needed, as in the other jobs.
+      # The minimal profile has no clippy, rustfmt or docs, none of which this job runs.
+      - name: install the declared minimum Rust
+        run: |
+          set -euo pipefail
+          for m in $(git ls-files '*Cargo.toml'); do
+            if ! grep -qx "rust-version = \"$MSRV\"" "$m"; then
+              echo "::error::$m does not declare rust-version = \"$MSRV\""
+              exit 1
+            fi
+          done
+          rustup toolchain install "$MSRV" --profile minimal
+          rustc "+$MSRV" --version && cargo "+$MSRV" --version
+
+      # Keyed on the version too: a `target/` built by another rustc is restored in full and none of
+      # it is reused.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-${{ env.MSRV }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-${{ env.MSRV }}-${{ runner.os }}-
+
+      # `check`, not `build`: Cargo refuses a locked crate whose `rust-version` is newer than the
+      # toolchain before it compiles anything, and rustc rejects syntax or a library API newer than
+      # itself while checking, so code generation would add time and cache, not coverage.
+      # `--locked`, because the lockfile is what decides the floor: it is where a dependency bump
+      # raises it. The default members, and sqleq-lean, which needs Lean only at run time.
+      # sqleq-fuzz and sqleq-solver declare the same floor but are left out: checking them would
+      # bring DuckDB's download and a Z3 compile into this job.
+      - run: |
+          cargo "+$MSRV" check --locked --all-targets --all-features \
+            -p sqleq-frontend -p sqleq-check -p sqleq-lean
 
   licenses:
     name: licenses
@@ -266,6 +337,14 @@ jobs:
 
       - run: cargo test -p sqleq-solver
       - run: cargo clippy -p sqleq-solver --all-targets -- -D warnings
+      # As in the frontend job. Z3 is not built again: rustdoc reuses the build script's output
+      # from the test build above.
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p sqleq-solver
+          cargo doc --no-deps -p sqleq-solver --document-private-items
 
       # The frontend job runs the harness tests too, but without this binary the ones that drive the
       # second opinion through it skip. Here they must run: `$SQLEQ_SOLVER_BIN` makes a missing

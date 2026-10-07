@@ -114,7 +114,7 @@ fn main() {
             .collect();
         let proved = prove::verify(ir) == Verdict::Eq { literal: false };
         rows += 1;
-        if rows % 50 == 0 {
+        if rows.is_multiple_of(50) {
             eprintln!("{rows} rows ({name}): compared {compared}, skipped {skipped}, mismatches {}", mismatches.len());
         }
 

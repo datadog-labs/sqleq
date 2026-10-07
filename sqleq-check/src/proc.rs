@@ -113,6 +113,15 @@ pub fn install_interrupt_handler() {
     }
 }
 
+/// The instant `secs` seconds after `t0`, or `None` for no deadline: `inf`, NaN, or a budget too
+/// large for an `Instant` to hold. A negative budget has already passed.
+pub fn deadline_after(t0: Instant, secs: f64) -> Option<Instant> {
+    if secs.is_nan() {
+        return None;
+    }
+    Duration::try_from_secs_f64(secs.max(0.0)).ok().and_then(|d| t0.checked_add(d))
+}
+
 enum Event {
     Out(Vec<u8>),
     Err(Vec<u8>),
@@ -198,7 +207,7 @@ pub fn run_limited(
 
     // Done when the process has exited *and* both pipes are closed: a child it left behind holding
     // them open is still running, and is killed with the group at the deadline.
-    let deadline = timeout.filter(|t| t.is_finite()).map(|t| t0 + Duration::from_secs_f64(t.max(0.0)));
+    let deadline = timeout.and_then(|t| deadline_after(t0, t));
     let (mut out, mut err, mut status) = (None, None, None);
     let mut timed_out = false;
     let mut collect = |ev: Event| match ev {

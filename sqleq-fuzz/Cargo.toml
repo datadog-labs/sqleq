@@ -7,7 +7,7 @@
 name = "sqleq-fuzz"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "License-clean concrete differential tester: a SQL non-equivalence disprover (DuckDB)"
 license = "Apache-2.0"
 publish = false

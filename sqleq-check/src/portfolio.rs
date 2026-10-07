@@ -106,6 +106,14 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
     (if pending.is_empty() { UNDECIDED } else { TIMEOUT }, Vec::new(), pending)
 }
 
+/// The axes of an alarm on `case`, from what each axis in `axes` said of it: under one binding, one
+/// claims equivalence and another refutes it. Read off the same answers as [`verdict`], so a run
+/// without `--portfolio` sees exactly the alarms a portfolio would.
+pub fn alarm(case: &Case, axes: &[&str]) -> Option<Vec<String>> {
+    let (v, by, _) = verdict(&crate::pinned::observe(case, axes));
+    (v == ALARM).then_some(by)
+}
+
 /// Everything a portfolio case needs besides the case itself.
 pub struct Ctx<'a> {
     pub axes: &'a [&'static str],
@@ -126,9 +134,9 @@ pub struct Ctx<'a> {
     pub ss_mem: Option<u64>,
 }
 
-/// Seconds left before `deadline`.
-fn left(deadline: Instant) -> f64 {
-    deadline.saturating_duration_since(Instant::now()).as_secs_f64()
+/// Seconds left before `deadline`; all the time in the world when there is none (`-t inf`).
+fn left(deadline: Option<Instant>) -> f64 {
+    deadline.map_or(f64::INFINITY, |d| d.saturating_duration_since(Instant::now()).as_secs_f64())
 }
 
 enum SsAnswer {
@@ -147,7 +155,7 @@ fn ss_one(
     out: &Path,
     cap_ms: Option<u64>,
     mem: Option<u64>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> SsAnswer {
     let remaining = left(deadline);
     let remaining_ms = (remaining * 1000.0) as u64;
@@ -183,7 +191,7 @@ enum LeanAnswer {
 /// sqleq-lean on one pair, within what is left of the deadline: a pair file by its path, a corpus
 /// row as a one-row CSV, whose record its corpus mode keys by the name of row 0. Its temporary
 /// directory is put in the case's own, so a killed run leaves nothing behind.
-fn lean_one(bin: &str, path: &str, row: Option<&CorpusRow>, workdir: &Path, deadline: Instant) -> LeanAnswer {
+fn lean_one(bin: &str, path: &str, row: Option<&CorpusRow>, workdir: &Path, deadline: Option<Instant>) -> LeanAnswer {
     let remaining = left(deadline);
     if remaining <= 0.0 {
         return LeanAnswer::CutOff;
@@ -231,7 +239,7 @@ fn lean_one(bin: &str, path: &str, row: Option<&CorpusRow>, workdir: &Path, dead
 /// One case through every backend in `ctx` at once.
 pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
     let t0 = Instant::now();
-    let deadline = t0 + std::time::Duration::from_secs_f64(ctx.timeout.max(0.0));
+    let deadline = crate::proc::deadline_after(t0, ctx.timeout);
     let mut case = Case::of(item);
     let (src, name) = (item.path.as_path(), item.name.as_str());
     let wd = match Workdir::new(ctx.keep_dir, name) {

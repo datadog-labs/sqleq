@@ -566,7 +566,7 @@ fn temporal_arith_type(op: &str, a: &str, b: &str) -> &'static str {
 /// — so handing it an even list does not mean "searched CASE with no ELSE", it silently reinterprets
 /// operand 0 as a scrutinee. An absent ELSE is `NULL`, and that is what gets appended.
 pub fn make_case(mut ops: Vec<Value>) -> Value {
-    if ops.len() % 2 == 0 {
+    if ops.len().is_multiple_of(2) {
         ops.push(json!({ "operator": "NULL", "operand": [], "type": "INTEGER" }));
     }
     let n = ops.len();
