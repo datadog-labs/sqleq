@@ -1223,7 +1223,9 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
         for (t, cols) in &at.cols {
             if let Some(i) = cat.find(t) {
                 for c in cols {
-                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n == c) {
+                    // `c` is lower-cased, as every attributed name is, and the catalog keeps a quoted
+                    // declaration's case; `Catalog::check_case_collisions` makes the match unique.
+                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n.to_lowercase() == *c) {
                         // Seeded even when the declared type is one nothing recognises: `Opaque` at
                         // `Schema` confidence is a *fact* -- the DDL says this column holds
                         // something we do not model -- and it has to outrank a name guess, or a
