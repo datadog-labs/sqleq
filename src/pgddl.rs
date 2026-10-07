@@ -34,7 +34,7 @@ use sqlparser::ast::{ColumnOption, Statement, TableConstraint};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{obj_name, Catalog, Table};
+use crate::catalog::{enforced_per_statement, index_col_name, obj_name, Catalog, Table};
 use crate::infer::{map_type_name, Ty};
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
@@ -304,12 +304,12 @@ fn simplify_item(item: &str) -> String {
             .map_or(item.len(), |&(s, _, _)| s);
         out.replace_range(ws[p].0..end, "DEFAULT qed_unparsed_default() ");
     }
-    // Quote the column name. Unquoted names are case-folded and quoted ones are not, but every name
-    // here is lowercased before it reaches the catalog, so this is a no-op for anything that already
-    // parsed — its only effect is to let a column named `primary` or `order` through.
+    // Quote the column name, folded to lower case first as Postgres folds an unquoted name: quoted,
+    // it would otherwise keep its case, and the catalog stores a quoted name as written. Its only
+    // effect is to let a column named `primary` or `order` through. A word is ASCII letters, digits
+    // and underscores (see [`word_spans`]), so the ASCII fold is the whole of Postgres's.
     if !constraint && !item.trim_start().starts_with('"') {
-        out.insert(e0, '"');
-        out.insert(s0, '"');
+        out.replace_range(s0..e0, &format!("\"{}\"", item[s0..e0].to_ascii_lowercase()));
     }
     out
 }
@@ -353,8 +353,9 @@ pub fn parse_provided_schema(raw: &str) -> Catalog {
 ///
 /// The `bool` is `true` for a statement that only parsed after the retry (`simplify_for_retry`). A
 /// caller that reads more than the catalog does must know which those are: the retry replaces every
-/// default in the table with `qed_unparsed_default()`, and it quotes every column name, so an
-/// unquoted `MyCol` (which Postgres folds to `mycol`) comes back looking case-sensitive.
+/// default in the table with `qed_unparsed_default()`, and it quotes every column name the DDL left
+/// unquoted, folded to lower case first (`MyCol` comes back as `"mycol"`), so the result no longer
+/// says which names the DDL quoted.
 pub fn parse_statements_reporting(raw: &str) -> (Vec<(Statement, bool)>, Vec<Rejected>) {
     let sql = unescape(raw);
     let mut errors = Vec::new();
@@ -395,6 +396,7 @@ pub struct Rejected {
 /// learn what the first one choked on, and a production caller can log them.
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
     let (statements, errors) = parse_statements_reporting(raw);
+    let created = crate::collation::created(statements.iter().map(|(st, _)| st));
     let mut tables = Vec::new();
     for (st, _) in statements {
         let Statement::CreateTable(ct) = st else { continue };
@@ -405,19 +407,35 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
 
         let mut cols: Vec<(String, String)> = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
+        let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
+        let mut collations = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
-            let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
-            cols.push((c.name.value.to_lowercase(), ty.to_string()));
+            let rendered = format!("{}", c.data_type);
+            let ty = map_pg_type(&rendered).unwrap_or(OPAQUE);
+            let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
+            // After the collation: a collated opaque column is `COLLATED`, never identity.
+            identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
+            // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
+            cols.push((crate::dml::fold_ident(&c.name), ty));
+            collations.push(collation);
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
             for opt in &c.options {
-                match opt.option {
-                    ColumnOption::Unique { .. } => keys.push(vec![idx]),
-                    ColumnOption::PrimaryKey(_) => {
-                        keys.push(vec![idx]);
+                match &opt.option {
+                    // A deferrable key is no key (`catalog::enforced_per_statement`); the NOT NULL a
+                    // PRIMARY KEY implies holds either way.
+                    ColumnOption::Unique(u) => {
+                        if enforced_per_statement(u.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
+                    }
+                    ColumnOption::PrimaryKey(pk) => {
+                        if enforced_per_statement(pk.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
                         nullable[idx] = false;
                     }
                     ColumnOption::NotNull => nullable[idx] = false,
@@ -431,20 +449,18 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let by_name: HashMap<&str, usize> =
             cols.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
         for con in &ct.constraints {
-            let (key_cols, pk) = match con {
-                TableConstraint::Unique(uc) => (&uc.columns, false),
-                TableConstraint::PrimaryKey(p) => (&p.columns, true),
+            let (key_cols, pk, enforced) = match con {
+                TableConstraint::Unique(uc) => {
+                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+                }
+                TableConstraint::PrimaryKey(p) => {
+                    (&p.columns, true, enforced_per_statement(p.characteristics.as_ref()))
+                }
                 _ => continue,
             };
             let set: Vec<usize> = key_cols
                 .iter()
-                .filter_map(|ic| match &ic.column.expr {
-                    sqlparser::ast::Expr::Identifier(id) => Some(id.value.to_lowercase()),
-                    sqlparser::ast::Expr::CompoundIdentifier(p) => {
-                        Some(p.last().unwrap().value.to_lowercase())
-                    }
-                    _ => None,
-                })
+                .filter_map(index_col_name)
                 .filter_map(|n| by_name.get(n.as_str()).copied())
                 .collect();
             if set.is_empty() {
@@ -455,7 +471,9 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
                     nullable[i] = false;
                 }
             }
-            keys.push(set);
+            if enforced {
+                keys.push(set);
+            }
         }
         // Two spellings of the same key (a column `UNIQUE` also named in a table constraint) are one
         // key. Order-preserving so the emitted schema is stable.
@@ -476,8 +494,10 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             n_declared: cols.len(),
             cols,
             nullable,
+            opaque_identity: identity,
             row_determined: determined,
             keys: seen,
+            collations,
         });
     }
     (Catalog { tables }, errors)

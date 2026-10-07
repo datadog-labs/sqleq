@@ -52,7 +52,11 @@ completeness, not soundness. Two such misses are known: `pgddl` does not read ke
 functional-dependence refusals — completeness work, in the safe direction. And a key reaches a prover
 only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
 columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
-`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query.
+`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query. Nor is a key read
+from a `DEFERRABLE` constraint (`INITIALLY DEFERRED`, which implies it, included): Postgres checks
+it when the transaction commits, or once a transaction defers it, so a query inside the
+transaction can see two rows that agree on it. The `NOT NULL` a deferrable `PRIMARY KEY` implies is
+checked at once, and is kept.
 
 ### Dates and timestamps are not one integer
 
@@ -116,11 +120,68 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
   inference, read every name from one table, so `uuid` and `money` are opaque in both.
+- **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
+  where two values `=` calls equal are the same value, and for `double precision`, `jsonb` and
+  `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the
+  first kind in `opaque_identity`, from an allowlist checked on Postgres 17 (`src/types.rs`,
+  `opaque_identity`); a type not on it, an enum, a domain or an extension's type included, is of
+  the second kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque
+  value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
+  only columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it
+  reads `=` and deduplication as identity on every type.
 - **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
   over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
   with `'01'` as strings. Text it cannot read the way Postgres does stays an uninterpreted cast of
   the literal.
+
+### Strings are ordered by a collation no input states
+
+Postgres orders two strings by the collation of their comparison: the one an operand names with
+`COLLATE`, else the one a column declares, else the database's default. Collations disagree: under
+`en_US.utf8`, `'a' < 'b' < 'B'`; under `C`, `'B' < 'a'`. No input states the database's default,
+so the provers are not told one, and assume none. Their own string order is by code point, which is
+the order of `C` and `POSIX` and of no other collation Postgres guarantees.
+
+- **An order comparison of two strings is native only under `C` or `POSIX`**, named by a column's
+  `COLLATE` or by an operand's (`s < 'a' COLLATE "C"`). Under the database's default collation
+  `a < b` is the uninterpreted predicate `q_str_lt(a, b)` and `a <= b` is `q_str_le(a, b)`, with
+  `a > b` read as `b < a`; under another named collation, the same with the collation's name as a
+  third operand, since two collations order one pair of strings differently. `BETWEEN` is its two
+  comparisons. The same comparison on both sides still meets; what is lost is ordering two
+  constants or chaining two comparisons, which is what proving `s > 'a' AND s < 'B'` equal to
+  `FALSE` takes. As in Postgres, a column's collation outranks the default of a constant or of a
+  column that declares none, so `c < 'x'` over a `COLLATE "C"` column is native. Two columns of two
+  collations in one comparison, an error in Postgres, are refused, and so is a `COLLATE` naming any
+  other collation, or one that is not an operand of a comparison, where it changes what `upper` or
+  `ILIKE` above it compute.
+- **`=` is identity only under a deterministic collation.** Every predefined collation is
+  deterministic, and so is every database's default; one made with `CREATE COLLATION … (deterministic
+  = false)` is not, and under it `'a' = 'A'` can hold. A column under such a collation is refused
+  wherever a query reads it, as `citext` is, and so is a column under a collation the DDL does not
+  create and that is not named the way Postgres names its predefined ones: `default`, `C`, `POSIX`,
+  `ucs_basic`, `unicode`, `pg_c_utf8`, a libc locale such as `en_US.utf8`, or an ICU one such as
+  `en-US-x-icu`. That reading is taken from the name, not checked against a database: a user can
+  create a non-deterministic collation named `en_US.utf8` in a schema of their own, and Postgres
+  reaches it where it predefines none of that name. A DDL that creates a collation under a
+  predefined name, or creates one name twice, makes that name refused. A column of a type the IR
+  keeps opaque, an array of text say, under a collation other than the default is refused as well:
+  its order would need a predicate of its own.
+- **Other operations read a collation too.** `min`, `max`, `greatest`, `least` and a row slice under
+  `ORDER BY` read its order; `upper`, `lower`, `ILIKE` and the regular expressions its character
+  classes. They are lowered with no collation in their names, which is sound while every string in
+  the pair has one collation, as it does when no column the pair reads declares one. Where one does,
+  an operation over strings is refused unless it is one of the comparisons above or never reads a
+  collation (`=`, `||`, `LIKE`, a cast, `COALESCE`, `NULLIF`, `COUNT`, the null tests, the JSON
+  lookups); so is a row slice ordered by a string, and an `ORDER BY … LIMIT` the two sides share is
+  not stripped: over `SELECT c AS x` and `SELECT d AS x`, with `c = d` on every row, `ORDER BY x
+  LIMIT 1` takes two different rows when `c` is `COLLATE "C"` and `d` is not. A comparison whose
+  operand is neither a column nor a constant (`(c || 'x') < 'y'`) takes its collation from the
+  columns it reads, which the frontend does not trace, so in such a pair it is refused too.
+
+`sqleq-fuzz` compares strings by code point, as DuckDB does, so it cannot refute a pair whose two
+sides differ only under another collation; the `witness:` of such a pinned pair names the collation
+it needs.
 
 ### Shapes that look like something simpler
 
@@ -191,13 +252,23 @@ what it is or refused:
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of
   them. Those are refused, and so is a bare `RETURNING *`, which reaches `u`'s columns.
-- **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
-  unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
-  only in case (`"s"` and `"S"`) is refused rather than resolved to one of them. So is a derived
-  table with two columns of one name up to case, whether the select list, the alias's column list
-  or a `*` named them: a `*` takes its names from the catalog, which has already folded them. Where
-  the frontend matches names itself, it folds as Postgres does: a `WITH "T"` binding is not a use
-  of `t`, and an `ORDER BY A` key is not the output column `"A"`.
+- **A quoted name keeps its case.** A name is folded as Postgres folds it: an unquoted one to lower
+  case (ASCII only, as under a multibyte server encoding), a quoted one not at all. So a column
+  declared `"A"` is not read by `A`, a table alias `"X"` is not `x`, a `WITH "T"` binding is not a
+  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. Table names are still
+  compared case-insensitively, as is the attribution of a column in type inference, so a schema with
+  two tables, or two columns of one table, whose names differ only in case (`"s"` and `"S"`) is
+  refused rather than resolved to one of them. So is a derived table with two columns of one name
+  up to case, whether the select list, the alias's column list or a `*` named them.
+- **A name is resolved where Postgres resolves it.** A qualified `s.x` reads the nearest relation
+  called `s`, and when that relation has no column `x` it is refused, as Postgres raises an error,
+  rather than read from an enclosing relation also called `s`. A bare name reads the query's own
+  `FROM` first and an enclosing query's only when no relation of its own has the name. Postgres
+  names every unaliased select-list item, and where the frontend cannot tell the name — a `CASE`,
+  a cast of an expression, a scalar subquery, a column of `VALUES` — the column is one no name
+  reaches. A name that misses a relation holding such a column is refused rather than looked for
+  further out, since Postgres may have given the column exactly that name; a `GROUP BY` name is
+  refused then too, rather than read as a select-list alias.
 - **A schema qualifier is part of a table's name.** Qualifiers are dropped so that `s.t` meets the
   DDL's `t`, but only when every reference in the pair to one bare name has the same qualifier.
   `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides read two
@@ -269,7 +340,9 @@ keeps an arbitrary row per key and is read the same way (`src/lower.rs`, `apply_
 
 That is the prover's abstraction and the standard one, and the frontend inherits it rather than
 widening it; `normalize::strip_identical_pagination`, which removes a top-level `ORDER BY … LIMIT …`
-identical on both sides, rests on the same reading. What it licenses is narrow. A proof over a slice
+identical on both sides, rests on the same reading, and is skipped where a column declares a
+collation, under which equal outputs need not be ordered alike
+([above](#strings-are-ordered-by-a-collation-no-input-states)). What it licenses is narrow. A proof over a slice
 that ties leave open says the two sides agree whenever the database settles the ties the same way
 for both — not that either returns the rows you meant. A difference in the pagination itself —
 another count, offset or ordering — lowers to a different term, and goes unproved unless the two are

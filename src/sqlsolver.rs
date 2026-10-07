@@ -156,11 +156,14 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             name: s["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("t{i}")),
             cols,
             nullable,
+            // Like `row_determined`: nothing reads it here, and the conservative value costs nothing.
+            opaque_identity: vec![false; n_declared],
             // Post-reduction: this catalog exists to render DDL for the bridge, so nothing reads
             // it. The conservative value costs nothing here.
             row_determined: vec![false; n_declared],
             keys,
             n_declared,
+            collations: vec![crate::collation::Collation::Default; n_declared],
         });
     }
     emit_mysql(&Catalog { tables })

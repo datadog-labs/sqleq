@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    visit_expressions, ColumnDef, ColumnOption, Expr, FunctionArguments, IndexColumn, ObjectName,
-    ObjectNamePart, Query, Statement, TableConstraint,
+    visit_expressions, ColumnDef, ColumnOption, ConstraintCharacteristics, DeferrableInitial, Expr,
+    FunctionArguments, IndexColumn, ObjectName, ObjectNamePart, Query, Statement, TableConstraint,
 };
 
+use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
-use crate::types::map_type;
+use crate::types::{map_type, opaque_identity};
 
 /// Columns Postgres puts on every table and no DDL ever declares.
 ///
@@ -32,8 +33,11 @@ use crate::types::map_type;
 #[allow(rustdoc::private_intra_doc_links)]
 pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"];
 
-/// A table's columns (lowercased name, prover type), per-column nullability, and key column-sets
-/// (from UNIQUE / PRIMARY KEY).
+/// A table's columns (name, prover type), per-column nullability, and key column-sets (from UNIQUE /
+/// PRIMARY KEY).
+///
+/// A column's name is the one Postgres stores: an unquoted declaration folded to lower case, a quoted
+/// one as written (`dml::fold_ident`). The table's own name is lower-cased whatever its quoting.
 #[derive(Clone)]
 pub struct Table {
     pub name: String,
@@ -45,6 +49,18 @@ pub struct Table {
     /// Nullable is therefore the default, and this is set `false` only for an explicit `NOT NULL`
     /// or a `PRIMARY KEY` (which implies it). Missing the constraint merely costs completeness.
     pub nullable: Vec<bool>,
+    /// Parallel to `cols`: `true` only where the column is the opaque VARBINARY and its declared
+    /// Postgres type has an `=` that is identity ([`opaque_identity`]), as `bytea` and `uuid` do and
+    /// `double precision` and `jsonb` do not. Emitted in the schema for `sqleq-solver`, which then
+    /// reads `=` on the column as identity.
+    ///
+    /// Direction matters for soundness, as for [`Table::nullable`]: a false `true` licenses
+    /// substituting values that `=` calls equal and a cast tells apart, while a false `false`
+    /// merely costs proofs. So it is `false` for a catalog built without DDL to read.
+    pub opaque_identity: Vec<bool>,
+    /// Column sets the DDL declares unique: every `PRIMARY KEY` and `UNIQUE` constraint that holds
+    /// at every statement (see [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is
+    /// not here.
     pub keys: Vec<Vec<usize>>,
     /// Parallel to `cols`: `true` only where the DDL proves the stored value is a function of the
     /// row as written, rather than of the row's *position* in the statement.
@@ -72,6 +88,10 @@ pub struct Table {
     ///
     /// Equal to `cols.len()` on every catalog until `add_system_columns` runs.
     pub n_declared: usize,
+    /// Parallel to `cols`: each column's declared collation, [`Collation::Default`] where the DDL
+    /// names none. A column under a collation the IR cannot carry has the type
+    /// [`COLLATED`][crate::collation::COLLATED] instead; see [`crate::collation`].
+    pub collations: Vec<Collation>,
 }
 
 impl Table {
@@ -112,11 +132,15 @@ impl Catalog {
     /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
     /// only in case.
     ///
-    /// The catalog folds every name to lower case, quoted or not, and resolution goes by the folded
-    /// name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its case: `"s"`
-    /// and `"S"` are two columns, and resolving both to one slot makes `SELECT "S"` lower like
-    /// `SELECT "s"`. Where no two names collide, folding loses nothing a query that runs could
-    /// need, because a reference whose case differs from the declaration fails in Postgres.
+    /// The catalog folds every table name to lower case, quoted or not, and a table is found by the
+    /// folded name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its
+    /// case: `"T"` and `t` are two tables, and finding both in one slot makes `FROM "T"` lower like
+    /// `FROM t`. Where no two names collide, folding loses nothing a query that runs could need,
+    /// because a reference whose case differs from the declaration fails in Postgres.
+    ///
+    /// A column keeps a quoted name's case, and name resolution tells `"S"` from `s`. Two columns of
+    /// one table that differ only in case are refused all the same, because type inference
+    /// attributes a reference to a column by its lower-cased name.
     pub fn check_case_collisions(&self) -> Result<()> {
         let mut tables = std::collections::HashSet::new();
         for t in &self.tables {
@@ -124,7 +148,7 @@ impl Catalog {
                 return Err(unsupported(format!("two tables named {} up to case", t.name)));
             }
             let mut cols = std::collections::HashSet::new();
-            if let Some((c, _)) = t.cols.iter().find(|(c, _)| !cols.insert(c.as_str())) {
+            if let Some((c, _)) = t.cols.iter().find(|(c, _)| !cols.insert(c.to_lowercase())) {
                 return Err(unsupported(format!("two columns of {} named {c} up to case", t.name)));
             }
         }
@@ -143,13 +167,32 @@ pub fn obj_name(n: &ObjectName) -> String {
         .join(".")
 }
 
-/// The (lowercased) column name referenced by an index column, if it's a plain identifier.
-fn index_col_name(ic: &IndexColumn) -> Option<String> {
+/// The column name referenced by an index column, folded as a column's name is (see [`Table`]), if
+/// it's a plain identifier.
+pub(crate) fn index_col_name(ic: &IndexColumn) -> Option<String> {
     match &ic.column.expr {
-        Expr::Identifier(id) => Some(id.value.to_lowercase()),
-        Expr::CompoundIdentifier(p) => Some(p.last().unwrap().value.to_lowercase()),
+        Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
+        Expr::CompoundIdentifier(p) => p.last().map(crate::dml::fold_ident),
         _ => None,
     }
+}
+
+/// Whether a `PRIMARY KEY` or `UNIQUE` constraint with these characteristics holds after every
+/// statement, which is what a key told to a prover claims: no state a query can observe has two
+/// rows agreeing on it.
+///
+/// Only the default, `NOT DEFERRABLE`, does. A `DEFERRABLE` constraint is checked when the
+/// transaction commits if it is `INITIALLY DEFERRED` (which implies `DEFERRABLE`), or once a
+/// transaction runs `SET CONSTRAINTS ... DEFERRED` if it is `INITIALLY IMMEDIATE`; until then a
+/// query sees the duplicates. `NOT ENFORCED` is not accepted on a key by Postgres, and a constraint
+/// that says it is not enforced is no premise either. The `NOT NULL` a `PRIMARY KEY` implies is a
+/// separate constraint, enforced at once whatever the key's deferrability, so it is kept.
+pub(crate) fn enforced_per_statement(c: Option<&ConstraintCharacteristics>) -> bool {
+    c.is_none_or(|c| {
+        c.deferrable != Some(true)
+            && c.initially != Some(DeferrableInitial::Deferred)
+            && c.enforced != Some(false)
+    })
 }
 
 /// Parse a `declare scalar|aggregate function NAME(args) returns TYPE;` DSL line into
@@ -199,26 +242,38 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
 /// queries they reduce to.
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
     let mut catalog = Catalog { tables: Vec::new() };
+    let created = crate::collation::created(statements);
     for st in statements {
         let Statement::CreateTable(ct) = st else { continue };
         let tname = obj_name(&ct.name).to_lowercase();
         let mut cols = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
+        let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
+        let mut collations: Vec<Collation> = Vec::new();
         for c in &ct.columns {
-            let cname = c.name.value.to_lowercase();
-            let cty = map_type(&c.data_type);
+            let cname = crate::dml::fold_ident(&c.name);
+            let (cty, collation) = crate::collation::column(&c.options, map_type(&c.data_type), &created);
             let idx = cols.len();
+            identity.push(cty == "VARBINARY" && opaque_identity(&c.data_type.to_string()));
             cols.push((cname, cty));
+            collations.push(collation);
             nullable.push(true);
             determined.push(row_determined(c));
             for opt in &c.options {
-                match opt.option {
-                    ColumnOption::Unique { .. } => keys.push(vec![idx]),
-                    // `PRIMARY KEY` is a key *and* implies `NOT NULL`.
-                    ColumnOption::PrimaryKey(_) => {
-                        keys.push(vec![idx]);
+                match &opt.option {
+                    ColumnOption::Unique(u) => {
+                        if enforced_per_statement(u.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
+                    }
+                    // `PRIMARY KEY` is a key *and* implies `NOT NULL`; the second holds even when
+                    // the first is deferrable.
+                    ColumnOption::PrimaryKey(pk) => {
+                        if enforced_per_statement(pk.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
                         nullable[idx] = false;
                     }
                     ColumnOption::NotNull => nullable[idx] = false,
@@ -229,11 +284,15 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let name_index: HashMap<String, usize> =
             cols.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
         for con in &ct.constraints {
-            // UNIQUE and PRIMARY KEY both become a key column-set; only PRIMARY KEY also implies its
-            // columns are NOT NULL.
-            let (key_cols, implies_not_null): (&[IndexColumn], bool) = match con {
-                TableConstraint::Unique(uc) => (&uc.columns, false),
-                TableConstraint::PrimaryKey(pk) => (&pk.columns, true),
+            // UNIQUE and PRIMARY KEY both become a key column-set, unless deferrable; only PRIMARY
+            // KEY also implies its columns are NOT NULL, deferrable or not.
+            let (key_cols, implies_not_null, enforced): (&[IndexColumn], bool, bool) = match con {
+                TableConstraint::Unique(uc) => {
+                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+                }
+                TableConstraint::PrimaryKey(pk) => {
+                    (&pk.columns, true, enforced_per_statement(pk.characteristics.as_ref()))
+                }
                 _ => continue,
             };
             let set: Vec<usize> = key_cols
@@ -248,7 +307,9 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
                         nullable[i] = false;
                     }
                 }
-                keys.push(set);
+                if enforced {
+                    keys.push(set);
+                }
             }
         }
         catalog.tables.push(Table {
@@ -256,8 +317,10 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             n_declared: cols.len(),
             cols,
             nullable,
+            opaque_identity: identity,
             row_determined: determined,
             keys,
+            collations,
         });
     }
     catalog
@@ -369,9 +432,11 @@ pub fn add_system_columns(cat: &mut Catalog, queries: &[Query]) {
             }
             t.cols.push((s.to_string(), Ty::Opaque.sql().to_string()));
             t.nullable.push(true);
+            t.opaque_identity.push(false);
             // A system column is never written, so no `INSERT` can omit it; the value is the
             // conservative one either way.
             t.row_determined.push(false);
+            t.collations.push(Collation::Default);
         }
     }
 }

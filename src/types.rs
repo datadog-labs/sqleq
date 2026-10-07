@@ -309,6 +309,9 @@ pub fn scalar_class(name: &str) -> Option<Scalar> {
 pub const UNFAITHFUL: &[(&str, &str)] = &[
     ("CITEXT", "citext compares case-insensitively"),
     ("BPCHAR", "char(n) compares ignoring trailing spaces"),
+    // A column under a collation the IR cannot carry (`crate::collation`), whose own refusal, with
+    // its own message, runs first.
+    (crate::collation::COLLATED, "its collation may compare different strings as equal"),
 ];
 
 /// The [`UNFAITHFUL`] type a type name denotes, an array of one included, or `None`.
@@ -435,6 +438,53 @@ pub fn normalize_type_name(t: &str) -> String {
         None => return up,
     }
     .to_string()
+}
+
+/// Whether Postgres's `=` on the type `name` is identity: two values it calls equal are the same
+/// value, so their text, their length and every function of them agree.
+///
+/// Read for the columns emitted as the opaque VARBINARY, which stands for types of both kinds. The
+/// emitted schema lists those columns (`opaque_identity`), and `sqleq-solver` reads `=` on them as
+/// identity, which lets it put one side of an equality in place of the other and deduplicate by
+/// value; on every other opaque column it compares through a key and refuses to deduplicate. A wrong
+/// `true` is a false-proof channel and a wrong `false` only costs proofs, so this is an allowlist,
+/// each entry checked on Postgres 17:
+///
+/// * `bytea`; `uuid`, whose input is case-insensitive and whose braces and hyphens are optional,
+///   and whose output is canonical; `money`, a count of cents (`'1.5'` and `'1.50'` both print
+///   `$1.50`); `name`;
+/// * the discrete ranges `int4range`, `int8range` and `daterange`, which are canonicalized
+///   (`int4range(1, 2, '[]')` is `[1,3)`);
+/// * an array of any type with an identity `=`, the integers, strings, `boolean`, `date`, `time`,
+///   `timestamp` and `timestamptz` included. Array `=` compares the dimensions, the lower bounds
+///   and the elements with their type's `=` (`'[0:1]={1,2}'::int[] = '{1,2}'` is false), and takes
+///   two NULL elements as equal.
+///
+/// A string is identity under a deterministic collation, which is how the IR's VARCHAR reads it
+/// too, and a `timestamptz` prints in the session's `TimeZone`, the same way for two equal values.
+/// Not identity, so never listed: `real` and `double precision` (`0 = -0`), `numeric` (`2.0 =
+/// 2.00`), `interval` (`'1 day' = '24 hours'`), `jsonb` (`{"a": 1.0} = {"a": 1.00}`), `numrange`
+/// (`[1.0,2.0)` and `[1.00,2.00)`), `box` (whose `=` compares areas), the [`UNFAITHFUL`] types, and
+/// arrays of any of them; nor a name this crate does not know, such as an enum, a domain (over
+/// whatever its author chose) or an extension's type.
+pub fn opaque_identity(name: &str) -> bool {
+    if unfaithful_type(name).is_some() {
+        return false;
+    }
+    let canon = name.replace(['"', '`'], "").to_uppercase();
+    // `t[]`, `t[3]`, `t[][]`, `t ARRAY` and `t ARRAY[3]` are arrays of `t`, and the element decides.
+    let elem = canon.split('[').next().unwrap_or(&canon).trim();
+    let elem = elem.strip_suffix(" ARRAY").unwrap_or(elem).trim();
+    let array = elem.len() < canon.trim().len();
+    let base = elem.split('(').next().unwrap_or(elem).trim();
+    let named = matches!(base, "BYTEA" | "UUID" | "MONEY" | "NAME" | "INT4RANGE" | "INT8RANGE" | "DATERANGE");
+    if named || scalar_class(elem) == Some(Scalar::Binary) {
+        return true;
+    }
+    // A scalar of these is not opaque, so only its array is asked about.
+    array
+        && (matches!(scalar_class(elem), Some(Scalar::Int | Scalar::Str | Scalar::Bool))
+            || matches!(temporal_class(elem), Some(Some("DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ"))))
 }
 
 /// The `type` annotation of a lowered expression Value (defaults to INTEGER if absent).

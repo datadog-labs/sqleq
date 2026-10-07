@@ -23,7 +23,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, Select, SelectItem,
+    FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Spanned, Statement, UnaryOperator, Value, Visit, VisitMut,
     Visitor, VisitorMut,
 };
@@ -41,7 +41,7 @@ use crate::schema::BARE_NUMERIC;
 /// before the construct would put a naive `column - 1` inside a character. Walking `char_indices` is
 /// the conversion that cannot be off. Returns `None` for the `line: 0` empty span sqlparser reports
 /// when it has no location, and for a location past the end of `sql`.
-fn byte_of(sql: &str, l: Location) -> Option<usize> {
+pub(crate) fn byte_of(sql: &str, l: Location) -> Option<usize> {
     if l.line == 0 || l.column == 0 {
         return None;
     }
@@ -517,6 +517,10 @@ pub const NONZERO: &str = "sqleq_nonzero";
 /// string, as Postgres's `~` does; the second also makes it case-insensitive, for `~*`.
 pub const PARTIAL: &str = "sqleq_partial";
 pub const IPARTIAL: &str = "sqleq_ipartial";
+/// The names `power`, `pow` and `exp` are renamed to: macros that raise where Postgres's
+/// `double precision` versions do (see [`postgres_operators`]).
+pub const POWER: &str = "sqleq_power";
+pub const EXP: &str = "sqleq_exp";
 
 /// Make DuckDB evaluate the operators whose meaning it does not share with Postgres as Postgres does,
 /// or say why it cannot: `Err` carries the reason the pair gets no verdict.
@@ -534,6 +538,20 @@ pub const IPARTIAL: &str = "sqleq_ipartial";
 ///   `SIMILAR TO` pattern as a bare regular expression, with no `%` or `_` wildcards; translating it
 ///   the way Postgres does (`similar_to_escape`) is a translation of the pattern language, not a
 ///   rename, so a pair using it is withheld.
+/// * **`LIKE` escapes with a backslash.** A Postgres `LIKE`, `ILIKE` or `NOT` either, without an
+///   `ESCAPE` clause, takes `\` as its escape character, so `'\a'` matches `'a'`; DuckDB's has no
+///   escape character unless given one. Each such pattern is given `ESCAPE '\'`, under which
+///   DuckDB 1.5.5 matches as Postgres does, raising where Postgres raises too: on a pattern whose
+///   match reaches a trailing unpaired backslash (checked against Postgres 17 over every operator
+///   and a grid of escaped patterns and strings). The operator spellings `~~`, `~~*`, `!~~` and
+///   `!~~*` take no `ESCAPE`, so a pair using one is withheld unless its pattern is a literal with
+///   no backslash in it.
+/// * **`power`, `pow` and `exp` raise as Postgres's do.** Over `double precision` Postgres raises for
+///   a zero base with a negative exponent, a negative base with a fractional one, and a result that
+///   overflows or underflows; DuckDB answers `inf`, `NaN` or `0`. The calls are renamed to [`POWER`]
+///   and [`EXP`], which raise on those inputs and on a non-finite one. A macro cannot take the name
+///   of a function DuckDB has (`crate::shim`), hence the rename; over `numeric` the functions are
+///   withheld before they get here (`crate::pgtype::unmodelled`), and so is the `^` operator.
 ///
 /// Each edit wraps an operand in a call. The operand is found by parsing it again, with sqlparser's
 /// own grammar, from the token after its operator at that operator's precedence -- sqlparser's spans
@@ -559,7 +577,8 @@ pub fn postgres_operators(sql: &str) -> Result<String, String> {
     if found.sites == 0 {
         return Ok(sql.to_string());
     }
-    let unplaced = || "a divisor or regex pattern whose extent could not be found".to_string();
+    let unplaced =
+        || "a divisor, LIKE or regex pattern whose extent could not be found".to_string();
     let toks = lex(sql).ok_or_else(unplaced)?;
 
     let mut edits: Vec<Edit> = Vec::new();
@@ -576,8 +595,49 @@ pub fn postgres_operators(sql: &str) -> Result<String, String> {
                 }
                 continue;
             }
+            Token::Word(w)
+                if w.quote_style.is_none() && matches!(w.keyword, Keyword::LIKE | Keyword::ILIKE) =>
+            {
+                Kind::Like
+            }
+            Token::Word(w) if w.quote_style.is_none() && renamed(&w.value).is_some() => {
+                let call = next_significant(&toks, i + 1)
+                    .is_some_and(|k| toks[k].token == Token::LParen);
+                let qualified = toks[..i]
+                    .iter()
+                    .rev()
+                    .find(|t| !t.is_blank())
+                    .is_some_and(|t| t.token == Token::Period);
+                if call && !qualified {
+                    let to = renamed(&w.value).expect("matched above");
+                    edits.push(Edit::new(toks[i].start, toks[i].end, to, 1));
+                }
+                continue;
+            }
             _ => continue,
         };
+        if matches!(kind, Kind::Like) {
+            // `LIKE ANY (..)` has no DuckDB counterpart and fails there as it is; the rest of the
+            // pattern is read exactly as the parser reads it, at `LIKE`'s precedence.
+            let after = next_significant(&toks, i + 1);
+            if after.is_some_and(|k| {
+                matches!(&toks[k].token, Token::Word(w) if matches!(w.keyword, Keyword::ANY | Keyword::ALL | Keyword::SOME))
+            }) {
+                continue;
+            }
+            let prec = Parser::new(&PostgreSqlDialect {})
+                .with_tokens_with_locations(toks[i..].iter().map(Tok::with_span).collect())
+                .get_next_precedence()
+                .map_err(|_| unplaced())?;
+            let (_, _, last) = parse_operand(&toks, i + 1, Some(prec)).ok_or_else(unplaced)?;
+            let escaped = next_significant(&toks, last + 1).is_some_and(|k| {
+                matches!(&toks[k].token, Token::Word(w) if w.keyword == Keyword::ESCAPE)
+            });
+            if !escaped {
+                edits.push(Edit::new(toks[last].end, toks[last].end, " ESCAPE '\\'", 0));
+            }
+            continue;
+        }
         // A prefix `~` is bitwise NOT, not a regex match: it follows no operand.
         if matches!(kind, Kind::Pattern { .. }) && !follows_operand(&toks, i) {
             continue;
@@ -594,6 +654,7 @@ pub fn postgres_operators(sql: &str) -> Result<String, String> {
             Kind::Divisor => NONZERO,
             Kind::Pattern { insensitive: false } => PARTIAL,
             Kind::Pattern { insensitive: true } => IPARTIAL,
+            Kind::Like => unreachable!("handled above"),
         };
         if let Kind::Pattern { insensitive: true } = kind {
             let plain = if toks[i].token == Token::TildeAsterisk { "~" } else { "!~" };
@@ -614,6 +675,20 @@ pub fn postgres_operators(sql: &str) -> Result<String, String> {
         Ok(after) if denested(&after) == denested(&expected) => Ok(out),
         _ => Err(unplaced()),
     }
+}
+
+/// The name a call to `name` is renamed to, if it is one [`postgres_operators`] renames.
+fn renamed(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "power" | "pow" => Some(POWER),
+        "exp" => Some(EXP),
+        _ => None,
+    }
+}
+
+/// The index of the first token from `from` on that is not blank.
+fn next_significant(toks: &[Tok], from: usize) -> Option<usize> {
+    (from..toks.len()).find(|&k| !toks[k].is_blank())
 }
 
 /// Parse one operand starting at token `from`: at `prec` (the right operand of a binary operator) or,
@@ -698,10 +773,16 @@ fn risky_token(t: &Token) -> bool {
         | Token::Tilde
         | Token::TildeAsterisk
         | Token::ExclamationMarkTilde
-        | Token::ExclamationMarkTildeAsterisk => true,
+        | Token::ExclamationMarkTildeAsterisk
+        | Token::DoubleTilde
+        | Token::DoubleTildeAsterisk
+        | Token::ExclamationMarkDoubleTilde
+        | Token::ExclamationMarkDoubleTildeAsterisk => true,
         Token::Word(w) => {
             w.quote_style.is_none()
-                && (w.keyword == Keyword::SIMILAR || w.value.eq_ignore_ascii_case("mod"))
+                && (matches!(w.keyword, Keyword::SIMILAR | Keyword::LIKE | Keyword::ILIKE)
+                    || w.value.eq_ignore_ascii_case("mod")
+                    || renamed(&w.value).is_some())
         }
         _ => false,
     }
@@ -711,6 +792,7 @@ fn risky_token(t: &Token) -> bool {
 enum Kind {
     Divisor,
     Pattern { insensitive: bool },
+    Like,
 }
 
 /// What [`postgres_operators`] finds on the parse: how many operands it has to wrap, and a reason
@@ -763,6 +845,56 @@ fn plain_args(e: &Expr) -> Option<Vec<&Expr>> {
         .collect()
 }
 
+/// Whether a `LIKE` is one [`postgres_operators`] gives an escape character: no `ESCAPE` of its own,
+/// and not `LIKE ANY` or `LIKE ALL`, which sqlparser reads as a call named `ALL`.
+fn unescaped_like(e: &Expr) -> bool {
+    match e {
+        Expr::Like {
+            any: false,
+            escape_char: None,
+            pattern,
+            ..
+        }
+        | Expr::ILike {
+            any: false,
+            escape_char: None,
+            pattern,
+            ..
+        } => !matches!(call_name(pattern).as_deref(), Some("all" | "any" | "some")),
+        _ => false,
+    }
+}
+
+/// Whether `e` is a call [`postgres_operators`] renames: `power`, `pow` or `exp`, unqualified.
+fn renamed_call(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => matches!(
+            f.name.0.as_slice(),
+            [ObjectNamePart::Identifier(id)] if id.quote_style.is_none() && renamed(&id.value).is_some()
+        ),
+        _ => false,
+    }
+}
+
+fn is_like_operator(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::PGLikeMatch
+            | BinaryOperator::PGILikeMatch
+            | BinaryOperator::PGNotLikeMatch
+            | BinaryOperator::PGNotILikeMatch
+    )
+}
+
+/// A string literal with no backslash in it: a pattern on which an escape character changes nothing.
+fn plain_pattern(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => plain_pattern(inner),
+        Expr::Value(v) => matches!(&v.value, Value::SingleQuotedString(s) if !s.contains('\\')),
+        _ => false,
+    }
+}
+
 fn is_regex(op: &BinaryOperator) -> bool {
     matches!(
         op,
@@ -787,6 +919,18 @@ impl Visitor for Operands {
             {
                 self.refused
                     .get_or_insert("a regex operator under ANY/ALL".into());
+            }
+            Expr::BinaryOp { op, right, .. } if is_like_operator(op) && !plain_pattern(right) => {
+                self.refused.get_or_insert(
+                    "a ~~ operator (Postgres's escapes with a backslash, DuckDB's cannot)".into(),
+                );
+            }
+            e if unescaped_like(e) || renamed_call(e) => self.sites += 1,
+            // `pg_catalog.power(..)` or `"exp"(..)`: Postgres's function all the same, but not a
+            // spelling the rename reaches.
+            Expr::Function(_) if call_name(e).is_some_and(|n| renamed(&n).is_some()) => {
+                self.refused
+                    .get_or_insert("a schema-qualified or quoted power or exp".into());
             }
             Expr::BinaryOp { op, right, .. } => {
                 let divides = matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo);
@@ -848,6 +992,21 @@ impl VisitorMut for Wrap {
     type Break = ();
 
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if unescaped_like(e) {
+            if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = e {
+                *escape_char = Some(Box::new(Expr::Value(
+                    Value::SingleQuotedString("\\".to_string()).with_empty_span(),
+                )));
+            }
+            return ControlFlow::Continue(());
+        }
+        if renamed_call(e) {
+            let to = call_name(e).and_then(|n| renamed(&n)).expect("checked above");
+            if let Expr::Function(f) = e {
+                f.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(to))]);
+            }
+            return ControlFlow::Continue(());
+        }
         if call_name(e).as_deref() == Some("mod") {
             if let Expr::Function(f) = e {
                 if let FunctionArguments::List(list) = &mut f.args {
@@ -1153,6 +1312,78 @@ mod tests {
                 Parser::parse_sql(&PostgreSqlDialect {}, &out).is_ok(),
                 "rewrite does not parse:\n  in:  {sql}\n  out: {out}"
             );
+        }
+    }
+
+    /// `LIKE` gets Postgres's escape character, and `power`/`exp` the macros that raise as
+    /// Postgres's do (issue #89).
+    mod like_and_power {
+        use super::super::postgres_operators;
+
+        fn ops(sql: &str) -> Result<String, String> {
+            postgres_operators(sql)
+        }
+
+        #[test]
+        fn a_like_without_an_escape_clause_gets_a_backslash() {
+            for (sql, want) in [
+                (
+                    "SELECT 1 FROM t WHERE s LIKE 'a'",
+                    r"SELECT 1 FROM t WHERE s LIKE 'a' ESCAPE '\'",
+                ),
+                (
+                    "SELECT 1 FROM t WHERE s NOT ILIKE $1 AND x",
+                    r"SELECT 1 FROM t WHERE s NOT ILIKE $1 ESCAPE '\' AND x",
+                ),
+                (
+                    "SELECT s LIKE 'a' || b FROM t",
+                    r"SELECT s LIKE 'a' || b ESCAPE '\' FROM t",
+                ),
+                (
+                    "SELECT 1 FROM t WHERE s LIKE 'a' AND s LIKE lower(b)",
+                    r"SELECT 1 FROM t WHERE s LIKE 'a' ESCAPE '\' AND s LIKE lower(b) ESCAPE '\'",
+                ),
+            ] {
+                assert_eq!(ops(sql).as_deref(), Ok(want), "{sql}");
+            }
+            // An escape of its own, and the quantified forms, are left alone.
+            for sql in [
+                "SELECT 1 FROM t WHERE s LIKE 'a!%' ESCAPE '!'",
+                "SELECT 1 FROM t WHERE s LIKE ANY (ARRAY['a', 'b'])",
+                "SELECT 1 FROM t WHERE s LIKE ALL (ARRAY['a', 'b'])",
+            ] {
+                assert_eq!(ops(sql).as_deref(), Ok(sql), "{sql}");
+            }
+        }
+
+        #[test]
+        fn the_like_operators_are_withheld_unless_nothing_is_escaped() {
+            assert!(ops(r"SELECT 1 FROM t WHERE s ~~ '\a'").is_err());
+            assert!(ops("SELECT 1 FROM t WHERE s !~~* $1").is_err());
+            let plain = "SELECT 1 FROM t WHERE s ~~ 'a%'";
+            assert_eq!(ops(plain).as_deref(), Ok(plain));
+        }
+
+        #[test]
+        fn power_and_exp_are_renamed_to_macros_that_raise() {
+            for (sql, want) in [
+                (
+                    "SELECT POWER(a, -1), pow(a, 2) FROM t",
+                    "SELECT sqleq_power(a, -1), sqleq_power(a, 2) FROM t",
+                ),
+                (
+                    "SELECT 1 FROM t WHERE exp(a / b) > 0",
+                    "SELECT 1 FROM t WHERE sqleq_exp(a / sqleq_nonzero(b)) > 0",
+                ),
+            ] {
+                assert_eq!(ops(sql).as_deref(), Ok(want), "{sql}");
+            }
+            // A qualified or quoted call is not renamed, so it is withheld; a column named alike is
+            // no call.
+            assert!(ops("SELECT pg_catalog.power(a, 2) FROM t").is_err());
+            assert!(ops(r#"SELECT "exp"(a) FROM t"#).is_err());
+            let column = "SELECT exp FROM t WHERE power > 1";
+            assert_eq!(ops(column).as_deref(), Ok(column));
         }
     }
 }

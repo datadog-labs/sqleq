@@ -546,15 +546,27 @@ fn same_target(a: &TableWithJoins, b: &TableWithJoins) -> Result<()> {
 }
 
 /// Postgres's identity for an identifier: an unquoted name folds to lower case, a quoted one does
-/// not.
+/// not. The fold is ASCII-only, as Postgres's is under a multibyte server encoding: an unquoted `É`
+/// stays `É`.
 ///
 /// This is the language's rule and not a normalisation of convenience, because it decides whether
-/// two `RETURNING` lists are the same projection — folding too much is a false proof, folding too
-/// little is a refusal.
+/// two `RETURNING` lists are the same projection, and which column or relation a name in a query
+/// reads — folding too much is a false proof, folding too little is a refusal. The catalog stores a
+/// column's name in this form, and name resolution in `lower` looks names up in it.
 pub(crate) fn fold_ident(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
-        None => id.value.to_lowercase(),
+        None => id.value.to_ascii_lowercase(),
+    }
+}
+
+/// An identifier that [`fold_ident`] reads back as `name`: unquoted where that already folds to it,
+/// quoted otherwise.
+fn spelled(name: &str) -> Ident {
+    if name.to_ascii_lowercase() == name {
+        Ident::new(name)
+    } else {
+        Ident::with_quote('"', name)
     }
 }
 
@@ -647,9 +659,10 @@ fn same_returning(
 }
 
 /// The parts of an `UPDATE` the reduction reads: its target, its assignments as
-/// `(lowercased column, value)`, and its predicate. The first two are borrowed from the statement,
-/// because the value expressions are spliced into the projection unchanged; the predicate is owned,
-/// because under `FROM` it is the `EXISTS` [`set_map`] builds around the statement's own.
+/// `(column, value)` with the column folded by [`fold_ident`], and its predicate. The first two are
+/// borrowed from the statement, because the value expressions are spliced into the projection
+/// unchanged; the predicate is owned, because under `FROM` it is the `EXISTS` [`set_map`] builds
+/// around the statement's own.
 type Parts<'a> = (&'a TableWithJoins, Vec<(String, &'a Expr)>, Option<Expr>);
 
 /// Read an `UPDATE` into its [`Parts`], refusing every shape the projection does not model.
@@ -683,7 +696,7 @@ fn set_map<'a>(cat: &Catalog, u: &'a Update) -> Result<Parts<'a>> {
         let Some(id) = part.as_ident() else {
             return Err(unsupported("SET target is not an identifier"));
         };
-        let col = id.value.to_lowercase();
+        let col = fold_ident(id);
         // Two assignments to one column: Postgres rejects it, and the projection has one slot per
         // column so it could only keep one of them.
         if sets.iter().any(|(seen, _)| *seen == col) {
@@ -866,7 +879,7 @@ fn project(cols: &[String], types: &[String], sets: &[(String, &Expr)], pred: Op
         .iter()
         .zip(types)
         .map(|(c, ty)| {
-            let old = Expr::Identifier(Ident::new(c.clone()));
+            let old = Expr::Identifier(spelled(c));
             let assigned = |value: &Expr| match crate::types::temporal_data_type(ty) {
                 Some(data_type) if type_is_evident(value) => Expr::Cast {
                     kind: CastKind::Cast,
@@ -896,7 +909,7 @@ fn project(cols: &[String], types: &[String], sets: &[(String, &Expr)], pred: Op
             };
             // Aliased even where the expression is the bare column, so the output names are the
             // catalog's and do not depend on how `lower` names an unaliased projection item.
-            SelectItem::ExprWithAlias { expr, alias: Ident::new(c.clone()) }
+            SelectItem::ExprWithAlias { expr, alias: spelled(c) }
         })
         .collect()
 }
@@ -1061,17 +1074,17 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query)> 
     // The declared prefix, for the reason [`update_pair`] gives: a system column is not written by
     // an `INSERT` and would look to the guard like an omitted one.
     let declared = &t.cols[..t.n_declared];
-    // Compared lowercased because `catalog::scan_ddl` lowercases a quoted declaration too, so a
-    // `RETURNING`-faithful fold is not the identity the catalog is keyed on. A listed column the
-    // catalog does not declare is refused rather than ignored: it is written by the statement and
-    // invisible to the guard, which would then compute the omitted set wrongly.
+    // Both sides are folded as Postgres folds a name: the list by `insert_shape`, the catalog by
+    // `catalog::scan_ddl`. A listed column the catalog does not declare is refused rather than
+    // ignored: it is written by the statement and invisible to the guard, which would then compute
+    // the omitted set wrongly.
     for c in &ca {
-        if !declared.iter().any(|(d, _)| *d == c.to_lowercase()) {
+        if !declared.iter().any(|(d, _)| d == c) {
             return Err(schema(format!("INSERT lists {c}, which {name} does not declare")));
         }
     }
     for (k, (col, _)) in declared.iter().enumerate() {
-        if ca.iter().any(|c| c.to_lowercase() == *col) || t.row_determined[k] {
+        if ca.contains(col) || t.row_determined[k] {
             continue;
         }
         return Err(unsupported(format!(
@@ -1148,9 +1161,11 @@ mod tests {
                 name: name.to_string(),
                 cols: cols.iter().map(|c| (c.to_string(), "INTEGER".to_string())).collect(),
                 nullable: vec![true; cols.len()],
+                opaque_identity: vec![false; cols.len()],
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),
                 keys: Vec::new(),
                 n_declared: cols.len(),
+                collations: vec![crate::collation::Collation::Default; cols.len()],
             }],
         }
     }

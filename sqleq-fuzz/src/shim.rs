@@ -205,6 +205,34 @@ const PARTIAL_DDL: &str =
 const IPARTIAL_DDL: &str =
     "CREATE OR REPLACE MACRO sqleq_ipartial(p) AS '(?si).*(?:' || p || ').*'";
 
+/// `power` and `exp` over `double precision`, raising where Postgres's `dpow` and `dexp` raise and
+/// DuckDB answers `inf`, `NaN` or `0`: a zero base with a negative exponent, a negative base with a
+/// fractional one, and a finite result Postgres reports as an overflow (infinite) or an underflow
+/// (zero from a non-zero base). They also raise on a non-finite argument and on a subnormal result,
+/// where what Postgres does depends on the platform's `pow` and `exp`; a raise only ever skips the
+/// trial. `crate::rewrite::postgres_operators` renames `power`, `pow` and `exp` calls to these (a
+/// macro cannot take a name DuckDB has), and `crate::pgtype::unmodelled` withholds the `numeric`
+/// ones before that.
+const POWER_DDL: &str = r"CREATE OR REPLACE MACRO sqleq_power_d(x, y) AS
+    CASE WHEN isnan(x) OR isinf(x) OR isnan(y) OR isinf(y)
+              THEN error('power of a non-finite value')
+         WHEN x = 0 AND y < 0 THEN error('zero raised to a negative power is undefined')
+         WHEN x < 0 AND floor(y) <> y
+              THEN error('a negative number raised to a non-integer power yields a complex result')
+         WHEN isinf(pow(x, y)) THEN error('value out of range: overflow')
+         WHEN pow(x, y) = 0 AND x <> 0 THEN error('value out of range: underflow')
+         WHEN pow(x, y) <> 0 AND abs(pow(x, y)) < 2.2250738585072014e-308
+              THEN error('a subnormal power')
+         ELSE pow(x, y) END;
+CREATE OR REPLACE MACRO sqleq_power(x, y) AS sqleq_power_d(CAST(x AS DOUBLE), CAST(y AS DOUBLE))";
+const EXP_DDL: &str = r"CREATE OR REPLACE MACRO sqleq_exp_d(x) AS
+    CASE WHEN isnan(x) OR isinf(x) THEN error('exp of a non-finite value')
+         WHEN isinf(exp(x)) THEN error('value out of range: overflow')
+         WHEN exp(x) = 0 THEN error('value out of range: underflow')
+         WHEN exp(x) < 2.2250738585072014e-308 THEN error('a subnormal exp')
+         ELSE exp(x) END;
+CREATE OR REPLACE MACRO sqleq_exp(x) AS sqleq_exp_d(CAST(x AS DOUBLE))";
+
 /// DuckDB has no `initcap` at all, so this is the one entry that is an implementation rather than
 /// a rename. Postgres uppercases the first character of each word and lowercases the rest, where a
 /// word is a run of alphanumerics; the character-wise form below states exactly that. The class is
@@ -319,6 +347,8 @@ static SHIMS: &[(&str, &str)] = &[
     ("sqleq_nonzero", NONZERO_DDL),
     ("sqleq_partial", PARTIAL_DDL),
     ("sqleq_ipartial", IPARTIAL_DDL),
+    ("sqleq_power", POWER_DDL),
+    ("sqleq_exp", EXP_DDL),
 ];
 
 /// Define every shimmed function whose name appears in `sqls`.

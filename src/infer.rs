@@ -1223,7 +1223,9 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
         for (t, cols) in &at.cols {
             if let Some(i) = cat.find(t) {
                 for c in cols {
-                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n == c) {
+                    // `c` is lower-cased, as every attributed name is, and the catalog keeps a quoted
+                    // declaration's case; `Catalog::check_case_collisions` makes the match unique.
+                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n.to_lowercase() == *c) {
                         // Seeded even when the declared type is one nothing recognises: `Opaque` at
                         // `Schema` confidence is a *fact* -- the DDL says this column holds
                         // something we do not model -- and it has to outrank a name guess, or a
@@ -1391,10 +1393,15 @@ pub fn build_inferred(
             n_declared: n,
             cols,
             nullable: vec![true; n],
+            // No DDL was read, so no column is known to be of a type whose `=` is identity.
+            opaque_identity: vec![false; n],
             // No DDL was read, so no column's default is known. The synthesized table holds only
             // the columns the queries name, so an `INSERT` here cannot omit one anyway.
             row_determined: vec![false; n],
             keys: Vec::new(),
+            // No DDL was read, so no column declares a collation: the synthesized schema is one
+            // in which every string has the database's default.
+            collations: vec![crate::collation::Collation::Default; n],
         });
     }
     Ok(Catalog { tables })

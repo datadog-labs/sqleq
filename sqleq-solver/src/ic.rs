@@ -69,6 +69,7 @@ mod tests {
             types: vec![Type::Integer, Type::Integer],
             key: vec![vec![0], vec![1]],
             nullable: vec![false, true],
+            opaque_identity: vec![],
         }];
         let ics = Ics::from_schemas(&schemas);
         assert_eq!(ics.keys.get("t"), Some(&vec![vec![0]]));

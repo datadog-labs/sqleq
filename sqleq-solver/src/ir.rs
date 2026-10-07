@@ -141,6 +141,12 @@ pub enum TranslateError {
     /// Translation-stage-only: a scalar subquery (`$SCALAR_QUERY`) whose inner relation doesn't have
     /// exactly one output column.
     ScalarSubqueryArity,
+    /// Translation-stage-only: `dedup-not-identity:<type>` -- a `DISTINCT`, `GROUP BY` key,
+    /// `UNION`, `INTERSECT` or `EXCEPT` over a column whose `=` is not identity of the values (see
+    /// `translate::eq_is_identity`). Postgres keeps one row per class of `=`-equal values, and which
+    /// of them it keeps is not modelled; `unresolved` names a set-operation column whose two branches
+    /// have different IR types.
+    DedupNotIdentity(String),
     /// Not part of `IrToRel`'s taxonomy: a plan nested deeper than [`MAX_DEPTH`]. Every stage
     /// recurses over the plan, so a bound is what keeps a deep plan a refusal instead of a stack
     /// overflow, which aborts the whole process.
@@ -172,6 +178,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::UnsupportedSort => write!(f, "unsupported-sort"),
             TranslateError::DistinctAggregateUnsupported => write!(f, "aggregate-distinct-unsupported"),
             TranslateError::ScalarSubqueryArity => write!(f, "scalar-subquery-arity"),
+            TranslateError::DedupNotIdentity(ty) => write!(f, "dedup-not-identity:{ty}"),
             TranslateError::TooDeep => write!(f, "nesting-too-deep"),
         }
     }
@@ -515,13 +522,20 @@ fn array(v: &Value) -> Result<&Vec<Value>, TranslateError> {
 /// to `"t{index}"` -- the exact spelling `IrToRel.build()` uses for a nameless schema, and the
 /// spelling `sqlsolver::ddl_from_ir` mints on the emitting side, so the two agree without a name
 /// ever needing to travel on the wire. `key`/`nullable` default to empty (`IrToRel.java` never reads
-/// either, but this port's integrity-constraint rewriting, `ic.rs`, does).
+/// either, but this port's integrity-constraint rewriting, `ic.rs`, does), and so does
+/// `opaque_identity`, which only this port reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub name: String,
     pub types: Vec<Type>,
     pub key: Vec<Vec<usize>>,
     pub nullable: Vec<bool>,
+    /// Parallel to `types`: `true` where the column is VARBINARY and the frontend vouches that the
+    /// Postgres type behind it has an `=` that is identity (`bytea`, `uuid`, an array of integers;
+    /// the frontend's `types::opaque_identity` lists them), so that two values `=` calls equal are
+    /// the same value. Absent, short, or on any other type it means `false`: VARBINARY also stands
+    /// for `double precision`, `jsonb` and `numeric[]`, whose `=` is not identity.
+    pub opaque_identity: Vec<bool>,
 }
 
 impl Schema {
@@ -551,7 +565,12 @@ impl Schema {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
             .unwrap_or_default();
-        Ok(Schema { name, types, key, nullable })
+        let opaque_identity = v
+            .get("opaque_identity")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
+            .unwrap_or_default();
+        Ok(Schema { name, types, key, nullable, opaque_identity })
     }
 }
 

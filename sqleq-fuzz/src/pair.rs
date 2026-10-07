@@ -23,6 +23,7 @@ use crate::gen::{
 use crate::lex::significant;
 use crate::limits::{self, Count};
 use crate::patterns as pat;
+use crate::pgtype;
 use crate::rewrite;
 use crate::schema::{parse_schema, Schema, VType};
 use crate::shim;
@@ -77,14 +78,16 @@ impl Default for Config {
 /// The outcome of testing one pair.
 #[derive(Clone, Debug)]
 pub enum Verdict {
-    /// A truly nondeterministic function is present — untestable.
+    /// A truly nondeterministic function is present, or a choice among tied rows that nothing about
+    /// the result survives ([`crate::limits::Choice::Unbounded`]) — untestable.
     NondetSkip,
     /// The two sides cannot be compared soundly, so no verdict is given either way (carries why).
     /// Either they have no shared observable -- a side is an `EXPLAIN`, which has query plans rather
     /// than query results (see [`crate::patterns::has_explain`]), or one side is a query and the
     /// other a mutation -- or DuckDB cannot be made to compute what Postgres computes on them: a
-    /// `char(n)` column, `SIMILAR TO`, a constraint that could not be read, a table spelled two ways
-    /// in a mutation pair (see [`test_pair`]).
+    /// `char(n)` or `interval` column, `SIMILAR TO`, a division of a `numeric`, a float printed as
+    /// text, a constraint that could not be read, a table spelled two ways in a mutation pair (see
+    /// [`test_pair`] and [`crate::pgtype`]).
     NotComparable(String),
     /// No parseable table schema.
     NoSchema,
@@ -264,9 +267,14 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     // prepared — which is the shape the `is_query` defect took.
     //
     // `wide_numerics` respells a type like `double_precision_floats` does, and `strip_public` only
-    // drops a qualifier, so neither changes what the later passes find. `postgres_operators` is the
-    // one pass that can refuse: it makes a zero divisor raise and a regex match partial, and where it
-    // cannot do either faithfully the pair gets no verdict.
+    // drops a qualifier, so neither changes what the later passes find. The passes after them can
+    // refuse. `postgres_operators` makes a zero divisor raise, a regex match partial, a `LIKE` escape
+    // with a backslash and `power`/`exp` raise as Postgres's do, and where it cannot do that
+    // faithfully the pair gets no verdict. `pgtype::unmodelled` and `pgtype::jsonb_literals` read
+    // types off the statement as it stands before that pass wraps operands in macros of no known
+    // type: the first refuses what DuckDB computes in another type (a `numeric` division, a float
+    // printed as text), and the second respells the string literals that meet a `jsonb` value, or
+    // refuses. None of these adds or removes a `$N` either.
     let prep = |sql: &str| -> Result<String, String> {
         if let Some(why) = pat::odd_number(sql) {
             return Err(why);
@@ -275,7 +283,12 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
         let doubled = rewrite::double_precision_floats(&unqualified);
         let widened = rewrite::wide_numerics(&doubled);
         let parenthesized = rewrite::parenthesize_json_ops(&widened);
-        let guarded = rewrite::postgres_operators(&rewrite::strip_public(&parenthesized))?;
+        let stripped = rewrite::strip_public(&parenthesized);
+        if let Some(why) = pgtype::unmodelled(&stripped, &schema) {
+            return Err(why);
+        }
+        let respelled = pgtype::jsonb_literals(&stripped, &schema)?;
+        let guarded = rewrite::postgres_operators(&respelled)?;
         Ok(pat::freeze_time(&guarded))
     };
     let (a, b) = match (prep(a), prep(b)) {
@@ -368,9 +381,17 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     let cut_nondet = cuts.iter().any(|c| {
         !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
     });
-    // Nondeterministic row selection/content: a cut over rows the order leaves tied, or a
-    // string-flattening aggregate.
-    let nondet = cut_nondet || pat::has_nondet_agg(&a, &b);
+    // The other arbitrary choices among tied rows: a `DISTINCT ON` or an order-sensitive window
+    // function whose order leaves ties the result can see. One that leaves only the cardinality
+    // determined is compared like a cut; one that leaves nothing is not compared at all.
+    let choice = limits::choices(&a, &schema).max(limits::choices(&b, &schema));
+    if choice == limits::Choice::Unbounded {
+        return Verdict::NondetSkip;
+    }
+    // Nondeterministic row selection/content: a cut over rows the order leaves tied, a `DISTINCT
+    // ON` that keeps an arbitrary row per key, or a string-flattening aggregate.
+    let nondet =
+        cut_nondet || choice == limits::Choice::Cardinality || pat::has_nondet_agg(&a, &b);
 
     let is_query_a = is_query(&a);
     let is_query_b = is_query(&b);
@@ -650,6 +671,9 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
 ///   is false there and true on one. A query reads such a column when it names it, selects `*` over
 ///   its table, or joins `NATURAL`ly; a mutation pair writes it however the statement is spelled
 ///   (`INSERT ... VALUES` names no column), so any `char(n)` column in a table it touches counts.
+/// * An `interval` column the pair reads, in the same sense. DuckDB's INTERVAL does not compute
+///   what Postgres's does: under `integer_division` it has no `/`, and its products and text differ
+///   (`1 month` where Postgres prints `1 mon`).
 /// * A table spelled two ways in a mutation pair, `s.t` beside `t`. Each spelling is a table of its
 ///   own here, loaded from the same rows, and a mutation through one leaves the other as it was;
 ///   both are one table in Postgres only if they resolve to it, which the DDL does not say. (`public.t`
@@ -667,35 +691,41 @@ fn unfaithful(
             return Some(format!("table {t}: {why}"));
         }
     }
-    let padded: Vec<(&String, &String)> = finals
+    // The columns DuckDB cannot read as Postgres does, with what they are.
+    let padded: Vec<(&String, &String, &str)> = finals
         .iter()
         .flat_map(|t| {
-            schema[t]
-                .cols
-                .iter()
-                .filter(|c| c.padded)
-                .map(move |c| (t, &c.name))
+            schema[t].cols.iter().filter_map(move |c| {
+                let kind = if c.padded {
+                    "char(n)"
+                } else if c.vt == VType::Interval {
+                    "interval"
+                } else {
+                    return None;
+                };
+                Some((t, &c.name, kind))
+            })
         })
         .collect();
-    if let Some((t, c)) = padded.first() {
+    if let Some((t, c, kind)) = padded.first() {
         if !queries {
-            return Some(format!("char(n) column {t}.{c} in a table a mutation writes"));
+            return Some(format!("{kind} column {t}.{c} in a table a mutation writes"));
         }
         for sql in [a, b] {
             let Some(toks) = significant(sql) else {
-                return Some(format!("char(n) column {t}.{c}"));
+                return Some(format!("{kind} column {t}.{c}"));
             };
             for (i, tok) in toks.iter().enumerate() {
                 use sqlparser::keywords::Keyword;
                 use sqlparser::tokenizer::Token;
                 let reads = match &tok.token {
                     Token::Word(w) if w.quote_style.is_none() && w.keyword == Keyword::NATURAL => {
-                        Some(format!("char(n) column {t}.{c} under a NATURAL join"))
+                        Some(format!("{kind} column {t}.{c} under a NATURAL join"))
                     }
                     Token::Word(w) => padded
                         .iter()
-                        .find(|(_, name)| w.value.to_lowercase() == **name)
-                        .map(|(t, c)| format!("char(n) column {t}.{c}")),
+                        .find(|(_, name, _)| w.value.to_lowercase() == **name)
+                        .map(|(t, c, kind)| format!("{kind} column {t}.{c}")),
                     // `*` right after SELECT/DISTINCT/RETURNING, a comma or a qualifier's dot is a
                     // wildcard; anywhere else it is a product or `count(*)`.
                     Token::Mul if i > 0 => match &toks[i - 1].token {
@@ -714,7 +744,7 @@ fn unfaithful(
                         }
                         _ => None,
                     }
-                    .map(|()| format!("char(n) column {t}.{c} under a wildcard")),
+                    .map(|()| format!("{kind} column {t}.{c} under a wildcard")),
                     _ => None,
                 };
                 if reads.is_some() {
