@@ -147,6 +147,10 @@ pub enum TranslateError {
     /// of them it keeps is not modelled; `unresolved` names a set-operation column whose two branches
     /// have different IR types.
     DedupNotIdentity(String),
+    /// Translation-stage-only: `extremum-not-identity:<type>` -- a `MAX` or `MIN` over a column
+    /// whose `=` is not identity of the values (see `translate::eq_is_identity`). Postgres returns
+    /// one of the inputs that `=` calls equal to the extremum, and which one is not modelled.
+    ExtremumNotIdentity(String),
     /// Not part of `IrToRel`'s taxonomy: a plan nested deeper than [`MAX_DEPTH`]. Every stage
     /// recurses over the plan, so a bound is what keeps a deep plan a refusal instead of a stack
     /// overflow, which aborts the whole process.
@@ -179,6 +183,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::DistinctAggregateUnsupported => write!(f, "aggregate-distinct-unsupported"),
             TranslateError::ScalarSubqueryArity => write!(f, "scalar-subquery-arity"),
             TranslateError::DedupNotIdentity(ty) => write!(f, "dedup-not-identity:{ty}"),
+            TranslateError::ExtremumNotIdentity(ty) => write!(f, "extremum-not-identity:{ty}"),
             TranslateError::TooDeep => write!(f, "nesting-too-deep"),
         }
     }

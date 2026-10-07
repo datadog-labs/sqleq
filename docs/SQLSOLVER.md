@@ -186,7 +186,10 @@ Each difference is there for soundness:
   `=` is identity again. Deduplication (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
   binds its output to its input by identity, so over a column whose `=` is not identity, where
   Postgres keeps one row of each class of `=`-equal values and a cast to text can tell which, it is
-  refused (`dedup-not-identity`). Two string constants are not ordered by
+  refused (`dedup-not-identity`). So is a `MAX` or `MIN` over such a column
+  (`extremum-not-identity`): it binds the extremum to an input by identity, so two inputs that `=`
+  calls equal, neither above the other, were two extrema where Postgres returns one of them, which
+  one depending on the order it reads them. Two string constants are not ordered by
   bytes, which only the `C` collation does. The two sides' output columns must have the same types,
   since `TRUE` and `1` are one term. A literal that does not denote a value of its IR type (an
   INTEGER `1e-5`) is refused.

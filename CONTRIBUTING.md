@@ -8,7 +8,7 @@ conventions are not the ones you would guess from the code — this file is the 
 ```sh
 cargo test                 # the frontend: 197 + 7 + 13 + 10 + 7 + 2 + 23 + 2 + 25 + 16 + 190 + 14 + 4 + 19 + 4 + 3 + 13 + 11 + 11 + 23 + 3; sqleq-check: 59 + 16 + 12 + 5 + 2 + 12 + 12
 cargo test -p sqleq-fuzz   # the disprover: 73 + 7 + 3 + 5 + 11 + 15 + 9 + 8 + 53
-cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 4 + 4 + 11 (compiles Z3, see below)
+cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 3 + 4 + 4 + 11 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 41 + 1 + 6 (needs Lean, see below)
 cargo build -p sqleq-fuzz -p sqleq-solver
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
