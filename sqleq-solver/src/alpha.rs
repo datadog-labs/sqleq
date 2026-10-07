@@ -36,16 +36,11 @@ struct Matcher<'w> {
     steps: usize,
 }
 
+/// Two constants match only when they are one value ([`UConst::same_value`]): equal numbers of
+/// different types or scales (`1`, `1.0`, `1.00`) do not, since a term may apply a function to
+/// them that tells them apart.
 fn same_const(a: &UConst, b: &UConst) -> bool {
-    let num = |c: &UConst| match c {
-        UConst::Int(n) => Some(*n as f64),
-        UConst::Decimal(s) => s.parse::<f64>().ok(),
-        _ => None,
-    };
-    match (num(a), num(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
+    a.same_value(b) == Some(true)
 }
 
 /// A hash that ignores every var id, so alpha-equivalent terms always agree on it. Used to skip
@@ -54,12 +49,9 @@ pub(crate) fn shape(t: &UTerm) -> u64 {
     fn go(t: &UTerm, h: &mut std::collections::hash_map::DefaultHasher) {
         std::mem::discriminant(t).hash(h);
         match t {
-            UTerm::Const(c) => match c {
-                UConst::Int(n) => n.hash(h),
-                // Numeric constants are compared numerically, so hash only their kind.
-                UConst::Decimal(_) => 0u8.hash(h),
-                other => other.hash(h),
-            },
+            // Constants match only when identical (`same_const`), and `UConst::Decimal` holds a
+            // canonical spelling, so the constant itself is the hash.
+            UTerm::Const(c) => c.hash(h),
             UTerm::Var(v) => proj_path(v, h),
             UTerm::Table { name, var } => {
                 name.hash(h);
