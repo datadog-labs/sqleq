@@ -33,6 +33,13 @@
 # or allows it with the reason. The one thing a pin would hold still is the floor, and `msrv`
 # checks that.
 #
+# Because that stable moves, every build cache is keyed by the compiler as well as by Cargo.lock: a
+# step named `rustc` hashes `rustc -vV`, and the hash is in both the key and the restore prefix. A
+# `target/` from another compiler is restored in full but none of it is reused -- cargo's
+# fingerprints include the compiler -- and when its key matched exactly the rebuilt one is never
+# saved, so a new runner image would rebuild everything, Z3 included, on every run. There is
+# deliberately no fallback to another compiler's cache, for the disk reason given in the frontend job.
+#
 # Deliberately absent: `cargo fmt`. There is no `rustfmt.toml`, over a thousand source lines
 # already run past 100 columns, and `src/dml.rs` has never been formatted, so a format gate would
 # rewrite the tree rather than check it. See CONTRIBUTING.md.
@@ -81,7 +88,10 @@ jobs:
       # The runner's preinstalled stable toolchain, on purpose: a third-party toolchain action is
       # one more thing an organisation has to allowlist, and this workspace pins no nightly
       # features. The `msrv` job checks the floor; the header says why stable is not pinned.
-      - run: rustc --version && cargo --version
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       # The prefix names the build settings in the job's `env`. A `target/` built under other
       # settings is restored in full but none of it is reused, and with it on disk the runner has no
@@ -93,8 +103,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: frontend-lines-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: frontend-lines-${{ runner.os }}-
+          key: frontend-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: frontend-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # `default-members` is the frontend and sqleq-check, so these two cover both crates and nothing
       # else. sqleq-check's tests include the hygiene gate over every committed pair (it lints, it
@@ -155,7 +165,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustc --version && cargo --version
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library.
       # The prefix names the build settings in the job's `env`, as in the frontend job; change it
@@ -166,8 +179,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: fuzz-lines-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: fuzz-lines-${{ runner.os }}-
+          key: fuzz-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: fuzz-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The build script downloads DuckDB's release library and verifies no checksum on it. This
       # org requires every Action to be pinned to a commit SHA; a 40 MB binary that gets linked
@@ -316,7 +329,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustc --version && cargo --version
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -327,8 +343,9 @@ jobs:
           # The prefix names how Z3 is built: `[profile.dev.package.z3-sys]` in Cargo.toml. A key
           # that matches exactly is never saved again, so a `target/` holding a Z3 built another way
           # would be restored and recompiled on every run. Change the prefix whenever that changes.
-          key: solver-z3release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: solver-z3release-${{ runner.os }}-
+          # The compiler is in the key for the same reason; see the header.
+          key: solver-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: solver-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # Z3 is compiled from the `z3-src` crate, whose checksum Cargo.lock pins, and linked
       # statically; the cache above keeps that compile to the first build after a lockfile change.
@@ -377,7 +394,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustc --version && cargo --version
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -386,8 +406,8 @@ jobs:
             ~/.cargo/git
             target
             lean/.lake
-          key: lean-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'lean/lean-toolchain', 'lean/**/*.lean') }}
-          restore-keys: lean-${{ runner.os }}-
+          key: lean-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock', 'lean/lean-toolchain', 'lean/**/*.lean') }}
+          restore-keys: lean-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The toolchain itself, cached apart from the build because it is large (the archive is over
       # half a gigabyte) and changes only with the version. The key carries the digest, so a cached
