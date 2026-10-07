@@ -279,14 +279,35 @@ mod tests {
     fn a_timeout_kills_the_whole_group() {
         let dir = crate::util::TempDir::new("sqleq-proc-test-").unwrap();
         let pidfile = dir.path().join("pid");
-        // The grandchild writes its pid and sleeps; the shell waits on it.
-        let script = format!("sh -c 'echo $$ > {}; exec sleep 30' & wait", pidfile.display());
-        let r = run(&sh(&script), None, &[], Some(0.5));
+        // The shell starts the grandchild in the background and records its pid at once, before it
+        // waits on it. The pid used to be written by a nested `sh -c` once it had started, and on a
+        // loaded machine the 0.5s timeout could kill the group before it got that far, so the test
+        // failed reading the pid rather than on what it checks. The timeout leaves room for the
+        // shell to start; the 30s sleep still means only the timeout can end the run.
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let r = run(&sh(&script), None, &[], Some(2.0));
         assert!(r.timed_out);
-        assert!(r.wall < 5.0, "{}", r.wall);
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!alive(pid), "grandchild {pid} survived the timeout");
+        assert!(r.wall < 10.0, "{}", r.wall);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap_or_else(|e| panic!("the shell recorded no grandchild pid before the timeout: {e}"))
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(gone_within(pid, Duration::from_secs(5)), "grandchild {pid} survived the timeout");
+    }
+
+    /// Whether `pid` stops running within `limit`. Polled rather than checked once after a fixed
+    /// pause: a killed process can take a moment to be reaped on a loaded machine, and a process the
+    /// group kill missed keeps running for the whole wait, so it still fails.
+    pub(crate) fn gone_within(pid: i32, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while alive(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 
     /// Running, as opposed to gone or a zombie waiting for whoever adopted it to reap it.

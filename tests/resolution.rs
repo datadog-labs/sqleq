@@ -73,6 +73,10 @@ create table "s2"."t" ("id" INTEGER, "a" INTEGER);"#;
 /// A table with a column named like the keyword `DEFAULT`.
 const DEFAULT_COLUMN: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER DEFAULT 0, "default" INTEGER);"#;
 
+/// An enclosing table with a column named like the one Postgres gives an unaliased `CASE`.
+const CASE_COLUMN: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER);
+create table "u" ("id" INTEGER, "case" INTEGER);"#;
+
 /// A semantics-changing mutant: `seed` and `mutant` are not equivalent in Postgres.
 struct Mutant {
     /// `operator/what it does`, the key [`KNOWN_OPEN`] uses.
@@ -332,6 +336,16 @@ const MUTANTS: &[Mutant] = &[
         "SELECT id FROM t WHERE a IN (SELECT t.a FROM u)",
         "t = {(1, 1, 0, NULL)}; u = {(1, 5, 0)}: A tests 1 IN {5} and returns no rows, B tests 1 IN {1} and returns 1",
     ),
+    // Postgres names an unaliased `CASE` `case`, which the frontend cannot tell from the tree.
+    Mutant {
+        ddl: CASE_COLUMN,
+        ..mutant(
+            "subquery/a-bare-name-an-unnamed-column-may-answer-to",
+            r#"SELECT id FROM u WHERE EXISTS (SELECT 1 FROM (SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t) AS s WHERE "case" = 1)"#,
+            r#"SELECT id FROM u WHERE EXISTS (SELECT 1 FROM (SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t) AS s WHERE u."case" = 1)"#,
+            r#"t = {(1, -1)}; u = {(1, 1)}: A's "case" is s's column, 0, and A returns no rows; B tests u."case" = 1 and returns 1"#,
+        )
+    },
     mutant(
         "with/a-binding-shadows-a-table",
         "WITH t AS (SELECT id, a + 1 AS a FROM u) SELECT a FROM t",
@@ -379,10 +393,7 @@ const MUTANTS: &[Mutant] = &[
 ];
 
 /// Each mutant that fails today, and the issue that tracks it. See the module doc.
-const KNOWN_OPEN: &[(&str, &str)] = &[
-    ("select/a-quoted-column-against-the-folded-name", "#57"),
-    ("from/a-quoted-alias-against-the-folded-name", "#57"),
-];
+const KNOWN_OPEN: &[(&str, &str)] = &[];
 
 const CONTROLS: &[Control] = &[
     control(

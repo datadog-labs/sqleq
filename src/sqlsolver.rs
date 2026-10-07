@@ -163,6 +163,7 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             row_determined: vec![false; n_declared],
             keys,
             n_declared,
+            collations: vec![crate::collation::Collation::Default; n_declared],
         });
     }
     emit_mysql(&Catalog { tables })

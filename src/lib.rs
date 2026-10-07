@@ -36,6 +36,7 @@
 
 mod catalog;
 mod casts;
+mod collation;
 /// Public because it is an entry point: the `--csv` mode of the CLI reads a corpus row and lowers it
 /// without going through the `.sql` intermediate format at all.
 pub mod corpus;
@@ -317,6 +318,9 @@ fn emit(
     decls: &HashMap<String, FnDecl>,
     queries: &[sqlparser::ast::Query],
 ) -> Result<Value> {
+    // The collations of tables neither query names cannot reach the pair; see `collation::narrow`.
+    let narrowed = collation::narrow(catalog, queries);
+    let catalog = narrowed.as_ref().unwrap_or(catalog);
     let schemas: Vec<Value> = catalog
         .tables
         .iter()
@@ -349,6 +353,10 @@ fn emit(
     let q1 = lower::lower_query(catalog, decls, &queries[1])?;
 
     let mut input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
+    // A column under a collation that may make `=` not identity, and, where a column the pair reads
+    // declares a collation, an operation that reads one its symbol does not name. Before the check
+    // below, which also sees the first, for the message.
+    collation::refuse(catalog, &input)?;
     // A `citext` or `char(n)` value has an `=` no prover's equality can stand for, and a numeric's
     // text shows a scale no prover's REAL carries. Checked on the lowered queries, so a column that
     // neither query reads costs nothing, and neither does a pair whose two queries lower to one plan.
@@ -848,8 +856,12 @@ fn parse_input(
     normalize::strip_identical_locks(&mut queries);
     // Pair-level, so it needs both queries and runs after they are separated out. Before the
     // `ORDER BY` strip, which it can unblock: removing the pair's only `LIMIT` leaves an ordering
-    // with nothing downstream to consume it.
-    normalize::strip_identical_pagination(&mut queries);
+    // with nothing downstream to consume it. Not where a column declares a collation: one ordering
+    // spelling can then sort the two sides' equal outputs under two collations, which pick two
+    // different pages (see `collation`).
+    if !collation::varies(&catalog) {
+        normalize::strip_identical_pagination(&mut queries);
+    }
     normalize::strip_dead_order_by(&mut queries);
     normalize::strip_schema(&mut queries);
     // Last, so it reads the trees lowering will actually see. After the DML reduction on purpose: an

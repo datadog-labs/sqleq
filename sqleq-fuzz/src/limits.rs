@@ -20,13 +20,14 @@
 //! `LIMIT ($1)` are seen for what they are. A statement that does not parse is scanned for the
 //! keywords instead and every cut in it is taken to be nondeterministic.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, Value, Visit, Visitor,
+    BinaryOperator, Distinct, Expr, Function, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByKind, Query, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableFactor, Value, Visit, Visitor, WindowFrameUnits, WindowSpec, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::Keyword;
@@ -284,16 +285,56 @@ pub fn is_total(q: &Query, schema: &Schema, ctes: &HashSet<String>) -> bool {
     if matches!(sel.distinct, Some(Distinct::On(_))) {
         return false;
     }
+    closure(sel, schema, ctes, |insts| {
+        items
+            .iter()
+            .filter_map(|item| order_column(&item.expr, sel, insts))
+            .collect()
+    })
+    .is_some_and(|c| c.total(sel))
+}
+
+/// The columns of one `SELECT` level that two of its rows agree on once they agree on some `seeds`,
+/// and the tables whose row that determines: [`is_total`]'s closure, described there.
+struct Closure<'a> {
+    insts: Vec<Inst<'a>>,
+    known: HashSet<Col>,
+    whole: HashSet<usize>,
+}
+
+impl Closure<'_> {
+    /// Whether two rows that agree on the seeds are one row: every table's row is determined, or,
+    /// at a `GROUP BY` level, every grouping column is.
+    fn total(&self, sel: &Select) -> bool {
+        match &sel.group_by {
+            GroupByExpr::Expressions(exprs, mods) if !exprs.is_empty() => {
+                mods.is_empty()
+                    && exprs.iter().all(|e| {
+                        column(e, &self.insts).is_some_and(|c| self.known.contains(&c))
+                    })
+            }
+            GroupByExpr::Expressions(..) => self.whole.len() == self.insts.len(),
+            GroupByExpr::All(_) => false,
+        }
+    }
+}
+
+/// [`is_total`]'s closure over `sel`, from the columns `seeds` picks out of its `FROM` tables; `None`
+/// outside the shape described there.
+fn closure<'a>(
+    sel: &'a Select,
+    schema: &'a Schema,
+    ctes: &HashSet<String>,
+    seeds: impl FnOnce(&[Inst<'a>]) -> Vec<Col>,
+) -> Option<Closure<'a>> {
     let mut srf = HasSetReturning::default();
     for item in &sel.projection {
         let _ = item.visit(&mut srf);
     }
     if srf.0 {
-        return false;
+        return None;
     }
-    let Some((insts, mut conjuncts, usings)) = from_clause(sel, schema, ctes) else {
-        return false;
-    };
+    let (insts, mut conjuncts, usings) = from_clause(sel, schema, ctes)?;
     if let Some(w) = &sel.selection {
         split_and(w, &mut conjuncts);
     }
@@ -330,11 +371,7 @@ pub fn is_total(q: &Query, schema: &Schema, ctes: &HashSet<String>) -> bool {
             _ => {}
         }
     }
-    for item in items {
-        if let Some(c) = order_column(&item.expr, sel, &insts) {
-            known.insert(c);
-        }
-    }
+    known.extend(seeds(&insts));
 
     // The closure. Each pass adds at least one column or stops, so it terminates.
     let mut whole: HashSet<usize> = HashSet::new();
@@ -374,16 +411,388 @@ pub fn is_total(q: &Query, schema: &Schema, ctes: &HashSet<String>) -> bool {
             break;
         }
     }
+    Some(Closure {
+        insts,
+        known,
+        whole,
+    })
+}
 
-    match &sel.group_by {
-        GroupByExpr::Expressions(exprs, mods) if !exprs.is_empty() => {
-            mods.is_empty()
-                && exprs
-                    .iter()
-                    .all(|e| column(e, &insts).is_some_and(|c| known.contains(&c)))
+/// What an arbitrary choice among tied rows leaves determined in a statement's result.
+///
+/// Two constructs other than a cut keep such a choice: `DISTINCT ON`, which keeps the first row of
+/// each key in an `ORDER BY` that may leave several first, and an order-sensitive window function
+/// (`row_number`, `lag`, a `ROWS` frame, ...), which numbers or reads tied rows in some order. Postgres
+/// makes the choice by physical order, so a pair whose two sides read the rows in different orders
+/// -- one through a sorted derived table, say -- makes it differently on the two sides, and DuckDB
+/// does too. `docs/SOUNDNESS.md` ("A row slice is taken as deterministic") reads such a choice as the
+/// same choice on both sides, so a difference that rests on it is not a counterexample.
+///
+/// Ordered by how much is left, so the larger of two sides' answers is the pair's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Choice {
+    /// No such choice, or every one is determined ([`choices`] says when).
+    Determined,
+    /// A `DISTINCT ON` at the top level -- the statement's own query, or a branch of a `UNION ALL`
+    /// that is -- whose row per key is not determined. Which row is kept is open; how many rows there
+    /// are is not, since it is the number of keys.
+    Cardinality,
+    /// A choice whose effect on the result nothing bounds: a `DISTINCT ON` below the top level, whose
+    /// row decides what the levels above it keep, or an order-sensitive window function.
+    Unbounded,
+}
+
+/// The arbitrary choices among tied rows in `sql`: see [`Choice`].
+///
+/// A choice is **determined** when the rows it chooses among cannot be told apart in the result.
+/// Two rows of a `SELECT` level that agree on the choice's keys -- a `DISTINCT ON`'s key and `ORDER
+/// BY` columns, or a window's `PARTITION BY` and `ORDER BY` columns -- agree on every column the
+/// [`is_total`] closure reaches from those keys. That settles it when
+///
+/// * the closure determines a row of every table (or, at a `GROUP BY` level, every grouping
+///   column), so no two rows tie at all -- the [`is_total`] test; or
+/// * at a level with no `GROUP BY`, `HAVING` or cut of its own, every column the level's select list
+///   reads is in the closure (a `*` reads every column of its tables), and so is every column a
+///   window function's arguments read: the tied rows then put the same values into the result,
+///   whichever comes first. For windows this needs one order-sensitive window specification per
+///   level, since two that order ties independently can pair their values up differently, and no
+///   window function at all beside a `DISTINCT ON`, whose kept row would then carry one.
+///
+/// A statement that does not parse is scanned for `DISTINCT ON` and `OVER` instead, and either makes
+/// it [`Choice::Unbounded`].
+pub fn choices(sql: &str, schema: &Schema) -> Choice {
+    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return unparsed_choices(sql);
+    };
+    let mut ctes = CteNames::default();
+    let mut top: HashSet<usize> = HashSet::new();
+    for st in &stmts {
+        let _ = Statement::visit(st, &mut ctes);
+        if let Statement::Query(q) = st {
+            top_selects(&q.body, &mut top);
         }
-        GroupByExpr::Expressions(..) => whole.len() == insts.len(),
-        GroupByExpr::All(_) => false,
+    }
+    let mut finder = Choices {
+        schema,
+        ctes: ctes.0,
+        top,
+        levels: HashMap::new(),
+        out: Choice::Determined,
+    };
+    for st in &stmts {
+        let _ = Statement::visit(st, &mut finder);
+    }
+    finder.out
+}
+
+/// [`choices`] for a statement the parser rejected.
+fn unparsed_choices(sql: &str) -> Choice {
+    let words: Vec<Keyword> = match significant(sql) {
+        Some(toks) => toks
+            .iter()
+            .filter_map(|t| match &t.token {
+                Token::Word(w) if w.quote_style.is_none() => Some(w.keyword),
+                _ => None,
+            })
+            .collect(),
+        None => {
+            let l = sql.to_lowercase();
+            return if l.contains("over") || l.contains("distinct") {
+                Choice::Unbounded
+            } else {
+                Choice::Determined
+            };
+        }
+    };
+    let distinct_on = words
+        .windows(2)
+        .any(|w| w[0] == Keyword::DISTINCT && w[1] == Keyword::ON);
+    if distinct_on || words.contains(&Keyword::OVER) {
+        Choice::Unbounded
+    } else {
+        Choice::Determined
+    }
+}
+
+/// The `SELECT`s whose row count is the statement's, or adds up to it: the query's own body, through
+/// parentheses and the branches of a `UNION ALL`. Keyed by address, which is what the visitor sees.
+fn top_selects(body: &SetExpr, out: &mut HashSet<usize>) {
+    match body {
+        SetExpr::Select(sel) => {
+            out.insert(&**sel as *const Select as usize);
+        }
+        SetExpr::Query(q) => top_selects(&q.body, out),
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            left,
+            right,
+        } => {
+            top_selects(left, out);
+            top_selects(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// What a `SELECT` level's own query adds to it: its `ORDER BY`, and whether it cuts rows.
+struct Level {
+    order_by: Vec<Expr>,
+    cut: bool,
+}
+
+struct Choices<'a> {
+    schema: &'a Schema,
+    ctes: HashSet<String>,
+    top: HashSet<usize>,
+    /// The level of each `SELECT` that is a query's body, by the `SELECT`'s address.
+    levels: HashMap<usize, Level>,
+    out: Choice,
+}
+
+impl Visitor for Choices<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        if let SetExpr::Select(sel) = &*q.body {
+            let order_by = match q.order_by.as_ref().map(|o| &o.kind) {
+                Some(OrderByKind::Expressions(items)) => {
+                    items.iter().map(|i| i.expr.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            let cut = q.limit_clause.is_some() || q.fetch.is_some();
+            self.levels
+                .insert(&**sel as *const Select as usize, Level { order_by, cut });
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, sel: &Select) -> ControlFlow<()> {
+        let at = sel as *const Select as usize;
+        let level = self.levels.get(&at);
+        let order_by: &[Expr] = level.map(|l| l.order_by.as_slice()).unwrap_or(&[]);
+        let cut = level.is_some_and(|l| l.cut);
+        let windows = level_windows(sel, order_by);
+
+        // Order-sensitive window functions, by the specification they order ties under.
+        let mut specs: Vec<Option<WindowSpec>> = Vec::new();
+        for f in &windows {
+            if order_sensitive(f) {
+                let spec = window_spec(f, sel);
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
+        }
+        for spec in &specs {
+            let determined = spec.as_ref().is_some_and(|spec| {
+                let seeds = |insts: &[Inst]| -> Vec<Col> {
+                    spec.partition_by
+                        .iter()
+                        .chain(spec.order_by.iter().map(|o| &o.expr))
+                        .filter_map(|e| column(e, insts))
+                        .collect()
+                };
+                closure(sel, self.schema, &self.ctes, seeds).is_some_and(|c| {
+                    c.total(sel) || (specs.len() == 1 && !cut && indistinct(sel, &c))
+                })
+            });
+            if !determined {
+                self.out = Choice::Unbounded;
+            }
+        }
+
+        if let Some(Distinct::On(keys)) = &sel.distinct {
+            let seeds = |insts: &[Inst]| -> Vec<Col> {
+                keys.iter()
+                    .chain(order_by)
+                    .filter_map(|e| order_column(e, sel, insts))
+                    .collect()
+            };
+            let determined = closure(sel, self.schema, &self.ctes, seeds).is_some_and(|c| {
+                c.total(sel) || (windows.is_empty() && !cut && indistinct(sel, &c))
+            });
+            if !determined {
+                let choice = if self.top.contains(&at) {
+                    Choice::Cardinality
+                } else {
+                    Choice::Unbounded
+                };
+                self.out = self.out.max(choice);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether, at a level with no `GROUP BY` or `HAVING`, every column its select list reads -- window
+/// arguments and specifications included -- is one the closure says the tied rows agree on. A name
+/// the level's tables do not settle, or a subquery, answers `false`.
+fn indistinct(sel: &Select, c: &Closure) -> bool {
+    let grouped = !matches!(&sel.group_by, GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty());
+    if grouped || sel.having.is_some() {
+        return false;
+    }
+    let all_of = |i: usize| (0..c.insts[i].table.cols.len()).all(|j| c.known.contains(&(i, j)));
+    for item in &sel.projection {
+        let ok = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let mut reads = Reads {
+                    insts: &c.insts,
+                    cols: Vec::new(),
+                    unsettled: false,
+                };
+                let _ = e.visit(&mut reads);
+                !reads.unsettled && reads.cols.iter().all(|col| c.known.contains(col))
+            }
+            SelectItem::Wildcard(_) => (0..c.insts.len()).all(all_of),
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
+                let qual = parts_of(n);
+                match c
+                    .insts
+                    .iter()
+                    .position(|i| qual.last() == Some(&i.name))
+                {
+                    Some(i) => all_of(i),
+                    None => false,
+                }
+            }
+            SelectItem::QualifiedWildcard(..) | SelectItem::ExprWithAliases { .. } => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The columns an expression reads, and whether it reads anything else: a name the tables do not
+/// settle, or a subquery.
+struct Reads<'a, 'b> {
+    insts: &'b [Inst<'a>],
+    cols: Vec<Col>,
+    unsettled: bool,
+}
+
+impl Visitor for Reads<'_, '_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+        self.unsettled = true;
+        ControlFlow::Break(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
+            match column(e, self.insts) {
+                Some(col) => self.cols.push(col),
+                None => {
+                    self.unsettled = true;
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The window function calls a level makes itself, in its select list and its `ORDER BY`, and not
+/// in a subquery.
+fn level_windows(sel: &Select, order_by: &[Expr]) -> Vec<Function> {
+    let mut found = LevelWindows {
+        depth: 0,
+        found: Vec::new(),
+    };
+    for item in &sel.projection {
+        let _ = item.visit(&mut found);
+    }
+    for e in order_by {
+        let _ = e.visit(&mut found);
+    }
+    found.found
+}
+
+struct LevelWindows {
+    depth: usize,
+    found: Vec<Function>,
+}
+
+impl Visitor for LevelWindows {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = e {
+            if self.depth == 0 && f.over.is_some() {
+                self.found.push(f.clone());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The specification a window call orders its rows by, a named window looked up in the level's
+/// `WINDOW` clause; `None` where it cannot be read (a window defined in terms of another).
+fn window_spec(f: &Function, sel: &Select) -> Option<WindowSpec> {
+    match f.over.as_ref()? {
+        WindowType::WindowSpec(spec) if spec.window_name.is_none() => Some(spec.clone()),
+        WindowType::WindowSpec(_) => None,
+        WindowType::NamedWindow(name) => sel.named_window.iter().find_map(|d| match &d.1 {
+            NamedWindowExpr::WindowSpec(spec)
+                if d.0.value.to_lowercase() == name.value.to_lowercase()
+                    && spec.window_name.is_none() =>
+            {
+                Some(spec.clone())
+            }
+            _ => None,
+        }),
+    }
+}
+
+/// Aggregates whose value over a window frame depends only on which rows the frame holds, so ties
+/// matter to them only when the frame is counted in rows. (`array_agg`'s element order does not
+/// matter either, since lists are compared sorted.)
+const FRAME_AGGREGATES: &[&str] = &[
+    "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every", "bit_and", "bit_or",
+    "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "array_agg",
+];
+
+/// Whether a window call's value on a row can depend on the order among rows its window ties:
+/// `row_number`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, an aggregate over
+/// a `ROWS` frame, and any function not known to be otherwise. `rank`, `dense_rank`, `percent_rank`
+/// and `cume_dist` give tied rows one value, and an aggregate over a `RANGE` or `GROUPS` frame (the
+/// default is `RANGE`) takes in tied rows together.
+fn order_sensitive(f: &Function) -> bool {
+    let name = f
+        .name
+        .0
+        .last()
+        .and_then(|p| match p {
+            ObjectNamePart::Identifier(id) => Some(id.value.to_lowercase()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    match name.as_str() {
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist" => false,
+        n if FRAME_AGGREGATES.contains(&n) => {
+            let frame = match &f.over {
+                Some(WindowType::WindowSpec(spec)) => spec.window_frame.as_ref(),
+                // A named window's frame is not read here: assume the worst.
+                _ => return true,
+            };
+            frame.is_some_and(|fr| fr.units == WindowFrameUnits::Rows)
+        }
+        _ => true,
     }
 }
 
@@ -707,5 +1116,78 @@ mod tests {
                 total: false
             }]
         );
+    }
+
+    /// The arbitrary choices among tied rows other than a cut (issue #89).
+    mod choices {
+        use super::super::{choices, Choice};
+        use crate::schema::parse_schema;
+
+        const T: &str = "create table t (id int primary key, g int, v int, w int not null unique)";
+
+        fn c(sql: &str) -> Choice {
+            choices(sql, &parse_schema(T))
+        }
+
+        #[test]
+        fn a_choice_the_result_cannot_see_is_determined() {
+            for sql in [
+                // A key in the order, or only what the tied rows agree on in the select list.
+                "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g, id",
+                "SELECT DISTINCT ON (g) g FROM t",
+                "SELECT DISTINCT ON (g, v) g, v FROM t ORDER BY g, v",
+                "SELECT DISTINCT ON (1) g FROM t",
+                "SELECT DISTINCT ON (g) g, count(*) FROM t GROUP BY g ORDER BY g",
+                "SELECT id, row_number() OVER (ORDER BY id) FROM t",
+                "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY w) FROM t",
+                "SELECT g, row_number() OVER (ORDER BY g) FROM t",
+                "SELECT g, row_number() OVER w FROM t WINDOW w AS (ORDER BY g)",
+                // Tied rows get one value.
+                "SELECT g, v, rank() OVER (ORDER BY g) FROM t",
+                "SELECT v, sum(v) OVER (ORDER BY g) FROM t",
+                "SELECT g, count(*) FROM t GROUP BY g",
+                // One row, or rows the select list cannot tell apart.
+                "SELECT row_number() OVER ()",
+                "SELECT row_number() OVER () FROM t",
+            ] {
+                assert_eq!(c(sql), Choice::Determined, "{sql}");
+            }
+        }
+
+        #[test]
+        fn a_top_level_distinct_on_leaves_its_cardinality() {
+            for sql in [
+                "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g",
+                "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g LIMIT 2",
+                "SELECT DISTINCT ON (g) g, v FROM (SELECT * FROM t) s ORDER BY g",
+                "SELECT DISTINCT ON (g) g, v FROM t UNION ALL SELECT g, v FROM t",
+                "WITH c AS (SELECT 1) SELECT DISTINCT ON (g) g, v FROM t",
+                "(SELECT DISTINCT ON (g) g, v FROM t ORDER BY g LIMIT 1)",
+            ] {
+                assert_eq!(c(sql), Choice::Cardinality, "{sql}");
+            }
+        }
+
+        #[test]
+        fn any_other_open_choice_leaves_nothing() {
+            for sql in [
+                "SELECT * FROM (SELECT DISTINCT ON (g) g, v FROM t ORDER BY g) s WHERE v > 0",
+                "SELECT id FROM t WHERE id IN (SELECT DISTINCT ON (g) id FROM t)",
+                "SELECT DISTINCT ON (g) g, v FROM t UNION SELECT g, v FROM t",
+                "WITH c AS (SELECT DISTINCT ON (g) g, v FROM t) SELECT * FROM c",
+                "DELETE FROM t WHERE id IN (SELECT DISTINCT ON (g) id FROM t)",
+                "SELECT DISTINCT ON (g) g, row_number() OVER () FROM t",
+                "SELECT id, row_number() OVER (ORDER BY g) FROM t",
+                "SELECT g, lag(v) OVER (ORDER BY g) FROM t",
+                "SELECT v, sum(v) OVER (ORDER BY g ROWS UNBOUNDED PRECEDING) FROM t",
+                "SELECT g, row_number() OVER (ORDER BY g), ntile(2) OVER (ORDER BY g DESC) FROM t",
+                "SELECT g, row_number() OVER (ORDER BY g) FROM t ORDER BY v LIMIT 1",
+                "SELECT g, row_number() OVER w FROM t WINDOW w AS (v2), v2 AS (ORDER BY g)",
+                "SELECT * FROM (SELECT v, row_number() OVER () AS rn FROM t) s WHERE rn = 1",
+                "this is not sql, but it has an OVER (",
+            ] {
+                assert_eq!(c(sql), Choice::Unbounded, "{sql}");
+            }
+        }
     }
 }
