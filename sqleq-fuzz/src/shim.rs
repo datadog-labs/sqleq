@@ -160,6 +160,51 @@ macro_rules! setof_ddl {
     };
 }
 
+/// `jsonb_build_object` is not `json_build_object`: a `jsonb` object stores its keys in its own
+/// order -- shorter keys first, then bytewise -- and keeps only the last of duplicate keys, so
+/// `jsonb_build_object('a', 1, 'b', 2)` and `('b', 2, 'a', 1)` are one value, and so are
+/// `('a', 1, 'a', 2)` and `('a', 2)`. DuckDB's `json_object` keeps both the call's order and its
+/// duplicates, which is right for the `json` builder and refutes equivalent pairs for this one.
+///
+/// So the arguments are gathered into a key list and a value list, the last occurrence of each key is
+/// kept, the survivors are sorted by (length, key) and the object is written out from them -- in
+/// `json_object`'s own spelling, so it compares as text with the objects the other shims build. A
+/// NULL key raises, as in Postgres (`argument … key must not be null`); a NULL value is a JSON
+/// `null`. The arities stop at seven pairs, like `json_build_object`'s.
+const JSONB_BUILD_OBJECT_DDL: &str = concat!(
+    "CREATE OR REPLACE MACRO sqleq_jsonb_object(ks, vs) AS ",
+    "CASE WHEN len(list_filter(ks, x -> x IS NULL)) > 0 ",
+    "THEN CAST(error('argument of jsonb_build_object: key must not be null') AS JSON) ",
+    "ELSE CAST('{' || array_to_string(list_transform(list_sort(list_transform(",
+    "list_filter(range(len(ks)), i -> NOT list_contains(ks[i + 2:], ks[i + 1])), ",
+    "i -> {'l': length(ks[i + 1]), 'k': ks[i + 1], 'v': vs[i + 1]})), ",
+    "s -> CAST(to_json(s.k) AS VARCHAR) || ':' || CAST(s.v AS VARCHAR)), ',') || '}' AS JSON) END;\n",
+    "CREATE OR REPLACE MACRO jsonb_build_object",
+            "(k1,v1) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON)])",
+            ", (k1,v1,k2,v2) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON)])",
+            ", (k1,v1,k2,v2,k3,v3) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR), CAST(k3 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON), coalesce(to_json(v3), 'null'::JSON)])",
+            ", (k1,v1,k2,v2,k3,v3,k4,v4) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR), CAST(k3 AS VARCHAR), CAST(k4 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON), coalesce(to_json(v3), 'null'::JSON), coalesce(to_json(v4), 'null'::JSON)])",
+            ", (k1,v1,k2,v2,k3,v3,k4,v4,k5,v5) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR), CAST(k3 AS VARCHAR), CAST(k4 AS VARCHAR), CAST(k5 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON), coalesce(to_json(v3), 'null'::JSON), coalesce(to_json(v4), 'null'::JSON), coalesce(to_json(v5), 'null'::JSON)])",
+            ", (k1,v1,k2,v2,k3,v3,k4,v4,k5,v5,k6,v6) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR), CAST(k3 AS VARCHAR), CAST(k4 AS VARCHAR), CAST(k5 AS VARCHAR), CAST(k6 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON), coalesce(to_json(v3), 'null'::JSON), coalesce(to_json(v4), 'null'::JSON), coalesce(to_json(v5), 'null'::JSON), coalesce(to_json(v6), 'null'::JSON)])",
+            ", (k1,v1,k2,v2,k3,v3,k4,v4,k5,v5,k6,v6,k7,v7) AS sqleq_jsonb_object([CAST(k1 AS VARCHAR), CAST(k2 AS VARCHAR), CAST(k3 AS VARCHAR), CAST(k4 AS VARCHAR), CAST(k5 AS VARCHAR), CAST(k6 AS VARCHAR), CAST(k7 AS VARCHAR)], [coalesce(to_json(v1), 'null'::JSON), coalesce(to_json(v2), 'null'::JSON), coalesce(to_json(v3), 'null'::JSON), coalesce(to_json(v4), 'null'::JSON), coalesce(to_json(v5), 'null'::JSON), coalesce(to_json(v6), 'null'::JSON), coalesce(to_json(v7), 'null'::JSON)])"
+);
+
+/// A divisor that raises on zero, as Postgres's `/`, `%` and `mod()` do, and is otherwise its
+/// argument, type included -- `error()` is untyped, so the `CASE` takes the argument's type and an
+/// integer division stays one. `crate::rewrite::postgres_operators` wraps every divisor that is not a
+/// non-zero literal in it.
+const NONZERO_DDL: &str = "CREATE OR REPLACE MACRO sqleq_nonzero(x) AS \
+     CASE WHEN x = 0 THEN error('division by zero') ELSE x END";
+
+/// A pattern that DuckDB's full-match `~` finds anywhere in the string, as Postgres's `~` does: a
+/// full match of `(?s).*(?:p).*` is a match of `p` anywhere. `(?s)` lets `.` match a newline, which
+/// it does in Postgres's default (not newline-sensitive) mode, and `^`/`$` still anchor at the ends of
+/// the string only. The `i` variant is `~*`'s.
+const PARTIAL_DDL: &str =
+    "CREATE OR REPLACE MACRO sqleq_partial(p) AS '(?s).*(?:' || p || ').*'";
+const IPARTIAL_DDL: &str =
+    "CREATE OR REPLACE MACRO sqleq_ipartial(p) AS '(?si).*(?:' || p || ').*'";
+
 /// DuckDB has no `initcap` at all, so this is the one entry that is an implementation rather than
 /// a rename. Postgres uppercases the first character of each word and lowercases the rest, where a
 /// word is a run of alphanumerics; the character-wise form below states exactly that. The class is
@@ -265,11 +310,15 @@ static SHIMS: &[(&str, &str)] = &[
     ),
     // -- builders and paths ----------------------------------------------------------------------
     ("json_build_object", build_object_ddl!("json_build_object")),
-    ("jsonb_build_object", build_object_ddl!("jsonb_build_object")),
+    ("jsonb_build_object", JSONB_BUILD_OBJECT_DDL),
     ("json_extract_path_text", extract_path_text_ddl!("json_extract_path_text")),
     ("jsonb_extract_path_text", extract_path_text_ddl!("jsonb_extract_path_text")),
     // -- the one implementation ------------------------------------------------------------------
     ("initcap", INITCAP_DDL),
+    // -- Postgres operator semantics, named by `crate::rewrite::postgres_operators` ---------------
+    ("sqleq_nonzero", NONZERO_DDL),
+    ("sqleq_partial", PARTIAL_DDL),
+    ("sqleq_ipartial", IPARTIAL_DDL),
 ];
 
 /// Define every shimmed function whose name appears in `sqls`.
@@ -289,16 +338,9 @@ pub fn install(con: &Connection, sqls: &[&str]) -> duckdb::Result<()> {
     Ok(())
 }
 
-/// Whether `sqls` mentions any shimmed name — the same test [`install`] applies, exposed so a
-/// caller can tell "no macro was needed" from "macros were installed".
-pub fn touches_shim(sqls: &[&str]) -> bool {
-    let hay: Vec<String> = sqls.iter().map(|s| s.to_ascii_lowercase()).collect();
-    SHIMS.iter().any(|(n, _)| hay.iter().any(|h| h.contains(n)))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{install, touches_shim, SHIMS};
+    use super::{install, SHIMS};
     use crate::duck::open_db;
     use duckdb::Connection;
 
@@ -446,6 +488,57 @@ mod tests {
         );
     }
 
+    /// `jsonb` normalizes an object: keys by (length, bytes), the last duplicate kept. The `json`
+    /// builder keeps what it was given, as Postgres's does.
+    #[test]
+    fn jsonb_build_object_normalizes_like_jsonb() {
+        let con = shimmed();
+        for (q, want) in [
+            ("jsonb_build_object('b', 2, 'a', 1)", r#"{"a":1,"b":2}"#),
+            ("jsonb_build_object('aa', 1, 'b', 2)", r#"{"b":2,"aa":1}"#),
+            ("jsonb_build_object('a', 1, 'a', 2)", r#"{"a":2}"#),
+            ("jsonb_build_object('a', NULL)", r#"{"a":null}"#),
+            ("jsonb_build_object(1, true)", r#"{"1":true}"#),
+            ("json_build_object('b', 2, 'a', 1)", r#"{"b":2,"a":1}"#),
+        ] {
+            assert_eq!(text(&con, &format!("SELECT {q}")).as_deref(), Some(want), "{q}");
+        }
+        assert!(con.execute_batch("SELECT jsonb_build_object(NULL, 1)").is_err());
+    }
+
+    /// The divisor guard raises on a zero of every numeric type and is the identity otherwise, type
+    /// included, so integer division stays integer division.
+    #[test]
+    fn the_divisor_guard_raises_on_zero_and_keeps_the_type() {
+        let con = shimmed();
+        for q in [
+            "SELECT 1 / sqleq_nonzero(0)",
+            "SELECT 1.0 / sqleq_nonzero(0.0)",
+            "SELECT 1 / sqleq_nonzero(CAST(-0.0 AS DOUBLE))",
+            "SELECT 5 % sqleq_nonzero(0)",
+        ] {
+            assert!(con.execute_batch(q).is_err(), "must raise: {q}");
+        }
+        assert_eq!(text(&con, "SELECT typeof(7 / sqleq_nonzero(2))").as_deref(), Some("INTEGER"));
+        assert_eq!(text(&con, "SELECT CAST(7 / sqleq_nonzero(2) AS VARCHAR)").as_deref(), Some("3"));
+        assert_eq!(text(&con, "SELECT CAST(7 / sqleq_nonzero(NULL) AS VARCHAR)"), None);
+    }
+
+    /// A partial match anywhere, as Postgres's `~`, against DuckDB's full match.
+    #[test]
+    fn the_partial_match_finds_a_pattern_anywhere() {
+        let con = shimmed();
+        let b = |q: &str| con.query_row(q, [], |r| r.get::<_, Option<bool>>(0)).unwrap();
+        assert_eq!(b("SELECT 'ax' ~ 'a'"), Some(false), "DuckDB's own `~` is a full match");
+        assert_eq!(b("SELECT 'ax' ~ sqleq_partial('a')"), Some(true));
+        assert_eq!(b("SELECT 'xa' ~ sqleq_partial('^a')"), Some(false));
+        assert_eq!(b("SELECT 'a|b' ~ sqleq_partial('x|b')"), Some(true));
+        assert_eq!(b("SELECT 'xy\na' ~ sqleq_partial('y.a')"), Some(true), "`.` matches a newline");
+        assert_eq!(b("SELECT 'x\nay' ~ sqleq_partial('^a')"), Some(false), "`^` is the string's start");
+        assert_eq!(b("SELECT 'AX' ~ sqleq_ipartial('a')"), Some(true));
+        assert_eq!(b("SELECT 'ax' ~ sqleq_partial(NULL)"), None);
+    }
+
     /// Set-returning functions are legal in both positions, so both forms are defined and both have
     /// to work from the one connection that defined them.
     #[test]
@@ -547,7 +640,6 @@ mod tests {
     #[test]
     fn nothing_is_installed_for_sql_that_names_no_shimmed_function() {
         let sql = "SELECT id, name FROM t WHERE x = $1";
-        assert!(!touches_shim(&[sql]));
 
         let con = open_db().unwrap();
         install(&con, &[sql]).unwrap();
@@ -557,7 +649,6 @@ mod tests {
         );
 
         // ... and the same connection gains it as soon as the SQL does mention it.
-        assert!(touches_shim(&["SELECT JSONB_AGG(x) FROM t"]));
         install(&con, &["SELECT JSONB_AGG(x) FROM t"]).unwrap();
         assert!(con.execute_batch("SELECT jsonb_agg(1)").is_ok());
     }

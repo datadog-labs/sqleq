@@ -8,15 +8,19 @@
 //! Modes:
 //!   * `sqleq-fuzz csv <corpus.csv> <names.txt> [out.json]` — batch a corpus (rows are `a,b,ddl`);
 //!     `names.txt` lists `pairNNNN` entries (the digits index a corpus row). Parallel with `--jobs`.
+//!     `out.json` defaults to the corpus path with its extension replaced by `.fuzz.json`.
 //!   * `sqleq-fuzz row <corpus.csv> <index>` — test a single corpus row and print the verdict.
-//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE TABLEs + exactly two
-//!     statements).
+//!   * `sqleq-fuzz file <pair.sql>` — test a self-contained file (CREATE and ALTER statements + exactly
+//!     two statements).
 //!
 //! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`. Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
-//! usage and exits 2.
+//! usage and exits 2. A panic while testing one pair is that pair's `ERROR:panic: …` verdict, and in
+//! `csv` mode the worker goes on to the next row.
 
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,10 +29,10 @@ use sqleq_fuzz::{test_pair, Config, Verdict};
 
 const USAGE: &str = "\
 usage:
-  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to
-                                                        /tmp/concrete_results.json)
+  sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   batch a corpus (out.json defaults to the
+                                                        corpus path with extension .fuzz.json)
   sqleq-fuzz row  <corpus.csv> <index>                  test one corpus row (counting from 0)
-  sqleq-fuzz file <pair.sql>                            test a file: CREATE TABLEs, two statements
+  sqleq-fuzz file <pair.sql>                            test a file: DDL, then two statements
 options:
   -j, --jobs N   parallel workers (csv mode, default 1)
   --trials N     random instances per pair (default 120)
@@ -106,13 +110,44 @@ fn load_corpus(path: &str) -> Result<Vec<(String, String, String)>, String> {
     Ok(out)
 }
 
+/// Test one pair, turning a panic into that pair's `ERROR` verdict instead of the process's end.
+///
+/// A panic is a defect in this crate, never a fact about the pair, so it must not read as a verdict
+/// about it; but it must not take other rows down with it either. In `csv` mode an uncaught panic
+/// killed the worker thread that drew the row, and with it every row that worker would have run
+/// next, while the run still exited 0.
+fn guarded_test(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
+    guarded(|| test_pair(a, b, ddl, cfg))
+}
+
+/// Run `f`, turning a panic into an `ERROR:panic: …` verdict.
+fn guarded(f: impl FnOnce() -> Verdict) -> Verdict {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        Verdict::Error(format!("panic: {}", msg.lines().next().unwrap_or("")))
+    })
+}
+
+/// Where `csv` mode writes when no `out.json` is given: beside the corpus, as `<corpus>.fuzz.json`.
+/// A fixed path elsewhere would let two runs overwrite each other.
+fn default_out(corpus_path: &str) -> String {
+    Path::new(corpus_path)
+        .with_extension("fuzz.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     let corpus_path = args.first().ok_or("csv mode needs <corpus.csv>")?;
     let names_path = args.get(1).ok_or("csv mode needs <names.txt>")?;
     let out_path = args
         .get(2)
         .cloned()
-        .unwrap_or_else(|| "/tmp/concrete_results.json".to_string());
+        .unwrap_or_else(|| default_out(corpus_path));
 
     let corpus = Arc::new(load_corpus(corpus_path)?);
     let names_txt = std::fs::read_to_string(names_path)
@@ -149,7 +184,7 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             let started = std::time::Instant::now();
             let (label, partial) = match row.and_then(|r| corpus.get(r)) {
                 Some((a, b, ddl)) => {
-                    let v = test_pair(a, b, ddl, cfg);
+                    let v = guarded_test(a, b, ddl, cfg);
                     let p = v.partial().map(|(ok, e)| (ok, e.to_string()));
                     (v.label(), p)
                 }
@@ -157,23 +192,25 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             };
             let ms = started.elapsed().as_millis();
             match &partial {
-                Some((ok, _)) => println!("{name}: {label} (ok={ok}/{}) {ms}ms", cfg.trials),
+                Some((ok, _)) => {
+                    println!("{name}: {label} (ok={ok}/{}) {ms}ms", cfg.total_trials())
+                }
                 None => println!("{name}: {label} {ms}ms"),
             }
             results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(name.clone(), (label, partial, ms));
         }));
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    // A worker can only die now through a defect outside `test_pair`; its unfinished rows would be
+    // missing from the output, so that is the run's failure rather than a quiet gap.
+    let died = handles.into_iter().map(|h| h.join()).filter(Result::is_err).count();
 
     // Write `{name: {"verdict": label, "ms": wall}}` (a superset of the Python tester's output
     // shape). Partially-run pairs carry two extra keys; consumers that only read "verdict" are
     // unaffected.
-    let map = results.lock().unwrap();
+    let map = results.lock().unwrap_or_else(|e| e.into_inner());
     let json: serde_json::Map<String, serde_json::Value> = map
         .iter()
         .map(|(k, (label, partial, ms))| {
@@ -193,6 +230,13 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot write {out_path}: {e}"))?;
     eprintln!("wrote {} verdicts to {out_path}", map.len());
+    if died > 0 {
+        return Err(format!(
+            "{died} worker(s) died; {} of {} rows have no verdict",
+            work.len() - map.len(),
+            work.len()
+        ));
+    }
     Ok(())
 }
 
@@ -207,7 +251,7 @@ fn run_row(args: &[String], cfg: Config) -> Result<(), String> {
     let (a, b, ddl) = corpus
         .get(idx)
         .ok_or(format!("row {idx} out of range (len {})", corpus.len()))?;
-    report(&test_pair(a, b, ddl, cfg));
+    report(&guarded_test(a, b, ddl, cfg));
     Ok(())
 }
 
@@ -215,7 +259,8 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     let path = args.first().ok_or("file mode needs <pair.sql>")?;
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // Drop the frontend's `declare ... function` DSL lines (not runnable SQL), then split into
-    // statements: CREATE* form the DDL, the remaining two are the query pair.
+    // statements: CREATE* and ALTER* form the DDL, the remaining two are the query pair. An
+    // `ALTER TABLE ... ADD PRIMARY KEY` is as much a part of the schema as the CREATE it alters.
     let cleaned: String = src
         .lines()
         .filter(|l| {
@@ -227,7 +272,8 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     let mut ddl_parts: Vec<String> = Vec::new();
     let mut queries: Vec<String> = Vec::new();
     for s in split_statements(&cleaned) {
-        if s.to_uppercase().starts_with("CREATE") {
+        let upper = s.to_uppercase();
+        if upper.starts_with("CREATE") || upper.starts_with("ALTER") {
             ddl_parts.push(s);
         } else {
             queries.push(s);
@@ -235,12 +281,12 @@ fn run_file(args: &[String], cfg: Config) -> Result<(), String> {
     }
     if queries.len() != 2 {
         return Err(format!(
-            "expected exactly 2 non-CREATE statements, got {}",
+            "expected exactly 2 statements besides the DDL, got {}",
             queries.len()
         ));
     }
     let ddl = ddl_parts.join(";\n");
-    report(&test_pair(&queries[0], &queries[1], &ddl, cfg));
+    report(&guarded_test(&queries[0], &queries[1], &ddl, cfg));
     Ok(())
 }
 
@@ -327,7 +373,29 @@ fn report(v: &Verdict) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_statements;
+    use super::{default_out, guarded, split_statements};
+    use sqleq_fuzz::Verdict;
+
+    /// A panic inside one pair's test is that pair's `ERROR` verdict. It used to unwind through the
+    /// `csv` worker that drew the row, and every row that worker would have run next went missing.
+    #[test]
+    fn a_panic_is_the_rows_error_verdict() {
+        match guarded(|| panic!("boom")) {
+            Verdict::Error(e) => assert_eq!(e, "panic: boom"),
+            other => panic!("{other:?}"),
+        }
+        match guarded(|| panic!("{} went wrong", 1 + 1)) {
+            Verdict::Error(e) => assert_eq!(e, "panic: 2 went wrong"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(guarded(|| Verdict::NoSchema), Verdict::NoSchema));
+    }
+
+    #[test]
+    fn the_default_output_sits_beside_the_corpus() {
+        assert_eq!(default_out("runs/corpus.csv"), "runs/corpus.fuzz.json");
+        assert_eq!(default_out("corpus"), "corpus.fuzz.json");
+    }
 
     /// The shape of `examples/*.sql`: a comment above the DDL used to hide `CREATE` from the
     /// classifier, so the schema was counted as a third query and the file was rejected.
