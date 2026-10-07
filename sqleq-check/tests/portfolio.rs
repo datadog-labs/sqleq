@@ -115,11 +115,19 @@ fn the_deadline_is_shared_and_kills_what_is_left() {
     assert_eq!(strings(&case["portfolio"]["pending"]), ["qed"]);
     assert_eq!(case["status"], "timeout");
     let pid: i32 = std::fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map(|s| s.rsplit(')').next().and_then(|t| t.split_whitespace().next()) != Some("Z"))
-        .unwrap_or(false);
-    assert!(!alive, "the prover ({pid}) outlived the deadline");
+    // Running, as opposed to gone or a zombie. Polled for a while rather than checked once after a
+    // fixed pause, so a slow reap on a loaded machine is not a failure; a prover the deadline did
+    // not kill keeps sleeping through the whole wait and still fails.
+    let alive = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| s.rsplit(')').next().and_then(|t| t.split_whitespace().next()) != Some("Z"))
+            .unwrap_or(false)
+    };
+    let until = Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!alive(), "the prover ({pid}) outlived the deadline");
 }
 
 #[test]
