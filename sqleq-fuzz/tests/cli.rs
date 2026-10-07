@@ -4,7 +4,9 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! The executable's own behaviour: `csv` mode keeps every row and writes beside its input
-//! (issues #63, #67), and `file` mode reads an `ALTER TABLE` as DDL (issue #64).
+//! (issues #63, #67), `file` mode reads an `ALTER TABLE` as DDL (issue #64), and the engine is
+//! Postgres unless it is told otherwise. Each test runs on both engines, Postgres only where a
+//! PostgreSQL 17 is there to run on (always, when `$SQLEQ_PG_REQUIRED` says one must be).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +19,19 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// The engines to test on: DuckDB, and Postgres where it can run.
+fn engines() -> Vec<&'static str> {
+    let found = sqleq_fuzz::pg::bin_dir().and_then(|b| sqleq_fuzz::pg::version(&b).map(|_| ()));
+    match found {
+        Ok(()) => vec!["duckdb", "postgres"],
+        Err(_) if std::env::var_os("SQLEQ_PG_REQUIRED").is_some() => vec!["duckdb", "postgres"],
+        Err(e) => {
+            eprintln!("postgres engine skipped: {e}");
+            vec!["duckdb"]
+        }
+    }
 }
 
 const DDL: &str = "create table t (id INTEGER, a INTEGER, unique (id))";
@@ -51,24 +66,26 @@ fn verdicts(path: &Path) -> serde_json::Map<String, serde_json::Value> {
 /// after it used to be missing, and the run still exited 0.
 #[test]
 fn csv_mode_gives_every_row_a_verdict() {
-    for jobs in ["1", "2"] {
-        let dir = scratch(&format!("rows-{jobs}"));
-        let corpus = corpus(&dir);
-        let out = dir.join("out.json");
-        let st = Command::new(BIN)
-            .args(["csv"])
-            .arg(&corpus)
-            .arg(dir.join("names.txt"))
-            .arg(&out)
-            .args(["--jobs", jobs, "--trials", "20"])
-            .output()
-            .unwrap();
-        assert!(st.status.success(), "{st:?}");
-        let v = verdicts(&out);
-        assert_eq!(v.len(), 3, "jobs {jobs}: {v:?}");
-        let label = |k: &str| v[k]["verdict"].as_str().unwrap().to_string();
-        assert!(label("row1").starts_with("ERROR:"), "{v:?}");
-        assert_eq!(label("row2"), "NOT-EQUIVALENT");
+    for engine in engines() {
+        for jobs in ["1", "2"] {
+            let dir = scratch(&format!("rows-{engine}-{jobs}"));
+            let corpus = corpus(&dir);
+            let out = dir.join("out.json");
+            let st = Command::new(BIN)
+                .args(["csv"])
+                .arg(&corpus)
+                .arg(dir.join("names.txt"))
+                .arg(&out)
+                .args(["--jobs", jobs, "--trials", "20", "--engine", engine])
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{engine}: {st:?}");
+            let v = verdicts(&out);
+            assert_eq!(v.len(), 3, "{engine}, jobs {jobs}: {v:?}");
+            let label = |k: &str| v[k]["verdict"].as_str().unwrap().to_string();
+            assert!(label("row1").starts_with("ERROR:"), "{engine}: {v:?}");
+            assert_eq!(label("row2"), "NOT-EQUIVALENT", "{engine}");
+        }
     }
 }
 
@@ -76,23 +93,43 @@ fn csv_mode_gives_every_row_a_verdict() {
 /// shares.
 #[test]
 fn csv_mode_writes_beside_its_input_by_default() {
-    let dir = scratch("default-out");
-    let corpus = corpus(&dir);
-    let st = Command::new(BIN)
-        .args(["csv"])
-        .arg(&corpus)
-        .arg(dir.join("names.txt"))
-        .args(["--trials", "5"])
-        .output()
-        .unwrap();
-    assert!(st.status.success(), "{st:?}");
-    assert_eq!(verdicts(&dir.join("corpus.fuzz.json")).len(), 3);
+    for engine in engines() {
+        let dir = scratch(&format!("default-out-{engine}"));
+        let corpus = corpus(&dir);
+        let st = Command::new(BIN)
+            .args(["csv"])
+            .arg(&corpus)
+            .arg(dir.join("names.txt"))
+            .args(["--trials", "5", "--engine", engine])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{engine}: {st:?}");
+        assert_eq!(verdicts(&dir.join("corpus.fuzz.json")).len(), 3, "{engine}");
+    }
 }
 
 /// `ALTER TABLE` belongs to the schema, so a pair file carrying one has two statements, not three.
 #[test]
 fn file_mode_reads_alter_table_as_ddl() {
-    let dir = scratch("alter");
+    for engine in engines() {
+        let dir = scratch(&format!("alter-{engine}"));
+        let pair = alter_pair(&dir);
+        let st = Command::new(BIN)
+            .arg("file")
+            .arg(&pair)
+            .args(["--engine", engine])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{engine}: {st:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&st.stdout).lines().next(),
+            Some("NO-COUNTEREXAMPLE"),
+            "{engine}"
+        );
+    }
+}
+
+fn alter_pair(dir: &Path) -> PathBuf {
     let pair = dir.join("pair.sql");
     std::fs::write(
         &pair,
@@ -101,14 +138,32 @@ fn file_mode_reads_alter_table_as_ddl() {
          SELECT id FROM t;\nSELECT DISTINCT id FROM t;\n",
     )
     .unwrap();
-    let st = Command::new(BIN)
-        .arg("file")
-        .arg(&pair)
-        .output()
-        .unwrap();
-    assert!(st.status.success(), "{st:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&st.stdout).lines().next(),
-        Some("NO-COUNTEREXAMPLE")
+    pair
+}
+
+/// With no `--engine` the pair runs on Postgres, which says so; `$SQLEQ_FUZZ_ENGINE` picks DuckDB.
+#[test]
+fn the_engine_is_postgres_unless_told_otherwise() {
+    if !engines().contains(&"postgres") {
+        return;
+    }
+    let dir = scratch("default-engine");
+    let pair = alter_pair(&dir);
+    let run = |env: Option<&str>| {
+        let mut cmd = Command::new(BIN);
+        cmd.arg("file").arg(&pair).env_remove("SQLEQ_FUZZ_ENGINE");
+        if let Some(e) = env {
+            cmd.env("SQLEQ_FUZZ_ENGINE", e);
+        }
+        let st = cmd.output().unwrap();
+        assert!(st.status.success(), "{st:?}");
+        String::from_utf8_lossy(&st.stdout).into_owned()
+    };
+    let default = run(None);
+    assert!(
+        default.lines().any(|l| l.starts_with("engine: postgres 17.")),
+        "{default}"
     );
+    let duck = run(Some("duckdb"));
+    assert!(!duck.lines().any(|l| l.starts_with("engine:")), "{duck}");
 }

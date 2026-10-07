@@ -14,7 +14,7 @@
 //!     two statements).
 //!
 //! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`, and `--engine duckdb|postgres`
-//! (default `$SQLEQ_FUZZ_ENGINE`, else `duckdb`; see `sqleq_fuzz::pg`). Any verdict exits 0; an
+//! (default `$SQLEQ_FUZZ_ENGINE`, else `postgres`; see `sqleq_fuzz::pg`). Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
 //! usage and exits 2. A panic while testing one pair is that pair's `ERROR:panic: …` verdict, and in
 //! `csv` mode the worker goes on to the next row.
@@ -39,14 +39,14 @@ options:
   --trials N     random instances per pair (default 120)
   --rows N       rows per table per instance (default 5)
   --seed N       RNG seed (default 0)
-  --engine E     where the statements run: duckdb (default; $SQLEQ_FUZZ_ENGINE overrides) or
-                 postgres, a private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH";
+  --engine E     where the statements run: postgres (default; $SQLEQ_FUZZ_ENGINE overrides), a
+                 private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH, or duckdb";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = Config::default();
     let mut jobs = 1usize;
-    let mut engine = std::env::var("SQLEQ_FUZZ_ENGINE").unwrap_or_else(|_| "duckdb".to_string());
+    let mut engine = std::env::var("SQLEQ_FUZZ_ENGINE").unwrap_or_else(|_| "postgres".to_string());
     let mut pos: Vec<String> = Vec::new();
 
     let mut i = 0;

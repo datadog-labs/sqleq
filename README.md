@@ -7,7 +7,7 @@ Turns query rewrites, optimizer changes, and migrations into something you verif
 ```
                               ┌─▶ sqleq-frontend ──▶ IR ───┬─▶ qed-prover ────▶ proof?
                               │   parse·resolve·type·lower └─▶ sqleq-solver ──▶ proof?
-SQL pair + DDL ─▶ sqleq-check ┼─▶ sqleq-fuzz ──▶ generated tables in DuckDB ──▶ counterexample?
+SQL pair + DDL ─▶ sqleq-check ┼─▶ sqleq-fuzz ──▶ generated tables in Postgres ▶ counterexample?
                               └─▶ sqleq-lean ──▶ Lean kernel ─────────────────▶ proof? (INSERTs)
 ```
 
@@ -45,8 +45,9 @@ cargo build --release                               # sqleq-frontend and sqleq-c
 cargo build --release -p sqleq-fuzz -p sqleq-solver # the refuter and the in-repo prover
 ```
 
-The first build of `sqleq-fuzz` downloads DuckDB's release library (~40 MB); the first build of
-`sqleq-solver` compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler.
+The first build of `sqleq-fuzz` downloads DuckDB's release library (~40 MB), and it runs pairs on a
+PostgreSQL 17 it finds through `SQLEQ_PG_BIN` or `PATH`; the first build of `sqleq-solver` compiles
+Z3 from source, which takes minutes and needs cmake and a C++20 compiler.
 See [Building](#building).
 
 Two pairs ship in [`examples/`](examples/), in the [input format](#input-format) every pair uses: a
@@ -235,9 +236,11 @@ Recent stable Rust (edition 2021; MSRV 1.88, set by the locked dependency tree).
 `sqlparser`, `serde_json` and `csv`. `sqleq-check` builds no backend: it runs each one as a
 subprocess, and the heavier ones are opt-in workspace members, each built with `-p`:
 
-* **`sqleq-fuzz`** — `cargo build --release -p sqleq-fuzz`. Its first build downloads DuckDB's
-  release library (~40 MB). To link a libduckdb you already have instead, set `DUCKDB_LIB_DIR`; the
-  build script checks it before it considers downloading anything.
+* **`sqleq-fuzz`** — `cargo build --release -p sqleq-fuzz`. At run time it needs a PostgreSQL 17:
+  the directory `SQLEQ_PG_BIN` names, or the `postgres` on `PATH` (`--engine duckdb` runs pairs on
+  DuckDB instead). Its first build downloads DuckDB's release library (~40 MB). To link a libduckdb
+  you already have instead, set `DUCKDB_LIB_DIR`; the build script checks it before it considers
+  downloading anything.
 * **`sqleq-solver`** — `cargo build --release -p sqleq-solver`. Its first build compiles Z3 from
   source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in statically, so
   the binary needs nothing at run time.

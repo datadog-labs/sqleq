@@ -22,14 +22,15 @@ For a query pair `(A, B)` under a schema, it repeatedly:
    match rows) — but only where that consistency is something the row supports, see
    [Parameter binding](#parameter-binding-is-an-assumption-not-a-given) below;
 3. freezes `now()` / `current_*` to one instant and skips truly nondeterministic functions;
-4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install), set up
-   and fed so that it computes what Postgres computes — or, where it cannot, gives no verdict;
+4. runs both statements on **PostgreSQL 17**, in a private cluster it starts for the run (see
+   [Engines](#engines)) — or, with `--engine duckdb`, on DuckDB, set up and fed so that it computes
+   what Postgres computes, or, where it cannot, giving no verdict;
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
    counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state,
    and the returned rows as well when both sides carry `RETURNING`. A pair with no one observable
    to compare — a query against a mutation, `RETURNING` on one side only, or an `EXPLAIN` — is
-   reported `NOT-COMPARABLE` instead of run, and so is a pair DuckDB cannot be made to evaluate as
-   Postgres does (see the rules below).
+   reported `NOT-COMPARABLE` instead of run, and so is a pair the engine cannot evaluate faithfully
+   (see [Engines](#engines) and the rules below).
 
 Any difference on a valid, deterministic instance is a **sound counterexample** ⇒ the pair is
 **non-equivalent**. This is a disprover: it can show non-equivalence (with a witness), never prove
@@ -37,15 +38,16 @@ equivalence.
 
 ## Engines
 
-`--engine duckdb`, the default, runs both statements on DuckDB as described here. `--engine
-postgres` runs them on PostgreSQL itself, so there is nothing to emulate: what Postgres computes is
-the answer. It starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, or the
+`--engine postgres`, the default, runs both statements on PostgreSQL itself, so there is nothing
+to emulate: what Postgres computes is the answer. `--engine duckdb` runs them on DuckDB instead,
+made to compute as Postgres does by the rules [below](#soundness-rules-a-false-positive-is-a-bug).
+The Postgres engine starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, or the
 `postgres` on `PATH`; any other major version is refused — serves it on a unix socket in a fresh
 temp directory, and stops and removes it when the run ends (or when the process is killed). The
 first run builds a template cluster under `$SQLEQ_PG_CACHE` (default `~/.cache/sqleq`); every later
 one copies it. `$SQLEQ_FUZZ_ENGINE` sets the default, which is how `sqleq-check` picks the engine.
 
-What changes with the Postgres engine:
+How the Postgres engine differs from the DuckDB one:
 
 - **The DDL runs as written**, once per pair, inside a transaction rolled back at the end, so every
   constraint it declares — `CHECK` and `FOREIGN KEY` included, which the DuckDB engine does not
@@ -72,7 +74,8 @@ What changes with the Postgres engine:
 ## Soundness rules (a false positive is a bug)
 
 A reported counterexample is only valid if the instance is valid *and* both queries are
-deterministic. The rules:
+deterministic. The rules that make DuckDB compute what Postgres computes, or withhold a pair, are
+the DuckDB engine's; the Postgres engine has no need of them. The rest hold on both. The rules:
 
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
   database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
@@ -246,6 +249,9 @@ cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 M
 cargo test  -p sqleq-fuzz               # the self-contained suite below
 ```
 
+Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says; `--engine duckdb` needs
+nothing installed.
+
 `sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
 the defaults below cannot move its answers. On its own:
 
@@ -255,7 +261,7 @@ sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting
 sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER) + exactly two statements
 
 options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
-         --seed N (default 0)  --engine duckdb|postgres (default $SQLEQ_FUZZ_ENGINE, else duckdb)
+         --seed N (default 0)  --engine postgres|duckdb (default $SQLEQ_FUZZ_ENGINE, else postgres)
 ```
 
 `row` and `file` print the verdict on the first line. A `NOT-EQUIVALENT` is followed by a
@@ -275,8 +281,8 @@ panic while testing one row is that row's `ERROR:panic: …`, and the run goes o
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
 `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
 a `:` still bucket correctly for a consumer that splits on the first one. `NOT-COMPARABLE` is a
-withheld verdict: either the two sides share no observable, or DuckDB cannot be made to evaluate them
-as Postgres does.
+withheld verdict: the two sides share no observable, a `$N` is an array on one side and a scalar on
+the other, or — on the DuckDB engine — DuckDB cannot be made to evaluate them as Postgres does.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file without exactly two

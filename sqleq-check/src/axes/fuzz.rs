@@ -6,7 +6,7 @@
 //! The fuzz axis.
 //!
 //! sqleq-fuzz is the only axis that can refute: it runs both statements on random instances in
-//! DuckDB and compares the results. It reads the pair file itself and binds `$N` on its own, so it
+//! PostgreSQL and compares the results. It reads the pair file itself and binds `$N` on its own, so it
 //! needs no frontend and ignores the catalog header. The trial budget is always passed explicitly
 //! -- the tool's defaults are free to change, and a pinned `no-counterexample` is only a claim about
 //! one budget.
