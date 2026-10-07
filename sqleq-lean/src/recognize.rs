@@ -166,7 +166,11 @@ impl Tail {
 
 #[derive(Clone, Debug)]
 pub struct Parts {
+    /// The target's last name, folded: what the schema is keyed by.
     pub target: String,
+    /// Every part of the target's name, folded: what tells `a.events` from `b.events`, so what the
+    /// two sides are compared on.
+    pub target_path: Vec<String>,
     target_obj: ObjectName,
     /// Target columns, folded.
     pub cols: Vec<String>,
@@ -467,6 +471,9 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let Some(target) = last_name(name) else {
         return Err(unsupported("INSERT target is not a plain name"));
     };
+    let Some(target_path) = name.0.iter().map(|p| p.as_ident().map(fold)).collect::<Option<Vec<_>>>() else {
+        return Err(unsupported("INSERT target is not a plain name"));
+    };
     let Some(q) = i.source.as_deref() else {
         return Err(unsupported("INSERT ... DEFAULT VALUES"));
     };
@@ -501,7 +508,7 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
             items.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
         }),
     };
-    Ok(Parts { target, target_obj: name.clone(), cols, col_text, src, src_text, tail, on: i.on.clone() })
+    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, on: i.on.clone() })
 }
 
 /// The original text of each `VALUES` cell (one inner list per row), or of each `unnest` argument

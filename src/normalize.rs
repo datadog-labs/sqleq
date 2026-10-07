@@ -1065,6 +1065,21 @@ impl VisitorMut for StripOrder {
 /// But A's `y` *is* its output while B's `y` is `t.b`, which B does not project — so over
 /// `t = {(a=1, b=2), (a=2, b=1)}` A yields `1` and B yields `2`. Checking A alone would strip and
 /// report a verdict for a pair whose two sides return different rows.
+///
+/// # And it names the same column on both
+///
+/// Determined on each side is still not enough, because the two sides can determine it by different
+/// columns:
+///
+/// ```text
+/// A: SELECT a AS b, b AS a FROM t ORDER BY a LIMIT 1    -- sorts by its 2nd column, t.b
+/// B: SELECT a, b FROM t ORDER BY a LIMIT 1              -- sorts by its 1st column, t.a
+/// ```
+///
+/// Both return the bag of `(t.a, t.b)`, so the stripped pair is provable, but over
+/// `t = {(a=1, b=2), (a=2, b=1)}` A yields `(2, 1)` and B yields `(1, 2)`. Equal bags give equal sets
+/// of pages only under one ordering of them, so each key is resolved to a position in its side's
+/// select list, and the clause is stripped only when the positions agree.
 pub fn strip_identical_pagination(queries: &mut [Query]) {
     let [a, b] = queries else { return };
     if !(has_row_slice(a) || has_row_slice(b)) {
@@ -1086,8 +1101,10 @@ pub fn strip_identical_pagination(queries: &mut [Query]) {
         return;
     }
     // Both sides: each names its key against its own projection, and identical clause text does not
-    // make one reading stand in for the other.
-    if !order_determined_by_projection(a) || !order_determined_by_projection(b) {
+    // make one reading stand in for the other. Each key has to be a column the side returns, and the
+    // same column, by position, on both.
+    let (Some(pa), Some(pb)) = (order_positions(a), order_positions(b)) else { return };
+    if pa != pb {
         return;
     }
     for q in [a, b] {
@@ -1188,6 +1205,11 @@ impl VisitorMut for ClearLocks {
 /// first and it becomes indistinguishable from a use of a CTE named `c`, which would substitute a
 /// definition for a reference to a real table.
 ///
+/// **A use names the binding under Postgres's folding.** An unquoted name folds to lower case and a
+/// quoted one keeps its case, so `c`, `C` and `"c"` all use `WITH c`, while `t` does not use
+/// `WITH "T"`: there it is still the base table `t`, and substituting the binding would read a
+/// different relation.
+///
 /// # What is not a precondition, and why
 ///
 /// **Multiple uses.** Inlining a binding used N times evaluates its body N times, and that is the
@@ -1247,7 +1269,7 @@ impl VisitorMut for InlineCtes {
             // A binding may use the ones before it in the same `WITH`, so each definition is closed
             // over its predecessors before being recorded as one itself.
             let _ = VisitMut::visit(&mut *cte.query, &mut ReplaceCteRefs(&defs));
-            defs.insert(cte.alias.name.value.to_lowercase(), cte);
+            defs.insert(crate::dml::fold_ident(&cte.alias.name), cte);
         }
         let _ = q.visit(&mut ReplaceCteRefs(&defs));
         ControlFlow::Continue(())
@@ -1292,7 +1314,10 @@ impl VisitorMut for ReplaceCteRefs<'_> {
         let Some(ident) = part.as_ident() else {
             return ControlFlow::Continue(());
         };
-        let Some(cte) = self.0.get(&ident.value.to_lowercase()) else {
+        // Postgres's identity for the name, not its lower-cased text: `"T"` and `t` are two names,
+        // so a binding `WITH "T"` must not capture the base table `t`, which the statement still
+        // reads (and which a `DELETE`'s target names, past `dml`'s shadowing check).
+        let Some(cte) = self.0.get(&crate::dml::fold_ident(ident)) else {
             return ControlFlow::Continue(());
         };
         // `AS b AT i` is a PartiQL index alias over a nested array, which is not what a `WITH` binding
@@ -1337,26 +1362,33 @@ const SYS_SCHEMAS: [&str; 4] = ["pg_catalog", "information_schema", "pg_temp", "
 /// no base tables at all — so this is a *naming* fix, not a semantic rewrite: it makes two spellings
 /// of the same table agree.
 ///
-/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing per query:
+/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing **for the
+/// pair**: the guards read every table reference of both queries, and either both are stripped or
+/// neither is.
 ///
 /// * **A system schema anywhere stops it.** `pg_catalog.x` is not the user's `x`, and folding one
 ///   into the other would silently answer a question about the wrong table. An unresolved reference
 ///   downstream is a refusal; a silent rename is not.
 /// * **A bare name reached through two different qualifiers stops it.** `a.orders` and `b.orders`
 ///   are two tables, and stripping would merge them into one — turning a join between two relations
-///   into a self-join, which changes the answer rather than the spelling.
+///   into a self-join, which changes the answer rather than the spelling. That holds across the
+///   pair as much as within a query: `SELECT a FROM s1.t` against `SELECT a FROM s2.t` reads two
+///   tables, and stripping each side on its own would make them one query. Qualifiers are compared
+///   under Postgres's folding, so `"S1".t` and `s1.t` are two schemas too.
 ///
 /// Column qualifiers are left as they are. A three-part `part_16.orders.id` resolves on its last
 /// two parts, so once the table is bare the column already matches it.
 pub fn strip_schema(queries: &mut [Query]) {
+    let mut names = CollectTableNames(Vec::new());
+    for q in queries.iter() {
+        // The read-only `Visit`, not `VisitMut`: the guards have to see every table reference of
+        // the pair before the first one is rewritten.
+        let _ = Visit::visit(q, &mut names);
+    }
+    if !safe_to_strip(&names.0) {
+        return;
+    }
     for q in queries {
-        let mut names = CollectTableNames(Vec::new());
-        // `&*q` so this picks the read-only `Visit`, not `VisitMut`: the guards have to see every
-        // table reference before the first one is rewritten.
-        let _ = Visit::visit(&*q, &mut names);
-        if !safe_to_strip(&names.0) {
-            continue;
-        }
         let _ = q.visit(&mut StripQualifier);
     }
 }
@@ -1385,73 +1417,110 @@ impl VisitorMut for StripQualifier {
     }
 }
 
-/// The two guards, checked over every table reference in one query before any of them is touched.
+/// The two guards, checked over every table reference of the pair before any of them is touched.
+///
+/// The bare name is keyed lower-cased, quoted or not, because that is how the catalog and lowering
+/// will look it up: `s1."T"` and `s2.t` end up at one table there, so they are one bare name here.
+/// The qualifier is compared under Postgres's folding instead, because nothing downstream sees it
+/// once it is stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
 fn safe_to_strip(names: &[ObjectName]) -> bool {
-    let part = |n: &ObjectName, i: usize| {
-        n.0.get(i).and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase())
-    };
-    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut seen: HashMap<String, Vec<String>> = HashMap::new();
     for n in names {
-        let Some(bare) = part(n, n.0.len() - 1) else { return false };
+        let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+            return false;
+        };
         if bare.starts_with("pg_") {
             return false;
         }
         let qualifier = n.0[..n.0.len() - 1]
             .iter()
-            .map(|p| p.as_ident().map(|id| id.value.to_lowercase()).unwrap_or_default())
+            .map(|p| p.as_ident().map(crate::dml::fold_ident).unwrap_or_default())
             .collect::<Vec<_>>();
-        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.as_str())) {
+        // The system schemas by their lower-cased name: `"PG_CATALOG"` is not one, but stopping on it
+        // costs only a refusal.
+        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.to_lowercase().as_str())) {
             return false;
         }
         // Two spellings of one bare name are two tables until proven otherwise.
         match seen.entry(bare) {
-            Entry::Occupied(e) if *e.get() != qualifier.join(".") => return false,
+            Entry::Occupied(e) if *e.get() != qualifier => return false,
             Entry::Occupied(_) => {}
             Entry::Vacant(e) => {
-                e.insert(qualifier.join("."));
+                e.insert(qualifier);
             }
         }
     }
     true
 }
 
-/// Is every `ORDER BY` key of this query recoverable from the rows it returns?
+/// The output column each `ORDER BY` key of this query sorts by, as a position in its select list,
+/// or `None` when some key is not one of the columns the query returns.
 ///
-/// Conservative by construction: it answers yes only for keys it can *match* to the projection, so
-/// an ordering it cannot analyse blocks the strip rather than being assumed harmless.
-fn order_determined_by_projection(q: &Query) -> bool {
-    let Some(order_by) = &q.order_by else { return true };
-    let OrderByKind::Expressions(keys) = &order_by.kind else { return false };
-    let SetExpr::Select(select) = &*q.body else { return false };
+/// A key is resolved as Postgres resolves it: an integer is a position; a bare name is the output
+/// column of that name, and only when no output column has it, an expression over the input; and
+/// anything else is an expression over the input. An expression is a returned column only when the
+/// select list computes it, spelled the same way. Conservative by construction: it answers only for
+/// keys it can match, so an ordering it cannot analyse blocks the strip rather than being assumed
+/// harmless.
+fn order_positions(q: &Query) -> Option<Vec<usize>> {
+    let Some(order_by) = &q.order_by else { return Some(Vec::new()) };
+    let OrderByKind::Expressions(keys) = &order_by.kind else { return None };
+    let SetExpr::Select(select) = &*q.body else { return None };
 
-    let mut projected: Vec<String> = Vec::new();
+    // Each item as its output name, where this can tell it, and its expression as text. The text keeps
+    // its quoting, so a key spelled the same way is the same value. The name is under Postgres's
+    // folding (an unquoted name lower-cased, a quoted one as written), and is taken only from an
+    // alias or a column; an expression's name is Postgres's choice (`CAST(a AS TEXT)` is named `a`,
+    // `count(*)` is `count`), and is left unknown. Matching an alias by its text instead would let
+    // the unquoted key `A`, which is the input column `a`, meet the alias `"A"`, and the key `t.a`
+    // meet an alias `"t.a"`.
+    let mut items: Vec<(Option<String>, String)> = Vec::new();
     for item in &select.projection {
-        match item {
-            // A star projects everything the sources have, so any key over those sources is
-            // recoverable — but working out *which* columns those are is name resolution, which has
-            // not run yet. Refuse rather than guess.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
-            SelectItem::UnnamedExpr(e) => projected.push(e.to_string()),
-            SelectItem::ExprWithAlias { expr, alias } => {
-                projected.push(expr.to_string());
-                projected.push(alias.value.clone());
+        items.push(match item {
+            // A star projects everything the sources have, but working out *which* columns, and at
+            // which positions, is name resolution, which has not run yet. Refuse rather than guess.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+            SelectItem::UnnamedExpr(e) => {
+                let name = match e {
+                    Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
+                    Expr::CompoundIdentifier(parts) => parts.last().map(crate::dml::fold_ident),
+                    _ => None,
+                };
+                (name, e.to_string())
             }
+            SelectItem::ExprWithAlias { expr, alias } => (Some(crate::dml::fold_ident(alias)), expr.to_string()),
             // A Spark multi-alias projection expands one expression into several output columns;
             // which key maps to which is not something this needs to work out to refuse.
-            SelectItem::ExprWithAliases { .. } => return false,
-        }
+            SelectItem::ExprWithAliases { .. } => return None,
+        });
     }
 
-    keys.iter().all(|key| {
-        // `ORDER BY 2` is the second output column by position — determined whenever it is in range.
-        if let Expr::Value(v) = &key.expr {
-            if let sqlparser::ast::Value::Number(n, _) = &v.value {
-                return n.parse::<usize>().is_ok_and(|i| i >= 1 && i <= select.projection.len());
+    keys.iter()
+        .map(|key| {
+            // `ORDER BY 2` is the second output column.
+            if let Expr::Value(v) = &key.expr {
+                if let Value::Number(n, _) = &v.value {
+                    return n.parse::<usize>().ok().filter(|i| (1..=items.len()).contains(i)).map(|i| i - 1);
+                }
             }
-        }
-        let text = key.expr.to_string();
-        projected.contains(&text)
-    })
+            if let Expr::Identifier(id) = &key.expr {
+                let name = crate::dml::fold_ident(id);
+                let named: Vec<usize> = (0..items.len()).filter(|&i| items[i].0.as_ref() == Some(&name)).collect();
+                if let Some(&first) = named.first() {
+                    // Two output columns of one name: Postgres sorts by them only if they are the
+                    // same expression, which then sorts the same either way.
+                    return named.iter().all(|&i| items[i].1 == items[first].1).then_some(first);
+                }
+                // No output column has the name as far as this can tell, but an expression's name
+                // could be it, and then Postgres sorts by that column, not by the input.
+                if items.iter().any(|(n, _)| n.is_none()) {
+                    return None;
+                }
+            }
+            let text = key.expr.to_string();
+            items.iter().position(|(_, e)| *e == text)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2020,6 +2089,16 @@ mod tests {
         assert_eq!(unschemad(sql), sql);
     }
 
+    /// The same across the pair: `SELECT x FROM a.orders` against `SELECT x FROM b.orders` reads two
+    /// tables, so neither side is stripped, though each qualifies its one table consistently.
+    #[test]
+    fn refuses_when_the_two_queries_qualify_one_bare_name_differently() {
+        let (a, b) = ("SELECT x FROM a.orders", "SELECT x FROM b.orders");
+        let mut qs = parse_queries(a, b);
+        strip_schema(&mut qs);
+        assert_eq!((qs[0].to_string(), qs[1].to_string()), (a.to_string(), b.to_string()));
+    }
+
     /// The same qualifier repeated is one table, not a collision.
     #[test]
     fn repeated_identical_qualifiers_are_not_a_collision() {
@@ -2029,14 +2108,22 @@ mod tests {
         );
     }
 
-    /// A bare name beside a qualified one is the same table under two spellings — which is the whole
-    /// point of the rewrite, so it must not be read as a collision.
+    /// Two bare names under one qualifier are two tables, not a collision, and the strip reaches the
+    /// ones in a subquery too.
     #[test]
-    fn a_bare_name_beside_its_qualified_form_still_strips() {
+    fn two_tables_under_one_qualifier_strip_everywhere() {
         assert_eq!(
             unschemad("SELECT x FROM s.orders WHERE id IN (SELECT oid FROM s.lines)"),
             "SELECT x FROM orders WHERE id IN (SELECT oid FROM lines)"
         );
+    }
+
+    /// A bare name beside its qualified form is a collision: `orders` and `s.orders` are one table only
+    /// if the search path reaches `s` first, which nothing here knows, so neither is stripped.
+    #[test]
+    fn a_bare_name_beside_its_qualified_form_is_a_collision() {
+        let sql = "SELECT x FROM orders WHERE id IN (SELECT oid FROM s.orders)";
+        assert_eq!(unschemad(sql), sql);
     }
 
     #[test]

@@ -9,10 +9,10 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issue #64: sqleq-fuzz loaded s1.t and s2.t from one generated table, so two different tables always held the same rows
--- witness: s1.t = {(1)}, s2.t = {(2)}: A yields 1, B yields 2
--- The frontend stripped each side's schema before comparing, so it found the two sides one query,
--- until issue #48's fix kept the schemas apart.
+-- origin: issue #48: strip_schema guarded each query on its own, so s1.t on one side and s2.t on the
+--   other both became t, and the reflexivity check found one query
+-- witness: s1.t = {(1)}, s2.t = {}: A returns 1, B returns no rows
+
 create table "s1"."t" ("a" INTEGER);
 create table "s2"."t" ("a" INTEGER);
 SELECT "a" FROM "s1"."t";
