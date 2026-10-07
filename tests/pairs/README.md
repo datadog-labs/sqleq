@@ -109,10 +109,11 @@ length, a date at infinity or a second session is pinned `no-counterexample` and
 |---|---|
 | an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend finds its two sides one query (`emit-reflexive` or `reflexive`), or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
 | the same, on a line marked `!known-unsound` | passes while the bug reproduces |
+| a proof (or the frontend's `emit-reflexive` or `reflexive`) and a `sqleq-fuzz` counterexample on one pair, an [alarm](../../sqleq-check/README.md#alarms) — whether or not either contradicts `truth`, as under a gather binding neither does | fails, unless one of the two is a `!known-unsound` line that still reproduces |
 | a `!known-unsound` line whose answer no longer contradicts `truth` | fails; `--bless` drops the marker |
 | a pinned answer that moved, either way | fails; `--bless` takes the new answer |
 | an axis that ran with no `expect` line | fails; `--bless` adds one |
-| `timeout` or `missing` | fails; shrink the pair or raise `--timeout` |
+| `timeout` or `missing` (no answer, as when the frontend crashed instead of refusing) | fails; shrink the pair, raise `--timeout`, or fix the crash |
 | a header error: no `truth` or `origin`, an unknown key, axis or word, a `truth`, `binding` or `catalog` that is not one of its values, an `expect` line of more than one word, a duplicate, a directive below the SQL, a pin that contradicts `truth` without a marker, a marker on one that contradicts nothing, or no evidence for the truth | fails; `--bless` skips the file |
 | a line for an axis this run did not ask | not checked |
 

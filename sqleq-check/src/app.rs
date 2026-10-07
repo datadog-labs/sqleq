@@ -270,11 +270,36 @@ pub fn main(args: Args) -> i32 {
     };
     let ss_timeout_ms = args.sqleq_solver_timeout.filter(|t| *t > 0).unwrap_or((args.timeout * 1000.0) as u64);
 
-    let keep_dir = args.keep.as_ref().map(PathBuf::from);
+    // Absolute: a case's directory under it is also the working directory its backends run in, so
+    // a path relative to ours would name somewhere else to them -- the sqleq-solver job a portfolio
+    // packages there among them.
+    let keep_dir = match args.keep.as_ref().map(PathBuf::from) {
+        None => None,
+        Some(k) => {
+            if let Err(e) = std::fs::create_dir_all(&k) {
+                eprintln!("error: {}: {e}", k.display());
+                return 2;
+            }
+            Some(k.canonicalize().unwrap_or_else(|_| crate::util::abspath(&k)))
+        }
+    };
+    // Each case's directory is emptied when the case starts, so two cases must not share one -- the
+    // second would empty the first's while it runs -- and none may hold an input.
     if let Some(k) = &keep_dir {
-        if let Err(e) = std::fs::create_dir_all(k) {
-            eprintln!("error: {}: {e}", k.display());
-            return 2;
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for i in &files {
+            if let Some(other) = seen.insert(crate::case::keep_name(&i.name), &i.name) {
+                eprintln!("error: --keep would put {other} and {} in one directory; rename one of them", i.name);
+                return 2;
+            }
+        }
+        let dirs: HashSet<PathBuf> = seen.keys().map(|n| k.join(n)).collect();
+        for i in &files {
+            let p = i.path.canonicalize().unwrap_or_else(|_| crate::util::abspath(&i.path));
+            if let Some(d) = p.ancestors().skip(1).find(|a| dirs.contains(*a)) {
+                eprintln!("error: --keep would empty {}, which holds the input {}", d.display(), i.path.display());
+                return 2;
+            }
         }
     }
 
@@ -292,7 +317,7 @@ pub fn main(args: Args) -> i32 {
                 // from `results.jsonl`, so a previous run's answers left in place would be reported
                 // as this run's without a single row being re-asked.
                 Some(k) => {
-                    let d = k.canonicalize().unwrap_or_else(|_| k.clone()).join("sqlsolver");
+                    let d = k.join("sqlsolver");
                     let _ = std::fs::remove_dir_all(&d);
                     d
                 }
@@ -596,6 +621,20 @@ pub fn main(args: Args) -> i32 {
     if !args.quiet && live {
         progress(&" ".repeat(30));
     }
+    // A proof and a counterexample on one pair: one of the backends is wrong. A portfolio's verdict
+    // says so; a run without one compares the very same answers here, so that no mode passes over
+    // what --portfolio fails on.
+    let mut alarms: Vec<report::Alarm> = cases
+        .iter()
+        .enumerate()
+        .filter_map(|(i, x)| {
+            let by = match &x.portfolio {
+                Some(o) => (o.verdict == portfolio::ALARM).then(|| o.by.clone()),
+                None => portfolio::alarm(x, &axes),
+            };
+            by.map(|by| report::Alarm { case: i, by, known: false })
+        })
+        .collect();
     let mut pinned = Vec::new();
     let mut blessed = Vec::new();
     if pinned_mode {
@@ -612,6 +651,14 @@ pub fn main(args: Args) -> i32 {
             // code are the pins as they now stand.
             pinned = pinned::judge_cases(&cases, &axes);
         }
+        // A pair whose wrong answer is pinned `!known-unsound` is a known bug reproducing, and its
+        // alarm passes as that pin does. Any other alarm fails here even where every pin holds: a
+        // pair stated under a gather binding has no index-binding truth for the two to contradict.
+        for a in &mut alarms {
+            a.known = pinned.iter().filter(|p| p.case == a.case).any(|p| {
+                p.judgements.iter().any(|j| j.state == crate::suite::KNOWN && a.by.contains(&j.axis))
+            });
+        }
         report::print_pinned(c, &pinned, &cases, &axes);
         if args.bless {
             println!("  {} {} file(s)", c.bold("blessed"), blessed.len());
@@ -619,6 +666,7 @@ pub fn main(args: Args) -> i32 {
                 println!("{}", c.dim(&format!("    {name}")));
             }
         }
+        report::print_alarms(c, &cases, &alarms);
     } else {
         if env.frontend.is_some() {
             report::print_summary(c, &cases, wall, axes.contains(&"qed"));
@@ -633,6 +681,8 @@ pub fn main(args: Args) -> i32 {
         }
         if args.portfolio {
             report::print_portfolio(c, &cases, &backends(&axes), args.timeout, retried);
+        } else {
+            report::print_alarms(c, &cases, &alarms);
         }
     }
 
@@ -685,6 +735,7 @@ pub fn main(args: Args) -> i32 {
             }
             out
         }),
+        alarms: alarms.iter().filter(|a| !a.known).map(|a| cases[a.case].name.clone()).collect(),
     };
     drop(ss_tmp);
     if let Some(path) = &args.json {
@@ -706,13 +757,14 @@ pub fn main(args: Args) -> i32 {
         }
     }
 
+    // A soundness alarm fails every policy, with or without --portfolio: it says one of the
+    // backends is wrong, which no report should pass over in silence.
+    if alarms.iter().any(|a| !a.known) {
+        return 1;
+    }
     let verdict_is = |x: &Case, v: &str| x.portfolio.as_ref().is_some_and(|o| o.verdict == v);
     if args.portfolio {
-        // The combined verdict decides, and a soundness alarm fails every policy: it says one of the
-        // backends is wrong, which no report should pass over in silence.
-        if cases.iter().any(|x| verdict_is(x, portfolio::ALARM)) {
-            return 1;
-        }
+        // The combined verdict decides.
         return match args.expect {
             Expect::Equivalent => i32::from(!cases.iter().all(|x| verdict_is(x, portfolio::EQUIVALENT))),
             _ => 0,
@@ -725,7 +777,8 @@ pub fn main(args: Args) -> i32 {
         Expect::Pinned => i32::from(!pinned.iter().all(|p| p.passed())),
         // Every case must be provable -- by *our* prover. The second opinion is deliberately not
         // part of the policy: adding an axis must not be able to turn a red CI run green, and its
-        // `no-proof` is not a failure to begin with.
+        // `no-proof` is not a failure to begin with. (Its proof can still be half of an alarm,
+        // above, which turns a green run red.)
         Expect::Equivalent => i32::from(!cases.iter().all(|x| x.status == PROVABLE)),
     }
 }
