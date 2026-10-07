@@ -9,10 +9,9 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported
--- origin: issue #58: numeric division was read as exact division
--- witness: t = {(1)}: A yields 0.99999999999999999990 (numeric division rounds to a finite scale), B yields 1
--- Refused since issue #84: the scale of a numeric quotient follows its operands' scales, so x / 3.0 is
--- not a function of x's value.
+-- origin: issue #84: coalesce() of a numeric was typed opaque, so the cast to text over it did not see a numeric
+-- witness: t = {(2.0)}, u = {(2.00)}: A yields '2.0', B yields '2.00'
 create table "t" ("x" NUMERIC);
-SELECT "x" / 3.0 * 3.0 FROM "t";
-SELECT "x" FROM "t";
+create table "u" ("x" NUMERIC);
+SELECT CAST(coalesce("t"."x", 0) AS TEXT) FROM "t" JOIN "u" ON "t"."x" = "u"."x";
+SELECT CAST(coalesce("u"."x", 0) AS TEXT) FROM "t" JOIN "u" ON "t"."x" = "u"."x";

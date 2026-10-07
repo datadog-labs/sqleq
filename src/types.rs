@@ -19,6 +19,9 @@
 //!
 //! Comparisons are exact. The values of one temporal type, `-infinity` and `infinity` included, form
 //! a bounded total order, so they embed order-preservingly into the integers a prover reads them as.
+//! For INTERVAL that order is one of classes, not of values: Postgres compares two intervals after
+//! normalizing a month to 30 days and a day to 24 hours, so `'1 day' = '24 hours'` holds of two
+//! values that print differently, and an operation that tells them apart is [`crate::equality`]'s.
 //!
 //! Arithmetic is not exact on those integers, because of the infinities: Postgres leaves `infinity`
 //! unchanged under `date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error
@@ -37,10 +40,11 @@
 //!
 //! * `numeric` is REAL: its `+`, `-` and `*` are exact. Its division rounds to a finite scale
 //!   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over REAL is the uninterpreted `q_arith_div_real_real`
-//!   ([`make_arith`]). REAL carries no scale, so a numeric turned into text, which shows it, is
-//!   refused ([`refuse_unfaithful`]).
-//! * `real`, `double precision` and the other floats are opaque (VARBINARY): float addition is not
-//!   associative, and arithmetic over any opaque operand is an uninterpreted `q_arith_*` function.
+//!   ([`make_arith`]). REAL carries no scale, so an operation that shows it -- a cast to text, or a
+//!   division, whose scale follows its operands' -- is [`crate::equality`]'s.
+//! * `real`, `double precision` and the other floats are opaque (VARBINARY, named `VARBINARY:float`
+//!   inside the frontend: [`COARSE_OPAQUE`]): float addition is not associative, and arithmetic over
+//!   any opaque operand is an uninterpreted `q_arith_*` function.
 //! * `citext` and the blank-padded `char(n)` are [`UNFAITHFUL`]: their `=` ignores case or trailing
 //!   spaces, so two values it calls equal can still be told apart, and a value of either is refused
 //!   wherever it reaches the plan ([`refuse_unfaithful`]).
@@ -80,8 +84,84 @@ pub fn is_temporal(t: &str) -> bool {
     TEMPORAL.contains(&t)
 }
 
-/// The spelling a type leaves the frontend with. Two differ: TIMESTAMPTZ is emitted as TIMESTAMP,
-/// and an [`UNFAITHFUL`] type as VARBINARY.
+/// The prefix of an opaque type whose `=` is not identity: `VARBINARY:float` is VARBINARY to the
+/// provers, and to the frontend a value of a type whose `=` calls two values equal that a function
+/// can still tell apart ([`crate::equality`]). The part after the colon names what the value may be,
+/// as [`coarse_class`] returns it: `float`, `numeric`, `interval`, `jsonb`, or one of those with `[]`.
+pub const COARSE_OPAQUE: &str = "VARBINARY:";
+
+/// What a value of type `t` is, among the types whose `=` is not identity: `numeric` for REAL,
+/// `interval`, `jsonb`, or the class a [`COARSE_OPAQUE`] name carries. `None` for every other type,
+/// whose `=` the frontend takes to be identity (see [`crate::equality`] for which those are).
+pub fn coarse_class(t: &str) -> Option<&str> {
+    match t {
+        "REAL" => Some("numeric"),
+        "INTERVAL" => Some("interval"),
+        "JSONB" => Some("jsonb"),
+        _ => t.strip_prefix(COARSE_OPAQUE),
+    }
+}
+
+/// Whether `t` is VARBINARY to the provers: VARBINARY itself or a [`COARSE_OPAQUE`] name.
+pub fn is_opaque(t: &str) -> bool {
+    t == "VARBINARY" || t.starts_with(COARSE_OPAQUE)
+}
+
+/// `t` as a part of a function's name (`q_arith_add_varbinary_integer`): a [`COARSE_OPAQUE`] name is
+/// VARBINARY there as everywhere the provers look, so it names the same function it always did.
+pub fn name_part(t: &str) -> &str {
+    if t.starts_with(COARSE_OPAQUE) {
+        "VARBINARY"
+    } else {
+        t
+    }
+}
+
+/// The opaque type a type name maps to: VARBINARY, or a [`COARSE_OPAQUE`] name for a float, for
+/// `jsonb`, and for an array of `numeric`, of a float, of `interval` or of `jsonb`, whose `=` compares
+/// the elements with theirs. Upper or lower case, with or without a typmod.
+pub fn opaque_name(name: &str) -> &'static str {
+    let up = name.replace(['"', '`'], "").to_uppercase();
+    let up = up.trim();
+    let element = if let Some(i) = up.find('[') {
+        Some(&up[..i])
+    } else if let Some(rest) = up.strip_prefix("ARRAY<").or_else(|| up.strip_prefix("ARRAY(")) {
+        Some(rest.trim_end_matches(['>', ')']))
+    } else {
+        up.find(" ARRAY").map(|i| &up[..i])
+    };
+    let class = |t: &str| -> Option<&'static str> {
+        let t = t.trim();
+        if t == "JSONB" {
+            return Some("jsonb");
+        }
+        if temporal_class(t) == Some(Some("INTERVAL")) {
+            return Some("interval");
+        }
+        match scalar_class(t) {
+            Some(Scalar::Numeric) => Some("numeric"),
+            Some(Scalar::Float) => Some("float"),
+            _ => None,
+        }
+    };
+    match element {
+        Some(e) => match class(e) {
+            Some("numeric") => "VARBINARY:numeric[]",
+            Some("float") => "VARBINARY:float[]",
+            Some("interval") => "VARBINARY:interval[]",
+            Some("jsonb") => "VARBINARY:jsonb[]",
+            _ => "VARBINARY",
+        },
+        None => match class(up) {
+            Some("float") => "VARBINARY:float",
+            Some("jsonb") => "VARBINARY:jsonb",
+            _ => "VARBINARY",
+        },
+    }
+}
+
+/// The spelling a type leaves the frontend with. Three differ: TIMESTAMPTZ is emitted as TIMESTAMP,
+/// and an [`UNFAITHFUL`] type and a [`COARSE_OPAQUE`] one as VARBINARY.
 ///
 /// QED reads DATE, TIME and TIMESTAMP as its integer sort, which keeps their order and their
 /// arithmetic, and any other name as an uninterpreted sort with equality only. A TIMESTAMPTZ is an
@@ -92,6 +172,8 @@ pub fn is_temporal(t: &str) -> bool {
 pub fn emitted_type_name(t: &str) -> &str {
     if t == "TIMESTAMPTZ" {
         "TIMESTAMP"
+    } else if t.starts_with(COARSE_OPAQUE) {
+        "VARBINARY"
     } else if UNFAITHFUL.iter().any(|(n, _)| *n == t) {
         // A schema's column that no query reads, or a value in a pair whose two plans are one
         // ([`refuse_unfaithful`]): opaque, under the name both provers accept for that.
@@ -248,20 +330,18 @@ pub fn unfaithful_type(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Refuse a lowered pair whose plans read something no prover reads the way Postgres does:
-///
-/// * a value of an [`UNFAITHFUL`] type. Read off the `type` of every expression, so it reaches every
-///   way such a value enters a plan: a column, a cast, a function declared to return one. A column
-///   of that type that neither query reads appears only in the schema, where it costs nothing.
-/// * a `numeric` turned into text ([`numeric_to_text`]). A numeric carries a scale, which its text
-///   shows: `1.0` and `1.00` are one number and two strings, and `x * 1.0` and `x * 1.00` are the
-///   same REAL to a prover, whose casts are functions of the value. No spelling of the cast says the
-///   scale either: `x::text` reads a column in one query and `x * 1.0` behind an alias in another.
+/// Refuse a lowered pair whose plans read a value of an [`UNFAITHFUL`] type. Read off the `type` of
+/// every expression, so it reaches every way such a value enters a plan: a column, a cast, a function
+/// declared to return one. A column of that type that neither query reads appears only in the
+/// schema, where it costs nothing.
 ///
 /// Except where the two queries lowered to one plan. Every node of a plan carries its type, and a
-/// literal its spelling, so a plan read with citext's own `=`, or with the scales Postgres computes,
-/// still says what the query computes, and two queries with one plan compute the same thing however
-/// those are read. The provers' misreading cannot matter to a proof that a plan equals itself.
+/// literal its spelling, so a plan read with citext's own `=` still says what the query computes, and
+/// two queries with one plan compute the same thing however that is read. The provers' misreading
+/// cannot matter to a proof that a plan equals itself.
+///
+/// The types whose `=` is coarser than identity in a way some IR type can still carry -- `numeric`,
+/// the floats, `interval`, `jsonb` -- are [`crate::equality`]'s.
 pub fn refuse_unfaithful(input: &Value) -> Result<()> {
     if input["queries"][0] == input["queries"][1] {
         return Ok(());
@@ -274,12 +354,6 @@ pub fn refuse_unfaithful(input: &Value) -> Result<()> {
                         return Some(unfaithful_refusal(t));
                     }
                 }
-                if numeric_to_text(v) {
-                    return Some(unsupported(
-                        "a numeric converted to text, whose scale it shows (1.0 and 1.00 are one number \
-                         and two strings) and the IR's REAL does not carry",
-                    ));
-                }
                 m.values().find_map(walk)
             }
             Value::Array(a) => a.iter().find_map(walk),
@@ -287,21 +361,6 @@ pub fn refuse_unfaithful(input: &Value) -> Result<()> {
         }
     }
     input.get("queries").and_then(walk).map_or(Ok(()), Err)
-}
-
-/// Whether `v` turns a REAL, the IR's `numeric`, into text: a cast to a string type over a REAL
-/// operand (a `CAST`, a named `q_cast_` for a qualified target such as `varchar(8)`, or a `qcastK`
-/// of the inferring modes), or a `||` with a REAL operand, which casts it to text.
-fn numeric_to_text(v: &Value) -> bool {
-    let op = v.get("operator").and_then(Value::as_str).unwrap_or("");
-    let operands = v.get("operand").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-    let real = |e: &Value| e.get("type").and_then(Value::as_str) == Some("REAL");
-    // `get`, not slicing: an operator is any function's name, and a name need not be ASCII.
-    let qcast = op.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("qcast"))
-        && op.get(5..).is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()));
-    let cast = op == "CAST" || op.starts_with("q_cast_") || qcast;
-    let to_text = v.get("type").and_then(Value::as_str) == Some("VARCHAR");
-    (cast && to_text && operands.first().is_some_and(real)) || (op == "||" && operands.iter().any(real))
 }
 
 /// The refusal for a value of the [`UNFAITHFUL`] type `name`.
@@ -312,8 +371,10 @@ pub fn unfaithful_refusal(name: &str) -> crate::error::FrontendError {
 
 /// Map a sqlparser `DataType` to the prover's type string. Classifies on the rendered type name so
 /// it stays robust across sqlparser versions, by exact name ([`scalar_class`]). Temporal types keep
-/// their own names (see the module docs); floats and BINARY/BLOB/BYTEA become the opaque
-/// `VARBINARY`; the [`UNFAITHFUL`] types keep their own names; unknown types pass through uppercased.
+/// their own names (see the module docs); BINARY/BLOB/BYTEA and arrays become the opaque
+/// `VARBINARY`, and floats and arrays whose elements' `=` is not identity a [`COARSE_OPAQUE`] name
+/// ([`opaque_name`]); the [`UNFAITHFUL`] types keep their own names; unknown types pass through
+/// uppercased.
 pub fn map_type(dt: &DataType) -> String {
     let s = format!("{dt}").to_uppercase();
     let base = s.split('(').next().unwrap_or(&s).trim();
@@ -325,8 +386,11 @@ pub fn map_type(dt: &DataType) -> String {
     // reads only the element's spelling: `int[]` would be an INTEGER and `timestamp[]` a
     // TIMESTAMP, and a scalar reading of an array value lets `||` and `= ANY` be modelled as
     // their scalar forms.
+    //
+    // Opaque does not mean that `=` is identity: an array of `numeric` compares its elements with
+    // `numeric`'s `=`, so it keeps that in its name ([`opaque_name`]).
     if s.contains('[') || s.starts_with("ARRAY") || s.split_whitespace().any(|w| w == "ARRAY") {
-        return "VARBINARY".into();
+        return opaque_name(&s).into();
     }
     if let Some(t) = temporal_class(&s) {
         return t.unwrap_or("VARBINARY").into();
@@ -334,7 +398,9 @@ pub fn map_type(dt: &DataType) -> String {
     match scalar_class(base) {
         Some(Scalar::Int) => "INTEGER",
         Some(Scalar::Numeric) => "REAL",
-        Some(Scalar::Float | Scalar::Binary) => "VARBINARY",
+        // `-0 = 0` holds, and the two print differently: see [`crate::equality`].
+        Some(Scalar::Float) => opaque_name(base),
+        Some(Scalar::Binary) => "VARBINARY",
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => base,
@@ -346,8 +412,8 @@ pub fn map_type(dt: &DataType) -> String {
 ///
 /// The DSL names the IR's types, so `REAL`, and `DOUBLE`, the spelling the preprocessor wrote for
 /// it, are the IR's exact REAL, and `VARBINARY` is the opaque type. Postgres's other names read as
-/// they do in a `CREATE TABLE` ([`map_type`]): `float8` is opaque, and `char` and `citext` are
-/// [`UNFAITHFUL`].
+/// they do in a `CREATE TABLE` ([`map_type`]): `float8` is opaque (`VARBINARY:float`), and `char` and
+/// `citext` are [`UNFAITHFUL`].
 pub fn normalize_type_name(t: &str) -> String {
     let up = t.to_uppercase();
     if let Some(class) = temporal_class(&up) {
@@ -362,7 +428,8 @@ pub fn normalize_type_name(t: &str) -> String {
     match scalar_class(&up) {
         Some(Scalar::Int) => "INTEGER",
         Some(Scalar::Numeric) => "REAL",
-        Some(Scalar::Float | Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Float) => opaque_name(&up),
+        Some(Scalar::Binary) => "VARBINARY",
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => return up,
@@ -385,10 +452,25 @@ pub fn is_builtin(t: &str) -> bool {
 
 /// Common type for a comparison's two operands. A non-builtin (opaque) type such as VARBINARY wins
 /// (we cast the other side to it, as Calcite does); otherwise REAL > VARCHAR > INTEGER.
+///
+/// Where the two meet at VARBINARY and one of them is a type whose `=` is not identity
+/// ([`coarse_class`]), the result is the [`COARSE_OPAQUE`] name of that type: VARBINARY to the
+/// provers, so nothing they read changes, and to [`crate::equality`] a value that may still be the
+/// `numeric` it was. A `CASE` with a `numeric` branch and an opaque one may yield the `numeric`.
+pub fn common_type(a: &str, b: &str) -> String {
+    let t = common_type_of_names(a, b);
+    if t == "VARBINARY" {
+        if let Some(class) = coarse_class(a).or_else(|| coarse_class(b)) {
+            return format!("{COARSE_OPAQUE}{class}");
+        }
+    }
+    t
+}
+
 // Same reasoning as `map_type`: the opaque-wins arms are separate because they answer
 // different questions about which side is opaque.
 #[allow(clippy::if_same_then_else)]
-pub fn common_type(a: &str, b: &str) -> String {
+fn common_type_of_names(a: &str, b: &str) -> String {
     if a == b {
         a.into()
     } else if is_temporal(a) || is_temporal(b) {
@@ -529,7 +611,7 @@ fn temporal_common(a: &str, b: &str) -> String {
 /// the target's qualifier appended when it has one. `timestamp(0)` rounds away the fractional
 /// seconds, so it is a different function from `timestamp`, and its name has to say so.
 pub fn conv_name(from: &str, to: &str, qualifier: Option<&str>) -> String {
-    let base = format!("q_conv_{}_{}", from.to_lowercase(), to.to_lowercase());
+    let base = format!("q_conv_{}_{}", name_part(from).to_lowercase(), name_part(to).to_lowercase());
     match qualifier {
         Some(q) => format!("{base}_{q}"),
         None => base,
@@ -605,7 +687,7 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
 ///   `text[]` would read as `ys`, while it parses each element.
 fn named_cast(dt: &DataType, target: &str) -> Option<String> {
     let spelled = format!("{dt}").to_lowercase().replace("[]", " array");
-    (spelled.contains('(') || target == "VARBINARY").then(|| {
+    (spelled.contains('(') || is_opaque(target)).then(|| {
         let safe: String = spelled.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         format!("q_cast_{}", safe.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"))
     })
@@ -622,6 +704,14 @@ pub fn temporal_mismatch(a: &str, b: &str) -> bool {
     a != b && is_temporal(a) && is_temporal(b)
 }
 
+/// Whether a column whose type a construct takes from its first branch or row, `first` (a set
+/// operation, a `VALUES` list), would hold under it a value of type `other` whose `=` is not identity
+/// while `first`'s is. A read of the column would take the value for one whose `=` is identity, so
+/// [`crate::equality`] would let through an operation that tells two equal values apart.
+pub fn hides_coarse(first: &str, other: &str) -> bool {
+    coarse_class(first).is_none() && coarse_class(other).is_some()
+}
+
 /// Coerce the left operand of `x IN (subquery)` to the type of the subquery's column, which is
 /// what Postgres does when that column is the higher type (`d IN (SELECT ts ..)` compares
 /// `d::timestamp`, `i IN (SELECT a / 2.0 ..)` compares `i::numeric`). `Err` names the pair when the
@@ -633,11 +723,17 @@ pub fn temporal_mismatch(a: &str, b: &str) -> bool {
 /// `NULL` is relabelled and a string literal read at the column's type, as in a comparison.
 pub fn coerce_in_operand(x: Value, col_ty: &str) -> std::result::Result<Value, String> {
     let xt = ty_of(&x);
-    if xt == col_ty {
+    if xt == col_ty || (is_opaque(&xt) && is_opaque(col_ty)) {
         return Ok(x);
     }
-    if is_null_lit(&x) || is_string_literal(&x) || common_type(&xt, col_ty) == col_ty {
-        Ok(cast_to(x, col_ty))
+    if is_null_lit(&x) || is_string_literal(&x) {
+        return Ok(cast_to(x, col_ty));
+    }
+    // Compared as the provers read the two types: a `numeric` operand against an opaque column
+    // meets it at VARBINARY, under the name that says what it was ([`common_type`]).
+    let ct = common_type(&xt, col_ty);
+    if name_part(&ct) == name_part(col_ty) {
+        Ok(cast_to(x, &ct))
     } else {
         Err(format!("{xt} compared with a subquery column of type {col_ty}"))
     }
@@ -657,7 +753,9 @@ fn is_null_lit(v: &Value) -> bool {
 /// type is a [`convert`] call instead; see the module docs. A string literal cast to INTEGER or
 /// BOOLEAN is read as one ([`read_literal`]).
 pub fn cast_to(mut v: Value, ct: &str) -> Value {
-    if ty_of(&v) == ct {
+    // Two names for VARBINARY are one type to the provers ([`COARSE_OPAQUE`]), and a cast between
+    // them would be a node neither reads.
+    if ty_of(&v) == ct || (is_opaque(&ty_of(&v)) && is_opaque(ct)) {
         return v;
     }
     if is_temporal(&ty_of(&v)) || is_temporal(ct) {
@@ -751,7 +849,11 @@ pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
     // a function named after both operand types.
     if opstr == "||" && !(is_builtin(&a) && is_builtin(&b)) {
         return json!({
-            "operator": format!("q_op_concat_{}_{}", a.to_lowercase(), b.to_lowercase()),
+            "operator": format!(
+                "q_op_concat_{}_{}",
+                name_part(&a).to_lowercase(),
+                name_part(&b).to_lowercase()
+            ),
             "operand": [l, r],
             "type": "VARBINARY"
         });
@@ -820,7 +922,7 @@ fn arith_symbol(op: &str, a: &str, b: &str) -> String {
         other => other,
     };
     let safe = |t: &str| -> String {
-        t.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+        name_part(t).to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
     };
     format!("q_arith_{name}_{}_{}", safe(a), safe(b))
 }

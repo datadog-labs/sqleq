@@ -228,13 +228,14 @@ mod aggregates {
     #[test]
     fn opaque_aggregates_carry_postgres_return_types() {
         // Postgres's own type where it has exactly one; opaque where it follows the argument.
+        // (Over the float `c`, `corr`, `regr_slope` and `stddev` are refused: an aggregate not known to
+        // give equal results on values `=` calls equal, such as `-0` and `0`, may not read one. See
+        // `tests/coarse_equality.rs`.)
         for (f, ty) in [
             (r#"bool_or("a" > 1)"#, "BOOLEAN"),
             (r#"regr_count("c", "c")"#, "INTEGER"),
-            (r#"corr("c", "c")"#, "REAL"),
-            (r#"regr_slope("c", "c")"#, "REAL"),
             (r#"var_pop("a")"#, "VARBINARY"),
-            (r#"stddev("c")"#, "VARBINARY"),
+            (r#"stddev("a")"#, "VARBINARY"),
             (r#"bit_xor("a")"#, "VARBINARY"),
         ] {
             let v = ok(&same(&format!(r#"SELECT {f} FROM "t""#)));

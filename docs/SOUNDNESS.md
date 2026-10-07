@@ -8,6 +8,16 @@ something it cannot check.
 Read [VALIDATION.md](VALIDATION.md) first if you want the method — how the axes check each other,
 and the defects it has caught. This page is the narrower question of what any one verdict means.
 
+## What "the same rows" means
+
+Two queries are equivalent when they return the same bag of rows, where two rows are the same if
+their values are equal under SQL `=`. So `2.0` and `2.00` are one value, though Postgres prints them
+differently, and so are `-0` and `0` as floats, `'1 day'` and `'24 hours'` as intervals, and
+`'{"a": 1.0}'` and `'{"a": 1.00}'` as `jsonb`. That is the comparison the provers can make, since they
+read the IR's `=` as identity, and `sqleq-fuzz` compares numbers by value. What the rule does not allow
+is putting one such value for the other *inside* an operation that can tell them apart, such as a cast
+to text; how the frontend keeps that out is [below](#values-that--calls-equal-and-that-are-still-two-values).
+
 ## The frontend refuses rather than guess
 
 The provers are taken to be sound: each proves only genuinely equivalent pairs **given faithful IR**
@@ -66,7 +76,10 @@ these; they were found by probing the lowering directly, and the disprover confi
 The rule now is that a comparison of two values of one temporal type stays native, and every
 *operation* on a temporal value is an uninterpreted function. Comparisons are exact: the values of
 one type, `-infinity` and `infinity` included, form a bounded total order, so they embed
-order-preservingly into the integers a prover reads them as.
+order-preservingly into the integers a prover reads them as. For `interval` it is an order of
+classes, not of values: Postgres compares two intervals after counting a month as 30 days and a day
+as 24 hours, so `'1 mon' = '30 days'`, and the two still add differently to a date
+([below](#values-that--calls-equal-and-that-are-still-two-values)).
 
 Arithmetic is not exact there, because of the infinities. Postgres leaves `infinity` unchanged under
 `date + integer`, so `'infinity'::date + 1 = 'infinity'`, and it raises an error for `infinity -
@@ -99,8 +112,9 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
 - **`numeric` is REAL, but its division is not exact, and REAL has no scale.** Addition,
   subtraction and multiplication of numerics are exact; division rounds to a finite scale
   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
-  A numeric's text shows its scale, `1.0` and `1.00` being one number and two strings, so a numeric
-  cast to text, or concatenated with `||`, is refused unless both queries lower to one plan.
+  A numeric's text shows its scale, `1.0` and `1.00` being one number and two strings, and so does
+  the scale a division rounds to; what that costs is
+  [below](#values-that--calls-equal-and-that-are-still-two-values).
 - **Floats are opaque.** `real`, `double precision` and `float` round, and float addition is not
   associative: `(0.1 + 0.2) + 0.3` is `0.6000000000000001` and `0.1 + (0.2 + 0.3)` is `0.6`. A
   float is VARBINARY, and arithmetic over any opaque operand, a float or a range or a point, is an
@@ -121,6 +135,50 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
   with `'01'` as strings. Text it cannot read the way Postgres does stays an uninterpreted cast of
   the literal.
+
+### Values that `=` calls equal and that are still two values
+
+For `numeric`, the floats, `interval` and `jsonb`, `=` is coarser than identity: `2.0 = 2.00`,
+`-0 = 0`, `'1 day' = '24 hours'` (and `'1 mon' = '30 days'`), `'{"a": 1.0}' = '{"a": 1.00}'`, and an
+array of one of them compares its elements the same way. The IR's values of these types stand for
+classes of Postgres values under `=`, which is faithful for an operation that gives equal results on
+equal arguments and not for one that does not. From `t.x = u.x`, or from a `GROUP BY`, a `DISTINCT`
+or a `UNION`, which put equal values in one class, a prover concludes `f(t.x) = f(u.x)` for every
+`f`. Postgres does not honour that where `f` is a cast to text, `||`, `concat`, `format`, `scale`,
+`->>`, a `numeric` division (the scale of a quotient follows its operands', so `1.0 / 3` and
+`1.000000000000000000000 / 3` differ), `avg` or the `stddev` and `var` family over `numeric` (which
+divide), or `date + interval` (`'2024-01-31'` plus `'1 mon'` is February 29th, plus `'30 days'`
+March 1st).
+
+So the frontend sorts every read of such a value in the lowered plans (`src/equality.rs`):
+
+- By an operation known to give equal results on equal arguments: a comparison, a null test, `IN`,
+  `count`, `min`, `max`, `sum` (exact over `numeric` and intervals), `+`, `-`, `*` and `%` over
+  `numeric`, float arithmetic, a cast to a number or a boolean, `coalesce`, `nullif`, `greatest`,
+  `least`, `abs`, `ceil`, `floor`, `round`, `trunc`, `sign`, `->`, `#>`, `@>`, `&&` or a subscript.
+  Nothing to do. A result of the same kind, such as `coalesce(x, 0)`, carries a type that says so,
+  across a query block too, so a read of it further up is sorted the same way.
+- By any other operation. If the value is fixed by its spelling, computed by one expression from
+  literals, parameters, clocks and values of types whose `=` is identity (`INTERVAL '1 day'` in
+  `ts + INTERVAL '1 day'`, or `n::numeric` over an integer `n` in `n / 2.0`), the operation reads it
+  through `q_exact_<type>(<the expression's spelling>, <those values>)`. Postgres evaluates one
+  expression on equal inputs to one value, printed one way, and a prover can equate two such terms
+  only where the spellings and the inputs are equal, so a filter `x = INTERVAL '1 mon' AND
+  x = INTERVAL '30 days'` does not make `d + INTERVAL '1 mon'` and `d + INTERVAL '30 days'` one
+  term. Otherwise the pair is refused.
+
+A pair whose two queries lower to one plan is lowered regardless, as for `citext`. A set operation or
+a `VALUES` list whose column takes an integer's type from its first branch or row and holds a
+`numeric` from a later one is refused, since a read of the column would take the value for one whose
+`=` is identity.
+
+The cost is those refusals: a pair whose two queries differ and that casts one of these values to
+text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, or adds
+an interval column to a date, is refused rather than proved. Three gaps remain. A value whose type
+the frontend does not know is read as one whose `=` is identity: the result of a function nobody
+declared is VARBINARY, though `sqrt(i)` is a float. So are opaque types whose `=` is not identity
+beyond these four (`numrange`, the geometric types, a domain over `numeric`). And the cast an
+`UPDATE` or `INSERT` applies when it stores one of these values in a text column is not modelled.
 
 ### Shapes that look like something simpler
 

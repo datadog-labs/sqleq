@@ -891,7 +891,7 @@ fn lower_setexpr_ctx(
             // branch pair that differs across a temporal boundary would put two units in one column;
             // with no conversion to insert inside a branch from here, it is refused.
             if let Some(((_, a), (_, b))) =
-                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b))
+                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b) || hides_coarse(a, b))
             {
                 return Err(unsupported(format!("set operation over columns of type {a} and {b}")));
             }
@@ -930,10 +930,13 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         .collect::<Result<Vec<_>>>()?;
     let schema_tys: Vec<String> = content[0].iter().map(ty_of).collect();
     // Same reason as the set operations: the column type is the first row's, and a later row of
-    // another temporal type would hold a value in another unit.
+    // another temporal type would hold a value in another unit, or one whose `=` is not identity a
+    // value the column's type does not say that of.
     for row in &content[1..] {
-        if let Some((a, b)) =
-            schema_tys.iter().zip(row.iter().map(ty_of)).find(|(a, b)| temporal_mismatch(a, b))
+        if let Some((a, b)) = schema_tys
+            .iter()
+            .zip(row.iter().map(ty_of))
+            .find(|(a, b)| temporal_mismatch(a, b) || hides_coarse(a, b))
         {
             return Err(unsupported(format!("VALUES column of type {a} holding a {b}")));
         }
@@ -2385,7 +2388,7 @@ impl AggCtx<'_> {
                 }
                 let operand =
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
-                let ret = fn_ret(self.fns, &name, &bare);
+                let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -2850,7 +2853,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .into_iter()
                 .map(|e| lower_expr(cat, scope, fns, e))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(json!({ "operator": name, "operand": operand, "type": fn_ret(fns, &name, &bare) }))
+            let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
+            Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
         // conjunction of the pairwise comparisons, three-valued logic included — true iff every
@@ -3307,7 +3311,7 @@ fn lower_quantified(
                     _ => false,
                 }
             };
-            if arr.elem.iter().zip(&elems).any(|(e, v)| !leaf(e) && ty_of(v) == "VARBINARY") {
+            if arr.elem.iter().zip(&elems).any(|(e, v)| !leaf(e) && is_opaque(&ty_of(v))) {
                 return Err(unsupported(format!(
                     "{op} {quant} over an ARRAY[..] with an element of opaque type"
                 )));
@@ -3383,10 +3387,15 @@ fn array_shape(arr: &sqlparser::ast::Array) -> Result<()> {
 /// the name because the IR carries every array as one opaque type, and `ARRAY[1]` and `ARRAY['1']`
 /// are different values. Only reached outside `= ANY(..)`, where the constructor is expanded
 /// instead (`lower_quantified`).
+///
+/// An array of values whose `=` is not identity compares its elements with that `=`, so it is named
+/// after them ([`COARSE_OPAQUE`]): VARBINARY to the provers, and to [`crate::equality`] an array of
+/// `numeric`.
 fn array_call(elems: Vec<Value>) -> Value {
     let ty = elems.iter().map(ty_of).reduce(|a, b| common_type(&a, &b)).unwrap_or_else(|| "VARBINARY".into());
     let operand: Vec<Value> = elems.into_iter().map(|v| cast_to(v, &ty)).collect();
-    json!({ "operator": format!("q_array_{}", ty.to_lowercase()), "operand": operand, "type": "VARBINARY" })
+    let array = coarse_class(&ty).map_or_else(|| "VARBINARY".to_string(), |c| format!("{COARSE_OPAQUE}{c}[]"));
+    json!({ "operator": format!("q_array_{}", name_part(&ty).to_lowercase()), "operand": operand, "type": array })
 }
 
 /// The indices of a subscript chain `a[i]..[j]`, refusing a slice and a field selection.
@@ -3407,9 +3416,16 @@ fn subscript_indices(chain: &[AccessExpr]) -> Result<Vec<&Expr>> {
 /// `m[1][2]` is an element, while `(m[1])[2]` is NULL, since a subscript with too few indices is.
 /// Typed VARBINARY, because the element type is not something the IR carries (an array is opaque
 /// whatever it holds).
+///
+/// An element of an array whose elements' `=` is not identity, or a part of a `jsonb`, is such a
+/// value too, and named after it ([`COARSE_OPAQUE`]).
 fn subscript_call(operand: Vec<Value>) -> Value {
-    let types: Vec<String> = operand.iter().map(|v| ty_of(v).to_lowercase()).collect();
-    json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": "VARBINARY" })
+    let types: Vec<String> = operand.iter().map(|v| name_part(&ty_of(v)).to_lowercase()).collect();
+    let element = operand
+        .first()
+        .and_then(|base| coarse_class(&ty_of(base)).map(|c| format!("{COARSE_OPAQUE}{}", c.trim_end_matches("[]"))))
+        .unwrap_or_else(|| "VARBINARY".to_string());
+    json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": element })
 }
 
 /// Lower one of the pattern-matching predicates to its named uninterpreted operator.

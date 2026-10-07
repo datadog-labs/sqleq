@@ -9,9 +9,9 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported
--- origin: issue #58: ->> and #>> were lowered to one symbol, though ->> looks up one key and #>> follows a path
--- witness: t = {('{"a": "x"}')}: A yields NULL (there is no key named {a}), B yields x (the path [a])
--- Refused since issue #84 (->> over a jsonb column); the two symbols stay apart on pairs that lower.
-create table "t" ("j" jsonb);
-SELECT "j" ->> '{a}' FROM "t";
-SELECT "j" #>> '{a}' FROM "t";
+-- origin: issue #84: scale() reads the scale that numeric equality ignores
+-- witness: t = {(2.0)}, u = {(2.00)}: A yields 1, B yields 2
+create table "t" ("x" NUMERIC);
+create table "u" ("x" NUMERIC);
+SELECT scale("t"."x") FROM "t" JOIN "u" ON "t"."x" = "u"."x";
+SELECT scale("u"."x") FROM "t" JOIN "u" ON "t"."x" = "u"."x";
