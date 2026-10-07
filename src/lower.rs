@@ -24,7 +24,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
 use crate::error::{schema, unsupported, Result};
-use crate::scope::{Binding, Scope};
+use crate::scope::{is_unnamed, unnamed, Binding, Scope};
 use crate::types::*;
 
 /// Output columns of a (sub)query: `(name, prover type)`.
@@ -939,7 +939,7 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         }
     }
     let out_cols: OutCols =
-        schema_tys.iter().enumerate().map(|(i, t)| (format!("$col{i}"), t.clone())).collect();
+        schema_tys.iter().enumerate().map(|(i, t)| (unnamed(i), t.clone())).collect();
     Ok((json!({ "values": { "schema": schema_tys, "content": content } }), out_cols))
 }
 
@@ -1696,7 +1696,7 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             // what keeps them apart; it stays because lifting it is a completeness change of its own.
             let low = |n: &str| n.to_lowercase();
             if let Some(i) = (1..cols.len()).find(|&i| cols[..i].iter().any(|(m, _)| low(m) == low(&cols[i].0))) {
-                let name = low(&cols[i].0);
+                let name = if is_unnamed(&cols[i].0) { "?column?".to_string() } else { low(&cols[i].0) };
                 return Err(unsupported(format!("derived table with two columns named {name} up to case")));
             }
             // No `table`: a derived table has no declared keys, so nothing it outputs can be shown
@@ -1845,8 +1845,8 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
 }
 
 /// The output name of the unaliased select-list item `e` at position `idx`: the name Postgres gives
-/// it, or, where this frontend cannot tell what that is, a `$col` placeholder no key ever matches
-/// (see [`is_unnamed`]).
+/// it, or, where this frontend cannot tell what that is, an [`unnamed`] placeholder that no key or
+/// reference ever matches.
 ///
 /// Postgres names such an item with `FigureColname`: a column reference after the column, a call
 /// after the function, a cast after what it casts when that is a column or a call (and after the
@@ -1859,13 +1859,7 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
 /// and drop or rewrite some type names. Only shapes those passes leave recognisable are named; any
 /// other is a placeholder, and a key that could have meant it is refused.
 fn expr_name(e: &Expr, idx: usize) -> String {
-    implicit_name(e).unwrap_or_else(|| format!("$col{idx}"))
-}
-
-/// Whether an output column's name is [`expr_name`]'s placeholder for a name not known (or one of
-/// `VALUES`' columns, which Postgres names `column1`, … and this frontend does not).
-fn is_unnamed(name: &str) -> bool {
-    name.starts_with("$col")
+    implicit_name(e).unwrap_or_else(|| unnamed(idx))
 }
 
 /// Postgres's identity for a name: an unquoted identifier folds to lower case, a quoted one is kept
@@ -2676,6 +2670,8 @@ fn extend_with_determined(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select, k
 /// Everything else declines rather than guesses:
 ///
 /// * a **qualified** name (`t.x`) never denotes an output column, so the fallback is not taken;
+/// * nor for a name the FROM scope has but refused to read (an outer `USING`'s merged column), or
+///   that may be a column whose name is not known: either is an input column in Postgres;
 /// * **two select items sharing the alias** is a resolution question with no right answer, refused
 ///   exactly as [`resolve_order_key`] refuses the same ambiguity for `ORDER BY`;
 /// * an alias over an **aggregate** is rejected by Postgres itself, so lowering it would be
@@ -2704,6 +2700,12 @@ fn lower_group_key(
         Err(err) => err,
     };
     let Expr::Identifier(id) = e else { return Err(err) };
+    // Only a name that no input column could be falls back to the select list. One that a binding
+    // has, or that may be a column whose name is not known ([`Scope::try_resolve`]'s `Err`), is an
+    // input column in Postgres, whatever this frontend made of it, so it keeps its refusal.
+    if !matches!(scope.try_resolve(None, &fold_name(id)), Ok(None)) {
+        return Err(err);
+    }
     match alias_target(fns, s, id)? {
         Some(target) => lower_expr(cat, scope, fns, target),
         None => Err(err),
@@ -3438,7 +3440,7 @@ fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     if scope.merged_conflict(qual, name) {
         return Err(unsupported(format!("unqualified {name} merged by an outer JOIN ... USING")));
     }
-    match scope.try_resolve(qual, name) {
+    match scope.try_resolve(qual, name)? {
         Some((idx, ty)) => Ok(json!({ "column": idx, "type": ty })),
         None => Err(schema(format!(
             "unresolved column {}{} (correlated subquery or unknown column)",

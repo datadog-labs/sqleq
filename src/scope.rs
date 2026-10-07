@@ -16,6 +16,25 @@
 //! name and `"A"` is another. Every name a [`Binding`] holds, and every name a caller passes to
 //! [`Scope::try_resolve`], is already in that form.
 
+use crate::error::{unsupported, Result};
+
+/// The name of an output column whose Postgres name this frontend does not know: an unaliased
+/// select-list item it cannot name the way Postgres's `FigureColname` would (a `CASE`, a cast of an
+/// expression, a scalar subquery, ...), or a column of `VALUES`.
+///
+/// It starts with a NUL, the one character no SQL identifier can contain, so no reference spells it
+/// (Postgres rejects a NUL anywhere in a query). [`Scope::try_resolve`] never matches such a column
+/// in any case: whatever name Postgres gave it is unknown here, so a reference that misses every named
+/// column of its binding may have meant it, and is refused rather than resolved further out.
+pub fn unnamed(idx: usize) -> String {
+    format!("\u{0}col{idx}")
+}
+
+/// Whether `name` is an [`unnamed`] placeholder.
+pub fn is_unnamed(name: &str) -> bool {
+    name.starts_with('\u{0}')
+}
+
 /// One relation instance in a FROM clause (a base table or a derived subquery), with its absolute
 /// column offset in the row scope and its output columns `(name, type)`.
 #[derive(Clone)]
@@ -142,25 +161,61 @@ impl Scope {
         outer.iter().map(|b| b.cols.len()).sum()
     }
 
-    /// Resolve a column reference to its absolute de-Bruijn index and type. `qual` and `col` are
-    /// folded names (see the module docs). Searches inner bindings first (SQL shadowing), then outer
-    /// bindings (correlation). Returns `None` if unresolved anywhere — the caller then refuses it
-    /// rather than silently rebinding (a soundness rule).
-    pub fn try_resolve(&self, qual: Option<&str>, col: &str) -> Option<(usize, String)> {
+    /// Resolve a column reference to its absolute de-Bruijn index and type, the way Postgres does.
+    /// `qual` and `col` are folded names (see the module docs).
+    ///
+    /// * A qualified `q.c` names the nearest binding called `q` — this query's own bindings first,
+    ///   then the enclosing ones, innermost first — and reads `c` there. If that binding has no
+    ///   column `c`, Postgres raises an error; it does not go on to a farther binding that is also
+    ///   called `q`, and neither does this.
+    /// * A bare `c` is the first of this query's own bindings that has a column `c`, and only when
+    ///   none has, the first enclosing binding that does (correlation).
+    ///
+    /// `Ok(None)` when nothing resolves it, a qualified name whose nearest binding lacks the column
+    /// included; the caller then refuses it rather than silently rebinding (a soundness rule).
+    ///
+    /// `Err` when the name misses every named column of a binding that also has an [`unnamed`]
+    /// column, and that binding is the one Postgres reads (a qualified name) or is searched before
+    /// the one the name would land on (a bare name). Postgres may have given the unnamed column
+    /// exactly this name, and then the reference reads it. Enclosing bindings are searched as one
+    /// list, without telling their levels apart, so an unnamed column anywhere before the match
+    /// refuses, even at the match's own level, where Postgres would have read the match or raised an
+    /// ambiguity. That is the conservative side.
+    pub fn try_resolve(&self, qual: Option<&str>, col: &str) -> Result<Option<(usize, String)>> {
+        let find = |b: &Binding| b.cols.iter().position(|(n, _)| !is_unnamed(n) && n == col);
+        let has_unnamed = |b: &Binding| b.cols.iter().any(|(n, _)| is_unnamed(n));
+        let unknown = |b: &Binding| {
+            let shown = qual.map(|q| format!("{q}.")).unwrap_or_default();
+            unsupported(format!(
+                "column {shown}{col} missed by {}, which has a column whose name is not known",
+                b.alias
+            ))
+        };
+        let hit = |b: &Binding, i: usize| Some((b.offset + i, b.cols[i].1.clone()));
         if let Some(q) = qual {
-            if !self.binds.iter().any(|b| b.alias == q) {
-                return None;
+            let Some(b) = self.binds.iter().find(|b| b.alias == q) else { return Ok(None) };
+            return match find(b) {
+                Some(i) => Ok(hit(b, i)),
+                None if has_unnamed(b) => Err(unknown(b)),
+                None => Ok(None),
+            };
+        }
+        let (inner, outer) = self.binds.split_at(self.inner_count);
+        if let Some((b, i)) = inner.iter().find_map(|b| find(b).map(|i| (b, i))) {
+            return Ok(hit(b, i));
+        }
+        if let Some(b) = inner.iter().find(|b| has_unnamed(b)) {
+            return Err(unknown(b));
+        }
+        for b in outer {
+            if let Some(i) = find(b) {
+                return Ok(hit(b, i));
+            }
+            if has_unnamed(b) {
+                return Err(unknown(b));
             }
         }
-        for b in &self.binds {
-            if qual.is_some_and(|q| b.alias != q) {
-                continue;
-            }
-            if let Some(i) = b.cols.iter().position(|(n, _)| n == col) {
-                return Some((b.offset + i, b.cols[i].1.clone()));
-            }
-        }
-        None
+        Ok(None)
     }
 
     /// Whether any inner binding carries columns `*` must not expand to — the system columns

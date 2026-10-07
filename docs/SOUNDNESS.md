@@ -203,6 +203,15 @@ what it is or refused:
   two tables, or two columns of one table, whose names differ only in case (`"s"` and `"S"`) is
   refused rather than resolved to one of them. So is a derived table with two columns of one name
   up to case, whether the select list, the alias's column list or a `*` named them.
+- **A name is resolved where Postgres resolves it.** A qualified `s.x` reads the nearest relation
+  called `s`, and when that relation has no column `x` it is refused, as Postgres raises an error,
+  rather than read from an enclosing relation also called `s`. A bare name reads the query's own
+  `FROM` first and an enclosing query's only when no relation of its own has the name. Postgres
+  names every unaliased select-list item, and where the frontend cannot tell the name — a `CASE`,
+  a cast of an expression, a scalar subquery, a column of `VALUES` — the column is one no name
+  reaches. A name that misses a relation holding such a column is refused rather than looked for
+  further out, since Postgres may have given the column exactly that name; a `GROUP BY` name is
+  refused then too, rather than read as a select-list alias.
 - **A schema qualifier is part of a table's name.** Qualifiers are dropped so that `s.t` meets the
   DDL's `t`, but only when every reference in the pair to one bare name has the same qualifier.
   `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides read two

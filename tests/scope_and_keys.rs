@@ -3,8 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Two rules of the catalog and of name resolution:
+//! Three rules of the catalog and of name resolution:
 //!
+//! * a reference that misses the named columns of a relation with an unaliased, unnamed column (a
+//!   `CASE`, a cast of an expression, a scalar subquery, a `VALUES` column) may be that column in
+//!   Postgres, so it is refused rather than resolved in an enclosing query; a qualified name reads
+//!   the nearest relation of that name or nothing; and the placeholder name of such a column is not
+//!   something a query can spell (issue #88);
 //! * a quoted name keeps its case, for a column and for a table alias alike, so `"A"` is not `A`
 //!   (issue #57);
 //! * a `DEFERRABLE` primary key or unique constraint is not a key, since Postgres lets it be violated
@@ -64,6 +69,143 @@ fn refused(ddl: &str, q0: &str, q1: &str, kind: &str, needle: &str) {
             (_, other) => panic!("{src:?}: expected a {kind} refusal mentioning {needle:?}, got {other:?}"),
         }
     }
+}
+
+/// A name that may be an unnamed column, missed by the frontend.
+const UNKNOWN: &str = "whose name is not known";
+
+// --- #88: an unnamed column of a derived table -----------------------------------------------
+
+/// `t` is the derived table's source, `u` the enclosing query's table, with columns named the way
+/// Postgres names the derived table's items: `case`, `text`, `max` and `column1`.
+const DERIVED: &str = r#"create table "t" ("v" INTEGER);
+create table "u" ("id" INTEGER, "case" INTEGER, "text" TEXT, "max" INTEGER, "column1" INTEGER);"#;
+
+/// `EXISTS` over a derived table whose one column is `item`, filtered by `cond`.
+fn exists_over(item: &str, cond: &str) -> String {
+    format!(r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM (SELECT {item} FROM "t") AS "s" WHERE {cond})"#)
+}
+
+/// Postgres names an unaliased `CASE` `case`, so a bare `"case"` is the derived table's column.
+/// `u = {(1, 1, ..)}`, `t = {(-1)}`: `s."case"` is 0, so the first returns no rows; the second tests
+/// `u."case" = 1` and returns 1. The bare name used to miss the placeholder and reach `u."case"`.
+#[test]
+fn a_bare_name_that_may_be_a_case_column_does_not_reach_the_enclosing_query() {
+    let case = r#"CASE WHEN "v" > 0 THEN 1 ELSE 0 END"#;
+    let (a, b) = (exists_over(case, r#""case" = 1"#), exists_over(case, r#""u"."case" = 1"#));
+    refused(DERIVED, &a, &b, "unsupported", UNKNOWN);
+}
+
+/// A cast of an expression is named after its type: `CAST(v + 1 AS TEXT)` is `text`.
+/// `u = {(1, .., '1', ..)}`, `t = {(5)}`: `s.text` is `'6'`, so the first returns no rows and the
+/// second returns 1.
+#[test]
+fn a_bare_name_that_may_be_a_cast_of_an_expression_does_not_reach_the_enclosing_query() {
+    let cast = r#"CAST("v" + 1 AS TEXT)"#;
+    let (a, b) = (exists_over(cast, r#""text" = '1'"#), exists_over(cast, r#""u"."text" = '1'"#));
+    refused(DERIVED, &a, &b, "unsupported", UNKNOWN);
+}
+
+/// A scalar subquery is named after what it selects when that is a call: here `max`.
+/// `u = {(1, .., 1, ..)}`, `t = {(2)}`: `s.max` is 2, so the first returns no rows and the second 1.
+#[test]
+fn a_bare_name_that_may_be_a_scalar_subquery_does_not_reach_the_enclosing_query() {
+    let sub = r#"(SELECT max("v") FROM "t")"#;
+    let (a, b) = (exists_over(sub, r#""max" = 1"#), exists_over(sub, r#""u"."max" = 1"#));
+    refused(DERIVED, &a, &b, "unsupported", UNKNOWN);
+}
+
+/// Postgres names the columns of `VALUES` `column1`, `column2`, ...
+/// `u = {(1, .., 1)}`: `s.column1` is 2, so the first returns no rows and the second 1.
+#[test]
+fn a_bare_name_that_may_be_a_values_column_does_not_reach_the_enclosing_query() {
+    let values = |cond: &str| {
+        format!(r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM (VALUES (2)) AS "s" WHERE {cond})"#)
+    };
+    refused(DERIVED, &values(r#""column1" = 1"#), &values(r#""u"."column1" = 1"#), "unsupported", UNKNOWN);
+}
+
+/// The same holds for a `GROUP BY` name, which falls back to a select-list alias only when no
+/// input column could be meant. `t = {(-1), (1)}`: the first groups by `s."case"` and returns
+/// `(1, 1)` twice, the second groups by a constant and returns `(1, 2)`. The first used to fall back
+/// to its alias `"case"`, the constant 1.
+#[test]
+fn a_group_by_name_that_may_be_an_unnamed_column_does_not_fall_back_to_an_alias() {
+    let q = |key: &str| {
+        format!(
+            r#"SELECT 1 AS "case", count(*) FROM (SELECT CASE WHEN "v" > 0 THEN 1 ELSE 0 END FROM "t") AS "s" GROUP BY {key}"#
+        )
+    };
+    refused(DERIVED, &q(r#""case""#), &q("2 - 1"), "unsupported", UNKNOWN);
+}
+
+/// A qualified `s.x` reads the nearest relation named `s`, and Postgres raises an error when that
+/// one has no column `x` ("column s.x does not exist"). It used to go on to the enclosing `t AS s`.
+/// On `t = {(1, 1), (2, 2)}` the second returns 1.
+#[test]
+fn a_qualified_name_stops_at_the_nearest_relation_of_that_name() {
+    let ddl = r#"create table "t" ("id" INTEGER, "x" INTEGER);"#;
+    refused(
+        ddl,
+        r#"SELECT "s"."id" FROM "t" AS "s" WHERE EXISTS (SELECT 1 FROM (SELECT "x" + 0 FROM "t") AS "s" WHERE "s"."x" = 1)"#,
+        r#"SELECT "o"."id" FROM "t" AS "o" WHERE EXISTS (SELECT 1 FROM (SELECT "x" + 0 FROM "t") AS "s" WHERE "o"."x" = 1)"#,
+        "schema",
+        "unresolved column s.x",
+    );
+    // When the nearest `s` has an unnamed column, the name may be that column: Postgres reads
+    // `s.text` as the cast below.
+    refused(
+        DERIVED,
+        r#"SELECT "s"."id" FROM "u" AS "s" WHERE EXISTS (SELECT 1 FROM (SELECT CAST("v" + 1 AS TEXT) FROM "t") AS "s" WHERE "s"."text" = '1')"#,
+        r#"SELECT "o"."id" FROM "u" AS "o" WHERE EXISTS (SELECT 1 FROM (SELECT CAST("v" + 1 AS TEXT) FROM "t") AS "s" WHERE "o"."text" = '1')"#,
+        "unsupported",
+        UNKNOWN,
+    );
+}
+
+/// The frontend's placeholder for an unnamed column is not a name a query can reach. Postgres
+/// rejects the first query (`column "$col0" does not exist`); it used to lower as the second.
+#[test]
+fn an_unnamed_column_cannot_be_spelled() {
+    let ddl = r#"create table "t" ("id" INTEGER, "x" INTEGER);"#;
+    let case = r#"CASE WHEN "x" > 0 THEN 1 ELSE 0 END"#;
+    for spelled in [r#""$col0""#, r#""s"."$col0""#] {
+        let q0 = format!(r#"SELECT {spelled} FROM (SELECT {case} FROM "t") AS "s""#);
+        let q1 = format!(r#"SELECT {case} FROM "t""#);
+        refused(ddl, &q0, &q1, "unsupported", UNKNOWN);
+    }
+}
+
+/// Controls: a name that resolves is unaffected. The derived table's named column (a cast of a
+/// column is named after the column), a name the same query's other relation has beside an unnamed
+/// column, a correlated name with no unnamed column on the way, and a qualified name with no nearer
+/// relation of that name all lower, and alike where they are one query.
+#[test]
+fn names_that_resolve_still_lower() {
+    // `s.v` and a bare `v` are the cast, in both.
+    assert!(identical(
+        DERIVED,
+        r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM (SELECT CAST("v" AS TEXT) FROM "t") AS "s" WHERE "v" = '1')"#,
+        r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM (SELECT CAST("v" AS TEXT) FROM "t") AS "s" WHERE "s"."v" = '1')"#,
+    ));
+    // `id` is `u`'s, beside the derived table's unnamed column in the same FROM.
+    assert!(identical(
+        DERIVED,
+        r#"SELECT "id" FROM (SELECT CASE WHEN "v" > 0 THEN 1 ELSE 0 END FROM "t") AS "s", "u""#,
+        r#"SELECT "u"."id" FROM (SELECT CASE WHEN "v" > 0 THEN 1 ELSE 0 END FROM "t") AS "s", "u""#,
+    ));
+    // A correlated bare name, and a qualified one reaching the enclosing query.
+    assert!(identical(
+        DERIVED,
+        r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM "t" WHERE "t"."v" = "max")"#,
+        r#"SELECT "id" FROM "u" WHERE EXISTS (SELECT 1 FROM "t" WHERE "t"."v" = "u"."max")"#,
+    ));
+    // A `GROUP BY` alias no input column has still falls back.
+    assert!(identical(
+        DERIVED,
+        r#"SELECT "v" + 1 AS "w", count(*) FROM "t" GROUP BY "w""#,
+        r#"SELECT "v" + 1 AS "w", count(*) FROM "t" GROUP BY "v" + 1"#,
+    ));
 }
 
 // --- #57: a quoted name keeps its case -------------------------------------------------------
