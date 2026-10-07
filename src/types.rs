@@ -227,6 +227,9 @@ pub fn scalar_class(name: &str) -> Option<Scalar> {
 pub const UNFAITHFUL: &[(&str, &str)] = &[
     ("CITEXT", "citext compares case-insensitively"),
     ("BPCHAR", "char(n) compares ignoring trailing spaces"),
+    // A column under a collation the IR cannot carry (`crate::collation`), whose own refusal, with
+    // its own message, runs first.
+    (crate::collation::COLLATED, "its collation may compare different strings as equal"),
 ];
 
 /// The [`UNFAITHFUL`] type a type name denotes, an array of one included, or `None`.

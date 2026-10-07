@@ -126,6 +126,54 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   with `'01'` as strings. Text it cannot read the way Postgres does stays an uninterpreted cast of
   the literal.
 
+### Strings are ordered by a collation no input states
+
+Postgres orders two strings by the collation of their comparison: the one an operand names with
+`COLLATE`, else the one a column declares, else the database's default. Collations disagree: under
+`en_US.utf8`, `'a' < 'b' < 'B'`; under `C`, `'B' < 'a'`. No input states the database's default,
+so the provers are not told one, and assume none. Their own string order is by code point, which is
+the order of `C` and `POSIX` and of no other collation Postgres guarantees.
+
+- **An order comparison of two strings is native only under `C` or `POSIX`**, named by a column's
+  `COLLATE` or by an operand's (`s < 'a' COLLATE "C"`). Under the database's default collation
+  `a < b` is the uninterpreted predicate `q_str_lt(a, b)` and `a <= b` is `q_str_le(a, b)`, with
+  `a > b` read as `b < a`; under another named collation, the same with the collation's name as a
+  third operand, since two collations order one pair of strings differently. `BETWEEN` is its two
+  comparisons. The same comparison on both sides still meets; what is lost is ordering two
+  constants or chaining two comparisons, which is what proving `s > 'a' AND s < 'B'` equal to
+  `FALSE` takes. As in Postgres, a column's collation outranks the default of a constant or of a
+  column that declares none, so `c < 'x'` over a `COLLATE "C"` column is native. Two columns of two
+  collations in one comparison, an error in Postgres, are refused, and so is a `COLLATE` naming any
+  other collation, or one that is not an operand of a comparison, where it changes what `upper` or
+  `ILIKE` above it compute.
+- **`=` is identity only under a deterministic collation.** Every predefined collation is
+  deterministic, and so is every database's default; one made with `CREATE COLLATION … (deterministic
+  = false)` is not, and under it `'a' = 'A'` can hold. A column under such a collation is refused
+  wherever a query reads it, as `citext` is, and so is a column under a collation the DDL does not
+  create and that is not named the way Postgres names its predefined ones: `default`, `C`, `POSIX`,
+  `ucs_basic`, `unicode`, `pg_c_utf8`, a libc locale such as `en_US.utf8`, or an ICU one such as
+  `en-US-x-icu`. That reading is taken from the name, not checked against a database: a user can
+  create a non-deterministic collation named `en_US.utf8` in a schema of their own, and Postgres
+  reaches it where it predefines none of that name. A DDL that creates a collation under a
+  predefined name, or creates one name twice, makes that name refused. A column of a type the IR
+  keeps opaque, an array of text say, under a collation other than the default is refused as well:
+  its order would need a predicate of its own.
+- **Other operations read a collation too.** `min`, `max`, `greatest`, `least` and a row slice under
+  `ORDER BY` read its order; `upper`, `lower`, `ILIKE` and the regular expressions its character
+  classes. They are lowered with no collation in their names, which is sound while every string in
+  the pair has one collation, as it does when no column the pair reads declares one. Where one does,
+  an operation over strings is refused unless it is one of the comparisons above or never reads a
+  collation (`=`, `||`, `LIKE`, a cast, `COALESCE`, `NULLIF`, `COUNT`, the null tests, the JSON
+  lookups); so is a row slice ordered by a string, and an `ORDER BY … LIMIT` the two sides share is
+  not stripped: over `SELECT c AS x` and `SELECT d AS x`, with `c = d` on every row, `ORDER BY x
+  LIMIT 1` takes two different rows when `c` is `COLLATE "C"` and `d` is not. A comparison whose
+  operand is neither a column nor a constant (`(c || 'x') < 'y'`) takes its collation from the
+  columns it reads, which the frontend does not trace, so in such a pair it is refused too.
+
+`sqleq-fuzz` compares strings by code point, as DuckDB does, so it cannot refute a pair whose two
+sides differ only under another collation; the `witness:` of such a pinned pair names the collation
+it needs.
+
 ### Shapes that look like something simpler
 
 A few constructs read like a simpler one and compute something else, and each is either lowered as
@@ -283,7 +331,9 @@ keeps an arbitrary row per key and is read the same way (`src/lower.rs`, `apply_
 
 That is the prover's abstraction and the standard one, and the frontend inherits it rather than
 widening it; `normalize::strip_identical_pagination`, which removes a top-level `ORDER BY … LIMIT …`
-identical on both sides, rests on the same reading. What it licenses is narrow. A proof over a slice
+identical on both sides, rests on the same reading, and is skipped where a column declares a
+collation, under which equal outputs need not be ordered alike
+([above](#strings-are-ordered-by-a-collation-no-input-states)). What it licenses is narrow. A proof over a slice
 that ties leave open says the two sides agree whenever the database settles the ties the same way
 for both — not that either returns the rows you meant. A difference in the pagination itself —
 another count, offset or ordering — lowers to a different term, and goes unproved unless the two are

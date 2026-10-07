@@ -1164,6 +1164,7 @@ mod tests {
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),
                 keys: Vec::new(),
                 n_declared: cols.len(),
+                collations: vec![crate::collation::Collation::Default; cols.len()],
             }],
         }
     }

@@ -1397,6 +1397,9 @@ pub fn build_inferred(
             // the columns the queries name, so an `INSERT` here cannot omit one anyway.
             row_determined: vec![false; n],
             keys: Vec::new(),
+            // No DDL was read, so no column declares a collation: the synthesized schema is one
+            // in which every string has the database's default.
+            collations: vec![crate::collation::Collation::Default; n],
         });
     }
     Ok(Catalog { tables })
