@@ -522,13 +522,20 @@ fn array(v: &Value) -> Result<&Vec<Value>, TranslateError> {
 /// to `"t{index}"` -- the exact spelling `IrToRel.build()` uses for a nameless schema, and the
 /// spelling `sqlsolver::ddl_from_ir` mints on the emitting side, so the two agree without a name
 /// ever needing to travel on the wire. `key`/`nullable` default to empty (`IrToRel.java` never reads
-/// either, but this port's integrity-constraint rewriting, `ic.rs`, does).
+/// either, but this port's integrity-constraint rewriting, `ic.rs`, does), and so does
+/// `opaque_identity`, which only this port reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub name: String,
     pub types: Vec<Type>,
     pub key: Vec<Vec<usize>>,
     pub nullable: Vec<bool>,
+    /// Parallel to `types`: `true` where the column is VARBINARY and the frontend vouches that the
+    /// Postgres type behind it has an `=` that is identity (`bytea`, `uuid`, an array of integers;
+    /// the frontend's `types::opaque_identity` lists them), so that two values `=` calls equal are
+    /// the same value. Absent, short, or on any other type it means `false`: VARBINARY also stands
+    /// for `double precision`, `jsonb` and `numeric[]`, whose `=` is not identity.
+    pub opaque_identity: Vec<bool>,
 }
 
 impl Schema {
@@ -558,7 +565,12 @@ impl Schema {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
             .unwrap_or_default();
-        Ok(Schema { name, types, key, nullable })
+        let opaque_identity = v
+            .get("opaque_identity")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
+            .unwrap_or_default();
+        Ok(Schema { name, types, key, nullable, opaque_identity })
     }
 }
 

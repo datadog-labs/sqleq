@@ -405,11 +405,14 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
 
         let mut cols: Vec<(String, String)> = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
+        let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
-            let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
+            let rendered = format!("{}", c.data_type);
+            let ty = map_pg_type(&rendered).unwrap_or(OPAQUE);
+            identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
             cols.push((c.name.value.to_lowercase(), ty.to_string()));
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
@@ -476,6 +479,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             n_declared: cols.len(),
             cols,
             nullable,
+            opaque_identity: identity,
             row_determined: determined,
             keys: seen,
         });
