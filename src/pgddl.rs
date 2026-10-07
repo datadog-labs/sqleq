@@ -34,7 +34,7 @@ use sqlparser::ast::{ColumnOption, Statement, TableConstraint};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{enforced_per_statement, obj_name, Catalog, Table};
+use crate::catalog::{enforced_per_statement, index_col_name, obj_name, Catalog, Table};
 use crate::infer::{map_type_name, Ty};
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
@@ -304,12 +304,12 @@ fn simplify_item(item: &str) -> String {
             .map_or(item.len(), |&(s, _, _)| s);
         out.replace_range(ws[p].0..end, "DEFAULT qed_unparsed_default() ");
     }
-    // Quote the column name. Unquoted names are case-folded and quoted ones are not, but every name
-    // here is lowercased before it reaches the catalog, so this is a no-op for anything that already
-    // parsed — its only effect is to let a column named `primary` or `order` through.
+    // Quote the column name, folded to lower case first as Postgres folds an unquoted name: quoted,
+    // it would otherwise keep its case, and the catalog stores a quoted name as written. Its only
+    // effect is to let a column named `primary` or `order` through. A word is ASCII letters, digits
+    // and underscores (see [`word_spans`]), so the ASCII fold is the whole of Postgres's.
     if !constraint && !item.trim_start().starts_with('"') {
-        out.insert(e0, '"');
-        out.insert(s0, '"');
+        out.replace_range(s0..e0, &format!("\"{}\"", item[s0..e0].to_ascii_lowercase()));
     }
     out
 }
@@ -353,8 +353,9 @@ pub fn parse_provided_schema(raw: &str) -> Catalog {
 ///
 /// The `bool` is `true` for a statement that only parsed after the retry (`simplify_for_retry`). A
 /// caller that reads more than the catalog does must know which those are: the retry replaces every
-/// default in the table with `qed_unparsed_default()`, and it quotes every column name, so an
-/// unquoted `MyCol` (which Postgres folds to `mycol`) comes back looking case-sensitive.
+/// default in the table with `qed_unparsed_default()`, and it quotes every column name the DDL left
+/// unquoted, folded to lower case first (`MyCol` comes back as `"mycol"`), so the result no longer
+/// says which names the DDL quoted.
 pub fn parse_statements_reporting(raw: &str) -> (Vec<(Statement, bool)>, Vec<Rejected>) {
     let sql = unescape(raw);
     let mut errors = Vec::new();
@@ -410,7 +411,8 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         for c in &ct.columns {
             let idx = cols.len();
             let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
-            cols.push((c.name.value.to_lowercase(), ty.to_string()));
+            // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
+            cols.push((crate::dml::fold_ident(&c.name), ty.to_string()));
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
             for opt in &c.options {
@@ -450,13 +452,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             };
             let set: Vec<usize> = key_cols
                 .iter()
-                .filter_map(|ic| match &ic.column.expr {
-                    sqlparser::ast::Expr::Identifier(id) => Some(id.value.to_lowercase()),
-                    sqlparser::ast::Expr::CompoundIdentifier(p) => {
-                        Some(p.last().unwrap().value.to_lowercase())
-                    }
-                    _ => None,
-                })
+                .filter_map(index_col_name)
                 .filter_map(|n| by_name.get(n.as_str()).copied())
                 .collect();
             if set.is_empty() {

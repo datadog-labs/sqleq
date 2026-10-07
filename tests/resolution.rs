@@ -379,10 +379,7 @@ const MUTANTS: &[Mutant] = &[
 ];
 
 /// Each mutant that fails today, and the issue that tracks it. See the module doc.
-const KNOWN_OPEN: &[(&str, &str)] = &[
-    ("select/a-quoted-column-against-the-folded-name", "#57"),
-    ("from/a-quoted-alias-against-the-folded-name", "#57"),
-];
+const KNOWN_OPEN: &[(&str, &str)] = &[];
 
 const CONTROLS: &[Control] = &[
     control(

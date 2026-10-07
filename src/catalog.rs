@@ -32,8 +32,11 @@ use crate::types::map_type;
 #[allow(rustdoc::private_intra_doc_links)]
 pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"];
 
-/// A table's columns (lowercased name, prover type), per-column nullability, and key column-sets
-/// (from UNIQUE / PRIMARY KEY).
+/// A table's columns (name, prover type), per-column nullability, and key column-sets (from UNIQUE /
+/// PRIMARY KEY).
+///
+/// A column's name is the one Postgres stores: an unquoted declaration folded to lower case, a quoted
+/// one as written (`dml::fold_ident`). The table's own name is lower-cased whatever its quoting.
 #[derive(Clone)]
 pub struct Table {
     pub name: String,
@@ -115,11 +118,15 @@ impl Catalog {
     /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
     /// only in case.
     ///
-    /// The catalog folds every name to lower case, quoted or not, and resolution goes by the folded
-    /// name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its case: `"s"`
-    /// and `"S"` are two columns, and resolving both to one slot makes `SELECT "S"` lower like
-    /// `SELECT "s"`. Where no two names collide, folding loses nothing a query that runs could
-    /// need, because a reference whose case differs from the declaration fails in Postgres.
+    /// The catalog folds every table name to lower case, quoted or not, and a table is found by the
+    /// folded name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its
+    /// case: `"T"` and `t` are two tables, and finding both in one slot makes `FROM "T"` lower like
+    /// `FROM t`. Where no two names collide, folding loses nothing a query that runs could need,
+    /// because a reference whose case differs from the declaration fails in Postgres.
+    ///
+    /// A column keeps a quoted name's case, and name resolution tells `"S"` from `s`. Two columns of
+    /// one table that differ only in case are refused all the same, because type inference
+    /// attributes a reference to a column by its lower-cased name.
     pub fn check_case_collisions(&self) -> Result<()> {
         let mut tables = std::collections::HashSet::new();
         for t in &self.tables {
@@ -127,7 +134,7 @@ impl Catalog {
                 return Err(unsupported(format!("two tables named {} up to case", t.name)));
             }
             let mut cols = std::collections::HashSet::new();
-            if let Some((c, _)) = t.cols.iter().find(|(c, _)| !cols.insert(c.as_str())) {
+            if let Some((c, _)) = t.cols.iter().find(|(c, _)| !cols.insert(c.to_lowercase())) {
                 return Err(unsupported(format!("two columns of {} named {c} up to case", t.name)));
             }
         }
@@ -146,11 +153,12 @@ pub fn obj_name(n: &ObjectName) -> String {
         .join(".")
 }
 
-/// The (lowercased) column name referenced by an index column, if it's a plain identifier.
-fn index_col_name(ic: &IndexColumn) -> Option<String> {
+/// The column name referenced by an index column, folded as a column's name is (see [`Table`]), if
+/// it's a plain identifier.
+pub(crate) fn index_col_name(ic: &IndexColumn) -> Option<String> {
     match &ic.column.expr {
-        Expr::Identifier(id) => Some(id.value.to_lowercase()),
-        Expr::CompoundIdentifier(p) => Some(p.last().unwrap().value.to_lowercase()),
+        Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
+        Expr::CompoundIdentifier(p) => p.last().map(crate::dml::fold_ident),
         _ => None,
     }
 }
@@ -228,7 +236,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
         for c in &ct.columns {
-            let cname = c.name.value.to_lowercase();
+            let cname = crate::dml::fold_ident(&c.name);
             let cty = map_type(&c.data_type);
             let idx = cols.len();
             cols.push((cname, cty));

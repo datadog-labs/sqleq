@@ -10,6 +10,11 @@
 //! evaluates a subquery with the outer row variables already in scope). So every binding carries its
 //! absolute column `offset`: in a correlated subquery the outer row occupies `[0, outer_width)` and
 //! the subquery's own columns `[outer_width, ...)`.
+//!
+//! Names are stored and looked up as Postgres identifies them: an unquoted identifier folds to lower
+//! case and a quoted one keeps its case (see [`crate::dml::fold_ident`]), so `A`, `a` and `"a"` are one
+//! name and `"A"` is another. Every name a [`Binding`] holds, and every name a caller passes to
+//! [`Scope::try_resolve`], is already in that form.
 
 /// One relation instance in a FROM clause (a base table or a derived subquery), with its absolute
 /// column offset in the row scope and its output columns `(name, type)`.
@@ -50,7 +55,8 @@ pub struct Scope {
     /// `base + n`, and writing plain `n` reaches an enclosing column instead. Zero at the top
     /// level, which is why that mistake stays invisible until the query is a subquery.
     pub base: usize,
-    /// Lowercased column names that a `JOIN ... USING` merged into a single output column.
+    /// Column names (folded, see the module docs) that a `JOIN ... USING` merged into a single
+    /// output column.
     ///
     /// `USING` does two things: it adds the equalities, and it collapses each named pair into one
     /// output column. We model only the first. The second is why these names are tracked: a bare
@@ -96,7 +102,7 @@ impl Scope {
 
     /// Whether this reference reaches a `USING`-merged column whose value we do not model.
     pub fn merged_conflict(&self, qual: Option<&str>, col: &str) -> bool {
-        self.merged_outer && qual.is_none() && self.merged.iter().any(|m| *m == col.to_lowercase())
+        self.merged_outer && qual.is_none() && self.merged.iter().any(|m| m == col)
     }
 
     /// This query's own bindings (excluding enclosing/correlation bindings).
@@ -136,24 +142,21 @@ impl Scope {
         outer.iter().map(|b| b.cols.len()).sum()
     }
 
-    /// Resolve a column reference to its absolute de-Bruijn index and type. Searches inner bindings
-    /// first (SQL shadowing), then outer bindings (correlation). Returns `None` if unresolved
-    /// anywhere — the caller then refuses it rather than silently rebinding (a soundness rule).
+    /// Resolve a column reference to its absolute de-Bruijn index and type. `qual` and `col` are
+    /// folded names (see the module docs). Searches inner bindings first (SQL shadowing), then outer
+    /// bindings (correlation). Returns `None` if unresolved anywhere — the caller then refuses it
+    /// rather than silently rebinding (a soundness rule).
     pub fn try_resolve(&self, qual: Option<&str>, col: &str) -> Option<(usize, String)> {
-        let c = col.to_lowercase();
-        let q = qual.map(|s| s.to_lowercase());
-        if let Some(ref q) = q {
-            if !self.binds.iter().any(|b| &b.alias == q) {
+        if let Some(q) = qual {
+            if !self.binds.iter().any(|b| b.alias == q) {
                 return None;
             }
         }
         for b in &self.binds {
-            if let Some(ref q) = q {
-                if &b.alias != q {
-                    continue;
-                }
+            if qual.is_some_and(|q| b.alias != q) {
+                continue;
             }
-            if let Some(i) = b.cols.iter().position(|(n, _)| *n == c) {
+            if let Some(i) = b.cols.iter().position(|(n, _)| n == col) {
                 return Some((b.offset + i, b.cols[i].1.clone()));
             }
         }

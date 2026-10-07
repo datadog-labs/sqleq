@@ -3,17 +3,126 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! A rule of the catalog: a `DEFERRABLE` primary key or unique constraint is not a key, since
-//! Postgres lets it be violated until the transaction commits (issue #95).
+//! Two rules of the catalog and of name resolution:
 //!
-//! The tests read the keys the frontend hands the provers, through both readers of a schema. They do
-//! not run a prover.
+//! * a quoted name keeps its case, for a column and for a table alias alike, so `"A"` is not `A`
+//!   (issue #57);
+//! * a `DEFERRABLE` primary key or unique constraint is not a key, since Postgres lets it be violated
+//!   until the transaction commits (issue #95).
+//!
+//! Each "apart" or "refused" test is a pair that is **not** equivalent in Postgres (its witness is
+//! in the doc comment, checked on Postgres 17) and that used to lower to identical IR, or to IR that
+//! read a name from the wrong relation. Controls beside them keep the spellings that are one query
+//! lowering alike. They do not run a prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource};
+use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
+
+const MODES: [CatalogSource; 2] = [CatalogSource::Declared, CatalogSource::InferredSeeded];
 
 fn pair(ddl: &str, q0: &str, q1: &str) -> String {
     format!("{ddl}\n{q0};\n{q1};")
+}
+
+/// Whether the pair lowers to byte-identical queries, in both catalog modes that read the DDL. A
+/// refusal in either is a test bug, so it panics.
+fn identical(ddl: &str, q0: &str, q1: &str) -> bool {
+    let mut seen = Vec::new();
+    for src in MODES {
+        let v = lower_with(&pair(ddl, q0, q1), src);
+        let v = v.unwrap_or_else(|e| panic!("{src:?}: expected Ok, got {e}"));
+        seen.push(v["queries"][0] == v["queries"][1]);
+    }
+    assert_eq!(seen[0], seen[1], "the two catalog modes disagree");
+    seen[0]
+}
+
+/// Whether the pair lowers to byte-identical queries under the declared catalog alone. For a pair
+/// that type inference refuses, as it refuses a bare name two tables declare up to case.
+fn identical_declared(ddl: &str, q0: &str, q1: &str) -> bool {
+    let v = lower_with(&pair(ddl, q0, q1), CatalogSource::Declared);
+    let v = v.unwrap_or_else(|e| panic!("expected Ok, got {e}"));
+    v["queries"][0] == v["queries"][1]
+}
+
+/// Whether the pair is kept apart in both modes: refused, or lowered to two different queries.
+fn apart(ddl: &str, q0: &str, q1: &str) -> bool {
+    MODES.iter().all(|&src| match lower_with(&pair(ddl, q0, q1), src) {
+        Ok(v) => v["queries"][0] != v["queries"][1],
+        Err(_) => true,
+    })
+}
+
+/// Assert the pair is refused in both modes, as unsupported or as a schema error as `kind` says,
+/// with `needle` in the reason.
+fn refused(ddl: &str, q0: &str, q1: &str, kind: &str, needle: &str) {
+    for src in MODES {
+        match (kind, lower_with(&pair(ddl, q0, q1), src)) {
+            ("unsupported", Err(FrontendError::Unsupported(m))) | ("schema", Err(FrontendError::Schema(m))) => {
+                assert!(m.contains(needle), "{src:?}: refused for {m:?}, not {needle:?}")
+            }
+            (_, other) => panic!("{src:?}: expected a {kind} refusal mentioning {needle:?}, got {other:?}"),
+        }
+    }
+}
+
+// --- #57: a quoted name keeps its case -------------------------------------------------------
+
+/// `m` has a quoted column `"A"`, which is not `a`; `t` has `a`; `u` is a second table with `a`.
+const QUOTED: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER);
+create table "u" ("id" INTEGER, "a" INTEGER);
+create table "m" ("id" INTEGER, "A" INTEGER);"#;
+
+/// `m = {(1, 10)}`, `t = {(1, 1)}`: the first reads `m."A"` and returns 10, the second folds `A` to
+/// `a`, which only `t` has, and returns 1. The catalog used to fold `"A"` to `a` as well. (Type
+/// inference still attributes a bare name by its lower-cased spelling, so under the inferred-seeded
+/// catalog it refuses both as a name `m` and `t` declare.)
+#[test]
+fn a_quoted_column_is_not_its_folded_name() {
+    assert!(apart(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT A FROM "m", "t""#));
+    assert!(!identical_declared(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT A FROM "m", "t""#));
+    assert!(identical_declared(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT "m"."A" FROM "m", "t""#));
+    assert!(identical_declared(QUOTED, r#"SELECT A FROM "m", "t""#, r#"SELECT "t"."a" FROM "m", "t""#));
+    assert!(identical(QUOTED, r#"SELECT "A" FROM "m""#, r#"SELECT "m"."A" FROM "m""#));
+    // A query that spells a quoted column unquoted reads a column that does not exist.
+    refused(QUOTED, r#"SELECT A FROM "m""#, r#"SELECT "A" FROM "m""#, "schema", "unresolved column a");
+}
+
+/// `t = {(1, 1)}`, `u = {(1, 5)}`: the first reads `"X"`, which is `t`, and returns 1; the second
+/// reads `x`, which is `u`, and returns 5. Both aliases used to be stored as `x`.
+#[test]
+fn a_quoted_table_alias_is_not_its_folded_name() {
+    let from = r#"FROM "t" AS "X", "u" AS x"#;
+    let (upper, lower) = (format!(r#"SELECT "X".a {from}"#), format!("SELECT x.a {from}"));
+    assert!(apart(QUOTED, &upper, &lower));
+    assert!(!identical(QUOTED, &upper, &lower));
+    assert!(identical(QUOTED, &format!("SELECT X.a {from}"), &format!(r#"SELECT "x".a {from}"#)));
+    // A table without an alias is referred to by its name as the query spells it.
+    assert!(identical(QUOTED, r#"SELECT M."A" FROM "m""#, r#"SELECT "m"."A" FROM m"#));
+}
+
+/// Controls for a mixed-case schema of the kind ORMs write: references spelled as declared lower,
+/// and an `UPDATE` or `INSERT` naming such a column still reduces.
+#[test]
+fn a_mixed_case_schema_still_lowers() {
+    let ddl = r#"create table "Users" ("id" INTEGER PRIMARY KEY, "createdAt" INTEGER);"#;
+    assert!(identical(
+        ddl,
+        r#"SELECT "Users"."createdAt" FROM "Users" WHERE "createdAt" > 1"#,
+        r#"SELECT "u"."createdAt" FROM "Users" AS "u" WHERE "u"."createdAt" > 1"#,
+    ));
+    assert!(identical(
+        ddl,
+        r#"UPDATE "Users" SET "createdAt" = 1 WHERE "createdAt" > 2"#,
+        r#"UPDATE "Users" SET "createdAt" = 1 WHERE "Users"."createdAt" > 2"#,
+    ));
+    for src in MODES {
+        let insert = |w: &str| {
+            format!(r#"INSERT INTO "Users" ("id", "createdAt") SELECT "id", "createdAt" FROM "Users" WHERE {w}"#)
+        };
+        lower_with(&pair(ddl, &insert(r#""id" = 1"#), &insert(r#"1 = "id""#)), src)
+            .unwrap_or_else(|e| panic!("{src:?}: expected Ok, got {e}"));
+    }
 }
 
 // --- #95: a deferrable key is not a key ------------------------------------------------------

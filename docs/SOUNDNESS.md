@@ -195,13 +195,14 @@ what it is or refused:
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of
   them. Those are refused, and so is a bare `RETURNING *`, which reaches `u`'s columns.
-- **A quoted name keeps its case.** Names resolve case-insensitively, which is Postgres's rule for
-  unquoted names only, so a schema with two tables, or two columns of one table, whose names differ
-  only in case (`"s"` and `"S"`) is refused rather than resolved to one of them. So is a derived
-  table with two columns of one name up to case, whether the select list, the alias's column list
-  or a `*` named them: a `*` takes its names from the catalog, which has already folded them. Where
-  the frontend matches names itself, it folds as Postgres does: a `WITH "T"` binding is not a use
-  of `t`, and an `ORDER BY A` key is not the output column `"A"`.
+- **A quoted name keeps its case.** A name is folded as Postgres folds it: an unquoted one to lower
+  case (ASCII only, as under a multibyte server encoding), a quoted one not at all. So a column
+  declared `"A"` is not read by `A`, a table alias `"X"` is not `x`, a `WITH "T"` binding is not a
+  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. Table names are still
+  compared case-insensitively, as is the attribution of a column in type inference, so a schema with
+  two tables, or two columns of one table, whose names differ only in case (`"s"` and `"S"`) is
+  refused rather than resolved to one of them. So is a derived table with two columns of one name
+  up to case, whether the select list, the alias's column list or a `*` named them.
 - **A schema qualifier is part of a table's name.** Qualifiers are dropped so that `s.t` meets the
   DDL's `t`, but only when every reference in the pair to one bare name has the same qualifier.
   `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides read two

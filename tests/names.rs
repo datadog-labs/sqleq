@@ -243,7 +243,7 @@ fn a_derived_table_with_two_columns_named_alike_up_to_case_is_refused() {
         ),
         "two columns named b",
     );
-    // And through `*` over a join, where the catalog has already folded the declared `"B"`.
+    // And through `*` over a join, which reads the two names out of the catalog.
     refused(
         "create table t (\"b\" INTEGER);\ncreate table u (\"B\" INTEGER);\n\
          SELECT s.\"B\" FROM (SELECT * FROM t, u) AS s;\nSELECT s.b FROM (SELECT * FROM t, u) AS s;",
