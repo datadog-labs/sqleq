@@ -97,7 +97,6 @@ use sqlparser::parser::Parser;
 
 use catalog::{parse_declare, FnDecl};
 pub use error::{FrontendError, Result};
-pub use lower::{is_volatile, VOLATILE_FUNCTIONS};
 
 /// The dialect every parse in this crate goes through, named once because the choice is load-bearing
 /// rather than a default.
@@ -498,15 +497,8 @@ impl Rewrites {
 ///   than exact equality, and [`normalize::strip_dead_order_by`], which asserts an ordering is
 ///   unobservable. Both already ship on the lowering path, so this widens their reach without adding
 ///   a new kind of risk.
-/// * Nondeterminism is a hazard only for a rewrite that changes how many times a call is evaluated.
-///   If both sides normalize to one tree they are one query, and a query is equivalent to itself
-///   however many `now()`s or `random()`s it contains — but only if each normalization kept the
-///   number of evaluations. Every one does except [`normalize::inline_ctes`], which evaluates a
-///   binding's body once per use where Postgres evaluates it once: `WITH c AS (SELECT random() AS r)
-///   SELECT x.r = y.r FROM c AS x, c AS y` is always true, and its inlined form almost never is.
-///   On the lowering path that is safe because lowering refuses every volatile call; here nothing is
-///   lowered, so a pair in which inlining would duplicate a call to one of [`VOLATILE_FUNCTIONS`] is
-///   declined instead (see [`inlining_duplicates_volatile_call`]).
+/// * Nondeterminism is *not* a hazard. If both sides normalize to one tree they are one query, and a
+///   query is equivalent to itself however many `now()`s it contains.
 ///
 /// Structural equality is the right comparison because sqlparser's `PartialEq` is span-insensitive:
 /// `Ident` destructures with `span: _`, `ValueWithSpan` compares only `.value`, and `AttachedToken`
@@ -541,14 +533,13 @@ pub fn reflexive_with(src: &str, rewrites: Rewrites) -> bool {
 
 /// The two sides as [`reflexive_with`] compares them, rendered back to SQL. For reading hits by
 /// hand: a `bool` says a pair collapsed but not to what, and an attribution that surprises you is
-/// only answerable by looking at the tree. `None` whenever [`reflexive_with`] would not compare them.
+/// only answerable by looking at the tree.
 pub fn reflexive_forms(src: &str, rewrites: Rewrites) -> Option<(String, String)> {
     normalized_pair(src, rewrites).map(|(a, b)| (a.to_string(), b.to_string()))
 }
 
-/// The pair under `rewrites`, or `None` when the input is not a pair at all, or when inlining its
-/// `WITH` bindings would duplicate a volatile call ([`inlining_duplicates_volatile_call`]). Splitting
-/// this out of [`reflexive_with`] keeps the comparison and the rendering reading the very same tree.
+/// The pair under `rewrites`, or `None` when the input is not a pair at all. Splitting this out of
+/// [`reflexive_with`] keeps the comparison and the rendering reading the very same tree.
 fn normalized_pair(
     src: &str,
     rewrites: Rewrites,
@@ -602,11 +593,6 @@ fn normalized_pair(
         })
         .collect();
     if rewrites.has(Rewrites::INLINE_CTES) {
-        // Declined rather than compared without the inlining: a `WITH` left in place would meet
-        // `strip_schema` below, which can turn a qualified table into a reference to the binding.
-        if queries.iter().any(inlining_duplicates_volatile_call) {
-            return None;
-        }
         normalize::inline_ctes(&mut queries);
     }
     if rewrites.has(Rewrites::STRIP_IDENTICAL_LOCKS) {
@@ -623,126 +609,6 @@ fn normalized_pair(
     }
     let mut it = queries.into_iter().map(|q| sqlparser::ast::Statement::Query(Box::new(q)));
     Some((it.next()?, it.next()?))
-}
-
-/// Whether [`normalize::inline_ctes`] would evaluate a volatile call in `q` more times than Postgres
-/// does: whether a `WITH` binding read more than once has a body that calls one of
-/// [`VOLATILE_FUNCTIONS`], itself or through another binding it reads.
-///
-/// SOUNDNESS GUARD for [`reflexive_with`]. Postgres evaluates a binding read more than once a single
-/// time per statement, and one that calls a volatile function always a single time; inlining
-/// evaluates the body once per read. `inline_ctes` argues that the difference is unobservable
-/// because lowering refuses every volatile call, and this check is where that refusal is applied to
-/// the trees `reflexive_with` compares without lowering them.
-///
-/// Over-approximated, in the direction that declines more: names are compared without case and
-/// without scope, so a binding counts as read wherever any table of its name is, and every binding of
-/// a name is taken to call a volatile function if one of them does. A call counts by its unqualified
-/// name, in an expression or as a table function.
-fn inlining_duplicates_volatile_call(q: &sqlparser::ast::Query) -> bool {
-    use sqlparser::ast::Visit;
-    let mut bindings = BindingReads::default();
-    let _ = q.visit(&mut bindings);
-    let mut volatile: BTreeSet<String> =
-        bindings.bodies.iter().filter(|b| b.volatile).map(|b| b.name.clone()).collect();
-    // Through other bindings: one that reads a volatile binding duplicates its call when inlined.
-    loop {
-        let more: Vec<String> = bindings
-            .bodies
-            .iter()
-            .filter(|b| !volatile.contains(&b.name) && b.reads.iter().any(|r| volatile.contains(r)))
-            .map(|b| b.name.clone())
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        volatile.extend(more);
-    }
-    let reads = table_reads(q);
-    volatile.iter().any(|v| reads.iter().filter(|r| *r == v).count() > 1)
-}
-
-/// One `WITH` binding, as [`inlining_duplicates_volatile_call`] sees it.
-struct BindingBody {
-    /// The binding's name, lowercased.
-    name: String,
-    /// Whether its body calls a volatile function.
-    volatile: bool,
-    /// The single-part table names its body reads, lowercased.
-    reads: Vec<String>,
-}
-
-/// Every `WITH` binding in a query, at any depth.
-#[derive(Default)]
-struct BindingReads {
-    bodies: Vec<BindingBody>,
-}
-
-impl sqlparser::ast::Visitor for BindingReads {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, q: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
-        for cte in q.with.iter().flat_map(|w| &w.cte_tables) {
-            self.bodies.push(BindingBody {
-                name: cte.alias.name.value.to_lowercase(),
-                volatile: calls_volatile(&cte.query),
-                reads: table_reads(&cte.query),
-            });
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
-
-/// Every table name of one part that `q` reads, lowercased, once per read.
-fn table_reads(q: &sqlparser::ast::Query) -> Vec<String> {
-    use sqlparser::ast::{TableFactor, Visit, Visitor};
-    struct Reads(Vec<String>);
-    impl Visitor for Reads {
-        type Break = ();
-        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> std::ops::ControlFlow<()> {
-            if let TableFactor::Table { name, .. } = tf {
-                if let [part] = &name.0[..] {
-                    if let Some(id) = part.as_ident() {
-                        self.0.push(id.value.to_lowercase());
-                    }
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        }
-    }
-    let mut reads = Reads(Vec::new());
-    let _ = q.visit(&mut reads);
-    reads.0
-}
-
-/// Whether `q` calls a function on [`VOLATILE_FUNCTIONS`] anywhere, in an expression or as a table
-/// function, matched on the unqualified name.
-fn calls_volatile(q: &sqlparser::ast::Query) -> bool {
-    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
-    fn volatile_name(name: &ObjectName) -> bool {
-        name.0.last().and_then(|p| p.as_ident()).is_some_and(|id| is_volatile(&id.value))
-    }
-    struct Calls;
-    impl Visitor for Calls {
-        type Break = ();
-        fn pre_visit_expr(&mut self, e: &Expr) -> std::ops::ControlFlow<()> {
-            match e {
-                Expr::Function(f) if volatile_name(&f.name) => std::ops::ControlFlow::Break(()),
-                _ => std::ops::ControlFlow::Continue(()),
-            }
-        }
-        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> std::ops::ControlFlow<()> {
-            match tf {
-                TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. }
-                    if volatile_name(name) =>
-                {
-                    std::ops::ControlFlow::Break(())
-                }
-                _ => std::ops::ControlFlow::Continue(()),
-            }
-        }
-    }
-    q.visit(&mut Calls).is_break()
 }
 
 fn parse_input(

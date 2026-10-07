@@ -36,10 +36,7 @@ lost outright: when a refused pair's two sides normalize to one query, the front
 (`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
 many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
 `--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
-asks whether the QED prover proved the pair, still counts it as refused. The claim needs every
-normalization to keep the number of times a call is evaluated, and `WITH` inlining does not: it
-evaluates a binding read twice twice, where Postgres evaluates it once. So the check declines a pair
-in which inlining would copy a volatile call such as `random()`.
+asks whether the QED prover proved the pair, still counts it as refused.
 
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
@@ -108,24 +105,6 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
-- **A volatile function is not a function.** `random()`, `nextval`, `clock_timestamp()` and every
-  other function Postgres declares volatile, in its core or in `pgcrypto` and `uuid-ossp`
-  (`sqleq_frontend::VOLATILE_FUNCTIONS`), can give two calls with equal arguments two values, so a
-  call to one is refused rather than read as an uninterpreted function. A volatile function a user
-  defines is a name like any other.
-- **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
-  refused: modelled as the prover's own (`count`, `sum`, `avg`, `min`, `max`) or as an uninterpreted
-  function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop`, `corr`, `regr_*`, `range_agg`,
-  …); refused when the bag does not determine its result (`array_agg`, `string_agg`, the `json*_agg`
-  family, `any_value`) or when it is an ordered-set or hypothetical-set aggregate
-  (`percentile_cont`, `mode`, `rank(…) WITHIN GROUP`). An aggregate in a subquery whose arguments
-  read only an enclosing query's columns belongs to that query, and is refused. An aggregate a user
-  defines is recognised only through a `declare aggregate function` line.
-- **A call is more than a name and positional arguments.** A named argument
-  (`make_interval(days => a)`, `json_object('k' VALUE a)`), a `t.*` argument, `WITHIN GROUP`, the
-  SQL/JSON `ON NULL` and `RETURNING` clauses, an `ORDER BY` or `WHERE` inside the parentheses and
-  `IGNORE NULLS` are refused, and so are `DISTINCT`, `FILTER` and `*` on a call that is not a known
-  aggregate. `SELECT … INTO`, which creates a table, is refused too.
 - **A join-delete or join-update is a semi-join only when nothing it assigns or returns reads the
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of
