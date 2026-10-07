@@ -33,6 +33,7 @@ statements against DuckDB looking for a counterexample and uses no part of the f
 | `tests/temporal.rs` | DATE/TIME/TIMESTAMP/TIMESTAMPTZ/INTERVAL kept apart in the IR, and every crossing between them named |
 | `tests/depth.rs` | long and deeply nested predicates stay within a prover's nesting limit |
 | `tests/reflexive.rs` | the reflexivity check: that it reaches past a lowering refusal, and never widens one into a proof |
+| `tests/resolution.rs` | name resolution, metamorphically: seed queries and mutants that change what a name resolves to must not meet, and mutants that keep it must still lower |
 | `tests/doc_links.rs` | every relative link in every Markdown file resolves |
 | `tests/pairs/` | pinned pairs: known truth, each axis's last answer, run by `sqleq-check --expect pinned` ([README](../tests/pairs/README.md)) |
 
@@ -86,6 +87,7 @@ in. What it rewrites, and where it deliberately differs from the original, is in
 | `sqleq-solver/src/{normalize,ic,alpha}.rs` | normalization, integrity-constraint rewrites, and the alpha-equivalence decision |
 | `sqleq-solver/src/{prove,setsolver}.rs` | the decision ladder, and the Z3 set solver as its last rung |
 | `sqleq-solver/src/eval.rs` | a concrete evaluator, so tests can check a rewrite against data |
+| `sqleq-solver/tests/` | the ladder end to end over hand-built IR, and the binary on plans past its depth bound |
 | `sqleq-solver/examples/` | gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks |
 
 ## The refuting axis (`sqleq-fuzz/`)

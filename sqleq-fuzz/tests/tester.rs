@@ -374,10 +374,11 @@ fn disjoint_parameter_sets_are_misaligned_too() {
 fn one_unparameterized_side_is_not_a_misalignment() {
     // Nothing is identified across the pair, so substituting values for the parameterized side's `$N`
     // *is* the caller's own quantification. A verdict is available and must still be given.
+    // (It is a refutation: a LIMIT on one side cuts rows the other side keeps.)
     let ddl = "CREATE TABLE t (a INTEGER)";
     assert_eq!(
         label("SELECT a FROM t LIMIT $1", "SELECT a FROM t", ddl),
-        "NO-COUNTEREXAMPLE"
+        "NOT-EQUIVALENT"
     );
     // Equal sets are the ordinary case, and the same-index-different-operand-order pair must survive.
     assert_eq!(
@@ -947,7 +948,8 @@ fn a_table_the_strict_parser_rejects_is_recovered() {
         vec!["care_case_id", "created_at", "id", "primary", "staffer_id"]
     );
     assert_eq!(t.cols[0].vt, VType::Uuid);
-    assert_eq!(t.cols[1].vt, VType::Timestamp);
+    // `timestamp with time zone` is materialized as DuckDB TIMESTAMPTZ, not as a naive timestamp.
+    assert_eq!(t.cols[1].vt, VType::TimestampTz);
     assert_eq!(t.cols[2].vt, VType::Integer);
     assert_eq!(t.cols[3].vt, VType::Boolean);
     // Losing NOT NULL would widen the instance space, which is the unsound direction.

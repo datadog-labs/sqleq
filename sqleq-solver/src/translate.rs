@@ -34,9 +34,83 @@
 //! term per predicate forces -- would make `NOT (a = 1)` true on a NULL `a`, a false-proof channel
 //! (`NOT (a = 1)` would equal `a IS DISTINCT FROM 1`), and would get `NOT IN` wrong whenever the
 //! subquery yields a NULL.
+//!
+//! ## Types
+//!
+//! A `UTerm` carries no types, so the translation keeps every distinction a type makes in the
+//! terms themselves. A constant keeps its own (see [`UConst`]: `1`, `1.0` and `1.00` are three
+//! values). Every uninterpreted symbol is named after the IR types of its operands and of its
+//! result (see `typed_symbol`), because Postgres picks a function by its name and argument types:
+//! `/` on two integers truncates and on a decimal does not, and `CAST(1 AS TEXT)` and
+//! `CAST(1.0 AS TEXT)` spell different strings. And SQL's `=` is read as identity of the two
+//! values -- the reading that lets normalization substitute one side for the other -- only between
+//! two values of one type on which `=` *is* identity; anywhere else (two decimals, an integer
+//! against a decimal, two intervals, two opaque values) it compares the values' images under a key
+//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`).
 
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
+
+/// The key function SQL's `=` compares two numbers (INTEGER or REAL, in any mix) through: their
+/// exact numeric value, whatever their type or scale. Normalization and the evaluator interpret it
+/// as exactly that, and nothing else does; see `sql_eq`.
+pub const NUMERIC_EQ_KEY: &str = "eq:numeric";
+
+/// The name of an uninterpreted symbol for `base` over operands of the IR types `args`, with
+/// result type `ret`. Postgres resolves a function or operator by its name *and* its argument
+/// types, so a symbol that left the types out would stand for several functions at once, and an
+/// uninterpreted symbol is sound only while it stands for one: the real function must be one of its
+/// interpretations.
+fn typed_symbol(base: &str, args: &[Type], ret: Type) -> String {
+    let args: Vec<&str> = args.iter().map(|t| t.name()).collect();
+    format!("{base}({})->{}", args.join(","), ret.name())
+}
+
+fn types_of(operand: &[Expr]) -> Vec<Type> {
+    operand.iter().map(Expr::ty).collect()
+}
+
+/// The key function through which SQL's `=` between a value of type `a` and one of type `b` is
+/// read, or `None` when it is identity of the two values. It is identity only between two values of
+/// one type whose `=` holds exactly when the values are the same: integers, strings (under a
+/// deterministic collation, which compares bytes), booleans, dates, times and timestamps. It is not
+/// between two decimals (`2.0 = 2.00`, yet they print, cast and divide differently), an integer and
+/// a decimal, two intervals (`'1 day' = '24 hours'`), or two values of the opaque VARBINARY, which
+/// stands for types whose `=` is not identity either: `double precision` (`0 = -0`), and arrays,
+/// which compare elements with the element type's `=` (`'{2.0}' = '{2.00}'`). There the two sides
+/// are compared through a key, which a substitution cannot see through, so an equality never
+/// licenses putting one value where the other was.
+fn eq_key(a: Type, b: Type) -> Option<String> {
+    let numeric = |t: Type| matches!(t, Type::Integer | Type::Real);
+    if a == b && !matches!(a, Type::Real | Type::Interval | Type::Varbinary) {
+        return None;
+    }
+    if numeric(a) && numeric(b) {
+        return Some(NUMERIC_EQ_KEY.to_string());
+    }
+    let (x, y) = if a.name() <= b.name() { (a, b) } else { (b, a) };
+    Some(if x == y { format!("eq:{}", x.name()) } else { format!("eq:{}|{}", x.name(), y.name()) })
+}
+
+/// SQL's `a = b` on two non-NULL values of the IR types `ta` and `tb`, as a 0/1 term: identity of
+/// the values where that is what `=` means, their images under [`eq_key`]'s key otherwise. `None`
+/// for a type the IR could not resolve, which is compared through a key of its own.
+fn sql_eq(a: UTerm, ta: Option<Type>, b: UTerm, tb: Option<Type>) -> UTerm {
+    sql_equality(PredKind::Eq, a, ta, b, tb)
+}
+
+/// [`sql_eq`], or with `kind` `Ne` its negation, SQL's `<>`.
+fn sql_equality(kind: PredKind, a: UTerm, ta: Option<Type>, b: UTerm, tb: Option<Type>) -> UTerm {
+    let key = match (ta, tb) {
+        (Some(ta), Some(tb)) => eq_key(ta, tb),
+        _ => Some("eq:unresolved".to_string()),
+    };
+    let args = match key {
+        None => vec![a, b],
+        Some(k) => vec![UTerm::Func { name: k.clone(), args: vec![a] }, UTerm::Func { name: k, args: vec![b] }],
+    };
+    UTerm::Pred { kind, args }
+}
 
 /// A value that might be null. See the module doc for the invariant governing `value`.
 #[derive(Debug, Clone)]
@@ -260,7 +334,7 @@ impl<'s> Translator<'s> {
             let mut factors = Vec::with_capacity(row.len());
             for (col, cell) in local.iter().zip(row.iter()) {
                 let v = match cell {
-                    Expr::Literal { value, ty } => self.literal_value(value, *ty),
+                    Expr::Literal { value, ty } => self.literal_value(value, *ty)?,
                     // `ir::Relation::parse` already guarantees every `values` cell is a literal
                     // before this stage ever runs.
                     _ => return Err(TranslateError::ValuesNonLiteral),
@@ -418,6 +492,7 @@ impl<'s> Translator<'s> {
             }
             "SUM" | "AVG" => {
                 let x = Self::agg_arg(&call.operand, scope)?;
+                let arg_ty: Vec<Type> = types_of(&call.operand);
                 let notnull_x = mk_neg(x.is_null.clone());
                 let nx = mk_sum(source_exposed.to_vec(), mk_mul([group_by_term.clone(), notnull_x.clone()]));
                 let sum_x = mk_sum(source_exposed.to_vec(), mk_mul([group_by_term.clone(), notnull_x, x.value]));
@@ -425,7 +500,9 @@ impl<'s> Translator<'s> {
                 let value = if call.operator == "SUM" {
                     sum_x
                 } else {
-                    UTerm::Func { name: "divide".to_string(), args: vec![sum_x, nx] }
+                    // Not `/` of the two: `avg` of integers is a decimal, while `/` of the
+                    // integer sum by the count truncates. Its own symbol, typed like any other.
+                    UTerm::Func { name: typed_symbol("avg", &arg_ty, call.ty), args: vec![sum_x, nx] }
                 };
                 Ok(value_eq(&outcol, &Value { is_null, value }))
             }
@@ -520,7 +597,13 @@ impl<'s> Translator<'s> {
             "=" | "<>" | "<" | "<=" | ">" | ">=" => {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
-                let holds = UTerm::Pred { kind: pred_kind(operator), args: vec![a.value, b.value] };
+                let (ta, tb) = (Some(operand[0].ty()), Some(operand[1].ty()));
+                let holds = match pred_kind(operator) {
+                    kind @ (PredKind::Eq | PredKind::Ne) => sql_equality(kind, a.value, ta, b.value, tb),
+                    // An order comparison is never read as identity, so it needs no key: values
+                    // equal under `=` are simply neither less than the other.
+                    kind => UTerm::Pred { kind, args: vec![a.value, b.value] },
+                };
                 Ok(Truth::guarded(mk_or(a.is_null, b.is_null), holds))
             }
             "IS NULL" => Ok(Truth::two_valued(self.translate_value(&operand[0], scope)?.is_null)),
@@ -530,14 +613,15 @@ impl<'s> Translator<'s> {
                 let b = self.translate_value(&operand[1], scope)?;
                 let both_null = mk_mul([a.is_null.clone(), b.is_null.clone()]);
                 let both_nonnull = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null)]);
-                let eq = UTerm::Pred { kind: PredKind::Eq, args: vec![a.value, b.value] };
+                let eq = sql_eq(a.value, Some(operand[0].ty()), b.value, Some(operand[1].ty()));
                 Ok(Truth::two_valued(mk_neg(mk_add([both_null, mk_mul([both_nonnull, eq])]))))
             }
             "IS NOT TRUE" => Ok(Truth::two_valued(mk_neg(self.translate_truth(&operand[0], scope)?.t))),
             "LIKE" => {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
-                let holds = truthy(UTerm::Func { name: "like".to_string(), args: vec![a.value, b.value] });
+                let name = typed_symbol("like", &types_of(operand), Type::Boolean);
+                let holds = truthy(UTerm::Func { name, args: vec![a.value, b.value] });
                 Ok(Truth::guarded(mk_or(a.is_null, b.is_null), holds))
             }
             // `x = ANY(arr)` is TRUE only with both operands non-NULL (`NULL = ANY(..)` and
@@ -549,9 +633,10 @@ impl<'s> Translator<'s> {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
                 let args = vec![a.is_null.clone(), a.value, b.is_null.clone(), b.value];
-                let holds = truthy(UTerm::Func { name: "= ANY".to_string(), args: args.clone() });
+                let name = typed_symbol("= ANY", &types_of(operand), Type::Boolean);
+                let holds = truthy(UTerm::Func { name: name.clone(), args: args.clone() });
                 let t = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null), holds]);
-                let unknown = truthy(UTerm::Func { name: "unknown:= ANY".to_string(), args });
+                let unknown = truthy(UTerm::Func { name: format!("unknown:{name}"), args });
                 Ok(Truth { f: mk_mul([mk_neg(t.clone()), mk_neg(unknown)]), t })
             }
             other => unreachable!("truth_call reached with non-boolean operator {other:?}"),
@@ -573,12 +658,13 @@ impl<'s> Translator<'s> {
         if inner.local.len() != lhs.len() {
             return Err(TranslateError::MalformedShape("IN operand arity does not match subquery width".into()));
         }
+        let inner_types = query.output_types(self.schemas);
         let mut eqs = Vec::with_capacity(lhs.len());
         let mut nulls = Vec::with_capacity(lhs.len());
-        for (l, col) in lhs.iter().zip(inner.local.iter()) {
+        for (i, (l, col)) in lhs.iter().zip(inner.local.iter()).enumerate() {
             let rhs = column_value(col.clone());
             let null = mk_or(l.is_null.clone(), rhs.is_null);
-            let eq = UTerm::Pred { kind: PredKind::Eq, args: vec![l.value.clone(), rhs.value] };
+            let eq = sql_eq(l.value.clone(), Some(operand[i].ty()), rhs.value, inner_types.get(i).copied().flatten());
             eqs.push(mk_mul([mk_neg(null.clone()), eq]));
             nulls.push(null);
         }
@@ -594,23 +680,29 @@ impl<'s> Translator<'s> {
     /// Only numerically correct when at most one row of the inner query satisfies its own term (SQL
     /// raises an error otherwise). Java asserts that precondition globally, through a `ScalarTerm`
     /// constraint; this port does not model it yet.
+    ///
+    /// The value is NULL when no row satisfies the term *or* the one that does holds NULL in its
+    /// column: under that precondition, exactly when no row holds a non-NULL value. Reading it as
+    /// NULL only when there is no row would make `(SELECT y …) IS NULL` say `NOT EXISTS (…)`, never
+    /// let a scalar aggregate (which always has its one row) be NULL, and turn `x = (SELECT …)`
+    /// over a NULL value into FALSE where SQL says UNKNOWN -- which a `NOT` then makes TRUE.
     fn scalar_subquery_value(&mut self, query: &Relation, scope: &Scope) -> Result<Value, TranslateError> {
         let inner = self.rel(query, scope.base + scope.local.len())?;
         if inner.local.len() != 1 {
             return Err(TranslateError::ScalarSubqueryArity);
         }
         let col = UTerm::Var(inner.local[0].clone());
-        let exists = mk_squash(mk_sum(inner.exposed.clone(), inner.term.clone()));
+        let non_null_row = mk_squash(mk_sum(inner.exposed.clone(), mk_mul([inner.term.clone(), mk_neg(is_null_of(&col))])));
         let value = mk_sum(inner.exposed, mk_mul([inner.term, col]));
-        Ok(Value { is_null: mk_neg(exists), value })
+        Ok(Value { is_null: mk_neg(non_null_row), value })
     }
 
     fn translate_value(&mut self, e: &Expr, scope: &Scope) -> Result<Value, TranslateError> {
         match e {
             Expr::Column { index, .. } => Ok(column_value(scope.resolve(*index)?)),
-            Expr::Literal { value, ty } => Ok(self.literal_value(value, *ty)),
+            Expr::Literal { value, ty } => self.literal_value(value, *ty),
             Expr::Cast { ty, operand } => self.cast_value(*ty, operand, scope),
-            Expr::Call { operator, operand, .. } => self.translate_call_value(operator, operand, scope),
+            Expr::Call { operator, operand, ty } => self.translate_call_value(operator, operand, *ty, scope),
             Expr::Subquery { operator, operand, query, .. } => match operator.as_str() {
                 "EXISTS" => Ok(Value::not_null(self.exists_predicate(query, scope)?)),
                 "IN" => {
@@ -623,25 +715,29 @@ impl<'s> Translator<'s> {
         }
     }
 
-    /// Every cast is an uninterpreted function of its operand, one symbol per target type, and null
-    /// exactly when the operand is. Java erases every cast (`UExprConcreteTranslator`), which is a
-    /// false-proof channel: `CAST(a AS REAL) / b` and `a / b` become the same term although integer
-    /// division differs. An uninterpreted symbol cannot license a false proof, because the real
-    /// conversion is one of its interpretations (the argument `src/casts.rs` makes for the
-    /// frontend's own `qcastK`) -- provided one symbol never stands for two different conversions.
+    /// Every cast is an uninterpreted function of its operand, one symbol per source and target
+    /// type (`typed_symbol`), and null exactly when the operand is. Java erases every cast
+    /// (`UExprConcreteTranslator`), which is a false-proof channel: `CAST(a AS REAL) / b` and
+    /// `a / b` become the same term although integer division differs. An uninterpreted symbol
+    /// cannot license a false proof, because the real conversion is one of its interpretations (the
+    /// argument `src/casts.rs` makes for the frontend's own `qcastK`) -- provided one symbol never
+    /// stands for two different conversions.
     ///
     /// Not even a cast between equal IR types is the identity. The frontend already drops the
     /// casts it knows compute nothing (`src/casts.rs` rule 4), so one that reaches the IR is one it
     /// did not: the IR's `INTEGER` also stands for DATE and TIMESTAMP, so `CAST(ts AS DATE)` over a
     /// timestamp arrives as INTEGER-to-INTEGER, and truncating to a day changes the value. The
     /// catch-all `VARBINARY` likewise does not record which real type it stands for, so the
-    /// one-symbol-per-conversion proviso holds only as far as the IR carries the target.
+    /// one-symbol-per-conversion proviso holds only as far as the IR carries the types. The source
+    /// type is part of the name because the target alone does not fix the conversion: `CAST(1 AS
+    /// TEXT)` is `'1'`, `CAST(1.0 AS TEXT)` is `'1.0'` and `CAST(TRUE AS TEXT)` is `'true'`.
     fn cast_value(&mut self, ty: Type, operand: &Expr, scope: &Scope) -> Result<Value, TranslateError> {
         let v = self.translate_value(operand, scope)?;
-        Ok(Value { is_null: v.is_null, value: UTerm::Func { name: format!("cast:{}", ty.name()), args: vec![v.value] } })
+        let name = typed_symbol("cast", &[operand.ty()], ty);
+        Ok(Value { is_null: v.is_null, value: UTerm::Func { name, args: vec![v.value] } })
     }
 
-    fn translate_call_value(&mut self, operator: &str, operand: &[Expr], scope: &Scope) -> Result<Value, TranslateError> {
+    fn translate_call_value(&mut self, operator: &str, operand: &[Expr], ty: Type, scope: &Scope) -> Result<Value, TranslateError> {
         if is_boolean_operator(operator, operand.len()) {
             // A boolean in value position is NULL exactly when it is UNKNOWN.
             let tr = self.truth_call(operator, operand, scope)?;
@@ -656,7 +752,9 @@ impl<'s> Translator<'s> {
                     "+" => mk_add([a.value, b.value]),
                     "-" => mk_add([a.value, mk_mul([UTerm::Const(UConst::Int(-1)), b.value])]),
                     "*" => mk_mul([a.value, b.value]),
-                    _ => UTerm::Func { name: "divide".to_string(), args: vec![a.value, b.value] },
+                    // Integer division truncates and decimal division does not, so `/` is one
+                    // symbol per operand and result types (`typed_symbol`), never one for all.
+                    _ => UTerm::Func { name: typed_symbol("divide", &types_of(operand), ty), args: vec![a.value, b.value] },
                 };
                 Ok(Value { is_null, value })
             }
@@ -671,12 +769,14 @@ impl<'s> Translator<'s> {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
                 let both_nonnull = mk_neg(mk_or(a.is_null.clone(), b.is_null.clone()));
-                let eq = UTerm::Pred { kind: PredKind::Eq, args: vec![a.value.clone(), b.value] };
+                let eq = sql_eq(a.value.clone(), Some(operand[0].ty()), b.value, Some(operand[1].ty()));
                 Ok(Value { is_null: mk_or(a.is_null, mk_mul([both_nonnull, eq])), value: a.value })
             }
-            "||" if operand.len() == 2 => self.strict_value("concat", operand, scope),
-            _ if is_null_exactly_on_null_input(operator) => self.strict_value(&operator.to_lowercase(), operand, scope),
-            _ => self.opaque_value(operator, operand, scope),
+            "||" if operand.len() == 2 => self.strict_value(&typed_symbol("concat", &types_of(operand), ty), operand, scope),
+            _ if is_null_exactly_on_null_input(operator) => {
+                self.strict_value(&typed_symbol(&operator.to_lowercase(), &types_of(operand), ty), operand, scope)
+            }
+            _ => self.opaque_value(&typed_symbol(operator, &types_of(operand), ty), operand, scope),
         }
     }
 
@@ -747,20 +847,27 @@ impl<'s> Translator<'s> {
         Ok(Value { is_null: remaining, value: mk_add(value_terms) })
     }
 
-    fn literal_value(&self, value: &str, ty: Type) -> Value {
+    /// A literal as the constant it denotes, exactly, or a refusal (`literal:<type>`) when its text
+    /// does not denote one of its type: an INTEGER literal must be an `i64` (`1e-5` or a number past
+    /// the `bigint` range is not, and reading it through a float would make it `0` or `i64::MAX`), a
+    /// REAL literal a decimal number, a BOOLEAN literal `true` or `false`. A REAL literal stays a
+    /// decimal even when integral (`2.0` is not `2`), and a BOOLEAN one is the 0/1 a predicate in
+    /// value position is; booleans and integers never meet in one position, since no Postgres
+    /// operator or function takes either for the other and every symbol is named by its operand
+    /// types, and `prove` compares the two sides' output types.
+    fn literal_value(&self, value: &str, ty: Type) -> Result<Value, TranslateError> {
         if value == "NULL" {
-            return Value::null();
+            return Ok(Value::null());
         }
+        let refuse = || TranslateError::Literal(ty.name().to_string());
         let term = match ty {
-            Type::Integer => {
-                let n = value.parse::<i64>().unwrap_or_else(|_| value.parse::<f64>().unwrap_or(0.0) as i64);
-                UTerm::Const(UConst::Int(n))
-            }
-            Type::Boolean => UTerm::Const(UConst::Int(if value.eq_ignore_ascii_case("true") { 1 } else { 0 })),
-            Type::Real => match value.parse::<i64>() {
-                Ok(n) => UTerm::Const(UConst::Int(n)),
-                Err(_) => UTerm::Const(UConst::Decimal(value.to_string())),
+            Type::Integer => UTerm::Const(UConst::Int(value.parse::<i64>().map_err(|_| refuse())?)),
+            Type::Boolean => match value.to_ascii_lowercase().as_str() {
+                "true" => UTerm::Const(UConst::Int(1)),
+                "false" => UTerm::Const(UConst::Int(0)),
+                _ => return Err(refuse()),
             },
+            Type::Real => UTerm::Const(UConst::decimal(value).ok_or_else(refuse)?),
             Type::Varchar | Type::Varbinary => UTerm::Const(UConst::Str(value.to_string())),
             // Refused by `ir::Expr::literal` before translation; keyed by type anyway, so that a
             // date and a timestamp spelled alike could never be one constant.
@@ -768,7 +875,7 @@ impl<'s> Translator<'s> {
                 UTerm::Const(UConst::Str(format!("{}:{value}", ty.name())))
             }
         };
-        Value::not_null(term)
+        Ok(Value::not_null(term))
     }
 }
 
@@ -795,12 +902,14 @@ pub const OUT_VAR_ID: u32 = u32::MAX;
 
 /// One side, closed: `term` is a function of `Base(OUT_VAR_ID)` alone (every other var is bound by a
 /// `Sum`), and that var has exactly `arity` columns, `Proj(0..arity)`. `widths` gives the column
-/// count of every base var the term mentions, the output var included.
+/// count of every base var the term mentions, the output var included, and `types` the IR type of
+/// each output column ([`Relation::output_types`]), which the term itself does not carry.
 #[derive(Debug, Clone)]
 pub struct Query {
     pub term: UTerm,
     pub arity: usize,
     pub widths: std::collections::HashMap<u32, usize>,
+    pub types: Vec<Option<Type>>,
 }
 
 /// Closes a top-level translation over the shared output var. When the relation already exposes a
@@ -808,14 +917,14 @@ pub struct Query {
 /// simply becomes the output var. Otherwise -- a top-level join, whose output is the concatenation
 /// of several vars -- the exposed vars are summed out and bound column-by-column to the output var.
 /// The binding is identity (`Null` equals `Null`), not SQL `=`, so null output columns are kept.
-fn close_output(t: Translated, widths: Vec<usize>) -> Query {
+fn close_output(t: Translated, widths: Vec<usize>, types: Vec<Option<Type>>) -> Query {
     let arity = t.local.len();
     let mut widths: std::collections::HashMap<u32, usize> =
         widths.into_iter().enumerate().map(|(id, w)| (id as u32, w)).collect();
     widths.insert(OUT_VAR_ID, arity);
     if let [v @ UVar::Base(id)] = t.exposed.as_slice() {
         if t.local.iter().enumerate().all(|(i, l)| *l == UVar::proj(i as u32, v.clone())) {
-            return Query { term: t.term.rename_base(*id, OUT_VAR_ID), arity, widths };
+            return Query { term: t.term.rename_base(*id, OUT_VAR_ID), arity, widths, types };
         }
     }
     let out = UVar::Base(OUT_VAR_ID);
@@ -823,7 +932,7 @@ fn close_output(t: Translated, widths: Vec<usize>) -> Query {
         kind: PredKind::Eq,
         args: vec![UTerm::Var(UVar::proj(i as u32, out.clone())), UTerm::Var(l.clone())],
     }));
-    Query { term: mk_sum(t.exposed, mk_mul([t.term, bind])), arity, widths }
+    Query { term: mk_sum(t.exposed, mk_mul([t.term, bind])), arity, widths, types }
 }
 
 /// Translates both sides of an `Input` independently -- each gets its own freshly-seeded `Translator`
@@ -831,11 +940,15 @@ fn close_output(t: Translated, widths: Vec<usize>) -> Query {
 /// alpha-equivalence, which treats bound vars as fully interchangeable. The one var they do
 /// share is the output var (see `close_output`).
 pub fn translate_input(input: &crate::ir::Input) -> Result<[Query; 2], TranslateError> {
+    let types = |q: &Relation| q.output_types(&input.schemas);
     let mut left = Translator::new(&input.schemas);
     let l = left.rel(&input.queries[0], 0)?;
     let mut right = Translator::new(&input.schemas);
     let r = right.rel(&input.queries[1], 0)?;
-    Ok([close_output(l, left.widths), close_output(r, right.widths)])
+    Ok([
+        close_output(l, left.widths, types(&input.queries[0])),
+        close_output(r, right.widths, types(&input.queries[1])),
+    ])
 }
 
 #[cfg(test)]
@@ -1163,5 +1276,72 @@ mod tests {
         let sides = [Box::new(wide), Box::new(narrow)];
         let err = t.set_op(SetOpKind::Union, &sides, 0).unwrap_err();
         assert_eq!(err, TranslateError::MalformedShape("set-op branches have different column counts".into()));
+    }
+
+    /// A scalar subquery's value is NULL when it has no row or its row holds NULL: checked on
+    /// concrete databases, against what Postgres answers.
+    mod scalar_subquery_nullness {
+        use super::*;
+
+        /// `t(id)`, `s(k, y)`, and the truth of `cond` on `t`'s one row `(1)` for each content of
+        /// `s`: (TRUE, UNKNOWN).
+        fn truths(cond: serde_json::Value, contents: &[Vec<UConst>]) -> Vec<(i64, i64)> {
+            let schemas = vec![
+                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![] },
+                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![] },
+            ];
+            let e = Expr::parse(&cond, 2).unwrap();
+            let mut t = Translator::new(&schemas);
+            let src = t.scan(0).unwrap();
+            let truth = t.translate_truth(&e, &Scope { base: 0, local: src.local }).unwrap();
+            let widths: std::collections::HashMap<u32, usize> = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
+            let universe = vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2), UConst::Int(5)];
+            contents
+                .iter()
+                .map(|rows| {
+                    let s = rows.chunks(2).map(|r| r.to_vec()).collect();
+                    let db = Db::new([("s".to_string(), s)].into(), universe.clone(), widths.clone());
+                    let mut env = Env::from([(0, vec![UConst::Int(1)])]);
+                    let mut count = |t: &UTerm| db.count(t, &mut env).unwrap();
+                    (count(&truth.t), count(&truth.u()))
+                })
+                .collect()
+        }
+
+        fn scalar(query: serde_json::Value) -> serde_json::Value {
+            json!({ "operator": "$SCALAR_QUERY", "type": "INTEGER", "operand": [], "query": query })
+        }
+
+        /// `SELECT y FROM s WHERE k = 1`.
+        fn y_where_k_is_1() -> serde_json::Value {
+            json!({ "project": { "source": { "filter": { "source": { "scan": 1 }, "condition": call("=", vec![c(1), lit(1)]) } },
+                                 "target": [c(2)] } })
+        }
+
+        /// `SELECT sum(y) FROM s`.
+        fn sum_y() -> serde_json::Value {
+            json!({ "group": { "keys": [], "source": { "project": { "source": { "scan": 1 }, "target": [c(2)] } },
+                               "function": [{ "operator": "SUM", "type": "INTEGER", "operand": [c(1)] }] } })
+        }
+
+        #[test]
+        fn is_null_holds_for_no_row_and_for_a_row_holding_null() {
+            let (n, one, two, five) = (UConst::Null, UConst::Int(1), UConst::Int(2), UConst::Int(5));
+            let contents = [vec![], vec![one.clone(), n.clone()], vec![one.clone(), five.clone()], vec![two.clone(), five.clone()]];
+            let got = truths(call("IS NULL", vec![scalar(y_where_k_is_1())]), &contents);
+            assert_eq!(got, [(1, 0), (1, 0), (0, 0), (1, 0)]);
+            // sum over no rows, or over only NULLs, is NULL.
+            let got = truths(call("IS NULL", vec![scalar(sum_y())]), &contents[..3]);
+            assert_eq!(got, [(1, 0), (1, 0), (0, 0)]);
+        }
+
+        #[test]
+        fn a_comparison_with_a_null_subquery_is_unknown_and_stays_so_under_not() {
+            let (n, one, five) = (UConst::Null, UConst::Int(1), UConst::Int(5));
+            let contents = [vec![], vec![one.clone(), n.clone()], vec![one.clone(), five.clone()], vec![one.clone(), one.clone()]];
+            let eq = call("=", vec![c(0), scalar(sum_y())]);
+            assert_eq!(truths(eq.clone(), &contents), [(0, 1), (0, 1), (0, 0), (1, 0)]);
+            assert_eq!(truths(call("NOT", vec![eq]), &contents), [(0, 1), (0, 1), (1, 0), (0, 0)]);
+        }
     }
 }

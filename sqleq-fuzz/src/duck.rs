@@ -10,6 +10,9 @@
 //! constraint so the instance stays *valid* — run the statement, and reduce the output to a sorted
 //! multiset of canonicalised rows (bag semantics: ORDER BY alone never counts). SELECTs compare the
 //! result set; DML compares the final table state.
+//!
+//! The connection is set up to compute what Postgres computes where DuckDB's defaults differ
+//! ([`open_db`]): integer division, the NULL order of `DESC`, and the session time zone.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::ControlFlow;
@@ -24,7 +27,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::gen::{lit, Val};
-use crate::schema::{Schema, Table};
+use crate::schema::{resolve, Schema, Table};
 
 /// Final table name -> the set of qualified name-part lists the queries reference it by.
 pub type Forms = BTreeMap<String, BTreeSet<Vec<String>>>;
@@ -69,10 +72,8 @@ pub fn table_forms(a: &str, b: &str, schema: &Schema) -> Forms {
         for st in sa.iter().chain(sb.iter()) {
             let _ = visit_relations(st, |name: &ObjectName| {
                 let parts = name_parts(name);
-                if let Some(last) = parts.last() {
-                    if schema.contains_key(last) {
-                        forms.entry(last.clone()).or_default().insert(parts.clone());
-                    }
+                if let Some(key) = resolve(schema, &parts) {
+                    forms.entry(key.clone()).or_default().insert(parts.clone());
                 }
                 ControlFlow::<()>::Continue(())
             });
@@ -90,10 +91,13 @@ pub fn table_forms(a: &str, b: &str, schema: &Schema) -> Forms {
         // segments `ensure_namespace` can build -- a deeper name simply does not match, which is
         // the conservative outcome.
         let text = format!("{a} {b}").to_lowercase().replace('"', "");
-        for t in schema.keys() {
+        for key in schema.keys() {
+            // A key is `name` or, for a name declared in several schemas, `schema.name`; the name is
+            // what to look for, and `resolve` decides whether the spelling found means this table.
+            let name = key.rsplit('.').next().unwrap_or(key);
             let re = regex::Regex::new(&format!(
                 r"(?:^|[^\w.])((?:[a-z_]\w*\.){{0,2}}){}(?:[^\w]|$)",
-                regex::escape(t)
+                regex::escape(name)
             ))
             .unwrap();
             for caps in re.captures_iter(&text) {
@@ -102,8 +106,10 @@ pub fn table_forms(a: &str, b: &str, schema: &Schema) -> Forms {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect();
-                parts.push(t.clone());
-                forms.entry(t.clone()).or_default().insert(parts);
+                parts.push(name.to_string());
+                if resolve(schema, &parts) == Some(key) {
+                    forms.entry(key.clone()).or_default().insert(parts);
+                }
             }
         }
     }
@@ -123,7 +129,7 @@ pub fn ddl_for(parts: &[String], t: &Table) -> String {
             let ty = if c.array {
                 format!("{}[]", c.vt.sql())
             } else {
-                c.vt.sql().to_string()
+                c.vt.sql()
             };
             format!(
                 "\"{}\" {}{}",
@@ -160,6 +166,86 @@ pub fn ddl_for(parts: &[String], t: &Table) -> String {
     format!("CREATE TABLE {} ({})", qualify(parts), cols.join(", "))
 }
 
+/// One `CREATE UNIQUE INDEX` per expression key of `t` ([`Table::expr_keys`]), on the table named
+/// by `parts`.
+///
+/// A unique index over expressions has no column-list form, so it is created as a DuckDB unique
+/// index, which rejects a colliding row on insert just as `UNIQUE (..)` does. An index is named
+/// within its table's schema, so the name carries the whole qualified table name to keep two
+/// spellings of one table apart; `DROP TABLE` takes the index along.
+pub fn expr_index_ddl(parts: &[String], t: &Table) -> Vec<String> {
+    let qn = qualify(parts);
+    let tag: String = parts
+        .join("_")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    t.expr_keys
+        .iter()
+        .enumerate()
+        .map(|(i, exprs)| {
+            format!(
+                "CREATE UNIQUE INDEX \"sqleq_uix_{tag}_{i}\" ON {qn} ({})",
+                exprs.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// Create the table `parts` names, with every constraint of `t`. Returns the expression keys DuckDB
+/// would not index -- it refuses a JSON operator in an index expression, for one -- which
+/// [`insert_rows`] and [`accepted_rows`] then enforce by checking each insert.
+fn create_table<'t>(
+    con: &Connection,
+    parts: &[String],
+    t: &'t Table,
+) -> duckdb::Result<Vec<&'t Vec<String>>> {
+    con.execute_batch(&ddl_for(parts, t))?;
+    Ok(expr_index_ddl(parts, t)
+        .iter()
+        .zip(&t.expr_keys)
+        .filter(|(ddl, _)| con.execute_batch(ddl).is_err())
+        .map(|(_, key)| key)
+        .collect())
+}
+
+/// Insert one row as a unique index on `unindexed` would: inside a transaction that is rolled back
+/// if the row fails a constraint DuckDB enforces, or leaves two rows equal and non-NULL on one of
+/// those expression lists. Whether it went in.
+///
+/// Evaluating the expressions after the insert, rather than refusing the table, keeps the pair: the
+/// rows the generator draws mostly leave such an expression NULL, which never collides. A key whose
+/// expressions DuckDB cannot evaluate at all makes the row fail, so nothing is inserted and the
+/// trial compares tables both sides see empty -- never a row Postgres would have refused.
+fn insert_checked(con: &Connection, qn: &str, row: &str, unindexed: &[&Vec<String>]) -> bool {
+    if con
+        .execute_batch(&format!("BEGIN TRANSACTION; INSERT INTO {qn} VALUES ({row})"))
+        .is_err()
+    {
+        let _ = con.execute_batch("ROLLBACK");
+        return false;
+    }
+    let collides = |key: &Vec<String>| -> duckdb::Result<bool> {
+        let exprs = key.join(", ");
+        let present = key
+            .iter()
+            .map(|e| format!("{e} IS NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        con.query_row(
+            &format!(
+                "SELECT count(*) > 0 FROM (SELECT 1 FROM {qn} WHERE {present} \
+                 GROUP BY {exprs} HAVING count(*) > 1)"
+            ),
+            [],
+            |r| r.get(0),
+        )
+    };
+    let ok = unindexed.iter().all(|k| matches!(collides(k), Ok(false)));
+    let _ = con.execute_batch(if ok { "COMMIT" } else { "ROLLBACK" });
+    ok
+}
+
 /// One database, reused for every trial of a pair. Constructing a DuckDB instance costs ~20ms —
 /// far more than the 5-row queries themselves — so opening one per side per trial spent most of the
 /// run in `duckdb_open`. Reuse is per *pair*, not per worker thread, so pairs stay isolated.
@@ -174,9 +260,32 @@ pub fn ddl_for(parts: &[String], t: &Table) -> String {
 /// in, so nothing here needs fetching and turning it off costs no coverage. A missing extension
 /// was never a soundness risk (`pair.rs` abandons a trial whose side errors, so a refutation
 /// always has two successful sides), but it was a reproducibility one.
+///
+/// Three session settings make DuckDB compute what Postgres computes, each where DuckDB's default
+/// does not, and each refuting equivalent pairs without it:
+///
+/// * `integer_division`: integer `/` truncates toward zero, as Postgres's does. DuckDB's default
+///   is floating-point division, so `a / 2` and `(a - a % 2) / 2` differ at `a = 1`, and `a / 2`
+///   against `a / 2.0` cannot be told apart. (DuckDB then has no `/` for an interval, so an
+///   `interval / n` side errors: a lost trial, not a different answer.)
+/// * `default_null_order = 'postgres'`: NULLs sort last under `ASC` and **first** under `DESC`.
+///   DuckDB's default puts them last under both, so `ORDER BY a DESC` and `a DESC NULLS FIRST`
+///   number rows differently in a window, or keep different rows under a `LIMIT`.
+/// * `TimeZone = 'UTC'`: a fixed session zone instead of the host's, so a verdict on a pair that
+///   converts between `timestamptz` and local time does not depend on the machine it ran on. Any
+///   one zone is a session Postgres can have, so a difference found under it is a real one.
+///
+/// What no setting fixes is handled in the query text instead (`crate::rewrite`): a zero divisor
+/// is made to raise, a regex match is made a partial one, and a bare `numeric` cast is widened.
 pub fn open_db() -> duckdb::Result<Connection> {
     let config = Config::default().threads(1)?.enable_autoload_extension(false)?;
-    Connection::open_in_memory_with_flags(config)
+    let con = Connection::open_in_memory_with_flags(config)?;
+    con.execute_batch(
+        "SET integer_division = true; \
+         SET default_null_order = 'postgres'; \
+         SET TimeZone = 'UTC';",
+    )?;
+    Ok(con)
 }
 
 /// Drop everything a side created, so the next side starts from a clean catalog. `thorough` also
@@ -240,9 +349,21 @@ fn rows_all_valid(t: &Table, rows: &[Vec<Val>]) -> bool {
 
 /// Insert the generated rows. A failing multi-row `INSERT` is atomic in DuckDB (it leaves the table
 /// untouched), so falling back row-by-row reproduces exactly the survivor set the row-by-row path
-/// would have produced on its own.
-fn insert_rows(con: &Connection, qn: &str, t: &Table, rows: &[Vec<Val>]) {
+/// would have produced on its own. Expression keys DuckDB would not index are checked row by row.
+fn insert_rows(
+    con: &Connection,
+    qn: &str,
+    t: &Table,
+    rows: &[Vec<Val>],
+    unindexed: &[&Vec<String>],
+) {
     let render = |row: &Vec<Val>| row.iter().map(lit).collect::<Vec<_>>().join(", ");
+    if !unindexed.is_empty() {
+        for row in rows {
+            insert_checked(con, qn, &render(row), unindexed);
+        }
+        return;
+    }
     if rows_all_valid(t, rows) {
         let all = rows
             .iter()
@@ -347,13 +468,33 @@ fn ensure_types(con: &Connection, stmt: &str) {
 /// and a rendering that kept the type would call two equal values different — a false refutation,
 /// the one failure this tester must not have. Rendering by value can only merge cells, never split
 /// them, so it cannot manufacture a counterexample either.
+///
+/// The same holds inside a composite value, so a composite is rendered from its parts' renderings
+/// rather than from its `Debug` text, which spells out each part's DuckDB type: `ROW(b)` over an
+/// `INTEGER`-materialized `bigint` and `ROW(b::bigint)` are one Postgres record. A STRUCT keeps its
+/// field order and drops its field names (a Postgres record has none to compare, and DuckDB names
+/// an anonymous one's fields after their expressions); a MAP is a set of entries; a fixed-size
+/// ARRAY is a LIST; a UNION is the value it holds.
 fn canon(v: &DVal) -> String {
     match v {
-        DVal::List(items) => {
+        DVal::List(items) | DVal::Array(items) => {
             let mut cs: Vec<String> = items.iter().map(canon).collect();
             cs.sort();
             format!("[{}]", cs.join(","))
         }
+        DVal::Struct(fields) => {
+            let cs: Vec<String> = fields.iter().map(|(_, v)| canon(v)).collect();
+            format!("({})", cs.join(","))
+        }
+        DVal::Map(entries) => {
+            let mut cs: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{}=>{}", canon(k), canon(v)))
+                .collect();
+            cs.sort();
+            format!("{{{}}}", cs.join(","))
+        }
+        DVal::Union(inner) => canon(inner),
         other => match number(other) {
             Some(n) => format!("Number({n})"),
             None => format!("{other:?}"),
@@ -410,13 +551,6 @@ fn fetch_rows(con: &Connection, sql: &str) -> duckdb::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Create tables, insert `rowdata`, run `stmt`, and return (comparable, row_count). `row_count` is
-/// deterministic even under a truncating LIMIT, so a count difference is always a sound signal.
-///
-/// `con` is shared across the pair's trials, so the catalog is cleared on the way *in* — an earlier
-/// side that failed mid-way may have left tables behind. `mutates` marks a statement that can create
-/// objects of its own, which the cheap name-directed reset would miss.
-#[allow(clippy::too_many_arguments)]
 /// Replay an instance and report, per table, the generated rows the database actually **accepted**.
 ///
 /// [`insert_rows`] drops any row violating a UNIQUE or NOT NULL constraint, so the generated rows
@@ -448,7 +582,7 @@ pub fn accepted_rows(
     for (fname, partsets) in forms {
         for parts in partsets {
             ensure_namespace(con, parts, &mut attached)?;
-            con.execute_batch(&ddl_for(parts, &schema[fname]))?;
+            let unindexed = create_table(con, parts, &schema[fname])?;
             let qn = qualify(parts);
             // Row by row unconditionally: the batched path in `insert_rows` is an optimisation for
             // the case where nothing is dropped, and it is the row-by-row path that reveals which.
@@ -456,8 +590,12 @@ pub fn accepted_rows(
                 .iter()
                 .filter(|row| {
                     let vals = row.iter().map(lit).collect::<Vec<_>>().join(", ");
-                    con.execute_batch(&format!("INSERT INTO {qn} VALUES ({vals})"))
-                        .is_ok()
+                    if unindexed.is_empty() {
+                        con.execute_batch(&format!("INSERT INTO {qn} VALUES ({vals})"))
+                            .is_ok()
+                    } else {
+                        insert_checked(con, &qn, &vals, &unindexed)
+                    }
                 })
                 .cloned()
                 .collect();
@@ -469,6 +607,12 @@ pub fn accepted_rows(
     Ok(out)
 }
 
+/// Create tables, insert `rowdata`, run `stmt`, and return (comparable, row_count). `row_count` is
+/// deterministic even under a truncating LIMIT, so a count difference is always a sound signal.
+///
+/// `con` is shared across the pair's trials, so the catalog is cleared on the way *in* — an earlier
+/// side that failed mid-way may have left tables behind. `mutates` marks a statement that can create
+/// objects of its own, which the cheap name-directed reset would miss.
 // Eight arguments, all of them per-side facts the caller already has; bundling them into a
 // struct would only move the same list one level out.
 #[allow(clippy::too_many_arguments)]
@@ -495,8 +639,14 @@ pub fn run_side(
     for (fname, partsets) in forms {
         for parts in partsets {
             ensure_namespace(con, parts, &mut attached)?;
-            con.execute_batch(&ddl_for(parts, &schema[fname]))?;
-            insert_rows(con, &qualify(parts), &schema[fname], &rowdata[fname]);
+            let unindexed = create_table(con, parts, &schema[fname])?;
+            insert_rows(
+                con,
+                &qualify(parts),
+                &schema[fname],
+                &rowdata[fname],
+                &unindexed,
+            );
         }
     }
 
@@ -550,6 +700,7 @@ mod tests {
             vt: VType::Json,
             notnull: false,
             array,
+            padded: false,
         }
     }
 
@@ -589,7 +740,7 @@ mod tests {
     fn a_json_column_round_trips_and_its_accessors_bind() {
         let t = Table {
             cols: vec![json_col("j", false), json_col("js", true)],
-            keys: vec![],
+            ..Table::default()
         };
         let ddl = ddl_for(&["t".to_string()], &t);
         assert!(ddl.contains("\"j\" JSON"), "{ddl}");
