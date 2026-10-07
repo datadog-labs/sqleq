@@ -119,7 +119,10 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   associative: `(0.1 + 0.2) + 0.3` is `0.6000000000000001` and `0.1 + (0.2 + 0.3)` is `0.6`. A
   float is VARBINARY, and arithmetic over any opaque operand, a float or a range or a point, is an
   uninterpreted `q_arith_<op>_<left>_<right>`. Proofs that need float arithmetic, or a float's
-  order against a constant, are given up with it.
+  order against a constant, are given up with it. For the same reason an aggregate that adds in
+  floating point is refused: `sum`, `avg` and the `stddev` and `var` family over a float add the
+  rows in the order they arrive, and `corr`, `covar_*` and the `regr_*` but `regr_count` are
+  declared over `double precision` only, so they do whatever they are given.
 - **`citext` and `char(n)` are refused.** Their `=` ignores case or trailing spaces. No IR type has
   that equality: as VARCHAR, `'A'` and `'a'` would be different values, and as an opaque type
   their `=` would be the prover's equality, which substitutes equals for equals, so from
@@ -234,9 +237,10 @@ what it is or refused:
   defines is a name like any other.
 - **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
   refused: modelled as the prover's own (`count`, `sum`, `avg`, `min`, `max`) or as an uninterpreted
-  function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop`, `corr`, `regr_*`, `range_agg`,
-  …); refused when the bag does not determine its result (`array_agg`, `string_agg`, the `json*_agg`
-  family, `any_value`) or when it is an ordered-set or hypothetical-set aggregate
+  function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop` over an exact type, `regr_count`,
+  `range_agg`, …); refused when the bag does not determine its result (`array_agg`, `string_agg`, the `json*_agg`
+  family, `any_value`, and an aggregate that adds in floating point: `sum` over a float, `corr`) or
+  when it is an ordered-set or hypothetical-set aggregate
   (`percentile_cont`, `mode`, `rank(…) WITHIN GROUP`). An aggregate in a subquery whose arguments
   read only an enclosing query's columns belongs to that query, and is refused. An aggregate a user
   defines is recognised only through a `declare aggregate function` line.

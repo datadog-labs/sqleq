@@ -228,8 +228,9 @@ mod aggregates {
     #[test]
     fn opaque_aggregates_carry_postgres_return_types() {
         // Postgres's own type where it has exactly one; opaque where it follows the argument.
-        // (Over the float `c`, `corr`, `regr_slope` and `stddev` are refused: an aggregate not known to
-        // give equal results on values `=` calls equal, such as `-0` and `0`, may not read one. See
+        // (`corr` and the other aggregates that add in floating point are refused, and so is
+        // `stddev` over the float `c`: see `tests/float_aggregates.rs`. Over `c` they would be refused
+        // anyway, as reads of a float not known to give equal results on `-0` and `0`: see
         // `tests/coarse_equality.rs`.)
         for (f, ty) in [
             (r#"bool_or("a" > 1)"#, "BOOLEAN"),
