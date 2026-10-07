@@ -47,8 +47,13 @@
 //!   any opaque operand is an uninterpreted `q_arith_*` function.
 //! * `citext` and the blank-padded `char(n)` are [`UNFAITHFUL`]: their `=` ignores case or trailing
 //!   spaces, so two values it calls equal can still be told apart, and a value of either is refused
-//!   wherever it reaches the plan ([`refuse_unfaithful`]).
+//!   wherever it reaches the plan ([`refuse_unfaithful`]). So are `box`, `circle`, `lseg` and
+//!   `line`, whose `=` compares within a tolerance and is not transitive.
 //! * Integer types are matched by name, so `int4range` and `point` are not integers.
+//! * A type no reader names keeps its own name (`numrange`), or is VARBINARY under raw DDL, and so
+//!   is the result of a function nobody declared. Its `=` is not taken to be identity
+//!   ([`coarse_class`]) unless it is on the [`opaque_identity`] list; a domain is its base type
+//!   ([`crate::catalog::Domains`]).
 //!
 //! A string literal compared with, or combined with, a value of another type is read at that type,
 //! as Postgres resolves an untyped literal: `a = '01'` over an INTEGER `a` compares with `1`
@@ -87,39 +92,101 @@ pub fn is_temporal(t: &str) -> bool {
 /// The prefix of an opaque type whose `=` is not identity: `VARBINARY:float` is VARBINARY to the
 /// provers, and to the frontend a value of a type whose `=` calls two values equal that a function
 /// can still tell apart ([`crate::equality`]). The part after the colon names what the value may be,
-/// as [`coarse_class`] returns it: `float`, `numeric`, `interval`, `jsonb`, or one of those with `[]`.
+/// as [`coarse_class`] returns it: `float`, `numeric`, `interval`, `jsonb`, one of those with `[]`,
+/// or the class of a value whose type the frontend does not know ([`UNKNOWN_CLASS`], or a type's own
+/// name).
 pub const COARSE_OPAQUE: &str = "VARBINARY:";
 
-/// What a value of type `t` is, among the types whose `=` is not identity: `numeric` for REAL,
-/// `interval`, `jsonb`, or the class a [`COARSE_OPAQUE`] name carries. `None` for every other type,
-/// whose `=` the frontend takes to be identity (see [`crate::equality`] for which those are).
+/// The frontend's name for an opaque value whose `=` is known to be identity: a column of a type on
+/// the [`opaque_identity`] list (`bytea`, `uuid`, `int[]`) or of one with no `=` at all
+/// ([`NO_EQUALITY`]), a cast to one, an array built of values whose `=` is identity, and the calls
+/// `crate::equality::call_type` knows to return one. VARBINARY to the provers, as a
+/// [`COARSE_OPAQUE`] name is.
+///
+/// Plain VARBINARY is the other kind: a value of a type the frontend does not know, such as the
+/// result of a function nobody declared or a column of a type no reader names. Its `=` is not taken
+/// to be identity ([`coarse_class`]), because identity is what has to be established: `round(i, 1)`
+/// is a `numeric` and `sqrt(i)` a float, and nothing in the IR says so.
+pub const IDENTITY_OPAQUE: &str = "VARBINARY=";
+
+/// The class [`coarse_class`] gives plain VARBINARY, a value of a type the frontend does not know.
+pub const UNKNOWN_CLASS: &str = "opaque";
+
+/// The types whose `=` the IR's own reading of them makes identity, as Postgres's is: the integers,
+/// text under a deterministic collation, `boolean`, and the temporal types but INTERVAL.
+const IDENTITY_TYPES: [&str; 7] = ["INTEGER", "VARCHAR", "BOOLEAN", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ"];
+
+/// The core types Postgres gives no `=` at all, so that no two of their values are ever one class:
+/// `DISTINCT`, `GROUP BY`, `UNION`, `IN` and a join over one fail (checked on Postgres 17), as does
+/// an array of one's `=`. Reading a value of one as itself, as the IR does, is faithful. Upper-cased,
+/// as a declared `CREATE TABLE` keeps their names.
+const NO_EQUALITY: [&str; 4] = ["JSON", "XML", "POINT", "POLYGON"];
+
+/// Whether the type name `name`, or the element type of an array named so, is one of the
+/// [`NO_EQUALITY`] types.
+fn no_equality(name: &str) -> bool {
+    let canon = name.replace(['"', '`'], "").to_uppercase();
+    let elem = canon.split('[').next().unwrap_or(&canon).trim();
+    let elem = elem.strip_suffix(" ARRAY").unwrap_or(elem).trim();
+    NO_EQUALITY.contains(&elem)
+}
+
+/// Whether the frontend knows `t`'s `=` to be identity: one of the IR's [`IDENTITY_TYPES`], an
+/// [`IDENTITY_OPAQUE`] value, or a type that keeps its own name and is on the [`opaque_identity`]
+/// list (`uuid` in a declared `CREATE TABLE`) or has no `=` ([`NO_EQUALITY`]).
+pub fn is_identity(t: &str) -> bool {
+    IDENTITY_TYPES.contains(&t) || t == IDENTITY_OPAQUE || (!is_opaque(t) && (opaque_identity(t) || no_equality(t)))
+}
+
+/// What a value of type `t` is, among the types whose `=` is not known to be identity: `numeric` for
+/// REAL, `interval`, `jsonb`, the class a [`COARSE_OPAQUE`] name carries, [`UNKNOWN_CLASS`] for plain
+/// VARBINARY, and its own name for a type the frontend does not know (`NUMRANGE`, an extension's
+/// type). `None` for a type whose `=` is identity ([`is_identity`]).
+///
+/// An allowlist, so that identity is the case to establish and not the default: a wrong `None` lets
+/// [`crate::equality`] pass an operation that tells two equal values apart, and a wrong class only
+/// costs proofs. Also `None` for an [`UNFAITHFUL`] type, whose `=` is not identity either, but which
+/// is refused wherever it reaches a plan ([`refuse_unfaithful`], which runs first).
 pub fn coarse_class(t: &str) -> Option<&str> {
     match t {
         "REAL" => Some("numeric"),
         "INTERVAL" => Some("interval"),
         "JSONB" => Some("jsonb"),
-        _ => t.strip_prefix(COARSE_OPAQUE),
+        "VARBINARY" => Some(UNKNOWN_CLASS),
+        _ if is_identity(t) || UNFAITHFUL.iter().any(|(n, _)| *n == t) => None,
+        _ => Some(t.strip_prefix(COARSE_OPAQUE).unwrap_or(t)),
     }
 }
 
-/// Whether `t` is VARBINARY to the provers: VARBINARY itself or a [`COARSE_OPAQUE`] name.
-pub fn is_opaque(t: &str) -> bool {
-    t == "VARBINARY" || t.starts_with(COARSE_OPAQUE)
+/// Whether `class`, as [`coarse_class`] returns it, is one the frontend knows the operations of:
+/// `numeric`, `float`, `interval` or `jsonb`, or an array of one. The others are values of types it
+/// does not know, of which it knows only that `=` is an equivalence relation.
+pub fn known_class(class: &str) -> bool {
+    matches!(class.trim_end_matches("[]"), "numeric" | "float" | "interval" | "jsonb")
 }
 
-/// `t` as a part of a function's name (`q_arith_add_varbinary_integer`): a [`COARSE_OPAQUE`] name is
-/// VARBINARY there as everywhere the provers look, so it names the same function it always did.
+/// Whether `t` is VARBINARY to the provers: VARBINARY itself, [`IDENTITY_OPAQUE`] or a
+/// [`COARSE_OPAQUE`] name.
+pub fn is_opaque(t: &str) -> bool {
+    t == "VARBINARY" || t == IDENTITY_OPAQUE || t.starts_with(COARSE_OPAQUE)
+}
+
+/// `t` as a part of a function's name (`q_arith_add_varbinary_integer`): an [`IDENTITY_OPAQUE`] or a
+/// [`COARSE_OPAQUE`] name is VARBINARY there as everywhere the provers look, so it names the same
+/// function it always did.
 pub fn name_part(t: &str) -> &str {
-    if t.starts_with(COARSE_OPAQUE) {
+    if is_opaque(t) {
         "VARBINARY"
     } else {
         t
     }
 }
 
-/// The opaque type a type name maps to: VARBINARY, or a [`COARSE_OPAQUE`] name for a float, for
-/// `jsonb`, and for an array of `numeric`, of a float, of `interval` or of `jsonb`, whose `=` compares
-/// the elements with theirs. Upper or lower case, with or without a typmod.
+/// The opaque type a type name maps to: a [`COARSE_OPAQUE`] name for a float, for `jsonb`, and for an
+/// array of `numeric`, of a float, of `interval` or of `jsonb`, whose `=` compares the elements with
+/// theirs; [`IDENTITY_OPAQUE`] for a type on the [`opaque_identity`] list, or one with no `=`
+/// ([`NO_EQUALITY`]); VARBINARY, whose `=` is not known, for any other. Upper or lower case, with or
+/// without a typmod.
 pub fn opaque_name(name: &str) -> &'static str {
     let up = name.replace(['"', '`'], "").to_uppercase();
     let up = up.trim();
@@ -150,18 +217,20 @@ pub fn opaque_name(name: &str) -> &'static str {
             Some("float") => "VARBINARY:float[]",
             Some("interval") => "VARBINARY:interval[]",
             Some("jsonb") => "VARBINARY:jsonb[]",
+            _ if opaque_identity(name) || no_equality(name) => IDENTITY_OPAQUE,
             _ => "VARBINARY",
         },
         None => match class(up) {
             Some("float") => "VARBINARY:float",
             Some("jsonb") => "VARBINARY:jsonb",
+            _ if opaque_identity(name) || no_equality(name) => IDENTITY_OPAQUE,
             _ => "VARBINARY",
         },
     }
 }
 
-/// The spelling a type leaves the frontend with. Three differ: TIMESTAMPTZ is emitted as TIMESTAMP,
-/// and an [`UNFAITHFUL`] type and a [`COARSE_OPAQUE`] one as VARBINARY.
+/// The spelling a type leaves the frontend with. Four differ: TIMESTAMPTZ is emitted as TIMESTAMP,
+/// and an [`UNFAITHFUL`] type, an [`IDENTITY_OPAQUE`] one and a [`COARSE_OPAQUE`] one as VARBINARY.
 ///
 /// QED reads DATE, TIME and TIMESTAMP as its integer sort, which keeps their order and their
 /// arithmetic, and any other name as an uninterpreted sort with equality only. A TIMESTAMPTZ is an
@@ -172,7 +241,7 @@ pub fn opaque_name(name: &str) -> &'static str {
 pub fn emitted_type_name(t: &str) -> &str {
     if t == "TIMESTAMPTZ" {
         "TIMESTAMP"
-    } else if t.starts_with(COARSE_OPAQUE) {
+    } else if is_opaque(t) {
         "VARBINARY"
     } else if UNFAITHFUL.iter().any(|(n, _)| *n == t) {
         // A schema's column that no query reads, or a value in a pair whose two plans are one
@@ -306,13 +375,70 @@ pub fn scalar_class(name: &str) -> Option<Scalar> {
 /// strings. An opaque type would make their `=` the prover's equality, which substitutes equals for
 /// equals: from `t.c = u.c` it concludes `t.c::text = u.c::text`, and over citext `'a'` and `'A'`
 /// are equal while their text is not. An array of either compares its elements the same way.
+///
+/// Four of the geometric types are here for a stronger reason: their `=` is not an equivalence
+/// relation, so no reading of their values as classes is faithful, and refusing the operations that
+/// tell two equal values apart ([`crate::equality`]) would not help. `box` and `circle` compare
+/// areas, `lseg` its endpoints and `line` its coefficients, each within a tolerance of `1e-6`, so
+/// `a = b` and `b = c` do not make `a = c`: boxes of area 1, 1.0000009 and 1.0000018 are such a
+/// chain (checked on Postgres 17). A prover reads `=` as an equivalence on every type, and would
+/// prove `a = b AND b = c` the same predicate as `a = b AND b = c AND a = c`. (`path`'s `=`, which
+/// compares the number of points, is an equivalence; `point` and `polygon` have no `=`.)
 pub const UNFAITHFUL: &[(&str, &str)] = &[
     ("CITEXT", "citext compares case-insensitively"),
     ("BPCHAR", "char(n) compares ignoring trailing spaces"),
+    ("BOX", "box compares areas within a tolerance"),
+    ("CIRCLE", "circle compares areas within a tolerance"),
+    ("LSEG", "lseg compares endpoints within a tolerance"),
+    ("LINE", "line compares coefficients within a tolerance"),
     // A column under a collation the IR cannot carry (`crate::collation`), whose own refusal, with
     // its own message, runs first.
     (crate::collation::COLLATED, "its collation may compare different strings as equal"),
 ];
+
+/// The core Postgres functions that return a value of one of the geometric [`UNFAITHFUL`] types, with
+/// the type: every function `pg_proc` lists with such a result on Postgres 17, by its unqualified,
+/// upper-cased name. Each name returns that type in every one of its overloads (`box(point, point)`,
+/// `box(circle)`), so the name decides.
+///
+/// A call nobody declared is otherwise opaque (`lower::UNDECLARED_RET`), and an opaque value's `=` is
+/// read as an equivalence relation, which is what these types' `=` is not. A function a user defines
+/// that returns one is a name like any other, as a volatile one is.
+const GEOMETRIC_RESULTS: [(&str, &str); 25] = [
+    ("BOX", "BOX"),
+    ("BOX_IN", "BOX"),
+    ("BOX_RECV", "BOX"),
+    ("BOUND_BOX", "BOX"),
+    ("BOX_ADD", "BOX"),
+    ("BOX_SUB", "BOX"),
+    ("BOX_MUL", "BOX"),
+    ("BOX_DIV", "BOX"),
+    ("BOX_INTERSECT", "BOX"),
+    ("GIST_BOX_UNION", "BOX"),
+    ("SPG_POLY_QUAD_COMPRESS", "BOX"),
+    ("CIRCLE", "CIRCLE"),
+    ("CIRCLE_IN", "CIRCLE"),
+    ("CIRCLE_RECV", "CIRCLE"),
+    ("CIRCLE_ADD_PT", "CIRCLE"),
+    ("CIRCLE_SUB_PT", "CIRCLE"),
+    ("CIRCLE_MUL_PT", "CIRCLE"),
+    ("CIRCLE_DIV_PT", "CIRCLE"),
+    ("LSEG", "LSEG"),
+    ("LSEG_IN", "LSEG"),
+    ("LSEG_RECV", "LSEG"),
+    ("DIAGONAL", "LSEG"),
+    ("LINE", "LINE"),
+    ("LINE_IN", "LINE"),
+    ("LINE_RECV", "LINE"),
+];
+
+/// The geometric [`UNFAITHFUL`] type a call to the function `name` returns, if it is one of the
+/// [`GEOMETRIC_RESULTS`]. `name` as the IR spells a call, upper-cased; a qualified name is matched on
+/// its last part, since `pg_catalog.box` is `box`.
+pub fn unfaithful_result(name: &str) -> Option<&'static str> {
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    GEOMETRIC_RESULTS.iter().find(|(n, _)| *n == bare).map(|(_, t)| *t)
+}
 
 /// The [`UNFAITHFUL`] type a type name denotes, an array of one included, or `None`.
 ///
@@ -329,6 +455,10 @@ pub fn unfaithful_type(name: &str) -> Option<&'static str> {
     match elem {
         "CITEXT" => Some("CITEXT"),
         "CHAR" | "CHARACTER" | "BPCHAR" | "NCHAR" | "NATIONAL CHAR" | "NATIONAL CHARACTER" => Some("BPCHAR"),
+        "BOX" => Some("BOX"),
+        "CIRCLE" => Some("CIRCLE"),
+        "LSEG" => Some("LSEG"),
+        "LINE" => Some("LINE"),
         _ => None,
     }
 }
@@ -344,7 +474,8 @@ pub fn unfaithful_type(name: &str) -> Option<&'static str> {
 /// cannot matter to a proof that a plan equals itself.
 ///
 /// The types whose `=` is coarser than identity in a way some IR type can still carry -- `numeric`,
-/// the floats, `interval`, `jsonb` -- are [`crate::equality`]'s.
+/// the floats, `interval`, `jsonb`, and any other whose `=` is not known to be identity -- are
+/// [`crate::equality`]'s.
 pub fn refuse_unfaithful(input: &Value) -> Result<()> {
     if input["queries"][0] == input["queries"][1] {
         return Ok(());
@@ -374,10 +505,12 @@ pub fn unfaithful_refusal(name: &str) -> crate::error::FrontendError {
 
 /// Map a sqlparser `DataType` to the prover's type string. Classifies on the rendered type name so
 /// it stays robust across sqlparser versions, by exact name ([`scalar_class`]). Temporal types keep
-/// their own names (see the module docs); BINARY/BLOB/BYTEA and arrays become the opaque
-/// `VARBINARY`, and floats and arrays whose elements' `=` is not identity a [`COARSE_OPAQUE`] name
+/// their own names (see the module docs); BINARY/BLOB/BYTEA and arrays become opaque: an array of
+/// values whose `=` is identity and a binary type [`IDENTITY_OPAQUE`], floats and arrays whose
+/// elements' `=` is not identity a [`COARSE_OPAQUE`] name, any other array VARBINARY
 /// ([`opaque_name`]); the [`UNFAITHFUL`] types keep their own names; unknown types pass through
-/// uppercased.
+/// uppercased, and [`coarse_class`] reads their `=` as not identity unless [`opaque_identity`] lists
+/// them.
 pub fn map_type(dt: &DataType) -> String {
     let s = format!("{dt}").to_uppercase();
     let base = s.split('(').next().unwrap_or(&s).trim();
@@ -403,7 +536,7 @@ pub fn map_type(dt: &DataType) -> String {
         Some(Scalar::Numeric) => "REAL",
         // `-0 = 0` holds, and the two print differently: see [`crate::equality`].
         Some(Scalar::Float) => opaque_name(base),
-        Some(Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Binary) => IDENTITY_OPAQUE,
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => base,
@@ -414,9 +547,10 @@ pub fn map_type(dt: &DataType) -> String {
 /// Normalise a type name written in the `declare ... function ... returns T` DSL.
 ///
 /// The DSL names the IR's types, so `REAL`, and `DOUBLE`, the spelling the preprocessor wrote for
-/// it, are the IR's exact REAL, and `VARBINARY` is the opaque type. Postgres's other names read as
-/// they do in a `CREATE TABLE` ([`map_type`]): `float8` is opaque (`VARBINARY:float`), and `char` and
-/// `citext` are [`UNFAITHFUL`].
+/// it, are the IR's exact REAL, and `VARBINARY` is the opaque type, whose `=` is not known to be
+/// identity: it says nothing about which Postgres type the function returns, and `bytea` is read the
+/// same way. Postgres's other names read as they do in a `CREATE TABLE` ([`map_type`]): `float8` is
+/// opaque (`VARBINARY:float`), and `char` and `citext` are [`UNFAITHFUL`].
 pub fn normalize_type_name(t: &str) -> String {
     let up = t.to_uppercase();
     if let Some(class) = temporal_class(&up) {
@@ -446,7 +580,9 @@ pub fn normalize_type_name(t: &str) -> String {
 /// Read for the columns emitted as the opaque VARBINARY, which stands for types of both kinds. The
 /// emitted schema lists those columns (`opaque_identity`), and `sqleq-solver` reads `=` on them as
 /// identity, which lets it put one side of an equality in place of the other and deduplicate by
-/// value; on every other opaque column it compares through a key and refuses to deduplicate. A wrong
+/// value; on every other opaque column it compares through a key and refuses to deduplicate. The
+/// frontend reads the list too: a value of a type on it is [`IDENTITY_OPAQUE`] or keeps its own name,
+/// and [`crate::equality`] lets an operation that observes more than its class read it. A wrong
 /// `true` is a false-proof channel and a wrong `false` only costs proofs, so this is an allowlist,
 /// each entry checked on Postgres 17:
 ///
@@ -503,18 +639,32 @@ pub fn is_builtin(t: &str) -> bool {
 /// Common type for a comparison's two operands. A non-builtin (opaque) type such as VARBINARY wins
 /// (we cast the other side to it, as Calcite does); otherwise REAL > VARCHAR > INTEGER.
 ///
-/// Where the two meet at VARBINARY and one of them is a type whose `=` is not identity
-/// ([`coarse_class`]), the result is the [`COARSE_OPAQUE`] name of that type: VARBINARY to the
-/// provers, so nothing they read changes, and to [`crate::equality`] a value that may still be the
-/// `numeric` it was. A `CASE` with a `numeric` branch and an opaque one may yield the `numeric`.
+/// Where the two meet at an opaque type, its name says what is known of the result's `=`
+/// ([`coarse_class`]): VARBINARY to the provers, so nothing they read changes, and to
+/// [`crate::equality`] a value that may still be the `numeric` it was. A `CASE` with a `numeric`
+/// branch and an opaque one may yield the `numeric`, so a class the frontend knows the operations of
+/// wins ([`known_class`]), then a type it does not know; the result is [`IDENTITY_OPAQUE`] only where
+/// both sides' `=` is identity.
 pub fn common_type(a: &str, b: &str) -> String {
     let t = common_type_of_names(a, b);
-    if t == "VARBINARY" {
-        if let Some(class) = coarse_class(a).or_else(|| coarse_class(b)) {
-            return format!("{COARSE_OPAQUE}{class}");
-        }
+    if !is_opaque(&t) {
+        return t;
     }
-    t
+    let classes: Vec<&str> = [t.as_str(), a, b].into_iter().filter_map(coarse_class).collect();
+    match classes.iter().find(|c| known_class(c)).or_else(|| classes.first()) {
+        Some(class) => opaque_of_class(class),
+        None => IDENTITY_OPAQUE.to_string(),
+    }
+}
+
+/// The opaque name of a value of the class `class`, as [`coarse_class`] returns it: plain VARBINARY
+/// for [`UNKNOWN_CLASS`], a [`COARSE_OPAQUE`] name for any other.
+pub fn opaque_of_class(class: &str) -> String {
+    if class == UNKNOWN_CLASS {
+        "VARBINARY".to_string()
+    } else {
+        format!("{COARSE_OPAQUE}{class}")
+    }
 }
 
 // Same reasoning as `map_type`: the opaque-wins arms are separate because they answer
@@ -756,10 +906,23 @@ pub fn temporal_mismatch(a: &str, b: &str) -> bool {
 
 /// Whether a column whose type a construct takes from its first branch or row, `first` (a set
 /// operation, a `VALUES` list), would hold under it a value of type `other` whose `=` is not identity
-/// while `first`'s is. A read of the column would take the value for one whose `=` is identity, so
-/// [`crate::equality`] would let through an operation that tells two equal values apart.
+/// while `first`'s is, or one of a class the frontend knows the operations of ([`known_class`]) while
+/// `first` is of a type it does not know. A read of the column would take the value for one whose `=`
+/// is identity, so [`crate::equality`] would let through an operation that tells two equal values
+/// apart, or for one that is not a float, so `sum` over it would not be refused as adding in
+/// floating point.
+///
+/// A value of a type the frontend does not know under a column of a date, time or timestamp type, or
+/// of `boolean`, hides nothing. Postgres gives the column one type for all its branches or rows, of
+/// the first one's category, and fails the query otherwise; in these two categories every type's `=`
+/// is identity (`timetz`'s too), so whatever the value is, it is one of those, an untyped parameter
+/// or literal included.
 pub fn hides_coarse(first: &str, other: &str) -> bool {
-    coarse_class(first).is_none() && coarse_class(other).is_some()
+    match (coarse_class(first), coarse_class(other)) {
+        (None, Some(o)) => known_class(o) || !matches!(first, "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "BOOLEAN"),
+        (Some(f), Some(o)) => !known_class(f) && known_class(o),
+        _ => false,
+    }
 }
 
 /// Coerce the left operand of `x IN (subquery)` to the type of the subquery's column, which is

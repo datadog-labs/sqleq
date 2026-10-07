@@ -8,14 +8,14 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    visit_expressions, ColumnDef, ColumnOption, ConstraintCharacteristics, DeferrableInitial, Expr,
+    visit_expressions, ColumnDef, ColumnOption, ConstraintCharacteristics, DataType, DeferrableInitial, Expr,
     FunctionArguments, IndexColumn, ObjectName, ObjectNamePart, Query, Statement, TableConstraint,
 };
 
 use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
-use crate::types::{map_type, opaque_identity};
+use crate::types::{map_type, opaque_identity, IDENTITY_OPAQUE};
 
 /// Columns Postgres puts on every table and no DDL ever declares.
 ///
@@ -51,8 +51,8 @@ pub struct Table {
     pub nullable: Vec<bool>,
     /// Parallel to `cols`: `true` only where the column is the opaque VARBINARY and its declared
     /// Postgres type has an `=` that is identity ([`opaque_identity`]), as `bytea` and `uuid` do and
-    /// `double precision` and `jsonb` do not. Emitted in the schema for `sqleq-solver`, which then
-    /// reads `=` on the column as identity.
+    /// `double precision` and `jsonb` do not; its type in `cols` is then [`IDENTITY_OPAQUE`]. Emitted
+    /// in the schema for `sqleq-solver`, which then reads `=` on the column as identity.
     ///
     /// Direction matters for soundness, as for [`Table::nullable`]: a false `true` licenses
     /// substituting values that `=` calls equal and a cast tells apart, while a false `false`
@@ -234,6 +234,72 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
     Some((name.to_uppercase(), FnDecl { ret, aggregate }))
 }
 
+/// The domains a DDL creates (`CREATE DOMAIN d AS numeric`), each by the name a column's type spells
+/// it with, as the type it is over; `None` for a name read as no domain.
+///
+/// A domain's `=`, its operators and its casts are its base type's: Postgres resolves an operator over
+/// a domain value as over the base type, so a domain over `numeric` is a `numeric` to every operation,
+/// `2.0 = 2.00` and `CAST(x AS TEXT)` included. So both readers of a `CREATE TABLE` type a column of
+/// one as its base type ([`Domains::resolve`]). What a domain adds, a `CHECK` or a `NOT NULL`, only
+/// narrows the values the column holds, and reading the column as the base type quantifies over more
+/// instances than Postgres has, which costs proofs and never makes one. (A domain's `DEFAULT` is not
+/// read, as no column's default is outside the `INSERT` reduction's guard.)
+///
+/// Not read as a domain, so that a column of it keeps the domain's name, a type the frontend does not
+/// know: a name created twice, a domain with a `COLLATE` (under which its `=` need not be its base
+/// type's), and a name Postgres predefines a type under ([`PG_CATALOG_TYPES`]), which it resolves to
+/// `pg_catalog`'s type first.
+pub struct Domains(HashMap<String, Option<DataType>>);
+
+/// The types Postgres 17 predefines in `pg_catalog`, but arrays: the names a domain of the same name
+/// does not shadow ([`Domains`]).
+const PG_CATALOG_TYPES: [&str; 80] = [
+    "aclitem", "bit", "bool", "box", "bpchar", "bytea", "char", "cid", "cidr", "circle", "date", "datemultirange",
+    "daterange", "float4", "float8", "gtsvector", "inet", "int2", "int4", "int4multirange", "int4range", "int8",
+    "int8multirange", "int8range", "interval", "json", "jsonb", "jsonpath", "line", "lseg", "macaddr", "macaddr8",
+    "money", "name", "numeric", "nummultirange", "numrange", "oid", "path", "pg_brin_bloom_summary",
+    "pg_brin_minmax_multi_summary", "pg_dependencies", "pg_lsn", "pg_mcv_list", "pg_ndistinct", "pg_node_tree",
+    "pg_snapshot", "point", "polygon", "refcursor", "regclass", "regcollation", "regconfig", "regdictionary",
+    "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "text", "tid", "time",
+    "timestamp", "timestamptz", "timetz", "tsmultirange", "tsquery", "tsrange", "tstzmultirange", "tstzrange",
+    "tsvector", "txid_snapshot", "uuid", "varbit", "varchar", "xid", "xid8", "xml",
+];
+
+/// The key a type's name is looked up under: its last part, lower-cased, as a table's is.
+fn domain_key(name: &ObjectName) -> String {
+    obj_name(name).rsplit('.').next().unwrap_or_default().to_lowercase()
+}
+
+impl Domains {
+    /// The domains `statements` create.
+    pub fn of<'a>(statements: impl IntoIterator<Item = &'a Statement>) -> Domains {
+        let mut out: HashMap<String, Option<DataType>> = HashMap::new();
+        for st in statements {
+            let Statement::CreateDomain(d) = st else { continue };
+            let key = domain_key(&d.name);
+            let usable = d.collation.is_none() && !PG_CATALOG_TYPES.contains(&key.as_str());
+            let base = usable.then(|| d.data_type.clone());
+            out.entry(key).and_modify(|b| *b = None).or_insert(base);
+        }
+        Domains(out)
+    }
+
+    /// The type a column declared as `dt` holds: `dt`, or the type the domain it names is over,
+    /// followed through a domain over a domain.
+    pub fn resolve<'a>(&'a self, mut dt: &'a DataType) -> &'a DataType {
+        // A domain over itself is not one Postgres creates; the bound keeps such an input finite,
+        // and leaves its column the domain's name.
+        for _ in 0..=self.0.len() {
+            let DataType::Custom(name, modifiers) = dt else { break };
+            match self.0.get(&domain_key(name)) {
+                Some(Some(base)) if modifiers.is_empty() => dt = base,
+                _ => break,
+            }
+        }
+        dt
+    }
+}
+
 /// Build the catalog from the input's `CREATE TABLE`s.
 ///
 /// Split from [`collect_queries`], which used to be the same pass, because the DML reduction sits
@@ -243,6 +309,7 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
     let mut catalog = Catalog { tables: Vec::new() };
     let created = crate::collation::created(statements);
+    let domains = Domains::of(statements);
     for st in statements {
         let Statement::CreateTable(ct) = st else { continue };
         let tname = obj_name(&ct.name).to_lowercase();
@@ -254,9 +321,12 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let mut collations: Vec<Collation> = Vec::new();
         for c in &ct.columns {
             let cname = crate::dml::fold_ident(&c.name);
-            let (cty, collation) = crate::collation::column(&c.options, map_type(&c.data_type), &created);
+            let data_type = domains.resolve(&c.data_type);
+            let (cty, collation) = crate::collation::column(&c.options, map_type(data_type), &created);
             let idx = cols.len();
-            identity.push(cty == "VARBINARY" && opaque_identity(&c.data_type.to_string()));
+            // A collated column is `COLLATED`, never identity. The list `sqleq-solver` reads is
+            // `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type with no `=`.
+            identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&data_type.to_string()));
             cols.push((cname, cty));
             collations.push(collation);
             nullable.push(true);
