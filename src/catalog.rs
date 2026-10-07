@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    visit_expressions, ColumnDef, ColumnOption, Expr, FunctionArguments, IndexColumn, ObjectName,
-    ObjectNamePart, Query, Statement, TableConstraint,
+    visit_expressions, ColumnDef, ColumnOption, ConstraintCharacteristics, DeferrableInitial, Expr,
+    FunctionArguments, IndexColumn, ObjectName, ObjectNamePart, Query, Statement, TableConstraint,
 };
 
 use crate::error::{schema, unsupported, Result};
@@ -45,6 +45,9 @@ pub struct Table {
     /// Nullable is therefore the default, and this is set `false` only for an explicit `NOT NULL`
     /// or a `PRIMARY KEY` (which implies it). Missing the constraint merely costs completeness.
     pub nullable: Vec<bool>,
+    /// Column sets the DDL declares unique: every `PRIMARY KEY` and `UNIQUE` constraint that holds
+    /// at every statement (see [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is
+    /// not here.
     pub keys: Vec<Vec<usize>>,
     /// Parallel to `cols`: `true` only where the DDL proves the stored value is a function of the
     /// row as written, rather than of the row's *position* in the statement.
@@ -152,6 +155,24 @@ fn index_col_name(ic: &IndexColumn) -> Option<String> {
     }
 }
 
+/// Whether a `PRIMARY KEY` or `UNIQUE` constraint with these characteristics holds after every
+/// statement, which is what a key told to a prover claims: no state a query can observe has two
+/// rows agreeing on it.
+///
+/// Only the default, `NOT DEFERRABLE`, does. A `DEFERRABLE` constraint is checked when the
+/// transaction commits if it is `INITIALLY DEFERRED` (which implies `DEFERRABLE`), or once a
+/// transaction runs `SET CONSTRAINTS ... DEFERRED` if it is `INITIALLY IMMEDIATE`; until then a
+/// query sees the duplicates. `NOT ENFORCED` is not accepted on a key by Postgres, and a constraint
+/// that says it is not enforced is no premise either. The `NOT NULL` a `PRIMARY KEY` implies is a
+/// separate constraint, enforced at once whatever the key's deferrability, so it is kept.
+pub(crate) fn enforced_per_statement(c: Option<&ConstraintCharacteristics>) -> bool {
+    c.is_none_or(|c| {
+        c.deferrable != Some(true)
+            && c.initially != Some(DeferrableInitial::Deferred)
+            && c.enforced != Some(false)
+    })
+}
+
 /// Parse a `declare scalar|aggregate function NAME(args) returns TYPE;` DSL line into
 /// `(uppercased name, declaration)`.
 ///
@@ -214,11 +235,18 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             nullable.push(true);
             determined.push(row_determined(c));
             for opt in &c.options {
-                match opt.option {
-                    ColumnOption::Unique { .. } => keys.push(vec![idx]),
-                    // `PRIMARY KEY` is a key *and* implies `NOT NULL`.
-                    ColumnOption::PrimaryKey(_) => {
-                        keys.push(vec![idx]);
+                match &opt.option {
+                    ColumnOption::Unique(u) => {
+                        if enforced_per_statement(u.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
+                    }
+                    // `PRIMARY KEY` is a key *and* implies `NOT NULL`; the second holds even when
+                    // the first is deferrable.
+                    ColumnOption::PrimaryKey(pk) => {
+                        if enforced_per_statement(pk.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
                         nullable[idx] = false;
                     }
                     ColumnOption::NotNull => nullable[idx] = false,
@@ -229,11 +257,15 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let name_index: HashMap<String, usize> =
             cols.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
         for con in &ct.constraints {
-            // UNIQUE and PRIMARY KEY both become a key column-set; only PRIMARY KEY also implies its
-            // columns are NOT NULL.
-            let (key_cols, implies_not_null): (&[IndexColumn], bool) = match con {
-                TableConstraint::Unique(uc) => (&uc.columns, false),
-                TableConstraint::PrimaryKey(pk) => (&pk.columns, true),
+            // UNIQUE and PRIMARY KEY both become a key column-set, unless deferrable; only PRIMARY
+            // KEY also implies its columns are NOT NULL, deferrable or not.
+            let (key_cols, implies_not_null, enforced): (&[IndexColumn], bool, bool) = match con {
+                TableConstraint::Unique(uc) => {
+                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+                }
+                TableConstraint::PrimaryKey(pk) => {
+                    (&pk.columns, true, enforced_per_statement(pk.characteristics.as_ref()))
+                }
                 _ => continue,
             };
             let set: Vec<usize> = key_cols
@@ -248,7 +280,9 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
                         nullable[i] = false;
                     }
                 }
-                keys.push(set);
+                if enforced {
+                    keys.push(set);
+                }
             }
         }
         catalog.tables.push(Table {

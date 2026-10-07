@@ -34,7 +34,7 @@ use sqlparser::ast::{ColumnOption, Statement, TableConstraint};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{obj_name, Catalog, Table};
+use crate::catalog::{enforced_per_statement, obj_name, Catalog, Table};
 use crate::infer::{map_type_name, Ty};
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
@@ -414,10 +414,18 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
             for opt in &c.options {
-                match opt.option {
-                    ColumnOption::Unique { .. } => keys.push(vec![idx]),
-                    ColumnOption::PrimaryKey(_) => {
-                        keys.push(vec![idx]);
+                match &opt.option {
+                    // A deferrable key is no key (`catalog::enforced_per_statement`); the NOT NULL a
+                    // PRIMARY KEY implies holds either way.
+                    ColumnOption::Unique(u) => {
+                        if enforced_per_statement(u.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
+                    }
+                    ColumnOption::PrimaryKey(pk) => {
+                        if enforced_per_statement(pk.characteristics.as_ref()) {
+                            keys.push(vec![idx]);
+                        }
                         nullable[idx] = false;
                     }
                     ColumnOption::NotNull => nullable[idx] = false,
@@ -431,9 +439,13 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let by_name: HashMap<&str, usize> =
             cols.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
         for con in &ct.constraints {
-            let (key_cols, pk) = match con {
-                TableConstraint::Unique(uc) => (&uc.columns, false),
-                TableConstraint::PrimaryKey(p) => (&p.columns, true),
+            let (key_cols, pk, enforced) = match con {
+                TableConstraint::Unique(uc) => {
+                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+                }
+                TableConstraint::PrimaryKey(p) => {
+                    (&p.columns, true, enforced_per_statement(p.characteristics.as_ref()))
+                }
                 _ => continue,
             };
             let set: Vec<usize> = key_cols
@@ -455,7 +467,9 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
                     nullable[i] = false;
                 }
             }
-            keys.push(set);
+            if enforced {
+                keys.push(set);
+            }
         }
         // Two spellings of the same key (a column `UNIQUE` also named in a table constraint) are one
         // key. Order-preserving so the emitted schema is stable.

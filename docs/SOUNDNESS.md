@@ -52,7 +52,11 @@ completeness, not soundness. Two such misses are known: `pgddl` does not read ke
 functional-dependence refusals — completeness work, in the safe direction. And a key reaches a prover
 only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
 columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
-`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query.
+`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query. Nor is a key read
+from a `DEFERRABLE` constraint (`INITIALLY DEFERRED`, which implies it, included): Postgres checks
+it when the transaction commits, or once a transaction defers it, so a query inside the
+transaction can see two rows that agree on it. The `NOT NULL` a deferrable `PRIMARY KEY` implies is
+checked at once, and is kept.
 
 ### Dates and timestamps are not one integer
 
