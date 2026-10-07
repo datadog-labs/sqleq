@@ -25,7 +25,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::ic::Ics;
-use crate::translate::OUT_VAR_ID;
+use crate::translate::{NUMERIC_EQ_KEY, OUT_VAR_ID};
 use crate::uterm::{mk_mul, mk_sum, PredKind, UConst, UTerm, UVar};
 
 /// Rounds of (simplify, eliminate bound vars, rename apart) before giving up on a fixpoint. Stopping
@@ -45,11 +45,48 @@ pub struct Normalizer {
     /// Integrity constraints to rewrite with; empty for none. An explicit parameter, where Java
     /// selects them through static state (`QueryUExprICRewriter.selectIC`).
     ics: Ics,
+    /// Set once a step of a round has produced a term past `max_tree`; the round then stops where
+    /// it is, and [`Normalizer::normalize`] answers `TooLarge`.
+    too_large: std::cell::Cell<bool>,
+    /// The tree size of the whole term while [`Normalizer::eliminate_bound`] rewrites it one sum at
+    /// a time: each sum's new body is charged its growth here, so many sums that each grow a little
+    /// cannot together outgrow the budget unnoticed.
+    size_now: std::cell::Cell<usize>,
 }
 
 impl Normalizer {
     pub fn new(widths: HashMap<u32, usize>, max_tree: usize) -> Self {
-        Normalizer { widths, max_tree, ics: Ics::default() }
+        Normalizer {
+            widths,
+            max_tree,
+            ics: Ics::default(),
+            too_large: std::cell::Cell::new(false),
+            size_now: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Whether `t`, read as a tree, is past the size budget -- and if so, remembers it. Checked after
+    /// every step that can grow a term, not only between rounds: distributing a product over a
+    /// sum multiplies sizes within one bottom-up pass, and each later step walks the tree, so a
+    /// term that has outgrown the budget must not reach the next step.
+    fn over_budget(&self, t: &UTerm) -> bool {
+        if !self.too_large.get() && t.tree_size(self.max_tree + 1) > self.max_tree {
+            self.too_large.set(true);
+        }
+        self.too_large.get()
+    }
+
+    /// Replacing a sum's body `old` with `new` inside the term [`Normalizer::eliminate_bound`] is
+    /// rewriting: charges the difference to the whole term's size, and whether that is now past the
+    /// budget.
+    fn charge(&self, old: &UTerm, new: &UTerm) -> bool {
+        let cap = self.max_tree + 1;
+        let now = (self.size_now.get() + new.tree_size(cap)).saturating_sub(old.tree_size(cap));
+        self.size_now.set(now);
+        if now > self.max_tree {
+            self.too_large.set(true);
+        }
+        self.too_large.get()
     }
 
     /// Rewrites with these constraints as well. The result is then only equivalent to the input
@@ -61,10 +98,13 @@ impl Normalizer {
 
     pub fn normalize(&mut self, t: &UTerm) -> Result<UTerm, NormalizeError> {
         let t = if self.ics.keys.is_empty() { t.clone() } else { mark_set_tables(t, &self.ics) };
+        if self.over_budget(&t) {
+            return Err(NormalizeError::TooLarge);
+        }
         let mut cur = self.rename_apart(&t);
         for _ in 0..MAX_ROUNDS {
             let next = self.round(&cur);
-            if next.tree_size(self.max_tree + 1) > self.max_tree {
+            if self.over_budget(&next) {
                 return Err(NormalizeError::TooLarge);
             }
             if next == cur {
@@ -76,9 +116,13 @@ impl Normalizer {
     }
 
     /// One round: local rules, bound-var elimination, renaming apart. Public so tooling can trace
-    /// how a term evolves; [`Normalizer::normalize`] is the entry point.
+    /// how a term evolves; [`Normalizer::normalize`] is the entry point. A step whose result is past
+    /// the size budget ends the round early, with that result, which is still equivalent to `t`.
     pub fn round(&mut self, t: &UTerm) -> UTerm {
         let mut next = simplify(t);
+        if self.over_budget(&next) {
+            return next;
+        }
         if !self.ics.not_null.is_empty() {
             next = self.remove_not_null(&next);
         }
@@ -86,9 +130,19 @@ impl Normalizer {
             next = self.drop_key_squash(&next);
         }
         let next = canonicalize_congruence(&next);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.contradict_neg_sum(&next);
+        self.size_now.set(next.tree_size(self.max_tree + 1));
         let next = self.eliminate_bound(&next);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.merge_complements(&next, false);
+        if self.over_budget(&next) {
+            return next;
+        }
         let next = self.rename_apart(&next);
         // Squash spines strip set markers (`‖T(x)‖` inside a squash is `T(x)`), and removing a
         // squash can expose such an atom again; re-marking every round keeps one canonical form.
@@ -198,6 +252,9 @@ impl Normalizer {
     /// (`QueryUExprNormalizer.removeDeterminedBoundedVarByTuple`/`ByConst`), and single columns so
     /// fixed (`removeDeterminedBoundedColumnByConst`). Inner sums first.
     fn eliminate_bound(&mut self, t: &UTerm) -> UTerm {
+        if self.too_large.get() {
+            return t.clone();
+        }
         match t {
             UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
             UTerm::Pred { .. } | UTerm::Func { .. } => pass_args(t, &mut |x| self.eliminate_bound(x)),
@@ -256,7 +313,8 @@ impl Normalizer {
                 if let Some(b) = cols.and_then(|cols| subst_cols(body, xid, &cols)) {
                     // Folded now, while the copies of each substituted term are still identical:
                     // the defining `[x.i = e]` has become `[e = e]`.
-                    return Some((pos, None, simplify(&b)));
+                    let b = simplify(&b);
+                    return (!self.charge(body, &b)).then_some((pos, None, b));
                 }
                 // By column: one column x.i equals a term e that does not mention x.i (other
                 // columns of x may occur in it). For each choice of the other columns exactly one
@@ -273,8 +331,12 @@ impl Normalizer {
                         let Some(e) = subst_cols(&e, xid, &cols) else { continue };
                         cols[i] = e;
                         if let Some(b) = subst_cols(body, xid, &cols) {
+                            let b = simplify(&b);
+                            if self.charge(body, &b) {
+                                return None;
+                            }
                             self.widths.insert(z, width - 1);
-                            return Some((pos, Some(UVar::Base(z)), simplify(&b)));
+                            return Some((pos, Some(UVar::Base(z)), b));
                         }
                     }
                 }
@@ -489,10 +551,15 @@ impl Normalizer {
     /// normalized one reaches the form its neighbours already have. Every rule preserves meaning.
     /// Runs on a copy of the widths, since elimination may mint vars, and returns them with it.
     fn local_rules(&self, t: &UTerm) -> (UTerm, HashMap<u32, usize>) {
-        let mut scratch = Normalizer { widths: self.widths.clone(), max_tree: self.max_tree, ics: self.ics.clone() };
+        let mut scratch = Normalizer::new(self.widths.clone(), self.max_tree).with_ics(self.ics.clone());
         let mut cur = t.clone();
         for _ in 0..MAX_LOCAL_PASSES {
             let mut next = simplify(&cur);
+            if scratch.over_budget(&next) {
+                // Too large to be the summand it is compared with; the caller's own budget check
+                // decides what happens to the round.
+                break;
+            }
             if !scratch.ics.not_null.is_empty() {
                 next = scratch.remove_not_null(&next);
             }
@@ -500,8 +567,9 @@ impl Normalizer {
                 next = scratch.drop_key_squash(&next);
             }
             let next = scratch.contradict_neg_sum(&canonicalize_congruence(&next));
+            scratch.size_now.set(next.tree_size(scratch.max_tree + 1));
             let next = scratch.eliminate_bound(&next);
-            if next == cur {
+            if next == cur || scratch.too_large.get() {
                 break;
             }
             cur = next;
@@ -667,27 +735,24 @@ fn int(n: i64) -> UTerm {
     UTerm::Const(UConst::Int(n))
 }
 
-fn as_number(c: &UConst) -> Option<f64> {
-    match c {
-        UConst::Int(n) => Some(*n as f64),
-        UConst::Decimal(s) => s.parse().ok(),
+/// The number a constant `[key(c)]` under SQL's numeric `=` key compares by.
+fn numeric_key_operand(t: &UTerm) -> Option<crate::uterm::Number> {
+    match t {
+        UTerm::Func { name, args } if name == NUMERIC_EQ_KEY => match args.as_slice() {
+            [UTerm::Const(c)] => c.number(),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// Identity of two constants, numbers compared numerically (so `Decimal("1.0")` is `Int(1)`) --
-/// the canonicalisation any "two distinct constants" rule needs first, or `1.0` against `1` would
-/// look like a contradiction.
-fn same_const(a: &UConst, b: &UConst) -> bool {
-    match (as_number(a), as_number(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// Folds `Pred`s decidable from their arguments alone. Mirrors [`crate::eval`]'s semantics: `Eq`
-/// is identity (`Null` equals `Null`), order comparisons hold only between two numbers or two
-/// strings.
+/// is identity (`Null` equals `Null`), so it folds only when the two constants are the same value
+/// or certainly different ones -- `1` against `1.0` is neither, being equal numbers of different
+/// types (see [`UConst::same_value`]). An order comparison holds only between two numbers, and is
+/// decided exactly. One between two strings is left alone: its answer depends on the collation,
+/// which the IR does not carry, and only `C` orders by bytes. SQL's `=` between two numbers is
+/// identity of their numeric-key images, which do fold, by exact value.
 fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
     let (kind, a, b) = match (kind, args) {
         (PredKind::Gt, [a, b]) => (PredKind::Lt, b, a),
@@ -696,19 +761,23 @@ fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
         _ => return UTerm::Pred { kind, args: args.to_vec() },
     };
     if let (UTerm::Const(x), UTerm::Const(y)) = (a, b) {
-        let ordered = matches!((x, y), (UConst::Str(_), UConst::Str(_))) || (as_number(x).is_some() && as_number(y).is_some());
-        let less = match (x, y) {
-            (UConst::Str(p), UConst::Str(q)) => p < q,
-            _ => matches!((as_number(x), as_number(y)), (Some(p), Some(q)) if p < q),
-        };
-        let holds = match kind {
-            PredKind::Eq => same_const(x, y),
-            PredKind::Ne => !same_const(x, y),
-            PredKind::Lt => less,
-            PredKind::Le => less || (ordered && same_const(x, y)),
+        let folded = match kind {
+            PredKind::Eq => x.same_value(y),
+            PredKind::Ne => x.same_value(y).map(|same| !same),
+            PredKind::Lt | PredKind::Le => match (x.number(), y.number()) {
+                (Some(p), Some(q)) => Some(if kind == PredKind::Lt { p < q } else { p <= q }),
+                _ if matches!((x, y), (UConst::Str(_), UConst::Str(_))) => None,
+                // NULL, or a number against a string: never ordered.
+                _ => Some(false),
+            },
             PredKind::Gt | PredKind::Ge => unreachable!("oriented above"),
         };
-        return int(holds as i64);
+        if let Some(holds) = folded {
+            return int(holds as i64);
+        }
+    }
+    if let (PredKind::Eq | PredKind::Ne, Some(p), Some(q)) = (kind, numeric_key_operand(a), numeric_key_operand(b)) {
+        return int(((p == q) == (kind == PredKind::Eq)) as i64);
     }
     if a == b {
         match kind {
@@ -768,6 +837,18 @@ fn strip_squash(t: UTerm) -> UTerm {
 pub fn simplify(t: &UTerm) -> UTerm {
     match t {
         UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
+        // The numeric `=` key depends on its operand's value alone, so a constant there may be any
+        // constant of that value; one canonical spelling lets `a = 1.0` and `a = 1` meet.
+        UTerm::Func { name, args } if name == NUMERIC_EQ_KEY => {
+            let args = args
+                .iter()
+                .map(|a| match simplify_value(a) {
+                    UTerm::Const(c) => UTerm::Const(c.numeric_canonical().unwrap_or(c)),
+                    other => other,
+                })
+                .collect();
+            UTerm::Func { name: name.clone(), args }
+        }
         UTerm::Func { name, args } => UTerm::Func { name: name.clone(), args: args.iter().map(simplify_value).collect() },
         UTerm::Pred { kind, args } => simplify_pred(*kind, &args.iter().map(simplify_value).collect::<Vec<_>>()),
         UTerm::Squash(c) => match strip_squash(simplify(c)) {
@@ -1101,7 +1182,10 @@ fn rep_rank(t: &UTerm) -> (u8, u64, u64) {
 /// identical to every other wherever the product is non-zero, so each other occurrence of a column
 /// member may be replaced by the class's representative. The class's own equalities are kept, in
 /// the canonical star form `[member = rep]`, so no binding is lost. A class holding two distinct
-/// constants makes the product 0 (`simplifyMultiplication`).
+/// constants makes the product 0 (`simplifyMultiplication`). One holding two constants that are
+/// neither the same value nor certainly different ones (`1` and `1.0`, see
+/// [`UConst::same_value`]) is left as it stands: no member is replaced, so neither constant is put
+/// where the other was.
 fn canonicalize_congruence(t: &UTerm) -> UTerm {
     match t {
         UTerm::Mul(fs) => {
@@ -1255,17 +1339,24 @@ fn rewrite_product(factors: Vec<UTerm>) -> Option<Vec<UTerm>> {
     for (term, &i) in &uf.ids {
         by_root.entry(uf.find(i)).or_default().push(term.clone());
     }
-    let mut classes: Vec<Vec<UTerm>> = by_root.into_values().collect();
-    for members in &mut classes {
+    let mut classes: Vec<(usize, Vec<UTerm>)> = by_root.into_iter().collect();
+    for (_, members) in &mut classes {
         members.sort_by_key(rep_rank);
     }
-    classes.sort_by_key(|members| rep_rank(&members[0]));
+    classes.sort_by_key(|(_, members)| rep_rank(&members[0]));
     let mut subst: HashMap<UTerm, UTerm> = HashMap::new();
     let mut stars: Vec<UTerm> = Vec::new();
-    for members in &classes {
+    let mut kept_roots: HashSet<usize> = HashSet::new();
+    for (root, members) in &classes {
         let consts: Vec<&UConst> = members.iter().filter_map(|m| if let UTerm::Const(c) = m { Some(c) } else { None }).collect();
-        if consts.windows(2).any(|w| !same_const(w[0], w[1])) {
+        // "Certainly different" is the complement of one equivalence (same kind and number, or
+        // same string), so it shows between some two neighbours whenever it shows at all.
+        if consts.windows(2).any(|w| w[0].same_value(w[1]) == Some(false)) {
             return None;
+        }
+        if consts.windows(2).any(|w| w[0].same_value(w[1]).is_none()) {
+            kept_roots.insert(*root);
+            continue;
         }
         let rep = members[0].clone();
         for m in members {
@@ -1277,8 +1368,17 @@ fn rewrite_product(factors: Vec<UTerm>) -> Option<Vec<UTerm>> {
             }
         }
     }
-    let mut out: Vec<UTerm> =
-        factors.iter().zip(&defining).filter(|(_, d)| !**d).map(|(f, _)| substitute(f, &subst)).collect();
+    // A defining equality of a class left alone stays as it was.
+    let kept = |f: &UTerm| match f {
+        UTerm::Pred { args, .. } => uf.ids.get(&args[0]).is_some_and(|&i| kept_roots.contains(&uf.find(i))),
+        _ => false,
+    };
+    let mut out: Vec<UTerm> = factors
+        .iter()
+        .zip(&defining)
+        .filter(|(f, d)| !**d || kept(f))
+        .map(|(f, _)| substitute(f, &subst))
+        .collect();
     out.extend(stars);
     Some(out)
 }
@@ -1702,8 +1802,54 @@ mod tests {
     }
 
     #[test]
-    fn decimal_and_integer_constants_compare_numerically() {
-        let got = simplify_pred(PredKind::Eq, &[UTerm::Const(UConst::Decimal("1.0".into())), int(1)]);
-        assert_eq!(got, int(1));
+    fn decimal_and_integer_constants_compare_numerically_only_under_sql_equality() {
+        // `Eq` is identity, and `1.0` and `1` are equal numbers but not one value (`CAST(1.0 AS
+        // TEXT)` is not `CAST(1 AS TEXT)`), so their identity is left open. SQL's `1.0 = 1`, the
+        // numeric key's equality, is true; and two different numbers are different either way.
+        let (one, one_dec) = (int(1), UTerm::Const(UConst::Decimal("1.0".into())));
+        let open = UTerm::Pred { kind: PredKind::Eq, args: vec![one_dec.clone(), one.clone()] };
+        assert_eq!(simplify_pred(PredKind::Eq, &[one_dec.clone(), one.clone()]), open);
+        let key = |c: UTerm| simplify(&UTerm::Func { name: NUMERIC_EQ_KEY.into(), args: vec![c] });
+        assert_eq!(simplify_pred(PredKind::Eq, &[key(one_dec.clone()), key(one.clone())]), int(1));
+        assert_eq!(simplify_pred(PredKind::Eq, &[UTerm::Const(UConst::Decimal("1.5".into())), one]), int(0));
+    }
+
+    /// The size budget is charged inside a round, where a term grows, not only between rounds.
+    mod budget_within_a_round {
+        use super::*;
+
+        fn atom(name: String) -> UTerm {
+            UTerm::Table { name, var: UVar::Base(OUT_VAR_ID) }
+        }
+
+        #[test]
+        fn a_product_of_sums_that_doubles_per_level_in_one_pass_is_too_large() {
+            // `(a39 + b39) · ((a38 + b38) · (… · (a0 + b0)))`: one bottom-up pass distributes every
+            // level, each doubling the tree, so the first pass's result is far past the budget
+            // though its input is a few hundred nodes. Every later step would walk that tree.
+            let mut t = UTerm::Add(vec![Rc::new(atom("a0".into())), Rc::new(atom("b0".into()))]);
+            for i in 1..40 {
+                let sum = UTerm::Add(vec![Rc::new(atom(format!("a{i}"))), Rc::new(atom(format!("b{i}")))]);
+                t = UTerm::Mul(vec![Rc::new(sum), Rc::new(t)]);
+            }
+            let widths = HashMap::from([(OUT_VAR_ID, 1)]);
+            let started = std::time::Instant::now();
+            assert_eq!(Normalizer::new(widths, 1_000_000).normalize(&t), Err(NormalizeError::TooLarge));
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
+        }
+
+        /// `count` products of `each` distinct table atoms, summed.
+        fn sum_of_products(count: usize, each: usize) -> UTerm {
+            let product = |k: usize| UTerm::Mul((0..each).map(|j| Rc::new(atom(format!("s{k}_{j}")))).collect());
+            UTerm::Add((0..count).map(|k| Rc::new(product(k))).collect())
+        }
+
+        #[test]
+        fn a_term_within_the_budget_is_still_normalized() {
+            // Ten thousand nodes: the checks inside the round charge growth, not size.
+            let t = sum_of_products(200, 50);
+            let widths = HashMap::from([(OUT_VAR_ID, 1)]);
+            assert!(Normalizer::new(widths, 1_000_000).normalize(&t).is_ok());
+        }
     }
 }

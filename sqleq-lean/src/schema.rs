@@ -118,6 +118,27 @@ pub enum DefaultKind {
     Fresh,
 }
 
+/// The functions a `DEFAULT` of which gives each row a new value, [`DefaultKind::Fresh`].
+///
+/// A function that gives a new value per call is volatile, so each of these must also be on the
+/// frontend's [`sqleq_frontend::VOLATILE_FUNCTIONS`], the one list of volatile functions;
+/// [`default_kind`] checks both, and a test keeps every entry here on that list. Volatile is not
+/// enough to be here: a clock (`clock_timestamp`), a sequence read (`currval`) or a function called
+/// for its effect can give two rows the same value, so a default calling one stays
+/// [`DefaultKind::Same`], the direction that can only withhold a witness.
+const FRESH_DEFAULTS: &[&str] = &[
+    "nextval",
+    "gen_random_uuid",
+    "uuid_generate_v1",
+    "uuid_generate_v1mc",
+    "uuid_generate_v4",
+    "uuid_generate_v7",
+    "uuidv4",
+    "uuidv7",
+    "random",
+    "gen_random_bytes",
+];
+
 /// Classify a `DEFAULT` expression.
 pub fn default_kind(e: &Expr) -> DefaultKind {
     match e {
@@ -125,11 +146,10 @@ pub fn default_kind(e: &Expr) -> DefaultKind {
         Expr::Value(v) if matches!(v.value, Value::Null) => DefaultKind::Null,
         Expr::Function(f) => {
             let name = last_name(&f.name).unwrap_or_default();
-            match name.as_str() {
-                "nextval" | "gen_random_uuid" | "uuid_generate_v1" | "uuid_generate_v1mc"
-                | "uuid_generate_v4" | "uuid_generate_v7" | "uuidv4" | "uuidv7" | "random"
-                | "gen_random_bytes" => DefaultKind::Fresh,
-                _ => DefaultKind::Same,
+            if FRESH_DEFAULTS.contains(&name.as_str()) && sqleq_frontend::is_volatile(&name) {
+                DefaultKind::Fresh
+            } else {
+                DefaultKind::Same
             }
         }
         // `'x'::text`, `nextval('s'::regclass)` is a Function above; a cast of anything else is
@@ -793,5 +813,29 @@ mod tests {
     fn a_name_declared_twice_is_ambiguous() {
         let s = Schema::from_ddl("CREATE TABLE a.t (x int); CREATE TABLE b.t (y int);");
         assert!(s.table("t").unwrap_err().contains("more than once"));
+    }
+}
+
+/// [`FRESH_DEFAULTS`] against the frontend's list of volatile functions.
+#[cfg(test)]
+mod fresh_defaults {
+    use super::*;
+
+    #[test]
+    fn every_fresh_default_is_on_the_frontends_volatile_list() {
+        for f in FRESH_DEFAULTS {
+            assert!(sqleq_frontend::is_volatile(f), "{f} is not on sqleq_frontend::VOLATILE_FUNCTIONS");
+        }
+    }
+
+    #[test]
+    fn a_volatile_default_that_can_repeat_is_same() {
+        let s = Schema::from_ddl(
+            "CREATE TABLE t (a timestamptz DEFAULT clock_timestamp(), b bigint DEFAULT currval('s'));",
+        );
+        let t = s.table("t").unwrap();
+        for c in ["a", "b"] {
+            assert_eq!(t.columns[t.column(c).unwrap()].default, DefaultKind::Same, "{c}");
+        }
     }
 }

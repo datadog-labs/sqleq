@@ -131,12 +131,7 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
         tail += &format!("  {}", c.yellow(&format!("⏱ {}", o.pending.join(", "))));
     }
     if o.verdict == portfolio::ALARM {
-        let words: Vec<String> = crate::pinned::observe(case, &crate::suite::AXES)
-            .into_iter()
-            .filter(|(a, _)| o.by.contains(a))
-            .map(|(a, (w, _))| format!("{a}: {w}"))
-            .collect();
-        tail += &format!("  {}", c.red(&format!("— {}", words.join(", "))));
+        tail += &format!("  {}", c.red(&format!("— {}", alarm_words(case, &o.by))));
     } else if o.verdict == portfolio::NOT_EQUIVALENT && !case.f_note.is_empty() {
         tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
     } else if !portfolio::decisive(&o.verdict) {
@@ -152,6 +147,49 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
         case.name,
         c.dim(&format!("{:6.2}s", case.wall))
     );
+}
+
+/// What each axis an alarm rests on said, in the order `by` names them: `qed: proved, fuzz:
+/// counterexample`.
+fn alarm_words(case: &Case, by: &[String]) -> String {
+    let said = crate::pinned::observe(case, &crate::suite::AXES);
+    let words: Vec<String> = by.iter().filter_map(|a| said.get(a).map(|(w, _)| format!("{a}: {w}"))).collect();
+    words.join(", ")
+}
+
+/// An alarm outside `--portfolio`: case `case` (an index into the run's cases), on which the axes
+/// `by` claimed equivalence and refuted it. `known` when `--expect pinned` finds the wrong side
+/// pinned `!known-unsound`, still reproducing: a known bug, which passes as its pin does.
+pub struct Alarm {
+    pub case: usize,
+    pub by: Vec<String>,
+    pub known: bool,
+}
+
+/// The alarms of a run without `--portfolio`, whose own table lists its alarms.
+pub fn print_alarms(c: Color, cases: &[Case], alarms: &[Alarm]) {
+    if alarms.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}{}",
+        c.red(&c.bold("  Alarms")),
+        c.dim("  — a proof and a counterexample on one pair: one of those backends is wrong")
+    );
+    println!("{}", rule(c));
+    for a in alarms {
+        let x = &cases[a.case];
+        let line = format!("  {}  {}  — {}", fmt_verdict(Color { on: false }, portfolio::ALARM), x.name, alarm_words(x, &a.by));
+        if a.known {
+            println!("{}", c.dim(&format!("{line}  (pinned !known-unsound, still reproducing)")));
+        } else {
+            println!("{}", c.red(&c.bold(&line)));
+        }
+    }
+    if alarms.iter().any(|a| !a.known) {
+        println!("{}", c.dim("  note  an alarm fails the run whatever --expect says."));
+    }
 }
 
 /// Seconds as the user wrote them: `60`, `0.5`.
@@ -251,12 +289,7 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
         println!("  {:<13} {retried} case(s) re-run serially, {won} decided by it", c.dim("retried"));
     }
     for (x, o) in outcomes.iter().filter(|(_, o)| o.verdict == portfolio::ALARM) {
-        let words: Vec<String> = crate::pinned::observe(x, &crate::suite::AXES)
-            .into_iter()
-            .filter(|(a, _)| o.by.contains(a))
-            .map(|(a, (w, _))| format!("{a}: {w}"))
-            .collect();
-        println!("{}", c.red(&format!("  ALARM  {}  — {}", x.name, words.join(", "))));
+        println!("{}", c.red(&format!("  ALARM  {}  — {}", x.name, alarm_words(x, &o.by))));
     }
     println!(
         "{}",
@@ -698,6 +731,10 @@ pub struct Meta {
     pub pinned: Option<PinnedMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub findings: Option<Vec<Finding>>,
+    /// The cases on which a proof and a counterexample met, and which fail the run for it: every
+    /// alarm but one `--expect pinned` finds pinned `!known-unsound`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alarms: Vec<String>,
 }
 
 #[derive(Serialize)]
