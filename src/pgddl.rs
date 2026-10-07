@@ -44,7 +44,8 @@ pub const OPAQUE: &str = "VARBINARY";
 /// has no faithful mapping.
 ///
 /// `None` is not a failure — it is the honest answer for `jsonb`, `geometry`, `inet`, `bytea`, a
-/// float, `uuid`, an enum, or any array. The caller turns it into [`OPAQUE`].
+/// float, `uuid`, an enum, or any array. The caller turns it into [`OPAQUE`], under the name
+/// `types::opaque_name` gives a float, a `jsonb` or an array of `numeric`, whose `=` is not identity.
 ///
 /// The classification is `map_type_name`'s, not a second copy of it: the rule for reading a
 /// Postgres type name is one rule, and this module needing a different *rendering* of the answer is
@@ -413,10 +414,13 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let mut collations = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
+            // An opaque type keeps, in its name, whether its `=` is identity: see
+            // `types::opaque_name`. The provers read VARBINARY either way.
             let rendered = format!("{}", c.data_type);
-            let ty = map_pg_type(&rendered).unwrap_or(OPAQUE);
+            let ty = map_pg_type(&rendered).unwrap_or_else(|| crate::types::opaque_name(&rendered));
             let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
-            // After the collation: a collated opaque column is `COLLATED`, never identity.
+            // After the collation: a collated opaque column is `COLLATED`, never identity, and an
+            // opaque name that records a coarse `=` (`types::COARSE_OPAQUE`) is not `OPAQUE` either.
             identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
             // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
             cols.push((crate::dml::fold_ident(&c.name), ty));

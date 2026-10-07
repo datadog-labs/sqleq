@@ -61,10 +61,9 @@ const BUILTIN_AGGS: [&str; 5] = ["COUNT", "SUM", "AVG", "MIN", "MAX"];
 /// An uninterpreted aggregate symbol is a *function of the bag*, so an entry here must be one:
 /// `bool_or` and `bit_or` fold with an operation that is commutative, associative and idempotent,
 /// `range_agg` and `range_intersect_agg` with union and intersection, and the statistical ones are
-/// functions of sums over the bag. Over floating-point input the rounding of those sums can depend on
-/// the order rows arrive in, as it can for `sum` and `avg`; that is how the frontend reads floating
-/// point everywhere (a `double precision` column is the prover's exact `REAL`), not something this
-/// list adds.
+/// functions of sums over the bag -- exact sums over `numeric` and the integers. Over floating-point
+/// input those sums round, and the rounding depends on the order the rows arrive in, so a call that
+/// adds in floating point is refused instead ([`FLOAT_SUMMING_AGGS`], [`FLOAT_ONLY_AGGS`]).
 ///
 /// The return types are Postgres's own where it has one: `bool_or`/`bool_and`/`every` return
 /// `boolean`, `regr_count` returns `bigint`, and `corr`, `covar_*` and the other `regr_*` return
@@ -159,6 +158,43 @@ const ORDER_SENSITIVE_AGGS: [&str; 19] = [
     "JSON_ARRAYAGG",
     "JSON_OBJECTAGG",
     "XMLAGG",
+];
+
+/// Aggregates that add their inputs in floating point when one of them is a float, and whose result
+/// then depends on the order the rows arrive in.
+///
+/// SOUNDNESS GUARD, for the reason [`ORDER_SENSITIVE_AGGS`] gives. Float addition rounds, so it is
+/// not associative: `(1e20 + 1) + -1e20` is `0` and `(-1e20 + 1e20) + 1` is `1`. Over `real` or
+/// `double precision`, `sum` and `avg` add the values in the order the rows reach the aggregate, and
+/// the `stddev` and `var` family accumulate their sums the same way. A rewrite that keeps the bag and
+/// changes the order -- the two branches of a `UNION ALL` swapped, a subquery's `ORDER BY` -- changes
+/// the result, while the prover's `sum`, or an uninterpreted aggregate, is a function of the bag and
+/// proves it unchanged. So a call to one of these over a float is refused, in aggregate position;
+/// elsewhere an aggregate is refused anyway. Over `numeric` and the integer types each of them adds
+/// exactly, and the bag determines the result.
+///
+/// Refused wherever it is lowered, never lifted because the two queries lowered to one plan: the
+/// lowering drops a subquery's `ORDER BY` that no row slice reads, so two queries that sort the rows
+/// they add in two orders lower to one plan.
+const FLOAT_SUMMING_AGGS: [&str; 8] =
+    ["SUM", "AVG", "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP"];
+
+/// Aggregates Postgres declares over `double precision` only, which compute in floating point whatever
+/// they are given: an integer or `numeric` argument is converted to a float first. Refused wherever
+/// they are lowered, as [`FLOAT_SUMMING_AGGS`] are over a float. `regr_count`, which counts, is not
+/// here.
+const FLOAT_ONLY_AGGS: [&str; 11] = [
+    "CORR",
+    "COVAR_POP",
+    "COVAR_SAMP",
+    "REGR_AVGX",
+    "REGR_AVGY",
+    "REGR_INTERCEPT",
+    "REGR_R2",
+    "REGR_SLOPE",
+    "REGR_SXX",
+    "REGR_SXY",
+    "REGR_SYY",
 ];
 
 /// The other built-in aggregates that are not a function of the bag of values they fold over, or that
@@ -420,6 +456,19 @@ fn reject_order_sensitive_agg(full: &str, bare: &str) -> Result<()> {
 fn reject_unmodelled_agg(full: &str, bare: &str) -> Result<()> {
     if UNMODELLED_AGGS.contains(&bare) {
         return Err(unsupported(format!("unmodelled aggregate {full}")));
+    }
+    Ok(())
+}
+
+/// SOUNDNESS GUARD: see [`FLOAT_SUMMING_AGGS`] and [`FLOAT_ONLY_AGGS`]. `args` are the lowered
+/// arguments, whose types say whether one is a float -- a float column, or a value computed from one,
+/// such as `coalesce(f, 0)` or `f * 2` ([`COARSE_OPAQUE`]).
+fn reject_float_summing(name: &str, args: &[Value]) -> Result<()> {
+    let float = args.iter().any(|v| coarse_class(&ty_of(v)) == Some("float"));
+    if FLOAT_ONLY_AGGS.contains(&name) || (float && FLOAT_SUMMING_AGGS.contains(&name)) {
+        return Err(unsupported(format!(
+            "{name} adds in floating point, so its result depends on the order the rows arrive in"
+        )));
     }
     Ok(())
 }
@@ -891,7 +940,7 @@ fn lower_setexpr_ctx(
             // branch pair that differs across a temporal boundary would put two units in one column;
             // with no conversion to insert inside a branch from here, it is refused.
             if let Some(((_, a), (_, b))) =
-                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b))
+                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b) || hides_coarse(a, b))
             {
                 return Err(unsupported(format!("set operation over columns of type {a} and {b}")));
             }
@@ -930,10 +979,13 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         .collect::<Result<Vec<_>>>()?;
     let schema_tys: Vec<String> = content[0].iter().map(ty_of).collect();
     // Same reason as the set operations: the column type is the first row's, and a later row of
-    // another temporal type would hold a value in another unit.
+    // another temporal type would hold a value in another unit, or one whose `=` is not identity a
+    // value the column's type does not say that of.
     for row in &content[1..] {
-        if let Some((a, b)) =
-            schema_tys.iter().zip(row.iter().map(ty_of)).find(|(a, b)| temporal_mismatch(a, b))
+        if let Some((a, b)) = schema_tys
+            .iter()
+            .zip(row.iter().map(ty_of))
+            .find(|(a, b)| temporal_mismatch(a, b) || hides_coarse(a, b))
         {
             return Err(unsupported(format!("VALUES column of type {a} holding a {b}")));
         }
@@ -2257,6 +2309,7 @@ impl AggCtx<'_> {
                 a.op
             )));
         }
+        reject_float_summing(&a.op, &lowered)?;
         let mut operand: Vec<Value> = Vec::new();
         for mut v in lowered {
             if let Some(p) = &filter {
@@ -2392,7 +2445,7 @@ impl AggCtx<'_> {
                 }
                 let operand =
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
-                let ret = fn_ret(self.fns, &name, &bare);
+                let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -2885,7 +2938,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .into_iter()
                 .map(|e| lower_expr(cat, scope, fns, e))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(json!({ "operator": name, "operand": operand, "type": fn_ret(fns, &name, &bare) }))
+            let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
+            Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
         // conjunction of the pairwise comparisons, three-valued logic included — true iff every
@@ -3350,7 +3404,7 @@ fn lower_quantified(
                     _ => false,
                 }
             };
-            if arr.elem.iter().zip(&elems).any(|(e, v)| !leaf(e) && ty_of(v) == "VARBINARY") {
+            if arr.elem.iter().zip(&elems).any(|(e, v)| !leaf(e) && is_opaque(&ty_of(v))) {
                 return Err(unsupported(format!(
                     "{op} {quant} over an ARRAY[..] with an element of opaque type"
                 )));
@@ -3426,10 +3480,15 @@ fn array_shape(arr: &sqlparser::ast::Array) -> Result<()> {
 /// the name because the IR carries every array as one opaque type, and `ARRAY[1]` and `ARRAY['1']`
 /// are different values. Only reached outside `= ANY(..)`, where the constructor is expanded
 /// instead (`lower_quantified`).
+///
+/// An array of values whose `=` is not identity compares its elements with that `=`, so it is named
+/// after them ([`COARSE_OPAQUE`]): VARBINARY to the provers, and to [`crate::equality`] an array of
+/// `numeric`.
 fn array_call(elems: Vec<Value>) -> Value {
     let ty = elems.iter().map(ty_of).reduce(|a, b| common_type(&a, &b)).unwrap_or_else(|| "VARBINARY".into());
     let operand: Vec<Value> = elems.into_iter().map(|v| cast_to(v, &ty)).collect();
-    json!({ "operator": format!("q_array_{}", ty.to_lowercase()), "operand": operand, "type": "VARBINARY" })
+    let array = coarse_class(&ty).map_or_else(|| "VARBINARY".to_string(), |c| format!("{COARSE_OPAQUE}{c}[]"));
+    json!({ "operator": format!("q_array_{}", name_part(&ty).to_lowercase()), "operand": operand, "type": array })
 }
 
 /// The indices of a subscript chain `a[i]..[j]`, refusing a slice and a field selection.
@@ -3450,9 +3509,16 @@ fn subscript_indices(chain: &[AccessExpr]) -> Result<Vec<&Expr>> {
 /// `m[1][2]` is an element, while `(m[1])[2]` is NULL, since a subscript with too few indices is.
 /// Typed VARBINARY, because the element type is not something the IR carries (an array is opaque
 /// whatever it holds).
+///
+/// An element of an array whose elements' `=` is not identity, or a part of a `jsonb`, is such a
+/// value too, and named after it ([`COARSE_OPAQUE`]).
 fn subscript_call(operand: Vec<Value>) -> Value {
-    let types: Vec<String> = operand.iter().map(|v| ty_of(v).to_lowercase()).collect();
-    json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": "VARBINARY" })
+    let types: Vec<String> = operand.iter().map(|v| name_part(&ty_of(v)).to_lowercase()).collect();
+    let element = operand
+        .first()
+        .and_then(|base| coarse_class(&ty_of(base)).map(|c| format!("{COARSE_OPAQUE}{}", c.trim_end_matches("[]"))))
+        .unwrap_or_else(|| "VARBINARY".to_string());
+    json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": element })
 }
 
 /// Lower one of the pattern-matching predicates to its named uninterpreted operator.

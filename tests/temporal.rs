@@ -134,7 +134,10 @@ fn date_and_interval_arithmetic_are_functions() {
     assert_eq!((target[0]["operator"].as_str(), target[0]["type"].as_str()), (Some("q_arith_add_date_integer"), Some("DATE")));
     assert_eq!((target[1]["operator"].as_str(), target[1]["type"].as_str()), (Some("q_arith_sub_date_date"), Some("INTEGER")));
     // `ts + dur - dur` is not `ts` when the interval counts months, so it must not reduce to it.
-    let ops = ops_of(r#"SELECT "ts" + "dur" - "dur" FROM "t""#, r#"SELECT "ts" FROM "t""#, CatalogSource::Declared);
+    // (Lowered as one plan: against `SELECT "ts"` the pair is refused, since `'1 mon' = '30 days'` and
+    // the two add differently; see `tests/coarse_equality.rs`.)
+    let q = r#"SELECT "ts" + "dur" - "dur" FROM "t""#;
+    let ops = ops_of(q, q, CatalogSource::Declared);
     assert!(ops.contains(&"q_arith_add_timestamp_interval".to_string()), "{ops:?}");
     assert!(ops.contains(&"q_arith_sub_timestamp_interval".to_string()), "{ops:?}");
     assert!(!ops.contains(&"+".to_string()) && !ops.contains(&"-".to_string()), "{ops:?}");

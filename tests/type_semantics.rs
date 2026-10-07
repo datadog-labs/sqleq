@@ -79,6 +79,13 @@ fn refused(ddl: &str, q0: &str, q1: &str, needle: &str) {
 }
 
 /// The schema types the frontend gives one table's columns.
+/// Whether `q0` and `q1` lower to one term, each lowered in a pair with itself. A pair whose two
+/// sides differ is refused once one of them reads a `jsonb` through an operation that can tell two
+/// equal values apart, such as `->>` (see `tests/coarse_equality.rs`); one plan on both sides is not.
+fn one_term(q0: &str, q1: &str) -> bool {
+    lower(q0, q0)["queries"][0] == lower(q1, q1)["queries"][0]
+}
+
 fn schema_types(v: &Value) -> Vec<String> {
     v["schemas"][0]["types"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
 }
@@ -91,8 +98,8 @@ fn schema_types(v: &Value) -> Vec<String> {
 fn a_key_lookup_and_a_path_lookup_are_two_operations() {
     // Over `{"a": "x"}`, `j ->> '{a}'` looks for the key `{a}` (NULL) and `j #>> '{a}'` follows the
     // path `[a]` (`x`).
-    assert!(!identical(r#"SELECT "j" ->> '{a}' FROM "t""#, r#"SELECT "j" #>> '{a}' FROM "t""#));
-    assert!(!identical(
+    assert!(!one_term(r#"SELECT "j" ->> '{a}' FROM "t""#, r#"SELECT "j" #>> '{a}' FROM "t""#));
+    assert!(!one_term(
         r#"SELECT CAST("j" -> '{a}' AS text) FROM "t""#,
         r#"SELECT CAST("j" #> '{a}' AS text) FROM "t""#,
     ));
@@ -103,7 +110,7 @@ fn json_extract_path_is_neither_operator() {
     // Over `[5]`, `jsonb_extract_path(j, '0')` follows the path to `5`; `j -> '0'` looks for the key
     // `0` and finds NULL.
     assert!(!identical(r#"SELECT jsonb_extract_path("j", '0') FROM "t""#, r#"SELECT "j" -> '0' FROM "t""#));
-    assert!(!identical(
+    assert!(!one_term(
         r#"SELECT jsonb_extract_path_text("j", '0') FROM "t""#,
         r#"SELECT "j" ->> '0' FROM "t""#,
     ));
@@ -112,7 +119,8 @@ fn json_extract_path_is_neither_operator() {
     // argument, so the two spellings cannot share a symbol.
     assert!(!identical(r#"SELECT jsonb_extract_path("j", '{a}') FROM "t""#, r#"SELECT "j" #> '{a}' FROM "t""#));
     // The two spellings of the function, json and jsonb, stay one symbol.
-    let v = lower(r#"SELECT jsonb_extract_path_text("j", 'a') FROM "t""#, r#"SELECT 1 FROM "t""#);
+    let q = r#"SELECT jsonb_extract_path_text("j", 'a') FROM "t""#;
+    let v = lower(q, q);
     assert!(ops(&v).iter().any(|o| o.eq_ignore_ascii_case("q_str_jsonpath_elems")), "{:?}", ops(&v));
 }
 
@@ -120,7 +128,7 @@ fn json_extract_path_is_neither_operator() {
 fn another_dialects_json_extract_is_an_ordinary_call() {
     // `json_extract` reads a JSONPath in the dialects that have it, and Postgres has none: it is not
     // `->`.
-    assert!(!identical(r#"SELECT json_extract("j", 'a') FROM "t""#, r#"SELECT "j" -> 'a' FROM "t""#));
+    assert!(!one_term(r#"SELECT json_extract("j", 'a') FROM "t""#, r#"SELECT "j" -> 'a' FROM "t""#));
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -296,7 +304,10 @@ fn a_float_cast_is_not_a_real() {
 #[test]
 fn numeric_division_is_not_exact() {
     // `1 / 3.0 * 3.0` is `0.99999999999999999990` in Postgres.
-    let v = lower_in(F, r#"SELECT "n" / 3.0 * 3.0 FROM "t""#, r#"SELECT "n" FROM "t""#, CatalogSource::Declared);
+    // (Lowered as one plan: against `SELECT "n"`, a division of the column `n` is refused, since its
+    // scale follows `n`'s; see `tests/coarse_equality.rs`.)
+    let q = r#"SELECT "n" / 3.0 * 3.0 FROM "t""#;
+    let v = lower_in(F, q, q, CatalogSource::Declared);
     assert!(!ops(&v).iter().any(|o| o == "/"), "a native / over numeric: {:?}", ops(&v));
     assert!(ops(&v).iter().any(|o| o == "q_arith_div_real_real"), "{:?}", ops(&v));
     // Addition, subtraction and multiplication are exact, and stay native.
@@ -324,7 +335,7 @@ fn a_numeric_turned_into_text_is_refused() {
         (r#"SELECT CAST("n" AS TEXT) FROM "t""#, r#"SELECT CAST("n" AS TEXT) FROM (SELECT "n" * 1.0 AS "n" FROM "t") AS "s""#),
     ] {
         let ddl = r#"create table "t" ("n" NUMERIC); create table "u" ("n" NUMERIC);"#;
-        refused(ddl, q0, q1, "numeric converted to text");
+        refused(ddl, q0, q1, "a value of type numeric read by");
     }
     // An integer's text has no scale to show, and one plan on both sides computes one thing.
     let v = lower(r#"SELECT CAST("a" AS TEXT), "a" || 'x' FROM "t""#, r#"SELECT CAST("a" AS TEXT), "a" || 'x' FROM "t" AS "x""#);

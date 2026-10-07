@@ -4,10 +4,10 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: equivalent
--- expect frontend: emit
+-- expect frontend: refuse:unsupported
 -- expect fuzz: not-comparable
--- expect qed: no-proof
--- expect sqleq-solver: no-proof
+-- expect qed: no-plan
+-- expect sqleq-solver: no-plan
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz let DuckDB divide a numeric into a DOUBLE, where Postgres divides to a
 --   finite decimal scale, so 2 / 3 * 3 came back as 2

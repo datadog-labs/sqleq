@@ -9,10 +9,9 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported
--- origin: issue #58: numeric division was read as exact division
--- witness: t = {(1)}: A yields 0.99999999999999999990 (numeric division rounds to a finite scale), B yields 1
--- Refused since issue #84: the scale of a numeric quotient follows its operands' scales, so x / 3.0 is
--- not a function of x's value.
-create table "t" ("x" NUMERIC);
-SELECT "x" / 3.0 * 3.0 FROM "t";
-SELECT "x" FROM "t";
+-- origin: issue #84: '1 day' = '24 hours' as intervals, but their text differs
+-- witness: t = {('1 day')}, u = {('24 hours')}: A yields '1 day', B yields '24:00:00'
+create table "t" ("x" INTERVAL);
+create table "u" ("x" INTERVAL);
+SELECT CAST("t"."x" AS TEXT) FROM "t" JOIN "u" ON "t"."x" = "u"."x";
+SELECT CAST("u"."x" AS TEXT) FROM "t" JOIN "u" ON "t"."x" = "u"."x";
