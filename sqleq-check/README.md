@@ -72,7 +72,7 @@ sqleq-check --expect report-only -j 8 --json out.json corpus/
 # Verbose per-case output, 30s/case, tighten each SMT request to 5s:
 sqleq-check -v -t 30 --smt-timeout 5000 rewrites/
 
-# Keep intermediates (.json/.result) for debugging:
+# Keep intermediates (.json/.result) for debugging, in one directory per case:
 sqleq-check --keep ./work rewrites/
 ```
 
@@ -82,11 +82,11 @@ sqleq-check --keep ./work rewrites/
 | Flag | Meaning |
 |------|---------|
 | `-j, --jobs N` | Parallel cases (default `min(8, ncpu)`). Each case runs z3+cvc5, so don't oversubscribe heavily. |
-| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60). On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. |
+| `-t, --timeout S` | Per-case wall-clock budget in seconds (default 60): a positive number, or `inf` for no deadline. On timeout the whole process group is killed. Under `--portfolio`, the one deadline every backend on the case shares. NaN, zero or a negative number is a usage error. |
 | `--portfolio` | Run every asked backend on each case at once, within `-t`, and report one combined verdict per case — see [Portfolio](#portfolio-every-backend-at-once). |
 | `--smt-timeout MS` | Sets `QED_SMT_TIMEOUT` per SMT request (prover default is 10000 ms). |
 | `--expect equivalent` | (default) Exit non-zero unless **every** case is `provable` — a policy on the qed axis, so `--axes` must ask `qed`. Under `--portfolio`, unless every case's verdict is `equivalent`. |
-| `--expect report-only` | Exit 0 whatever the cases say; just report. Under `--portfolio` an `alarm` still exits 1. |
+| `--expect report-only` | Exit 0 whatever the cases say; just report. An [alarm](#alarms) still exits 1. |
 | `--expect pinned` | Each case's header pins every axis's answer; exit non-zero on any movement. See [Pinned pairs](#pinned-pairs). |
 | `--axes LIST` | Which axes to run, comma-separated: `frontend`, `fuzz`, `qed`, `sqleq-solver`, `sqlsolver-jvm`, `lean` (default `frontend,qed`). A prover axis brings in `frontend`; at most one SQLSolver per run. `sqlsolver-rust`, sqleq-solver's axis before it was renamed, is still read as `sqleq-solver`. |
 | `--bless` | With `--expect pinned`: rewrite each case's `expect` lines for the axes that ran. Never pins an answer that contradicts the case's truth, nor a timeout. |
@@ -95,10 +95,10 @@ sqleq-check --keep ./work rewrites/
 | `--fuzz-bin PATH` | The `sqleq-fuzz` binary ([lookup order](#requirements)). |
 | `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR, unless a flag names one. |
 | `--json FILE` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
-| `--keep DIR` | Keep intermediates instead of using temp dirs. |
+| `--keep DIR` | Keep intermediates instead of using temp dirs: each case's in `DIR/<name>`, with every `/` in the name as `__`. That directory is emptied when the case starts, so a re-run never reads the answers a previous run left there. |
 | `--no-retry` | Don't re-run transient failures at the end. |
-| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism, a second, longer tier (defaults: `--timeout`, `--smt-timeout`, and 1 — serially). |
-| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Outside `--portfolio` and `--expect pinned`, it never changes the exit code. |
+| `--retry-timeout S` / `--retry-smt-timeout MS` / `--retry-jobs N` | The retry pass's own budget and parallelism, a second, longer tier (defaults: `--timeout`, `--smt-timeout`, and 1 — serially). `--retry-timeout` takes what `-t` takes. |
+| `--sqleq-solver` | Ask `sqleq-solver`, a Rust rewrite of SQLSolver, about the same cases too — see [Second opinion](#second-opinion-sqleq-solver). Outside `--portfolio` and `--expect pinned`, it never changes the exit code, unless its proof is half of an [alarm](#alarms). |
 | `--sqleq-solver-bin PATH` | The `sqleq-solver` binary ([lookup order](#requirements)). |
 | `--sqleq-solver-timeout MS` | Per-row cap for the second opinion (default: `-t` in ms). Its own, because the provers are not comparably fast. Under `--portfolio` it is also capped by what is left of the case's deadline. |
 | `--sqleq-solver-jobs N` | sqleq-solver drivers side by side (default 1, the reproducible choice). Not used under `--portfolio`, which runs it per case. |
@@ -121,10 +121,10 @@ sqleq-check --keep ./work rewrites/
 |--------|---------|
 | `provable` | The prover proved the two queries equivalent. |
 | `unprovable` | The prover ran but could not prove equivalence. |
-| `refused` | The frontend would not lower the SQL. Sub-classified as `refuse_kind`: `parse` (sqlparser rejected the text), `unsupported` (a construct we decline to lower), `parameter-misaligned` (the two queries' `$N` do not line up), `schema` (unknown table/column, bad DDL, wrong number of queries). |
+| `refused` | The frontend would not lower the SQL: it exited 1 with its reason on stderr, as it does for every refusal. Sub-classified as `refuse_kind`: `parse` (sqlparser rejected the text), `unsupported` (a construct we decline to lower), `parameter-misaligned` (the two queries' `$N` do not line up), `schema` (unknown table/column, bad DDL, wrong number of queries). |
 | `panic` | The prover panicked/crashed on the case. |
 | `timeout` | Exceeded the per-case wall-clock budget. |
-| `error` | Anything else (e.g. an unreadable result). |
+| `error` | Anything else: an unreadable result, or a frontend that failed instead of refusing — a panic (exit 101), a signal (a stack overflow aborts), any other exit code, or no plan and no reason. The message names the exit code or the signal. Like a prover crash, it is retried, and `--bless` never pins it. |
 | `lowered` | The frontend lowered the pair, and the qed axis was not asked (`--axes` without `qed`). When no asked axis needs the frontend (`--axes fuzz`, `--axes lean`), every case carries this status as a placeholder, with `lowered: false`. |
 
 A refused case whose two sides normalize to the same query carries `reflexive: true` in the JSON: it
@@ -172,8 +172,9 @@ comparing the two statements in the source text after whitespace normalization
 `sqleq-solver`, this repo's Rust rewrite of SQLSolver. With `--sqlsolver-jvm` instead, the original
 SQLSolver answers, kept as a deprecated backup cross-check. It is off by default. Under
 `--expect equivalent` and `report-only` it never changes the exit code — that policy is the qed
-axis's — while `--expect pinned` judges its pins like any other axis's, and under `--portfolio` its
-proof counts toward the combined verdict.
+axis's — unless its proof meets a sqleq-fuzz counterexample on the same pair, an
+[alarm](#alarms). `--expect pinned` judges its pins like any other axis's, and under `--portfolio`
+its proof counts toward the combined verdict.
 
 ```sh
 sqleq-check --expect report-only --sqleq-solver -j 8 -t 30 corpus/
@@ -204,7 +205,7 @@ reason the flag exists. The buckets are the `s_bucket` column of the JSON and CS
 | `no-proof` | It considered the pair and found no proof. |
 | `unsupported` | **Ours, not theirs.** Either the frontend refused the row, or the bridge could not express the plan. The `s_note` column says which. |
 | `timeout` | The cap ran out. Kept out of `no-proof` deliberately: that prover answers `UNKNOWN` when interrupted, so `killed` is the only thing separating "we stopped asking" from "they declined". |
-| `error` | It threw. |
+| `error` | It threw, or its job could not be packaged: the frontend could not read the plan back (exit 2) or write the job, or it crashed. |
 | `missing` | It never answered — the driver died before reaching the row. |
 
 Two things about the numbers, both printed under the table on every run:
@@ -283,7 +284,7 @@ equivalent.
 **The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
 case is `equivalent`, so a proof from any prover that reads the IR, or the frontend's reflexivity,
 counts, and a Lean proof does not. `--expect report-only` passes unless some case is an `alarm`, which fails every
-run. `--expect pinned` and `--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend
+run, as it does [without `--portfolio`](#alarms). `--expect pinned` and `--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend
 on a time budget, and a JVM started per case would cost more than the case.
 
 Output: the per-axis tables as without it, then a `Portfolio` table — the verdict counts,
@@ -308,6 +309,22 @@ Three things to know before reading one:
   a prover crash, an error, or a sqleq-solver error or missing answer — unless `--no-retry`. The
   re-run uses the retry pass's budget and parallelism (`--retry-timeout`, `--retry-jobs`; serially by
   default), is kept only if it decides the case, and marks the case `retried`.
+
+## Alarms
+
+A proof and a counterexample on the same pair mean one of the two backends is wrong: a prover's
+proof (`proved` or `proved-literal`), or the frontend's finding that the two sides are one query
+(`emit-reflexive` or `reflexive`), against a sqleq-fuzz `counterexample`. Every run that asks both
+sides compares them, with or without `--portfolio`, by the same rule its `alarm` verdict uses, and
+under the same parameter binding only. Each alarm is printed by name with the answers that met,
+`--json` lists the cases in `meta.alarms`, and **an alarm fails the run whatever `--expect` says**,
+`report-only` included.
+
+The one exception is `--expect pinned`, for a pair whose wrong answer is pinned `!known-unsound`
+and still reproduces: that is the known bug the marker records, and it passes as the pin does. Any
+other alarm fails a pinned run even when every pin holds, which can happen on a pair stated under a
+gather binding: an index-binding proof and counterexample contradict each other there, but neither
+contradicts its truth.
 
 ## Corpus runs
 
@@ -394,7 +411,8 @@ replaces a file atomically, only when its bytes change.
 ## Exit codes
 
 - `0` — policy satisfied (see `--expect`).
-- `1` — policy not satisfied (some case failed the expectation).
+- `1` — policy not satisfied (some case failed the expectation), or an [alarm](#alarms), in any
+  mode.
 - `2` — usage / setup error (no inputs, binary not found, a flag that does not combine, …).
 - `130` / `143` — interrupted by Ctrl-C / `SIGTERM` (128 + the signal); every backend still running
   is killed first.

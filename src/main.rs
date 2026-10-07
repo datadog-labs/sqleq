@@ -35,12 +35,6 @@
 //! lowers nothing — deliberately, so that `sqleq-check` can hand the SQLSolver axis the very bytes
 //! it handed the QED prover, with no second lowering between the two. See
 //! [`sqleq_frontend::sqlsolver::ir_job_from_input`].
-//!
-//! `--sqlsolver --ir --csv <corpus.csv> -o <jobs.jsonl>` does the same for a whole corpus, lowering
-//! each row first; a row that refuses becomes a job with no plan and its refusal. Without `--ir`,
-//! `--sqlsolver [--normalized] --csv` writes SQL-text jobs instead, for the original SQLSolver's
-//! own SQL entry point: those lower nothing and refuse nothing, and nothing in this repository runs
-//! them. See [`sqleq_frontend::sqlsolver`].
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -49,7 +43,6 @@ use sqleq_frontend::{corpus, CatalogSource};
 
 const USAGE: &str = "usage: sqleq-frontend [--infer|--infer-seeded] [--ddl <schema.sql>] <input.sql> [out.json]
        sqleq-frontend [--infer|--infer-seeded] --csv <corpus.csv> -o <dir> [--report <report.json>] [--limit N]
-       sqleq-frontend --sqlsolver [--normalized|--ir] [--infer|--infer-seeded] --csv <corpus.csv> -o <jobs.jsonl> [--limit N]
        sqleq-frontend --sqlsolver --ir <input.json> [--name <id>] [-o <job.jsonl>]
 
 Lowers a SQL pair to prover input. To check pairs end to end, run sqleq-check.";
@@ -64,10 +57,7 @@ fn main() -> ExitCode {
     }
     let sqlsolver = args.iter().any(|a| a == "--sqlsolver");
     args.retain(|a| a != "--sqlsolver");
-    // Only meaningful with `--sqlsolver`; see [`sqleq_frontend::sqlsolver::job_normalized`].
-    let normalized = args.iter().any(|a| a == "--normalized");
-    args.retain(|a| a != "--normalized");
-    // Also only meaningful with `--sqlsolver`; see [`sqleq_frontend::sqlsolver::ir_job`].
+    // Only meaningful with `--sqlsolver`; see [`sqleq_frontend::sqlsolver::ir_job_from_input`].
     let ir = args.iter().any(|a| a == "--ir");
     args.retain(|a| a != "--ir");
     let mut source = CatalogSource::Declared;
@@ -99,41 +89,22 @@ fn main() -> ExitCode {
     let limit = opt("--limit").and_then(|s| s.parse::<usize>().ok());
     let name_override = opt("--name");
 
-    if normalized && !sqlsolver {
-        eprintln!("--normalized is only meaningful with --sqlsolver");
-        return ExitCode::from(2);
-    }
     if ir && !sqlsolver {
         eprintln!("--ir is only meaningful with --sqlsolver");
         return ExitCode::from(2);
     }
-    // `--normalized` replaces the two queries with the SQL our rewriter prints; `--ir` sends no SQL
-    // at all. Normalizing is already what lowering does, so the combination is not a third mode.
-    if ir && normalized {
-        eprintln!("--ir carries the lowered IR, which is already normalized; drop --normalized");
-        return ExitCode::from(2);
-    }
-
-    if let Some(csv) = csv_path {
-        return if sqlsolver {
-            run_sqlsolver(Path::new(&csv), outdir.as_deref(), limit, normalized, ir, source)
-        } else {
-            run_csv(Path::new(&csv), outdir.as_deref(), report.as_deref(), limit, source)
-        };
-    }
-    // `--sqlsolver --ir` is the one sqlsolver-axis mode with a single-case form, because it is the
-    // one whose input is an `Input`: the text modes need the row's own SQL and DDL, which only the
-    // corpus has. Everything else here still needs `--csv`.
-    if sqlsolver && ir {
-        if args.is_empty() {
-            eprintln!("--sqlsolver --ir needs <input.json> (or --csv <corpus.csv>)");
+    // The one SQLSolver-axis mode: package one already-lowered plan. It has no corpus form, because
+    // the plan it packages is the one a caller has already handed the QED prover.
+    if sqlsolver {
+        if !ir || csv_path.is_some() || args.is_empty() {
+            eprintln!("--sqlsolver needs --ir <input.json>");
             return ExitCode::from(2);
         }
         return run_ir_job(Path::new(&args[0]), name_override.as_deref(), outdir.as_deref());
     }
-    if sqlsolver {
-        eprintln!("--sqlsolver needs --csv <corpus.csv>");
-        return ExitCode::from(2);
+
+    if let Some(csv) = csv_path {
+        return run_csv(Path::new(&csv), outdir.as_deref(), report.as_deref(), limit, source);
     }
 
     if args.is_empty() {
@@ -197,9 +168,8 @@ fn main() -> ExitCode {
 /// (`sqleq-solver`, or the JVM fork's `IrDriver`) gets the same bytes, plus the MySQL DDL those
 /// bytes imply.
 ///
-/// Refusal follows the single-file convention rather than the corpus one -- a reason on stderr and
-/// a non-zero exit, not an `ir: null` job. A batch run needs every name present so the two runs
-/// cover the same population; a caller that named one file wants to be told it cannot be bridged.
+/// A plan that cannot be bridged is refused with a reason on stderr and a non-zero exit, not
+/// written as an `ir: null` job: a caller that named one file wants to be told.
 fn run_ir_job(path: &Path, name: Option<&str>, out: Option<&str>) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -334,109 +304,6 @@ fn run_csv(
             return ExitCode::FAILURE;
         }
         println!("\nwrote {path}");
-    }
-    ExitCode::SUCCESS
-}
-
-/// Turn a whole corpus CSV into a SQLSolver work file, one JSON job per line.
-///
-/// Exits 0 whatever the notes say: every row gets a job, and what SQLSolver makes of it is
-/// the measurement (see [`sqleq_frontend::sqlsolver`]).
-fn run_sqlsolver(
-    csv: &Path,
-    out: Option<&str>,
-    limit: Option<usize>,
-    normalized: bool,
-    ir: bool,
-    source: CatalogSource,
-) -> ExitCode {
-    let Some(out) = out else {
-        eprintln!("--sqlsolver needs -o <jobs.jsonl>");
-        return ExitCode::from(2);
-    };
-    let mut rows = match corpus::read(csv) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(n) = limit {
-        rows.truncate(n);
-    }
-
-    let mut body = String::new();
-    let mut notes: std::collections::BTreeMap<&str, usize> = Default::default();
-    let mut with_schema = 0usize;
-    // Counted only on the IR path, where a row can fail to produce anything to verify. On the text
-    // path every row yields a job, so the equivalent number is always `rows.len()`.
-    let mut lowered = 0usize;
-    let mut refusals: std::collections::BTreeMap<String, usize> = Default::default();
-    for row in &rows {
-        let line = if ir {
-            let job = sqleq_frontend::sqlsolver::ir_job(row, source);
-            if !job.schema.is_empty() {
-                with_schema += 1;
-            }
-            if job.ir.is_some() {
-                lowered += 1;
-            }
-            if let Some(r) = &job.refusal {
-                // Keyed on the leading clause: the refusal text carries the offending identifier,
-                // which would make every row its own bucket.
-                let head = r.split([':', '(']).next().unwrap_or(r).trim();
-                *refusals.entry(head.to_string()).or_default() += 1;
-            }
-            for n in &job.notes {
-                *notes.entry(n).or_default() += 1;
-            }
-            job.to_json()
-        } else {
-            let job = match normalized {
-                true => sqleq_frontend::sqlsolver::job_normalized(row),
-                false => sqleq_frontend::sqlsolver::job(row),
-            };
-            if !job.schema.is_empty() {
-                with_schema += 1;
-            }
-            for n in &job.notes {
-                *notes.entry(n).or_default() += 1;
-            }
-            job.to_json()
-        };
-        body.push_str(&line);
-        body.push('\n');
-    }
-    if let Err(e) = std::fs::write(out, body) {
-        eprintln!("cannot write {out}: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    println!(
-        "queries        : {}",
-        match (ir, normalized) {
-            (true, _) => "lowered IR",
-            (false, true) => "normalized",
-            (false, false) => "as written",
-        }
-    );
-    println!("rows processed : {}", rows.len());
-    println!("jobs written   : {}  -> {out}", rows.len());
-    println!("with a schema  : {with_schema}");
-    if ir {
-        println!("lowered        : {lowered}");
-        if !refusals.is_empty() {
-            println!("\nrefusals:");
-            let mut by_count: Vec<_> = refusals.iter().collect();
-            by_count.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-            for (r, c) in by_count.iter().take(15) {
-                println!("  {c:>5}  {r}");
-            }
-        }
-    }
-    println!("\nnotes:");
-    for (n, c) in &notes {
-        println!("  {c:>5}  {n}");
     }
     ExitCode::SUCCESS
 }

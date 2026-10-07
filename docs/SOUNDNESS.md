@@ -17,7 +17,10 @@ therefore **refuses** (returns an error) any construct it cannot lower faithfull
 functions, `HAVING` it can't express, correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`,
 `LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
 a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
-TIES`, etc. — rather than emitting best-effort IR. It never panics or exits on bad input.
+TIES`, a `WITH` it cannot inline (`RECURSIVE`, or one with a data-modifying binding, at any level),
+etc. — rather than emitting best-effort IR. It never panics or exits on bad input: a statement whose
+expressions or set operations nest more than 1,024 levels deep, which the parser builds with a loop
+from a long chain such as `a + a + … + a`, is refused before any pass recurses on it.
 
 Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
 `OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause
@@ -36,14 +39,20 @@ lost outright: when a refused pair's two sides normalize to one query, the front
 (`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
 many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
 `--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
-asks whether the QED prover proved the pair, still counts it as refused.
+asks whether the QED prover proved the pair, still counts it as refused. The claim needs every
+normalization to keep the number of times a call is evaluated, and `WITH` inlining does not: it
+evaluates a binding read twice twice, where Postgres evaluates it once. So the check declines a pair
+in which inlining would copy a volatile call such as `random()`.
 
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs
 completeness, not soundness. Two such misses are known: `pgddl` does not read keys declared by
 `CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`. Both cost
-functional-dependence refusals — completeness work, in the safe direction.
+functional-dependence refusals — completeness work, in the safe direction. And a key reaches a prover
+only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
+columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
+`SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query.
 
 ### Dates and timestamps are not one integer
 
@@ -122,6 +131,9 @@ what it is or refused:
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
   target.
+- **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
+  where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
+  it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.
 - **An array is not its element type.** An array column is opaque whatever it holds, and a cast to
   an array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
   opaque operand is a function, not text concatenation, because array `||` is not strict (`'{a}' ||
@@ -144,6 +156,37 @@ what it is or refused:
 - **A quantified pattern is not a pattern.** `s LIKE ALL($1)` is refused: `NULL LIKE ALL('{}')` is
   TRUE, so it is not a strict `LIKE` against one opaque pattern.
 - **A set-returning function is not a scalar** in any position, over aggregates included.
+- **A constant says its value and nothing more.** A prover reads a constant's value off its name,
+  so a string spelled `null` in any case, which a prover would read as SQL NULL, is emitted as a
+  concatenation (`'n' || 'ull'`). A numeric literal has Postgres's type — `1e-5` and an integer past
+  the `bigint` range are `numeric`, not integers — and Postgres's spelling (`.5` is `0.5`). The QED
+  prover reads a decimal constant through an `f32`, so one that is not exactly such an `f32`
+  (`0.1`, `20000000.5`) is an uninterpreted function of its text, and so is a string constant cast
+  to a decimal type that the cast would round the same way. A number run into a name, `0b101` or
+  `1x`, is refused: Postgres reads it as one token, an integer in base 2, 8 or 16 or a syntax error,
+  where the parser reads a number and an alias.
+- **Integer division truncates.** Postgres rounds `-7 / 2` toward zero and gives `-7 % 2` the sign
+  of the dividend; a prover's integer division is Euclidean. So `/` and `%` on integers are
+  functions named after their operand types (`q_arith_div_integer_integer`), never the native
+  operators.
+- **A volatile function is not a function.** `random()`, `nextval`, `clock_timestamp()` and every
+  other function Postgres declares volatile, in its core or in `pgcrypto` and `uuid-ossp`
+  (`sqleq_frontend::VOLATILE_FUNCTIONS`), can give two calls with equal arguments two values, so a
+  call to one is refused rather than read as an uninterpreted function. A volatile function a user
+  defines is a name like any other.
+- **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
+  refused: modelled as the prover's own (`count`, `sum`, `avg`, `min`, `max`) or as an uninterpreted
+  function of the bag of its inputs (`bool_or`, `bit_or`, `var_pop`, `corr`, `regr_*`, `range_agg`,
+  …); refused when the bag does not determine its result (`array_agg`, `string_agg`, the `json*_agg`
+  family, `any_value`) or when it is an ordered-set or hypothetical-set aggregate
+  (`percentile_cont`, `mode`, `rank(…) WITHIN GROUP`). An aggregate in a subquery whose arguments
+  read only an enclosing query's columns belongs to that query, and is refused. An aggregate a user
+  defines is recognised only through a `declare aggregate function` line.
+- **A call is more than a name and positional arguments.** A named argument
+  (`make_interval(days => a)`, `json_object('k' VALUE a)`), a `t.*` argument, `WITHIN GROUP`, the
+  SQL/JSON `ON NULL` and `RETURNING` clauses, an `ORDER BY` or `WHERE` inside the parentheses and
+  `IGNORE NULLS` are refused, and so are `DISTINCT`, `FILTER` and `*` on a call that is not a known
+  aggregate. `SELECT … INTO`, which creates a table, is refused too.
 - **A join-delete or join-update is a semi-join only when nothing it assigns or returns reads the
   join.** `DELETE FROM t USING u WHERE p` deletes the rows `EXISTS (SELECT 1 FROM u WHERE p)` keeps,
   but when several `u` rows match, a `SET` or `RETURNING` reading `u` takes an unspecified one of

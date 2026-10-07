@@ -74,7 +74,8 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
     }
     match vt {
         VType::Integer => Val::Int(*[0i64, 1, 2].choose(rng).unwrap()),
-        VType::Double => Val::Dbl(*[0.0f64, 1.0, 2.0].choose(rng).unwrap()),
+        // A `numeric` column draws from the same pool; its DuckDB DECIMAL stores each value exactly.
+        VType::Double | VType::Decimal(..) => Val::Dbl(*[0.0f64, 1.0, 2.0].choose(rng).unwrap()),
         VType::Boolean => Val::Bool(*[true, false].choose(rng).unwrap()),
         VType::Date => Val::Date(
             (*["2020-01-01", "2020-01-02", "2020-01-03"]
@@ -82,7 +83,8 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
                 .unwrap())
             .to_string(),
         ),
-        VType::Timestamp => Val::Ts(
+        // A `timestamptz` column takes the same literals, read as instants in the UTC session.
+        VType::Timestamp | VType::TimestampTz => Val::Ts(
             (*[
                 "2020-01-01 00:00:00",
                 "2020-01-02 00:00:00",
@@ -162,6 +164,8 @@ pub fn cast_target(ty: &str) -> Option<CastTarget> {
         CastTarget::V(VType::Boolean)
     } else if base == "date" {
         CastTarget::V(VType::Date)
+    } else if base == "timestamptz" || (base == "timestamp" && t.contains("with time zone")) {
+        CastTarget::V(VType::TimestampTz)
     } else if base.starts_with("timestamp") || base == "datetime" {
         CastTarget::V(VType::Timestamp)
     } else if base.starts_with("time") {
@@ -272,6 +276,7 @@ mod tests {
             vt: VType::Varchar,
             notnull: false,
             array: true,
+            padded: false,
         };
         let mut rng = StdRng::seed_from_u64(7);
         let mut saw_list = 0;
@@ -315,6 +320,7 @@ mod tests {
             vt: VType::Integer,
             notnull: true,
             array: false,
+            padded: false,
         };
         assert!(matches!(randval_col(&c, &mut rng), Val::Int(_)));
     }
