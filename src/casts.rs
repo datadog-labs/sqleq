@@ -755,7 +755,7 @@ mod tests {
         // A float is not a REAL: it rounds. Its cast is a `qcast` into the opaque type.
         let (q, rw) = run("SELECT t.user_id::float FROM t").expect("rewrites");
         assert!(q[0].contains("qcast0"), "{}", q[0]);
-        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), arg: Ty::Int, ret: Ty::Opaque }]);
+        assert_eq!(rw.qcasts, vec![QCast { name: "qcast0".into(), ret: Ty::Opaque }]);
     }
 
     #[test]

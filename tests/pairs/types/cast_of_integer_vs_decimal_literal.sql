@@ -4,10 +4,10 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: emit
+-- expect frontend: refuse:unsupported
 -- expect fuzz: counterexample
--- expect qed: no-proof
--- expect sqleq-solver: no-proof
+-- expect qed: no-plan
+-- expect sqleq-solver: no-plan
 -- expect lean: unsupported
 -- origin: issue #61: sqleq-solver's set solver made 1 and 1.0 one constant, so their text casts were one value
 -- witness: t = {(1, 2)}: A yields '1.0', B yields '1'
