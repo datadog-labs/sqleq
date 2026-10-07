@@ -138,9 +138,13 @@ impl Catalog {
     /// `FROM t`. Where no two names collide, folding loses nothing a query that runs could need,
     /// because a reference whose case differs from the declaration fails in Postgres.
     ///
-    /// A column keeps a quoted name's case, and name resolution tells `"S"` from `s`. Two columns of
-    /// one table that differ only in case are refused all the same, because type inference
-    /// attributes a reference to a column by its lower-cased name.
+    /// A column keeps a quoted name's case, and name resolution and type inference both tell `"S"`
+    /// from `s`. Two columns of one table that differ only in case are refused all the same: that
+    /// is no longer what keeps them apart, and lifting it is a completeness change of its own.
+    ///
+    /// A catalog synthesized by type inference is not checked here: `infer::build_inferred`
+    /// refuses a pair that names two tables up to case, and a synthesized table may hold two such
+    /// columns, since the pair's own references, compared exactly, are what named them.
     pub fn check_case_collisions(&self) -> Result<()> {
         let mut tables = std::collections::HashSet::new();
         for t in &self.tables {

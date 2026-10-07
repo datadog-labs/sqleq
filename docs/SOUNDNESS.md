@@ -317,11 +317,13 @@ what it is or refused:
 - **A quoted name keeps its case.** A name is folded as Postgres folds it: an unquoted one to lower
   case (ASCII only, as under a multibyte server encoding), a quoted one not at all. So a column
   declared `"A"` is not read by `A`, a table alias `"X"` is not `x`, a `WITH "T"` binding is not a
-  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. Table names are still
-  compared case-insensitively, as is the attribution of a column in type inference, so a schema with
+  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. Type inference folds names
+  the same way, so without a DDL `"createdAt"` and `createdat` are two columns, and `"Orders"` and
+  `orders` two tables. Table names are still compared case-insensitively, so a DDL that declares
   two tables, or two columns of one table, whose names differ only in case (`"s"` and `"S"`) is
-  refused rather than resolved to one of them. So is a derived table with two columns of one name
-  up to case, whether the select list, the alias's column list or a `*` named them.
+  refused rather than resolved to one of them, and so, under type inference, is a pair that names
+  two such tables (`"Orders"` and `orders`, `"S".t` and `s.t`). So is a derived table with two columns of one
+  name up to case, whether the select list, the alias's column list or a `*` named them.
 - **A name is resolved where Postgres resolves it.** A qualified `s.x` reads the nearest relation
   called `s`, and when that relation has no column `x` it is refused, as Postgres raises an error,
   rather than read from an enclosing relation also called `s`. A bare name reads the query's own
