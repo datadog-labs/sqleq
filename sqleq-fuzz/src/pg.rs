@@ -3,20 +3,25 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Experimental: run a pair on a private PostgreSQL cluster instead of DuckDB.
+//! The Postgres engine (`--engine postgres`): run a pair on a private PostgreSQL cluster, where what
+//! Postgres computes is the answer and nothing has to be emulated.
 //!
-//! This is the throughput and reach spike for replacing DuckDB with Postgres itself. It is not wired
-//! into [`crate::test_pair`]; `sqleq-fuzz pg-csv` drives it and writes timings beside each verdict.
 //! The instance generator, the parameter analysis and the cut and nondeterminism rules are the ones
-//! `test_pair` uses. What differs is where the statements run:
+//! [`crate::test_pair`] uses. What differs is where and how the statements run:
 //!
+//! * [`Server`] serves a copy of a cached template cluster from a fresh temp directory, on a unix
+//!   socket there only, with one database per worker, and is gone when dropped or when the process
+//!   dies.
 //! * The DDL runs once per pair, inside a transaction rolled back at the end, so every constraint it
-//!   declares is Postgres's to enforce and a generated row Postgres rejects is simply not there. Three
-//!   repairs make captured DDL run, and none adds a constraint: a schema the DDL names is created, a
-//!   table the rest of the DDL names by one schema is created in that schema, and a type nothing
-//!   declares is stood in for by a `text` domain (counted, since enum order and labels are lost).
+//!   declares is Postgres's to enforce and a generated row Postgres rejects is simply not there.
+//!   Captured DDL is repaired only in ways that add no constraint: a schema it names is created, a
+//!   table the rest of the DDL names by one schema is created there, a table the queries name by one
+//!   schema is moved there, a type nothing declares is a `text` domain, and a column default that
+//!   calls a function nothing declares is dropped ([`Timing::caveat`] reports the last two).
 //! * Each trial loads its rows under a savepoint and runs each side under a nested one, so nothing is
 //!   re-created per side, and a sequence is reset before each side that can write.
+//! * Each placeholder is written in as a cast to the type Postgres infers for it, one type per `$N`
+//!   across the pair.
 //! * Results are read as Postgres's own text. Two bags of one size that differ only in spelling are
 //!   compared again under Postgres `=`, so `2.0` and `2.00` are the same value.
 
@@ -58,12 +63,51 @@ const EXTENSIONS: &[&str] = &[
     "btree_gin",
 ];
 
-/// A private cluster, stopped when dropped.
-pub struct Server {
-    bin: PathBuf,
-    data: PathBuf,
-    sock: PathBuf,
-    port: u16,
+/// The Postgres major version verdicts are defined against.
+pub const MAJOR: u32 = 17;
+
+/// Bumped whenever what the cached template holds changes, so an old template is never reused.
+const TEMPLATE_FORMAT: u32 = 1;
+
+/// Where the Postgres binaries are: `$SQLEQ_PG_BIN`, else the directory of the `postgres` on `PATH`.
+pub fn bin_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("SQLEQ_PG_BIN") {
+        return Ok(PathBuf::from(dir));
+    }
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path).find(|d| d.join("postgres").is_file() && d.join("initdb").is_file())
+        })
+        .ok_or_else(|| {
+            format!(
+                "no PostgreSQL {MAJOR} found: set SQLEQ_PG_BIN to the directory holding its \
+                 `postgres` and `initdb`"
+            )
+        })
+}
+
+/// The server's version (`17.11`), refusing any major but [`MAJOR`]: a verdict is a claim about one
+/// version's semantics.
+pub fn version(bin: &Path) -> Result<String, String> {
+    let out = Command::new(bin.join("postgres"))
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", bin.join("postgres").display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let ver = text
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_string();
+    let major: Option<u32> = ver.split('.').next().and_then(|m| m.parse().ok());
+    if major != Some(MAJOR) {
+        return Err(format!(
+            "sqleq-fuzz needs PostgreSQL {MAJOR}, and {} is `{}`",
+            bin.join("postgres").display(),
+            text.trim()
+        ));
+    }
+    Ok(ver)
 }
 
 fn run(cmd: &mut Command) -> Result<(), String> {
@@ -79,106 +123,264 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-impl Server {
-    /// Initialise a cluster under `root` (unless one is already there) and start it, reachable only
-    /// through a unix socket in `root`. Errors are the common case here -- a row a constraint refuses,
-    /// a side Postgres rejects -- so the server logs none of them: a corpus run would otherwise
-    /// write every failing statement's text to `server.log`.
-    pub fn start(bin: &Path, root: &Path, port: u16, max_connections: usize) -> Result<Server, String> {
-        let data = root.join("data");
-        let sock = root.join("s");
-        std::fs::create_dir_all(&sock).map_err(|e| e.to_string())?;
-        if !data.join("PG_VERSION").exists() {
-            run(Command::new(bin.join("initdb")).arg("-D").arg(&data).args([
-                "--locale=C",
-                "--encoding=UTF8",
-                "-A",
-                "trust",
-                "-U",
-                "postgres",
-                "--no-sync",
-                "-N",
-            ]))?;
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
         }
-        let opts = format!(
-            "-c listen_addresses= -c unix_socket_directories={} -c port={port} \
-             -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c jit=off \
-             -c max_connections={max_connections} -c dynamic_shared_memory_type=mmap \
-             -c TimeZone=UTC -c lc_messages=C -c shared_buffers=256MB \
-             -c log_min_messages=fatal -c log_min_error_statement=panic",
-            sock.display()
-        );
-        run(Command::new(bin.join("pg_ctl"))
+    }
+    Ok(())
+}
+
+/// A fresh directory under the system temp dir, named for this process.
+fn fresh_dir(prefix: &str) -> Result<PathBuf, String> {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}{}-{}-{nanos:x}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The prefix of every directory a run serves a cluster from.
+const RUN_PREFIX: &str = "sqleq-pg-";
+
+/// Remove the run directories of processes that died without removing theirs (a timeout's kill):
+/// those whose socket nothing answers on, left more than ten minutes ago.
+fn sweep_stale_runs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(RUN_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(600));
+        let live = std::os::unix::net::UnixStream::connect(path.join(".s.PGSQL.5432")).is_ok();
+        if old && !live {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// A postmaster serving `data` on a unix socket in `sock` only, run under a shell that stops it the
+/// moment its stdin closes -- when the [`Postmaster`] is dropped, and equally when this process is
+/// killed, which `pg_ctl`'s detached server would outlive.
+struct Postmaster {
+    supervisor: std::process::Child,
+}
+
+impl Postmaster {
+    fn start(bin: &Path, data: &Path, sock: &Path, max_connections: usize) -> Result<Postmaster, String> {
+        let log = std::fs::File::create(sock.join("server.log")).map_err(|e| e.to_string())?;
+        let supervisor = Command::new("sh")
+            .arg("-c")
+            .arg(r#""$@" & pid=$!; read -r _; kill -INT "$pid" 2>/dev/null; wait "$pid""#)
+            .arg("sh")
+            .arg(bin.join("postgres"))
             .arg("-D")
-            .arg(&data)
-            .arg("-l")
-            .arg(root.join("server.log"))
-            .args(["-w", "-o", &opts, "start"]))?;
-        Ok(Server {
-            bin: bin.to_path_buf(),
-            data,
-            sock,
-            port,
-        })
-    }
-
-    pub fn connect(&self, db: &str) -> Result<Client, String> {
-        let mut c = Client::connect(
-            &format!(
-                "host={} port={} user=postgres dbname={db}",
-                self.sock.display(),
-                self.port
-            ),
-            NoTls,
-        )
-        .map_err(|e| e.to_string())?;
-        c.batch_execute("SET statement_timeout = '10s'; SET lock_timeout = '2s'")
-            .map_err(|e| msg(&e))?;
-        Ok(c)
-    }
-
-    pub fn version(&self) -> Result<String, String> {
-        let mut c = self.connect("postgres")?;
-        let row = c.query_one("SHOW server_version", &[]).map_err(|e| msg(&e))?;
-        Ok(row.get(0))
-    }
-
-    /// One database per worker, cloned from a template carrying [`EXTENSIONS`]: concurrent
-    /// transactions that create same-named catalog objects in one database wait on each other.
-    pub fn worker_databases(&self, n: usize) -> Result<Vec<String>, String> {
-        let mut admin = self.connect("postgres")?;
-        for i in 0..n {
-            let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS sqleq_w{i}"));
+            .arg(data)
+            .args(["-c", "listen_addresses=", "-c"])
+            .arg(format!("unix_socket_directories={}", sock.display()))
+            .args([
+                "-c",
+                "port=5432",
+                "-c",
+                "fsync=off",
+                "-c",
+                "synchronous_commit=off",
+                "-c",
+                "full_page_writes=off",
+                "-c",
+                "jit=off",
+                "-c",
+                "dynamic_shared_memory_type=mmap",
+                "-c",
+                "shared_buffers=32MB",
+                "-c",
+                "TimeZone=UTC",
+                "-c",
+                "lc_messages=C",
+                // Errors are the common case here -- a row a constraint refuses, a side Postgres
+                // rejects -- so none is logged: a corpus run would otherwise write every failing
+                // statement's text to the log.
+                "-c",
+                "log_min_messages=fatal",
+                "-c",
+                "log_min_error_statement=panic",
+                "-c",
+            ])
+            .arg(format!("max_connections={max_connections}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map_err(|e| format!("cannot start postgres: {e}"))?;
+        let pm = Postmaster { supervisor };
+        // Ready once a connection is accepted.
+        let started = Instant::now();
+        loop {
+            if Client::connect(&conninfo(sock, "postgres"), NoTls).is_ok() {
+                return Ok(pm);
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let log = std::fs::read_to_string(sock.join("server.log")).unwrap_or_default();
+                return Err(format!("postgres did not start: {}", log.trim()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let _ = admin.batch_execute("DROP DATABASE IF EXISTS sqleq_tmpl");
-        admin
-            .batch_execute("CREATE DATABASE sqleq_tmpl")
-            .map_err(|e| msg(&e))?;
+    }
+}
+
+impl Drop for Postmaster {
+    fn drop(&mut self) {
+        drop(self.supervisor.stdin.take());
+        let _ = self.supervisor.wait();
+    }
+}
+
+fn conninfo(sock: &Path, db: &str) -> String {
+    format!("host={} port=5432 user=postgres dbname={db}", sock.display())
+}
+
+/// The template every run copies: an initialised cluster whose `sqleq_tmpl` database carries
+/// [`EXTENSIONS`]. Built once per Postgres version, under `$SQLEQ_PG_CACHE` (default
+/// `~/.cache/sqleq`), and renamed into place whole, so two processes building it at once each get a
+/// complete one.
+fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
+    let cache = match std::env::var_os("SQLEQ_PG_CACHE") {
+        Some(d) => PathBuf::from(d),
+        None => std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .ok_or("no cache directory: set SQLEQ_PG_CACHE")?
+            .join("sqleq"),
+    };
+    let dir = cache.join(format!("pg-template-{ver}-v{TEMPLATE_FORMAT}"));
+    if dir.join("PG_VERSION").is_file() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&cache).map_err(|e| format!("cannot create {}: {e}", cache.display()))?;
+    let work = fresh_dir(RUN_PREFIX)?;
+    let built = (|| {
+        let data = work.join("data");
+        run(Command::new(bin.join("initdb")).arg("-D").arg(&data).args([
+            "--locale=C",
+            "--encoding=UTF8",
+            "-A",
+            "trust",
+            "-U",
+            "postgres",
+            "--no-sync",
+            "-N",
+        ]))?;
         {
-            let mut t = self.connect("sqleq_tmpl")?;
+            let _pm = Postmaster::start(bin, &data, &work, 8)?;
+            let mut admin = Client::connect(&conninfo(&work, "postgres"), NoTls).map_err(|e| e.to_string())?;
+            admin
+                .batch_execute("CREATE DATABASE sqleq_tmpl")
+                .map_err(|e| msg(&e))?;
+            let mut t = Client::connect(&conninfo(&work, "sqleq_tmpl"), NoTls).map_err(|e| e.to_string())?;
             for ext in EXTENSIONS {
+                // An install that lacks one leaves only the pairs that use it without a schema.
                 let _ = t.batch_execute(&format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\""));
             }
         }
-        let mut names = Vec::with_capacity(n);
-        for i in 0..n {
-            let name = format!("sqleq_w{i}");
-            admin
-                .batch_execute(&format!("CREATE DATABASE {name} TEMPLATE sqleq_tmpl"))
-                .map_err(|e| msg(&e))?;
-            names.push(name);
+        let staged = cache.join(format!(
+            "{}.{}",
+            dir.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::rename(&data, &staged).or_else(|_| copy_dir(&data, &staged)).map_err(|e| e.to_string())?;
+        if std::fs::rename(&staged, &dir).is_err() {
+            // Another process put a template in place first; theirs serves as well as ours.
+            let _ = std::fs::remove_dir_all(&staged);
         }
-        Ok(names)
+        Ok::<(), String>(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    built.map(|()| dir)
+}
+
+/// A private cluster for one run: a copy of the cached template cluster in a fresh temp directory,
+/// served on a unix socket there, with one database per worker. Dropping it stops the server and
+/// removes the directory.
+pub struct Server {
+    root: PathBuf,
+    postmaster: Option<Postmaster>,
+    version: String,
+}
+
+impl Server {
+    pub fn start(workers: usize) -> Result<Server, String> {
+        let bin = bin_dir()?;
+        let version = version(&bin)?;
+        sweep_stale_runs();
+        let tmpl = template(&bin, &version)?;
+        let root = fresh_dir(RUN_PREFIX)?;
+        let mut server = Server {
+            root: root.clone(),
+            postmaster: None,
+            version,
+        };
+        copy_dir(&tmpl, &root.join("data")).map_err(|e| format!("cannot copy the template: {e}"))?;
+        // Postgres refuses a data directory others can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(root.join("data"), std::fs::Permissions::from_mode(0o700));
+        }
+        server.postmaster = Some(Postmaster::start(&bin, &root.join("data"), &root, workers + 4)?);
+        let mut admin = server.connect("postgres")?;
+        for i in 0..workers {
+            admin
+                .batch_execute(&format!("CREATE DATABASE sqleq_w{i} TEMPLATE sqleq_tmpl"))
+                .map_err(|e| msg(&e))?;
+        }
+        Ok(server)
+    }
+
+    /// The server's version, as `postgres --version` reports it (`17.11`).
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The database of worker `i`.
+    pub fn worker(&self, i: usize) -> Result<Client, String> {
+        self.connect(&format!("sqleq_w{i}"))
+    }
+
+    fn connect(&self, db: &str) -> Result<Client, String> {
+        let mut c = Client::connect(&conninfo(&self.root, db), NoTls).map_err(|e| e.to_string())?;
+        c.batch_execute("SET statement_timeout = '10s'; SET lock_timeout = '2s'")
+            .map_err(|e| msg(&e))?;
+        Ok(c)
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new(self.bin.join("pg_ctl"))
-            .arg("-D")
-            .arg(&self.data)
-            .args(["-m", "immediate", "-w", "stop"])
-            .output();
+        drop(self.postmaster.take());
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -200,6 +402,8 @@ pub struct Timing {
     pub rows_kept: usize,
     /// Types nothing declared, stood in for by a `text` domain.
     pub stand_ins: usize,
+    /// Column defaults dropped because they call a function nothing declared.
+    pub dropped_defaults: usize,
     /// Placeholders whose value domain came from the type Postgres inferred for them.
     pub typed_params: usize,
     /// Trials whose bags differed as text and agreed under `=`.
@@ -212,6 +416,24 @@ pub struct Timing {
 pub struct Outcome {
     pub verdict: Verdict,
     pub timing: Timing,
+}
+
+impl Timing {
+    /// What the verdict rests on beyond the DDL as written, if anything: a type read as text loses an
+    /// enum's order and labels, and a dropped default changes what an INSERT omitting its column stores.
+    pub fn caveat(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.stand_ins > 0 {
+            parts.push(format!("{} undeclared types read as text", self.stand_ins));
+        }
+        if self.dropped_defaults > 0 {
+            parts.push(format!(
+                "{} defaults calling undeclared functions dropped",
+                self.dropped_defaults
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
 }
 
 /// A client that counts its round trips.
@@ -653,7 +875,10 @@ fn run_side(
     let msgs = match db.simple(&sql) {
         Ok(m) => m,
         Err(e) => {
-            db.exec("ROLLBACK TO SAVEPOINT side")?;
+            // A syntax error rejects the whole batch before its savepoint is taken, so this can
+            // fail too; the trial's own rollback, which follows, recovers either way. The error the
+            // side raised is the one to report.
+            let _ = db.exec("ROLLBACK TO SAVEPOINT side");
             return Err(e);
         }
     };
@@ -987,7 +1212,8 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             }
         }
     }
-    timing.stand_ins = stubs.len();
+    timing.stand_ins = stubs.iter().filter(|s| !s.is_empty()).count();
+    timing.dropped_defaults = stubs.iter().filter(|s| s.is_empty()).count();
 
     // A table the queries name by one schema, created in another, moves there: it is one table under
     // the spelling the queries use. Named by two schemas, it is two tables to the queries.
@@ -1384,9 +1610,6 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 real = true;
             }
             if real {
-                if std::env::var_os("SQLEQ_PG_DEBUG").is_some() {
-                    eprintln!("A: {sub_a}\nB: {sub_b}\nA bags: {ra:?}\nB bags: {rb:?}");
-                }
                 verdict = Some(Verdict::NotEquivalent(describe(&binds, &kept)));
             } else if unknown {
                 timing.uncomparable += 1;

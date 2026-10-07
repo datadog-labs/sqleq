@@ -206,6 +206,20 @@ jobs:
           echo "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb  $dir/libduckdb-linux-amd64.zip" \
             | sha256sum -c -
 
+      # The Postgres engine's tests need a PostgreSQL 17, which the engine requires: the runner's
+      # preinstalled server is another major version, so take 17 from the PostgreSQL project's own
+      # apt repository. `SQLEQ_PG_REQUIRED` makes a missing server fail those tests instead of
+      # skipping them.
+      - name: install PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-17
+          /usr/lib/postgresql/17/bin/postgres --version
+          echo "SQLEQ_PG_BIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+          echo "SQLEQ_PG_REQUIRED=1" >> "$GITHUB_ENV"
+
       - run: cargo test -p sqleq-fuzz
       - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built. The
