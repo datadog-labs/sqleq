@@ -81,7 +81,9 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 impl Server {
     /// Initialise a cluster under `root` (unless one is already there) and start it, reachable only
-    /// through a unix socket in `root`.
+    /// through a unix socket in `root`. Errors are the common case here -- a row a constraint refuses,
+    /// a side Postgres rejects -- so the server logs none of them: a corpus run would otherwise
+    /// write every failing statement's text to `server.log`.
     pub fn start(bin: &Path, root: &Path, port: u16, max_connections: usize) -> Result<Server, String> {
         let data = root.join("data");
         let sock = root.join("s");
@@ -102,7 +104,8 @@ impl Server {
             "-c listen_addresses= -c unix_socket_directories={} -c port={port} \
              -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c jit=off \
              -c max_connections={max_connections} -c dynamic_shared_memory_type=mmap \
-             -c TimeZone=UTC -c lc_messages=C -c shared_buffers=256MB",
+             -c TimeZone=UTC -c lc_messages=C -c shared_buffers=256MB \
+             -c log_min_messages=fatal -c log_min_error_statement=panic",
             sock.display()
         );
         run(Command::new(bin.join("pg_ctl"))
