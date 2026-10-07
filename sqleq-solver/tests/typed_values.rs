@@ -4,8 +4,8 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! A value keeps its SQL type: integer and decimal division are different functions, `2` and
-//! `2.0` (and `2.0` and `2.00`) are different values though `=` calls them equal, constants are
-//! compared exactly, `TRUE` is not `1`, and strings are not ordered by bytes. Each pair marked
+//! `2.0` (and `2.0` and `2.00`, or two opaque values) are different values though `=` calls them
+//! equal, constants are compared exactly, `TRUE` is not `1`, and strings are not ordered by bytes. Each pair marked
 //! "not equivalent" was proved before.
 
 mod support;
@@ -91,6 +91,26 @@ fn an_equality_between_decimals_does_not_make_them_one_value() {
         select_where(vec![cast("VARCHAR", col(2, "REAL"))], a_eq_b()),
     );
     assert!(!proved(&v), "{v:?}");
+}
+
+#[test]
+fn an_equality_between_opaque_values_does_not_make_them_one_value() {
+    // VARBINARY stands for types whose `=` is not identity: `double precision` (`0 = -0`, and
+    // `CAST(-0 AS TEXT)` is '-0'), and arrays, which compare elements with the element type's `=`
+    // (`'{2.0}' = '{2.00}'`). So `a = b` must not let one stand for the other inside a cast.
+    let schemas = vec![table("t", &["INTEGER", "VARBINARY", "VARBINARY"], &[true, true, true], &[])];
+    let a_eq_b = || pred("=", vec![col(1, "VARBINARY"), col(2, "VARBINARY")]);
+    for text in [|x: Value| cast("VARCHAR", x), |x: Value| call("QCAST0", "VARCHAR", vec![x])] {
+        let v = pair(
+            schemas.clone(),
+            select_where(vec![text(col(1, "VARBINARY"))], a_eq_b()),
+            select_where(vec![text(col(2, "VARBINARY"))], a_eq_b()),
+        );
+        assert!(!proved(&v), "{v:?}");
+    }
+    // The comparison itself still commutes.
+    let ids = |x: u32, y: u32| select_where(vec![col(0, "INTEGER")], pred("=", vec![col(x, "VARBINARY"), col(y, "VARBINARY")]));
+    assert!(proved(&pair(schemas, ids(1, 2), ids(2, 1))));
 }
 
 #[test]

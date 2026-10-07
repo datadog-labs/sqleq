@@ -176,8 +176,11 @@ Each difference is there for soundness:
   `CAST(1.0 AS TEXT)` is `'1.0'`. A constant is a value of its own type, compared exactly and never
   through a float, so `1`, `1.0` and `1.00` are three values that `=` calls equal. SQL's `=` is read
   as identity, which lets normalization put one side in place of the other, only between two
-  values of one type on which it is identity; between two decimals, an integer and a decimal, or
-  two intervals it compares the values through a key. Two string constants are not ordered by
+  values of one type on which it is identity; between two decimals, an integer and a decimal, two
+  intervals, or two values of the opaque VARBINARY (which stands for `double precision`, where
+  `0 = -0`, and for arrays, whose `=` is their elements') it compares the values through a key.
+  Deduplication (`DISTINCT`, `GROUP BY`, set operations) still keeps values apart by identity.
+  Two string constants are not ordered by
   bytes, which only the `C` collation does. The two sides' output columns must have the same types,
   since `TRUE` and `1` are one term. A literal that does not denote a value of its IR type (an
   INTEGER `1e-5`) is refused.

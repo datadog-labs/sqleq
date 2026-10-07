@@ -45,8 +45,8 @@
 //! `CAST(1.0 AS TEXT)` spell different strings. And SQL's `=` is read as identity of the two
 //! values -- the reading that lets normalization substitute one side for the other -- only between
 //! two values of one type on which `=` *is* identity; anywhere else (two decimals, an integer
-//! against a decimal, two intervals) it compares the values' images under a key function, so that
-//! `a = 2.0` says nothing about what `a` *is* (see `sql_eq`).
+//! against a decimal, two intervals, two opaque values) it compares the values' images under a key
+//! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`).
 
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
@@ -73,14 +73,16 @@ fn types_of(operand: &[Expr]) -> Vec<Type> {
 /// The key function through which SQL's `=` between a value of type `a` and one of type `b` is
 /// read, or `None` when it is identity of the two values. It is identity only between two values of
 /// one type whose `=` holds exactly when the values are the same: integers, strings (under a
-/// deterministic collation, which compares bytes), booleans, dates, times and timestamps, and the
-/// opaque VARBINARY. It is not between two decimals (`2.0 = 2.00`, yet they print, cast and divide
-/// differently), an integer and a decimal, or two intervals (`'1 day' = '24 hours'`). There the two
-/// sides are compared through a key, which a substitution cannot see through, so an equality never
+/// deterministic collation, which compares bytes), booleans, dates, times and timestamps. It is not
+/// between two decimals (`2.0 = 2.00`, yet they print, cast and divide differently), an integer and
+/// a decimal, two intervals (`'1 day' = '24 hours'`), or two values of the opaque VARBINARY, which
+/// stands for types whose `=` is not identity either: `double precision` (`0 = -0`), and arrays,
+/// which compare elements with the element type's `=` (`'{2.0}' = '{2.00}'`). There the two sides
+/// are compared through a key, which a substitution cannot see through, so an equality never
 /// licenses putting one value where the other was.
 fn eq_key(a: Type, b: Type) -> Option<String> {
     let numeric = |t: Type| matches!(t, Type::Integer | Type::Real);
-    if a == b && !matches!(a, Type::Real | Type::Interval) {
+    if a == b && !matches!(a, Type::Real | Type::Interval | Type::Varbinary) {
         return None;
     }
     if numeric(a) && numeric(b) {
