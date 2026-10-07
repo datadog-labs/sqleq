@@ -5,12 +5,13 @@
 
 -- truth: not-equivalent
 -- expect frontend: emit
--- expect fuzz: counterexample
+-- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issues #61 and #56: 2e0 reaches sqleq-solver typed INTEGER, which read it through a float as the integer 2
--- witness: t = {(7)}: 2e0 is numeric, so A yields 3.5 and B yields 3
+-- origin: issue #55: integer / reached the QED prover as z3's Euclidean div, which rounds -1 / 2 to
+--   -1 where Postgres truncates it to 0
+-- witness: t = {(-1)}: A yields no rows (-1 / 2 = 0 in Postgres, and 0 > -1), B yields (-1)
 create table "t" ("a" INTEGER);
-SELECT "a" / 2e0 FROM "t";
-SELECT "a" / 2 FROM "t";
+SELECT "a" FROM "t" WHERE "a" / 2 * 2 <= "a";
+SELECT "a" FROM "t" WHERE "a" IS NOT NULL;

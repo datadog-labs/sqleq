@@ -6,7 +6,7 @@
 -- truth: equivalent
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
--- expect qed: panic
+-- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #62: a bare `numeric` cast target reached DuckDB, which reads it as DECIMAL(18,3)
