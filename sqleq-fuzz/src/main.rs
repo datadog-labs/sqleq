@@ -78,6 +78,7 @@ fn main() -> ExitCode {
 
     let result = match pos.first().map(String::as_str) {
         Some("csv") => run_csv(&pos[1..], cfg, jobs.max(1)),
+        Some("pg-csv") => run_pg_csv(&pos[1..], cfg, jobs.max(1)),
         Some("row") => run_row(&pos[1..], cfg),
         Some("file") => run_file(&pos[1..], cfg),
         _ => {
@@ -236,6 +237,136 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
             work.len() - map.len(),
             work.len()
         ));
+    }
+    Ok(())
+}
+
+/// Experimental: batch a corpus on a private Postgres cluster (`sqleq_fuzz::pg`), writing one JSON
+/// line per pair with its verdict and what it cost. `$SQLEQ_PG_BIN` names the Postgres bin
+/// directory, `$SQLEQ_PG_ROOT` the directory the cluster lives in, `$SQLEQ_PG_PORT` its socket's
+/// port number (default 55418).
+fn run_pg_csv(args: &[String], cfg: Config, jobs: usize) -> Result<(), String> {
+    use sqleq_fuzz::pg;
+    use std::io::Write;
+
+    let corpus_path = args.first().ok_or("pg-csv mode needs <corpus.csv>")?;
+    let names_path = args.get(1).ok_or("pg-csv mode needs <names.txt>")?;
+    let out_path = args.get(2).ok_or("pg-csv mode needs <out.jsonl>")?;
+    let bin = std::env::var("SQLEQ_PG_BIN").map_err(|_| "set SQLEQ_PG_BIN")?;
+    let root = std::env::var("SQLEQ_PG_ROOT").map_err(|_| "set SQLEQ_PG_ROOT")?;
+    let port: u16 = std::env::var("SQLEQ_PG_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55418);
+
+    let started = std::time::Instant::now();
+    let server = Arc::new(pg::Server::start(
+        Path::new(&bin),
+        Path::new(&root),
+        port,
+        jobs + 4,
+    )?);
+    let dbs = server.worker_databases(jobs)?;
+    eprintln!(
+        "postgres {} up with {jobs} worker databases in {:.2}s",
+        server.version()?,
+        started.elapsed().as_secs_f64()
+    );
+
+    let corpus = Arc::new(load_corpus(corpus_path)?);
+    let names_txt = std::fs::read_to_string(names_path)
+        .map_err(|e| format!("cannot read {names_path}: {e}"))?;
+    let work: Arc<Vec<(String, Option<usize>)>> = Arc::new(
+        names_txt
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let digits: String = l.chars().filter(|c| c.is_ascii_digit()).collect();
+                (l.to_string(), digits.parse::<usize>().ok())
+            })
+            .collect(),
+    );
+    let out = Arc::new(Mutex::new(
+        std::fs::File::create(out_path).map_err(|e| format!("cannot write {out_path}: {e}"))?,
+    ));
+    let next = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for db in dbs {
+        let (corpus, work, out, next, server) = (
+            Arc::clone(&corpus),
+            Arc::clone(&work),
+            Arc::clone(&out),
+            Arc::clone(&next),
+            Arc::clone(&server),
+        );
+        handles.push(std::thread::spawn(move || {
+            let mut client = server.connect(&db).expect("connect to worker database");
+            loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= work.len() {
+                    break;
+                }
+                let (name, row) = &work[idx];
+                let t = std::time::Instant::now();
+                let outcome = match row.and_then(|r| corpus.get(r)) {
+                    Some((a, b, ddl)) => catch_unwind(AssertUnwindSafe(|| {
+                        pg::test_pair_pg(&mut client, a, b, ddl, cfg)
+                    }))
+                    .unwrap_or_else(|_| {
+                        let _ = client.batch_execute("ROLLBACK");
+                        pg::Outcome {
+                            verdict: Verdict::Error("panic".to_string()),
+                            timing: Default::default(),
+                        }
+                    }),
+                    None => pg::Outcome {
+                        verdict: Verdict::Error("no row".to_string()),
+                        timing: Default::default(),
+                    },
+                };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                let tm = &outcome.timing;
+                let mut trial = tm.trial_ms.clone();
+                trial.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let q = |f: f64| trial.get(((trial.len() as f64 - 1.0) * f) as usize).copied();
+                let mut o = serde_json::json!({
+                    "name": name,
+                    "verdict": outcome.verdict.label(),
+                    "ms": ms,
+                    "ddl_ms": tm.ddl_ms,
+                    "trials": trial.len(),
+                    "trial_p50": q(0.5),
+                    "trial_p95": q(0.95),
+                    "trial_max": trial.last().copied(),
+                    "rows_tried": tm.rows_tried,
+                    "rows_kept": tm.rows_kept,
+                    "stand_ins": tm.stand_ins,
+                    "typed_params": tm.typed_params,
+                    "eq_agreed": tm.eq_agreed,
+                    "uncomparable": tm.uncomparable,
+                    "round_trips": tm.round_trips,
+                });
+                if let Some((ok, err)) = outcome.verdict.partial() {
+                    o["ok_trials"] = serde_json::json!(ok);
+                    o["trial_error"] = serde_json::json!(err);
+                }
+                if let Verdict::NotEquivalent(cx) = &outcome.verdict {
+                    o["counterexample"] = serde_json::json!(cx);
+                }
+                let mut f = out.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = writeln!(f, "{o}");
+            }
+        }));
+    }
+    let died = handles.into_iter().map(|h| h.join()).filter(Result::is_err).count();
+    eprintln!(
+        "pg-csv: {} pairs in {:.1}s",
+        work.len(),
+        started.elapsed().as_secs_f64()
+    );
+    if died > 0 {
+        return Err(format!("{died} worker(s) died"));
     }
     Ok(())
 }

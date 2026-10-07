@@ -35,3 +35,5 @@ rand = "0.10"
 csv = { workspace = true }
 # Batch verdict output.
 serde_json = { workspace = true }
+# Experimental Postgres engine (`pg-csv`): a synchronous client, matching the std::thread pool.
+postgres = "0.19"
