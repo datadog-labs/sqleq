@@ -43,7 +43,10 @@ deterministic. The rules:
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
   database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
   makes its columns `NOT NULL` too), from `CREATE UNIQUE INDEX`, and from `ALTER TABLE … ADD
-  PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET NOT NULL`. A unique index over an expression is
+  PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET NOT NULL`. A `serial` column (`smallserial`,
+  `bigserial`, `serial2/4/8`) and an identity column (`GENERATED … AS IDENTITY`) are `NOT NULL`,
+  and draw distinct values, as a fresh sequence does (that is not a key: Postgres lets an explicit
+  value repeat one). A unique index over an expression is
   created as a DuckDB unique index on that expression (or, where DuckDB will not index it, checked
   after each insert), and `NULLS NOT DISTINCT` admits at most one NULL key. `CREATE UNIQUE INDEX` that the parser drops is recovered by a regex fallback over the raw
   DDL; partial indexes are treated as *total* (conservative — only shrinks the valid space). A

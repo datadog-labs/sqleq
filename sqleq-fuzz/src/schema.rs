@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use regex::Regex;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, DataType, ExactNumberInfo,
-    Expr, IndexColumn, NullsDistinctOption, ObjectName, ObjectNamePart, Statement,
+    Expr, GeneratedAs, IndexColumn, NullsDistinctOption, ObjectName, ObjectNamePart, Statement,
     TableConstraint,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -120,6 +120,12 @@ pub struct Column {
     /// agree, while `c LIKE 'a'` is false. Materialized as a DuckDB VARCHAR it has none of that, and a
     /// pair that reads such a column gets no verdict ([`crate::pair::test_pair`]).
     pub padded: bool,
+    /// Filled from a sequence: a `serial` (`serial2/4/8`, `smallserial`, `bigserial`) or an identity
+    /// column (`GENERATED … AS IDENTITY`). Both are NOT NULL in Postgres, which [`Column::notnull`]
+    /// carries, and a fresh table's sequence never repeats a value, so the generator draws distinct
+    /// ones ([`Table::admits`]). Postgres does not enforce that (an explicit value may repeat one),
+    /// so it is not a key: no DuckDB constraint is created and no key-based reasoning relies on it.
+    pub sequenced: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -143,10 +149,14 @@ pub struct Table {
 }
 
 impl Table {
-    /// Whether a row may join `kept` under the `NULLS NOT DISTINCT` keys: no earlier row holds the
-    /// same values there, NULL counting as a value. The other constraints are DuckDB's to enforce.
+    /// Whether a row may join `kept` under the `NULLS NOT DISTINCT` keys -- no earlier row holds the
+    /// same values there, NULL counting as a value -- and with a value of its own in every
+    /// [`Column::sequenced`] column. The other constraints are DuckDB's to enforce.
     pub fn admits<V: PartialEq>(&self, kept: &[Vec<V>], row: &[V]) -> bool {
-        self.nnd_keys.iter().all(|key| {
+        let fresh = self.cols.iter().enumerate().all(|(i, c)| {
+            !c.sequenced || !kept.iter().any(|other| other[i] == row[i])
+        });
+        fresh && self.nnd_keys.iter().all(|key| {
             let idx: Vec<usize> = key
                 .iter()
                 .filter_map(|c| self.cols.iter().position(|col| &col.name == c))
@@ -207,6 +217,8 @@ struct ColType {
     vt: VType,
     array: bool,
     padded: bool,
+    /// A serial type: NOT NULL, and filled from a sequence ([`Column::sequenced`]).
+    serial: bool,
     problem: Option<String>,
 }
 
@@ -230,6 +242,7 @@ fn map_vtype(dt: &DataType) -> ColType {
             vt: VType::Varchar,
             array: true,
             padded: false,
+            serial: false,
             problem: None,
         },
         DataType::Numeric(info) | DataType::Decimal(info) | DataType::Dec(info) => {
@@ -254,6 +267,7 @@ fn decimal_col(p: Option<i64>, s: Option<i64>) -> ColType {
         vt: VType::Decimal(w as u8, s as u8),
         array: false,
         padded: false,
+        serial: false,
         problem: None,
     };
     match (p, s) {
@@ -319,10 +333,18 @@ fn col_type(raw: &str) -> ColType {
     } else {
         vtype_word(&word)
     };
+    // Shorthand for an integer column that is NOT NULL and defaults to `nextval(..)`. An array of
+    // one is not a type Postgres has.
+    let serial = !array
+        && matches!(
+            word.as_str(),
+            "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
+        );
     ColType {
         vt,
         array,
         padded,
+        serial,
         problem: None,
     }
 }
@@ -651,7 +673,9 @@ fn recover_body(body: &str) -> Option<Table> {
                 let ct = col_type(&type_region(rest));
                 let (_, opts) = take_ident(rest)?;
                 let opts = opts_text(opts);
-                let mut notnull = opts.contains(" not null ");
+                // An identity column is NOT NULL, and so is a serial one (`ColType::serial`).
+                let sequenced = ct.serial || opts.contains(" as identity ");
+                let mut notnull = opts.contains(" not null ") || sequenced;
                 if opts.contains(" primary key ") {
                     notnull = true;
                     t.keys.push(vec![name.clone()]);
@@ -675,6 +699,7 @@ fn recover_body(body: &str) -> Option<Table> {
                         notnull,
                         array,
                         padded: ct.padded,
+                        sequenced,
                     });
                 }
             }
@@ -768,10 +793,23 @@ enum Pending {
 fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<String>) {
     let name = c.name.value.to_lowercase();
     let ct = map_vtype(&c.data_type);
-    let mut notnull = false;
+    // A serial or identity column is NOT NULL in Postgres whatever else the definition says (an
+    // explicit `NULL` on one is an error there), and is filled from a sequence.
+    let mut sequenced = ct.serial;
+    let mut notnull = ct.serial;
     for opt in &c.options {
         match &opt.option {
             ColumnOption::NotNull => notnull = true,
+            // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; a generated column with an expression
+            // (`GENERATED ALWAYS AS (..) STORED`) is neither NOT NULL nor sequenced.
+            ColumnOption::Generated {
+                generated_as: GeneratedAs::Always | GeneratedAs::ByDefault,
+                generation_expr: None,
+                ..
+            } => {
+                notnull = true;
+                sequenced = true;
+            }
             ColumnOption::PrimaryKey(_) => {
                 notnull = true; // PRIMARY KEY implies NOT NULL
                 keys.push((Key::Cols(vec![name.clone()], false), true));
@@ -794,6 +832,7 @@ fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<Stri
             notnull,
             array: ct.array,
             padded: ct.padded,
+            sequenced,
         },
         problem,
     )

@@ -701,6 +701,7 @@ mod tests {
             notnull: false,
             array,
             padded: false,
+            sequenced: false,
         }
     }
 

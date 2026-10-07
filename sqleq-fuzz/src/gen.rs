@@ -277,6 +277,7 @@ mod tests {
             notnull: false,
             array: true,
             padded: false,
+            sequenced: false,
         };
         let mut rng = StdRng::seed_from_u64(7);
         let mut saw_list = 0;
@@ -321,6 +322,7 @@ mod tests {
             notnull: true,
             array: false,
             padded: false,
+            sequenced: false,
         };
         assert!(matches!(randval_col(&c, &mut rng), Val::Int(_)));
     }
