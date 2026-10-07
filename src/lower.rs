@@ -2340,7 +2340,20 @@ impl AggCtx<'_> {
                 let r = self.lower_post(right)?;
                 let (s, t) = binop(op, &l, &r)?;
                 if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) {
-                    Ok(make_cmp(&s, l, r))
+                    // A group key or an aggregate is not a column of the scope, so its collation is
+                    // not traced here: it is the default one only when no column the pair reads
+                    // declares another (see `collation`).
+                    let cat = self.cat;
+                    crate::collation::compare(&s, l, r, |_, _| {
+                        if crate::collation::varies(cat) {
+                            Err(unsupported(
+                                "an order comparison of strings after grouping, where a column the pair reads \
+                                 declares a collation",
+                            ))
+                        } else {
+                            Ok(Some(crate::collation::Collation::Default))
+                        }
+                    })
                 } else {
                     Ok(make_arith(&s, l, r, &t))
                 }
@@ -2811,6 +2824,28 @@ fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
     }
 }
 
+/// `left op right` for a comparison operator. An operand may name `C` or `POSIX` with `COLLATE`,
+/// which decides this comparison's collation and nothing else; an order comparison of two strings
+/// is native only under such a collation, and the uninterpreted predicate for its collation under
+/// any other ([`crate::collation`]).
+fn lower_comparison(
+    cat: &Catalog,
+    scope: &Scope,
+    fns: &Fns,
+    op: &BinaryOperator,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Value> {
+    let (left, lc) = crate::collation::strip(left)?;
+    let (right, rc) = crate::collation::strip(right)?;
+    let l = lower_expr(cat, scope, fns, left)?;
+    let r = lower_expr(cat, scope, fns, right)?;
+    let (opstr, _) = binop(op, &l, &r)?;
+    crate::collation::compare(&opstr, l, r, |a, b| {
+        crate::collation::comparison(cat, scope, lc || rc, &[(left, a), (right, b)])
+    })
+}
+
 /// Lower a scalar expression to an `Expr` Value.
 fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value> {
     match e {
@@ -2890,14 +2925,13 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         }
         Expr::BinaryOp { left, op, right } => {
             use BinaryOperator::*;
+            if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) {
+                return lower_comparison(cat, scope, fns, op, left, right);
+            }
             let l = lower_expr(cat, scope, fns, left)?;
             let r = lower_expr(cat, scope, fns, right)?;
             let (opstr, ty) = binop(op, &l, &r)?;
-            if matches!(op, Eq | NotEq | Lt | Gt | LtEq | GtEq) {
-                Ok(make_cmp(&opstr, l, r))
-            } else {
-                Ok(make_arith(&opstr, l, r, &ty))
-            }
+            Ok(make_arith(&opstr, l, r, &ty))
         }
         Expr::UnaryOp { op, expr } => {
             let inner = lower_expr(cat, scope, fns, expr)?;
@@ -3027,12 +3061,21 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             refuse_quantified_pattern("SIMILAR TO", pattern)?;
             lower_match(cat, scope, fns, "SIMILAR TO", *negated, expr, pattern, escape_char.is_some())
         }
+        // Postgres reads `e BETWEEN lo AND hi` as `e >= lo AND e <= hi`, and gives each of the two
+        // comparisons its own collation: a `COLLATE` on `e` decides both, one on `lo` the first.
         Expr::Between { expr, negated, low, high } => {
+            let (expr, ec) = crate::collation::strip(expr)?;
+            let (low, lc) = crate::collation::strip(low)?;
+            let (high, hc) = crate::collation::strip(high)?;
             let e = lower_expr(cat, scope, fns, expr)?;
             let lo = lower_expr(cat, scope, fns, low)?;
             let hi = lower_expr(cat, scope, fns, high)?;
-            let ge = make_cmp(">=", e.clone(), lo);
-            let le = make_cmp("<=", e, hi);
+            let ge = crate::collation::compare(">=", e.clone(), lo, |a, b| {
+                crate::collation::comparison(cat, scope, ec || lc, &[(expr, a), (low, b)])
+            })?;
+            let le = crate::collation::compare("<=", e, hi, |a, b| {
+                crate::collation::comparison(cat, scope, ec || hc, &[(expr, a), (high, b)])
+            })?;
             Ok(if *negated {
                 json!({ "operator": "OR", "operand": [not_bool(ge), not_bool(le)], "type": "BOOLEAN" })
             } else {

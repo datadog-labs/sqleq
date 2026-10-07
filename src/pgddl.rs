@@ -395,6 +395,7 @@ pub struct Rejected {
 /// learn what the first one choked on, and a production caller can log them.
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
     let (statements, errors) = parse_statements_reporting(raw);
+    let created = crate::collation::created(statements.iter().map(|(st, _)| st));
     let mut tables = Vec::new();
     for (st, _) in statements {
         let Statement::CreateTable(ct) = st else { continue };
@@ -407,10 +408,13 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let mut nullable: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
         let mut keys: Vec<Vec<usize>> = Vec::new();
+        let mut collations = Vec::new();
         for c in &ct.columns {
             let idx = cols.len();
             let ty = map_pg_type(&format!("{}", c.data_type)).unwrap_or(OPAQUE);
-            cols.push((c.name.value.to_lowercase(), ty.to_string()));
+            let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
+            cols.push((c.name.value.to_lowercase(), ty));
+            collations.push(collation);
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
             for opt in &c.options {
@@ -478,6 +482,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             nullable,
             row_determined: determined,
             keys: seen,
+            collations,
         });
     }
     (Catalog { tables }, errors)
