@@ -1261,6 +1261,29 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     } else {
         String::new()
     };
+    // A column default that calls a volatile function (`gen_random_uuid()`, `clock_timestamp()`, a
+    // user function not declared otherwise) draws a value of its own on each side, so two inserts
+    // that omit the column fill it differently whatever they are; only the number of rows each side
+    // leaves is a fact about the statements. `nextval` is the exception: sequences are reset before
+    // each side. Every function a default calls, built-in or not, is named in its stored expression
+    // tree, as a `:funcid` or an operator's `:opfuncid`; `pg_depend` would miss the built-in ones,
+    // on which no dependency is recorded.
+    let volatile_default = mutates && {
+        let regs: Vec<String> = targets.iter().map(|(_, t)| t.reg.clone()).collect();
+        db.trips += 1;
+        match db.c.query(
+            "SELECT EXISTS (SELECT 1 FROM pg_attrdef ad \
+               CROSS JOIN LATERAL regexp_matches(ad.adbin::text, ':(?:op)?funcid ([0-9]+)', 'g') AS m \
+               JOIN pg_proc p ON p.oid = m[1]::oid \
+              WHERE ad.adrelid = ANY (ARRAY(SELECT r::regclass::oid FROM unnest($1::text[]) AS r)) \
+                AND p.provolatile = 'v' AND p.oid <> 'nextval(regclass)'::regprocedure)",
+            &[&regs],
+        ) {
+            Ok(rows) => rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(true),
+            Err(e) => return Verdict::Error(msg(&e)),
+        }
+    };
+    let nondet = nondet || volatile_default;
     // Each side's parameter types: inferred by Postgres, or failing that, inferred with the
     // heuristics' column links declared as hints. The generator's domain for a placeholder is taken
     // only where both sides agree on it.

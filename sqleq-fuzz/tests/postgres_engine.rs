@@ -283,6 +283,25 @@ fn each_side_draws_the_same_sequence_values() {
 }
 
 #[test]
+fn a_volatile_default_draws_a_value_of_its_own_on_each_side() {
+    // Each side's insert draws its own uuid for `id`, so the two tables differ in it whatever the
+    // statements are; only the number of rows is a fact about them.
+    let ddl = r#"create table "t" ("id" UUID PRIMARY KEY DEFAULT gen_random_uuid(), "a" INTEGER)"#;
+    assert_kind!(
+        r#"INSERT INTO "t" ("a") VALUES (7)"#,
+        r#"INSERT INTO "t" ("a") SELECT 7"#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+    assert_kind!(
+        r#"INSERT INTO "t" ("a") VALUES (7)"#,
+        r#"INSERT INTO "t" ("a") VALUES (7), (8)"#,
+        ddl,
+        "NOT-EQUIVALENT"
+    );
+}
+
+#[test]
 fn a_mutation_that_touches_other_rows_is_refuted() {
     assert_kind!(
         r#"UPDATE "t" SET "a" = "a" + 1 WHERE "id" = $1"#,
