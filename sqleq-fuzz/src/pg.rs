@@ -67,7 +67,7 @@ const EXTENSIONS: &[&str] = &[
 pub const MAJOR: u32 = 17;
 
 /// Bumped whenever what the cached template holds changes, so an old template is never reused.
-const TEMPLATE_FORMAT: u32 = 1;
+const TEMPLATE_FORMAT: u32 = 2;
 
 /// Where the Postgres binaries are: `$SQLEQ_PG_BIN` when it is set, else the PostgreSQL the build
 /// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
@@ -266,6 +266,10 @@ impl Postmaster {
                 "log_min_messages=fatal",
                 "-c",
                 "log_min_error_statement=panic",
+                // A pair's DDL creates every table, index and type in one transaction, which can
+                // take more locks than the default lock table holds.
+                "-c",
+                "max_locks_per_transaction=1024",
                 "-c",
             ])
             .arg(format!("max_connections={max_connections}"))
@@ -300,6 +304,25 @@ impl Drop for Postmaster {
 fn conninfo(sock: &Path, db: &str) -> String {
     format!("host={} port=5432 user=postgres dbname={db}", sock.display())
 }
+
+/// The `uuid-ossp` functions core PostgreSQL computes exactly, defined under their own names where the
+/// extension cannot load: the one a build carries may need a library the system lacks (the fetched
+/// Linux build links OSSP's libuuid), and a schema that calls them must run on every build alike.
+/// `gen_random_uuid()` draws a version-4 uuid as `uuid_generate_v4()` does; the namespace constants
+/// are RFC 4122's.
+const UUID_OSSP_CORE: &str = "\
+    CREATE FUNCTION uuid_generate_v4() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE \
+        AS 'SELECT gen_random_uuid()'; \
+    CREATE FUNCTION uuid_nil() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '00000000-0000-0000-0000-000000000000'::uuid$$; \
+    CREATE FUNCTION uuid_ns_dns() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_url() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_oid() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b812-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_x500() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b814-9dad-11d1-80b4-00c04fd430c8'::uuid$$;";
 
 /// The template every run copies: an initialised cluster whose `sqleq_tmpl` database carries
 /// [`EXTENSIONS`]. Built once per Postgres version, under `$SQLEQ_PG_CACHE` (default
@@ -349,6 +372,13 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
             for ext in EXTENSIONS {
                 // An install that lacks one leaves only the pairs that use it without a schema.
                 let _ = t.batch_execute(&format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\""));
+            }
+            let has_uuid = t
+                .query_one("SELECT to_regprocedure('uuid_generate_v4()') IS NOT NULL", &[])
+                .map(|r| r.get::<_, bool>(0))
+                .unwrap_or(true);
+            if !has_uuid {
+                t.batch_execute(UUID_OSSP_CORE).map_err(|e| msg(&e))?;
             }
         }
         let staged = cache.join(format!(
@@ -612,7 +642,10 @@ fn drop_defaults(ddl: &str, name: &str) -> Option<String> {
         .split('.')
         .map(|p| format!(r#""?{}"?"#, regex::escape(p)))
         .collect();
-    let re = Regex::new(&format!(r"(?i)\s+DEFAULT\s+{}\s*\(\s*\)", parts.join(r"\s*\.\s*"))).ok()?;
+    // `DEFAULT f()`, `DEFAULT (f())`, either with a cast: `DEFAULT (f())::text`.
+    let call = format!(r"{}\s*\(\s*\)", parts.join(r"\s*\.\s*"));
+    let cast = r#"(?:\s*::\s*"?[A-Za-z_][A-Za-z0-9_$.]*"?(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\s*\[\])?)?"#;
+    let re = Regex::new(&format!(r"(?i)\s+DEFAULT\s+(?:\(\s*{call}\s*\)|{call}){cast}")).ok()?;
     re.is_match(ddl).then(|| re.replace_all(ddl, "").into_owned())
 }
 
@@ -1769,6 +1802,11 @@ mod tests {
             "CREATE TABLE t (id uuid NOT NULL, n int DEFAULT 0);"
         );
         assert!(drop_defaults(ddl, "other").is_none());
+        let cast = "CREATE TABLE t (id text NOT NULL DEFAULT (gen_id())::text, b uuid DEFAULT gen_id()::uuid);";
+        assert_eq!(
+            drop_defaults(cast, "gen_id").unwrap(),
+            "CREATE TABLE t (id text NOT NULL, b uuid);"
+        );
     }
 
     #[test]
