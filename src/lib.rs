@@ -42,6 +42,7 @@ mod collation;
 pub mod corpus;
 mod depth;
 mod dml;
+mod equality;
 mod error;
 /// Selected on the shipping path by [`CatalogSource`], off by default.
 mod infer;
@@ -357,10 +358,12 @@ fn emit(
     // declares a collation, an operation that reads one its symbol does not name. Before the check
     // below, which also sees the first, for the message.
     collation::refuse(catalog, &input)?;
-    // A `citext` or `char(n)` value has an `=` no prover's equality can stand for, and a numeric's
-    // text shows a scale no prover's REAL carries. Checked on the lowered queries, so a column that
-    // neither query reads costs nothing, and neither does a pair whose two queries lower to one plan.
+    // A `citext` or `char(n)` value has an `=` no prover's equality can stand for, and two `numeric`,
+    // float, `interval` or `jsonb` values that `=` calls equal can still print differently. Checked
+    // on the lowered queries, so a column that neither query reads costs nothing, and neither does a
+    // pair whose two queries lower to one plan.
     types::refuse_unfaithful(&input)?;
+    equality::refuse_observed(&mut input)?;
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
     verify::check_levels(&input)?;
