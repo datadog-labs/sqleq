@@ -524,7 +524,9 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     let (Source::Values(rows), Source::Unnest { args, .. }) = (&a.src, &b.src) else {
         unreachable!("oriented by translate")
     };
-    if a.target != b.target {
+    // On the whole name, not the last part the schema is keyed by: `a.events` and `b.events` are two
+    // tables, and so are `events` and `archive.events`, whichever of them the DDL declares.
+    if a.target_path != b.target_path {
         return Err(unsupported("the two sides insert into different tables"));
     }
     if a.cols != b.cols {
@@ -650,7 +652,7 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     // A, so the kernel's equality checks compare two independent renderings. If the comparisons
     // above had a bug, the kernel would refuse the pair rather than prove it.
     let side = |p: &Parts, i: &mut Interner| {
-        let target = i.id(format!("t:{}", p.target));
+        let target = i.id(format!("t:{}", p.target_path.join("\u{1f}")));
         let cols: Vec<u32> = p.cols.iter().map(|c| i.id(format!("c:{c}"))).collect();
         let tail = tokens(&p.tail, i);
         (target, cols, tail)
@@ -875,5 +877,33 @@ mod tests {
         let mut i = Interner::default();
         let t = Tail { alias: None, on: Some("DO UPDATE SET x=$12,y".into()), returning: None };
         assert!(tokens(&t, &mut i).contains(&LTok::Param(12)));
+    }
+
+    /// The two targets are compared on their whole name. The schema is keyed by the last part, so
+    /// `a.t` and `b.t` used to pass as one table, and the pair was proved though it writes two.
+    mod qualified_targets {
+        use super::*;
+
+        const BV: &str = "SELECT * FROM unnest($1::int[], $2::text[])";
+
+        fn on(ta: &str, tb: &str) -> Result<LeanPair, Refusal> {
+            pair(&format!("INSERT INTO {ta} (a, b) VALUES ($1, $2), ($3, $4)"), &format!("INSERT INTO {tb} (a, b) {BV}"))
+        }
+
+        #[test]
+        fn two_qualifiers_of_one_table_name_are_two_tables() {
+            for (ta, tb) in [("a.t", "b.t"), ("t", "archive.t"), ("public.t", "t"), ("\"S\".t", "s.t")] {
+                let r = on(ta, tb).expect_err(&format!("{ta} and {tb} were not refused"));
+                assert!(r.reason().contains("different tables"), "{ta} | {tb}: {}", r.reason());
+            }
+        }
+
+        /// Control: one name, however it is spelled, is one table.
+        #[test]
+        fn one_qualified_name_on_both_sides_is_one_table() {
+            for (ta, tb) in [("a.t", "a.t"), ("A.T", "a.t"), ("\"a\".t", "a.\"t\"")] {
+                assert!(on(ta, tb).is_ok(), "{ta} | {tb}");
+            }
+        }
     }
 }

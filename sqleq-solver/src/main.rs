@@ -24,6 +24,10 @@
 //! with status 3 -- exactly `IrDriver`'s self-halt, which callers already answer by resuming on a
 //! fresh process over the rows not yet written. Z3's own per-query timeout is the primary cap; this
 //! is the backstop.
+//!
+//! A plan nested deeper than [`ir::MAX_DEPTH`] is answered `NOTRANS` (`nesting-too-deep`) without
+//! being read, and the row's thread has a stack sized for every stage at that depth: a stack
+//! overflow cannot be caught, and it would abort the whole run.
 
 use std::io::{BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -31,8 +35,8 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use sqleq_solver::ir::Input;
+use serde::{Deserialize, Serialize};
+use sqleq_solver::ir::{self, Input, TranslateError};
 use sqleq_solver::prove::{self, NotProvedReason, Verdict};
 use sqleq_solver::translate::translate_input;
 
@@ -50,6 +54,44 @@ struct Row {
     refused: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// The fields of a job line read before its plan is: the plan itself is skipped without recursing
+/// into it, so a pathologically deep one can still be named in a refusal.
+#[derive(Deserialize)]
+struct Header {
+    name: Option<String>,
+}
+
+/// The stack each row's thread runs on. Translation, normalization and the solver's encoding all
+/// recurse over the plan; at [`ir::MAX_DEPTH`] they need a few tens of megabytes, far past a
+/// spawned thread's default of 2 MiB. It is address space, reserved, not memory used.
+const WORKER_STACK: usize = 512 << 20;
+
+/// The JSON nesting depth of `text` (objects and arrays), counted without parsing it.
+fn text_depth(text: &str) -> usize {
+    let (mut depth, mut deepest, mut in_string, mut escaped) = (0usize, 0usize, false, false);
+    for b in text.bytes() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// What the worker thread reports back.
@@ -104,7 +146,22 @@ fn main() -> ExitCode {
         if line.trim().is_empty() {
             continue;
         }
-        // Real IR nests past serde_json's default 128-level limit.
+        // The job object adds one level to its plan's.
+        if text_depth(&line) > ir::MAX_DEPTH + 1 {
+            let (row, _) = match serde_json::from_str::<Header>(&line) {
+                Ok(h) => too_deep(h.name.unwrap_or_else(|| "?".to_string())),
+                Err(e) => {
+                    eprintln!("malformed job line in {}: {e}", args[0]);
+                    return ExitCode::from(2);
+                }
+            };
+            if write_row(&mut out, &row).is_err() {
+                eprintln!("cannot write {}", args[1]);
+                return ExitCode::from(2);
+            }
+            continue;
+        }
+        // Real IR nests past serde_json's default 128-level limit; the check above bounds it.
         let mut de = serde_json::Deserializer::from_str(&line);
         de.disable_recursion_limit();
         let job: serde_json::Value = match serde::de::Deserialize::deserialize(&mut de) {
@@ -118,24 +175,36 @@ fn main() -> ExitCode {
         };
         let name = job.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
         let (row, hung) = run(name, job, dry, Duration::from_millis(cap_ms), Duration::from_millis(grace_ms));
-        let text = serde_json::to_string(&row).expect("a result row always serializes");
-        if writeln!(out, "{text}").and_then(|_| out.flush()).is_err() {
+        if write_row(&mut out, &row).is_err() {
             eprintln!("cannot write {}", args[1]);
             return ExitCode::from(2);
         }
-        eprintln!(
-            "{} {} {}ms{}",
-            row.name,
-            row.verdict,
-            row.ms,
-            row.refused.as_deref().map(|r| format!(" refused={r}")).unwrap_or_default()
-        );
         if hung {
             eprintln!("driver: {} did not stop within the grace period; exiting so the harness resumes on a fresh process", row.name);
             return ExitCode::from(3);
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Appends one result row, flushed, and reports it on stderr.
+fn write_row(out: &mut std::fs::File, row: &Row) -> std::io::Result<()> {
+    let text = serde_json::to_string(row).expect("a result row always serializes");
+    writeln!(out, "{text}").and_then(|_| out.flush())?;
+    eprintln!(
+        "{} {} {}ms{}",
+        row.name,
+        row.verdict,
+        row.ms,
+        row.refused.as_deref().map(|r| format!(" refused={r}")).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// The row for a job whose plan is nested past [`ir::MAX_DEPTH`].
+fn too_deep(name: String) -> (Row, bool) {
+    let refused = Some(TranslateError::TooDeep.to_string());
+    (Row { name, verdict: "NOTRANS", ms: 0, killed: false, literal: None, refused, error: None }, false)
 }
 
 fn usage_error(arg: &str) -> ! {
@@ -156,14 +225,12 @@ fn run(name: String, job: serde_json::Value, dry: bool, cap: Duration, grace: Du
     }
     // Tier 0 on the raw IR, before anything is parsed: two identical trees are equal whatever the
     // prover would say. Recorded as `literal` because a syntactic coincidence is not a proof.
-    if let Some([a, b]) = ir.get("queries").and_then(|q| q.as_array()).map(Vec::as_slice) {
-        if a == b {
-            return (Row { literal: Some(true), ms: t0.elapsed().as_millis(), ..row("EQ") }, false);
-        }
+    if prove::identical_sides(&ir) {
+        return (Row { literal: Some(true), ms: t0.elapsed().as_millis(), ..row("EQ") }, false);
     }
 
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().stack_size(WORKER_STACK).spawn(move || {
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
             if dry {
                 match Input::parse(&ir).and_then(|input| translate_input(&input).map(|_| ())) {
@@ -188,6 +255,10 @@ fn run(name: String, job: serde_json::Value, dry: bool, cap: Duration, grace: Du
         // The receiver is gone only when the row was abandoned; nothing is waiting for it then.
         let _ = tx.send(outcome);
     });
+    if let Err(e) = spawned {
+        let error = Some(format!("cannot start the row's thread: {e}"));
+        return (Row { error, ms: t0.elapsed().as_millis(), ..row("ERROR") }, false);
+    }
 
     let (outcome, killed) = match rx.recv_timeout(cap) {
         Ok(o) => (Some(o), false),

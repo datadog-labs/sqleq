@@ -301,9 +301,14 @@ fn demoted(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
     use BinaryOperator::*;
     Some(match op {
         // `->` and `#>` yield json/jsonb, which has no counterpart in the prover's five types, so
-        // the opaque sort it is; `->>` and `#>>` yield text.
-        Arrow | HashArrow => ("q_op_jsonx", false, false),
-        LongArrow | HashLongArrow => ("q_str_jsonx", false, false),
+        // the opaque sort it is; `->>` and `#>>` yield text. `->` looks up one key (or one array
+        // index) and `#>` follows a path, so they are two operations with two symbols: over
+        // `{"a": "x"}`, `j ->> '{a}'` looks for the key `{a}` and finds nothing, while `j #>> '{a}'`
+        // follows the path `[a]` to `x`.
+        Arrow => ("q_op_jsonx", false, false),
+        LongArrow => ("q_str_jsonx", false, false),
+        HashArrow => ("q_op_jsonpath", false, false),
+        HashLongArrow => ("q_str_jsonpath", false, false),
         // Containment, in both directions off one symbol.
         AtArrow => ("q_bool_contains", false, false),
         ArrowAt => ("q_bool_contains", true, false),
@@ -325,7 +330,7 @@ fn demoted(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
 /// whether two queries agree for every database state, the clock is part of that state, and a
 /// constant symbol shared by both sides asks exactly that. `clock_timestamp()` and `random()` fail the
 /// test — they move during one query — and stay refused by [`lower`][crate::lower]'s
-/// `NONDETERMINISTIC`, which is why they are absent here.
+/// `VOLATILE_FUNCTIONS`, which is why they are absent here.
 ///
 /// Spellings share a symbol only where Postgres makes them the same value. `now()`,
 /// `current_timestamp` and `transaction_timestamp()` are one value under three names and are unified;
@@ -349,41 +354,36 @@ const CLOCKS: [(&str, &str); 7] = [
 
 /// The JSON extraction *functions*, and the symbol each becomes.
 ///
-/// These are the call spellings of the extraction operators in [`demoted`]: `json_extract_path_text(p,
-/// 'a')` and `p #>> 'a'` are one Postgres operation written two ways. Unifying them is the same move
-/// that gives `@>` and `<@` one symbol, and it is what the abstraction requires — a pair that rewrites
-/// between the two spellings otherwise gets two unrelated symbols and can never be proved, though the
-/// rewrite is exactly the kind an optimizer performs.
+/// `json_extract_path(p, 'a', 'b')` follows the path `[a, b]`, as `p #> '{a,b}'` does, and the
+/// `_text` forms do the same and yield `text`. Each gets a symbol of its own, `q_op_jsonpath_elems`
+/// or `q_str_jsonpath_elems`, apart from both operators':
 ///
-/// The return type follows Postgres, so the split is the same one the operators make: the `_text` and
-/// `_scalar` forms yield `text` and take `q_str_`, the rest yield `json`/`jsonb` and take `q_op_`.
+/// * not `->`'s, though with one path element the two agree on an object: over the array `[5]`,
+///   `jsonb_extract_path(j, '0')` follows the path to `5` and `j -> '0'` looks for a key and finds
+///   NULL;
+/// * not `#>`'s, though they are one operation, because their arguments are spelled differently:
+///   `#>` takes the path as one array, the function as one text argument per element. With one
+///   symbol, `j #> '{a}'` and `jsonb_extract_path(j, '{a}')` would be one term, and the first follows
+///   `[a]` while the second follows `["{a}"]`. A pair that rewrites between the two spellings goes
+///   unproved.
 ///
-/// # Why all eight, when the operator spellings are the ones that occur
+/// The return type follows Postgres, so the split is the same one the operators make: the `_text`
+/// forms yield `text` and take `q_str_`, the rest yield `json`/`jsonb` and take `q_op_`.
 ///
-/// Six of these are the names a dialect-aware SQL library will already bucket as JSON extraction;
-/// `jsonb_extract_path` and `jsonb_extract_path_text` are routinely missed, falling through to a
-/// generic "anonymous function" node instead. That omission is an artifact of a dialect table rather
-/// than a decision — they are the exact `jsonb` counterparts of two names that do get bucketed — so
-/// all eight are listed here.
-///
-/// Reach was measured, not assumed: the call spellings are rare next to `->` and `->>`, which is what
-/// real queries overwhelmingly write. So this closes a parity gap and an asymmetry between spellings;
-/// it is not expected to move a verdict on its own.
-const JSON_FNS: [(&str, &str); 8] = [
-    ("JSON_EXTRACT", "q_op_jsonx"),
-    ("JSONB_EXTRACT", "q_op_jsonx"),
-    ("JSON_EXTRACT_PATH", "q_op_jsonx"),
-    ("JSONB_EXTRACT_PATH", "q_op_jsonx"),
-    ("JSON_EXTRACT_SCALAR", "q_str_jsonx"),
-    ("JSONB_EXTRACT_SCALAR", "q_str_jsonx"),
-    ("JSON_EXTRACT_PATH_TEXT", "q_str_jsonx"),
-    ("JSONB_EXTRACT_PATH_TEXT", "q_str_jsonx"),
+/// Only Postgres's own names are here. A `json_extract` or a `json_extract_scalar` is another
+/// dialect's function, which reads a JSONPath string, and Postgres has no function of that name; it
+/// lowers as any other function nobody declared.
+const JSON_FNS: [(&str, &str); 4] = [
+    ("JSON_EXTRACT_PATH", "q_op_jsonpath_elems"),
+    ("JSONB_EXTRACT_PATH", "q_op_jsonpath_elems"),
+    ("JSON_EXTRACT_PATH_TEXT", "q_str_jsonpath_elems"),
+    ("JSONB_EXTRACT_PATH_TEXT", "q_str_jsonpath_elems"),
 ];
 
 /// The symbol a JSON extraction call becomes, if `f` is one.
 ///
 /// Matched on the bare, unqualified name, as [`clock_symbol`] is and for the same reason: a qualified
-/// `myschema.json_extract` is somebody's own function and means nothing to us. Every modifier a call
+/// `myschema.json_extract_path` is somebody's own function and means nothing to us. Every modifier a call
 /// can carry disqualifies it too — `OVER`, `FILTER`, `DISTINCT`, an `ORDER BY`, a named or wildcard
 /// argument. None of them is meaningful on these functions, so one appearing means the call is not
 /// what the name suggests, and leaving it alone costs a proof where rewriting it would risk a wrong
@@ -1065,6 +1065,21 @@ impl VisitorMut for StripOrder {
 /// But A's `y` *is* its output while B's `y` is `t.b`, which B does not project — so over
 /// `t = {(a=1, b=2), (a=2, b=1)}` A yields `1` and B yields `2`. Checking A alone would strip and
 /// report a verdict for a pair whose two sides return different rows.
+///
+/// # And it names the same column on both
+///
+/// Determined on each side is still not enough, because the two sides can determine it by different
+/// columns:
+///
+/// ```text
+/// A: SELECT a AS b, b AS a FROM t ORDER BY a LIMIT 1    -- sorts by its 2nd column, t.b
+/// B: SELECT a, b FROM t ORDER BY a LIMIT 1              -- sorts by its 1st column, t.a
+/// ```
+///
+/// Both return the bag of `(t.a, t.b)`, so the stripped pair is provable, but over
+/// `t = {(a=1, b=2), (a=2, b=1)}` A yields `(2, 1)` and B yields `(1, 2)`. Equal bags give equal sets
+/// of pages only under one ordering of them, so each key is resolved to a position in its side's
+/// select list, and the clause is stripped only when the positions agree.
 pub fn strip_identical_pagination(queries: &mut [Query]) {
     let [a, b] = queries else { return };
     if !(has_row_slice(a) || has_row_slice(b)) {
@@ -1086,8 +1101,10 @@ pub fn strip_identical_pagination(queries: &mut [Query]) {
         return;
     }
     // Both sides: each names its key against its own projection, and identical clause text does not
-    // make one reading stand in for the other.
-    if !order_determined_by_projection(a) || !order_determined_by_projection(b) {
+    // make one reading stand in for the other. Each key has to be a column the side returns, and the
+    // same column, by position, on both.
+    let (Some(pa), Some(pb)) = (order_positions(a), order_positions(b)) else { return };
+    if pa != pb {
         return;
     }
     for q in [a, b] {
@@ -1166,7 +1183,7 @@ impl VisitorMut for ClearLocks {
 ///
 /// A `WITH` binding *is* a derived table that has been given a name and hoisted, so substituting the
 /// definition back into each use returns it to the form it is sugar for. The prover's IR has no
-/// binding construct at all — [`infer`][crate::infer] refuses a query that still carries a `WITH` —
+/// binding construct at all — lowering refuses a query that still carries a `WITH`, at any level —
 /// so without this every CTE-bearing pair is unlowerable — which on real rewrite pairs is the largest
 /// single refusal bucket there is.
 ///
@@ -1188,12 +1205,19 @@ impl VisitorMut for ClearLocks {
 /// first and it becomes indistinguishable from a use of a CTE named `c`, which would substitute a
 /// definition for a reference to a real table.
 ///
+/// **A use names the binding under Postgres's folding.** An unquoted name folds to lower case and a
+/// quoted one keeps its case, so `c`, `C` and `"c"` all use `WITH c`, while `t` does not use
+/// `WITH "T"`: there it is still the base table `t`, and substituting the binding would read a
+/// different relation.
+///
 /// # What is not a precondition, and why
 ///
 /// **Multiple uses.** Inlining a binding used N times evaluates its body N times, and that is the
 /// same value each time: [`lower`][crate::lower] refuses every function whose result can differ
-/// between two calls with equal arguments (`random`, `nextval`, `clock_timestamp` — see its
-/// `NONDETERMINISTIC`). With those gone, "how many times" is not an observable.
+/// between two calls with equal arguments (`random`, `nextval`, `clock_timestamp` — see
+/// [`VOLATILE_FUNCTIONS`][crate::VOLATILE_FUNCTIONS]). With those gone, "how many times" is not an
+/// observable. [`reflexive`][crate::reflexive] compares trees without lowering them, so it declines
+/// a pair where this would duplicate such a call.
 ///
 /// **`MATERIALIZED`.** Same argument. The hint controls whether the planner evaluates the body once
 /// into a temporary or folds it into each use; for a body whose value is a function of the input
@@ -1245,7 +1269,7 @@ impl VisitorMut for InlineCtes {
             // A binding may use the ones before it in the same `WITH`, so each definition is closed
             // over its predecessors before being recorded as one itself.
             let _ = VisitMut::visit(&mut *cte.query, &mut ReplaceCteRefs(&defs));
-            defs.insert(cte.alias.name.value.to_lowercase(), cte);
+            defs.insert(crate::dml::fold_ident(&cte.alias.name), cte);
         }
         let _ = q.visit(&mut ReplaceCteRefs(&defs));
         ControlFlow::Continue(())
@@ -1290,7 +1314,10 @@ impl VisitorMut for ReplaceCteRefs<'_> {
         let Some(ident) = part.as_ident() else {
             return ControlFlow::Continue(());
         };
-        let Some(cte) = self.0.get(&ident.value.to_lowercase()) else {
+        // Postgres's identity for the name, not its lower-cased text: `"T"` and `t` are two names,
+        // so a binding `WITH "T"` must not capture the base table `t`, which the statement still
+        // reads (and which a `DELETE`'s target names, past `dml`'s shadowing check).
+        let Some(cte) = self.0.get(&crate::dml::fold_ident(ident)) else {
             return ControlFlow::Continue(());
         };
         // `AS b AT i` is a PartiQL index alias over a nested array, which is not what a `WITH` binding
@@ -1335,26 +1362,33 @@ const SYS_SCHEMAS: [&str; 4] = ["pg_catalog", "information_schema", "pg_temp", "
 /// no base tables at all — so this is a *naming* fix, not a semantic rewrite: it makes two spellings
 /// of the same table agree.
 ///
-/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing per query:
+/// It is still a rewrite that can be wrong, in one specific way, so it is all-or-nothing **for the
+/// pair**: the guards read every table reference of both queries, and either both are stripped or
+/// neither is.
 ///
 /// * **A system schema anywhere stops it.** `pg_catalog.x` is not the user's `x`, and folding one
 ///   into the other would silently answer a question about the wrong table. An unresolved reference
 ///   downstream is a refusal; a silent rename is not.
 /// * **A bare name reached through two different qualifiers stops it.** `a.orders` and `b.orders`
 ///   are two tables, and stripping would merge them into one — turning a join between two relations
-///   into a self-join, which changes the answer rather than the spelling.
+///   into a self-join, which changes the answer rather than the spelling. That holds across the
+///   pair as much as within a query: `SELECT a FROM s1.t` against `SELECT a FROM s2.t` reads two
+///   tables, and stripping each side on its own would make them one query. Qualifiers are compared
+///   under Postgres's folding, so `"S1".t` and `s1.t` are two schemas too.
 ///
 /// Column qualifiers are left as they are. A three-part `part_16.orders.id` resolves on its last
 /// two parts, so once the table is bare the column already matches it.
 pub fn strip_schema(queries: &mut [Query]) {
+    let mut names = CollectTableNames(Vec::new());
+    for q in queries.iter() {
+        // The read-only `Visit`, not `VisitMut`: the guards have to see every table reference of
+        // the pair before the first one is rewritten.
+        let _ = Visit::visit(q, &mut names);
+    }
+    if !safe_to_strip(&names.0) {
+        return;
+    }
     for q in queries {
-        let mut names = CollectTableNames(Vec::new());
-        // `&*q` so this picks the read-only `Visit`, not `VisitMut`: the guards have to see every
-        // table reference before the first one is rewritten.
-        let _ = Visit::visit(&*q, &mut names);
-        if !safe_to_strip(&names.0) {
-            continue;
-        }
         let _ = q.visit(&mut StripQualifier);
     }
 }
@@ -1383,73 +1417,110 @@ impl VisitorMut for StripQualifier {
     }
 }
 
-/// The two guards, checked over every table reference in one query before any of them is touched.
+/// The two guards, checked over every table reference of the pair before any of them is touched.
+///
+/// The bare name is keyed lower-cased, quoted or not, because that is how the catalog and lowering
+/// will look it up: `s1."T"` and `s2.t` end up at one table there, so they are one bare name here.
+/// The qualifier is compared under Postgres's folding instead, because nothing downstream sees it
+/// once it is stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
 fn safe_to_strip(names: &[ObjectName]) -> bool {
-    let part = |n: &ObjectName, i: usize| {
-        n.0.get(i).and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase())
-    };
-    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut seen: HashMap<String, Vec<String>> = HashMap::new();
     for n in names {
-        let Some(bare) = part(n, n.0.len() - 1) else { return false };
+        let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+            return false;
+        };
         if bare.starts_with("pg_") {
             return false;
         }
         let qualifier = n.0[..n.0.len() - 1]
             .iter()
-            .map(|p| p.as_ident().map(|id| id.value.to_lowercase()).unwrap_or_default())
+            .map(|p| p.as_ident().map(crate::dml::fold_ident).unwrap_or_default())
             .collect::<Vec<_>>();
-        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.as_str())) {
+        // The system schemas by their lower-cased name: `"PG_CATALOG"` is not one, but stopping on it
+        // costs only a refusal.
+        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.to_lowercase().as_str())) {
             return false;
         }
         // Two spellings of one bare name are two tables until proven otherwise.
         match seen.entry(bare) {
-            Entry::Occupied(e) if *e.get() != qualifier.join(".") => return false,
+            Entry::Occupied(e) if *e.get() != qualifier => return false,
             Entry::Occupied(_) => {}
             Entry::Vacant(e) => {
-                e.insert(qualifier.join("."));
+                e.insert(qualifier);
             }
         }
     }
     true
 }
 
-/// Is every `ORDER BY` key of this query recoverable from the rows it returns?
+/// The output column each `ORDER BY` key of this query sorts by, as a position in its select list,
+/// or `None` when some key is not one of the columns the query returns.
 ///
-/// Conservative by construction: it answers yes only for keys it can *match* to the projection, so
-/// an ordering it cannot analyse blocks the strip rather than being assumed harmless.
-fn order_determined_by_projection(q: &Query) -> bool {
-    let Some(order_by) = &q.order_by else { return true };
-    let OrderByKind::Expressions(keys) = &order_by.kind else { return false };
-    let SetExpr::Select(select) = &*q.body else { return false };
+/// A key is resolved as Postgres resolves it: an integer is a position; a bare name is the output
+/// column of that name, and only when no output column has it, an expression over the input; and
+/// anything else is an expression over the input. An expression is a returned column only when the
+/// select list computes it, spelled the same way. Conservative by construction: it answers only for
+/// keys it can match, so an ordering it cannot analyse blocks the strip rather than being assumed
+/// harmless.
+fn order_positions(q: &Query) -> Option<Vec<usize>> {
+    let Some(order_by) = &q.order_by else { return Some(Vec::new()) };
+    let OrderByKind::Expressions(keys) = &order_by.kind else { return None };
+    let SetExpr::Select(select) = &*q.body else { return None };
 
-    let mut projected: Vec<String> = Vec::new();
+    // Each item as its output name, where this can tell it, and its expression as text. The text keeps
+    // its quoting, so a key spelled the same way is the same value. The name is under Postgres's
+    // folding (an unquoted name lower-cased, a quoted one as written), and is taken only from an
+    // alias or a column; an expression's name is Postgres's choice (`CAST(a AS TEXT)` is named `a`,
+    // `count(*)` is `count`), and is left unknown. Matching an alias by its text instead would let
+    // the unquoted key `A`, which is the input column `a`, meet the alias `"A"`, and the key `t.a`
+    // meet an alias `"t.a"`.
+    let mut items: Vec<(Option<String>, String)> = Vec::new();
     for item in &select.projection {
-        match item {
-            // A star projects everything the sources have, so any key over those sources is
-            // recoverable — but working out *which* columns those are is name resolution, which has
-            // not run yet. Refuse rather than guess.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
-            SelectItem::UnnamedExpr(e) => projected.push(e.to_string()),
-            SelectItem::ExprWithAlias { expr, alias } => {
-                projected.push(expr.to_string());
-                projected.push(alias.value.clone());
+        items.push(match item {
+            // A star projects everything the sources have, but working out *which* columns, and at
+            // which positions, is name resolution, which has not run yet. Refuse rather than guess.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+            SelectItem::UnnamedExpr(e) => {
+                let name = match e {
+                    Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
+                    Expr::CompoundIdentifier(parts) => parts.last().map(crate::dml::fold_ident),
+                    _ => None,
+                };
+                (name, e.to_string())
             }
+            SelectItem::ExprWithAlias { expr, alias } => (Some(crate::dml::fold_ident(alias)), expr.to_string()),
             // A Spark multi-alias projection expands one expression into several output columns;
             // which key maps to which is not something this needs to work out to refuse.
-            SelectItem::ExprWithAliases { .. } => return false,
-        }
+            SelectItem::ExprWithAliases { .. } => return None,
+        });
     }
 
-    keys.iter().all(|key| {
-        // `ORDER BY 2` is the second output column by position — determined whenever it is in range.
-        if let Expr::Value(v) = &key.expr {
-            if let sqlparser::ast::Value::Number(n, _) = &v.value {
-                return n.parse::<usize>().is_ok_and(|i| i >= 1 && i <= select.projection.len());
+    keys.iter()
+        .map(|key| {
+            // `ORDER BY 2` is the second output column.
+            if let Expr::Value(v) = &key.expr {
+                if let Value::Number(n, _) = &v.value {
+                    return n.parse::<usize>().ok().filter(|i| (1..=items.len()).contains(i)).map(|i| i - 1);
+                }
             }
-        }
-        let text = key.expr.to_string();
-        projected.contains(&text)
-    })
+            if let Expr::Identifier(id) = &key.expr {
+                let name = crate::dml::fold_ident(id);
+                let named: Vec<usize> = (0..items.len()).filter(|&i| items[i].0.as_ref() == Some(&name)).collect();
+                if let Some(&first) = named.first() {
+                    // Two output columns of one name: Postgres sorts by them only if they are the
+                    // same expression, which then sorts the same either way.
+                    return named.iter().all(|&i| items[i].1 == items[first].1).then_some(first);
+                }
+                // No output column has the name as far as this can tell, but an expression's name
+                // could be it, and then Postgres sorts by that column, not by the input.
+                if items.iter().any(|(n, _)| n.is_none()) {
+                    return None;
+                }
+            }
+            let text = key.expr.to_string();
+            items.iter().position(|(_, e)| *e == text)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2018,6 +2089,16 @@ mod tests {
         assert_eq!(unschemad(sql), sql);
     }
 
+    /// The same across the pair: `SELECT x FROM a.orders` against `SELECT x FROM b.orders` reads two
+    /// tables, so neither side is stripped, though each qualifies its one table consistently.
+    #[test]
+    fn refuses_when_the_two_queries_qualify_one_bare_name_differently() {
+        let (a, b) = ("SELECT x FROM a.orders", "SELECT x FROM b.orders");
+        let mut qs = parse_queries(a, b);
+        strip_schema(&mut qs);
+        assert_eq!((qs[0].to_string(), qs[1].to_string()), (a.to_string(), b.to_string()));
+    }
+
     /// The same qualifier repeated is one table, not a collision.
     #[test]
     fn repeated_identical_qualifiers_are_not_a_collision() {
@@ -2027,14 +2108,22 @@ mod tests {
         );
     }
 
-    /// A bare name beside a qualified one is the same table under two spellings — which is the whole
-    /// point of the rewrite, so it must not be read as a collision.
+    /// Two bare names under one qualifier are two tables, not a collision, and the strip reaches the
+    /// ones in a subquery too.
     #[test]
-    fn a_bare_name_beside_its_qualified_form_still_strips() {
+    fn two_tables_under_one_qualifier_strip_everywhere() {
         assert_eq!(
             unschemad("SELECT x FROM s.orders WHERE id IN (SELECT oid FROM s.lines)"),
             "SELECT x FROM orders WHERE id IN (SELECT oid FROM lines)"
         );
+    }
+
+    /// A bare name beside its qualified form is a collision: `orders` and `s.orders` are one table only
+    /// if the search path reaches `s` first, which nothing here knows, so neither is stripped.
+    #[test]
+    fn a_bare_name_beside_its_qualified_form_is_a_collision() {
+        let sql = "SELECT x FROM orders WHERE id IN (SELECT oid FROM s.orders)";
+        assert_eq!(unschemad(sql), sql);
     }
 
     #[test]
@@ -2183,51 +2272,31 @@ mod tests {
         );
         assert_eq!(
             demoted_sql("SELECT payload #> '{a,b}' FROM t"),
-            "SELECT q_op_jsonx(payload, '{a,b}') FROM t"
+            "SELECT q_op_jsonpath(payload, '{a,b}') FROM t"
         );
         assert_eq!(
             demoted_sql("SELECT payload #>> '{a,b}' FROM t"),
-            "SELECT q_str_jsonx(payload, '{a,b}') FROM t"
+            "SELECT q_str_jsonpath(payload, '{a,b}') FROM t"
         );
     }
 
-    /// The call spellings land on the same two symbols, split the same way by return type.
+    /// The call spellings get symbols of their own, split the same way by return type.
     #[test]
-    fn json_extraction_functions_demote_like_their_operators() {
-        for n in ["json_extract", "jsonb_extract", "json_extract_path", "jsonb_extract_path"] {
+    fn json_extraction_functions_demote_by_return_type() {
+        for n in ["json_extract_path", "jsonb_extract_path"] {
             assert_eq!(
                 demoted_sql(&format!("SELECT {n}(payload, 'a') FROM t")),
-                "SELECT q_op_jsonx(payload, 'a') FROM t",
+                "SELECT q_op_jsonpath_elems(payload, 'a') FROM t",
                 "{n}"
             );
         }
-        for n in [
-            "json_extract_scalar",
-            "jsonb_extract_scalar",
-            "json_extract_path_text",
-            "jsonb_extract_path_text",
-        ] {
+        for n in ["json_extract_path_text", "jsonb_extract_path_text"] {
             assert_eq!(
                 demoted_sql(&format!("SELECT {n}(payload, 'a') FROM t")),
-                "SELECT q_str_jsonx(payload, 'a') FROM t",
+                "SELECT q_str_jsonpath_elems(payload, 'a') FROM t",
                 "{n}"
             );
         }
-    }
-
-    /// The point of the previous test, stated as the property it exists for: the operator and the
-    /// function are one operation, so a pair that rewrites between the spellings has to see one
-    /// symbol. Two symbols here is not a wrong answer, it is a proof that never lands.
-    #[test]
-    fn operator_and_function_spellings_agree() {
-        assert_eq!(
-            demoted_sql("SELECT payload ->> 'a' FROM t"),
-            demoted_sql("SELECT json_extract_path_text(payload, 'a') FROM t")
-        );
-        assert_eq!(
-            demoted_sql("SELECT payload -> 'a' FROM t"),
-            demoted_sql("SELECT jsonb_extract_path(payload, 'a') FROM t")
-        );
     }
 
     /// The path is variadic, so the arity is carried through rather than fixed at two.
@@ -2235,7 +2304,7 @@ mod tests {
     fn json_extraction_keeps_its_arity() {
         assert_eq!(
             demoted_sql("SELECT json_extract_path(payload, 'a', 'b', 'c') FROM t"),
-            "SELECT q_op_jsonx(payload, 'a', 'b', 'c') FROM t"
+            "SELECT q_op_jsonpath_elems(payload, 'a', 'b', 'c') FROM t"
         );
     }
 
@@ -2245,15 +2314,15 @@ mod tests {
     fn only_a_plain_unqualified_call_is_demoted() {
         for sql in [
             // Somebody's own function that happens to share the name.
-            "SELECT myschema.json_extract(payload, 'a') FROM t",
+            "SELECT myschema.json_extract_path(payload, 'a') FROM t",
             // Not the two-argument extraction.
-            "SELECT json_extract(payload) FROM t",
+            "SELECT json_extract_path(payload) FROM t",
             // Modifiers that make it something other than a plain scalar call.
-            "SELECT json_extract(DISTINCT payload, 'a') FROM t",
-            "SELECT json_extract(payload, 'a') OVER () FROM t",
+            "SELECT json_extract_path(DISTINCT payload, 'a') FROM t",
+            "SELECT json_extract_path(payload, 'a') OVER () FROM t",
         ] {
             let out = demoted_sql(sql);
-            assert!(!out.contains("jsonx"), "should have been left alone: {sql} -> {out}");
+            assert!(!out.contains("q_op_json"), "should have been left alone: {sql} -> {out}");
         }
     }
 
@@ -2262,7 +2331,7 @@ mod tests {
     fn a_function_extraction_nests_with_an_operator_one() {
         assert_eq!(
             demoted_sql("SELECT json_extract_path_text(payload -> 'a', 'b') FROM t"),
-            "SELECT q_str_jsonx(q_op_jsonx(payload, 'a'), 'b') FROM t"
+            "SELECT q_str_jsonpath_elems(q_op_jsonx(payload, 'a'), 'b') FROM t"
         );
     }
 
@@ -2298,7 +2367,7 @@ mod tests {
         // entries in the table.
         assert_eq!(
             demoted_sql("SELECT 1 FROM t WHERE payload #>> '{a,b}' <> 'v'"),
-            "SELECT 1 FROM t WHERE q_str_jsonx(payload, '{a,b}') <> 'v'"
+            "SELECT 1 FROM t WHERE q_str_jsonpath(payload, '{a,b}') <> 'v'"
         );
         // The jsonb-returning arrows sit above `=` too, and above `IS NULL`.
         assert_eq!(

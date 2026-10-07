@@ -30,6 +30,7 @@ options:
   --replay-plan <file>  also write, for each proved or no-witness pair, what
                     tools/lean_replay.py needs to re-run it on Postgres
   --full-names      key a pair file's record by its path, not its file name
+                    (two pair files with one file name are refused without it)
   --translate-only  run no Lean: report each pair's refusal, or the claim it
                     would be checked under
 
@@ -117,12 +118,22 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+        // Records are keyed by name, so two files with one name would leave one record, silently.
+        let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
         for f in files {
             let name = if full_names {
                 f.to_string_lossy().to_string()
             } else {
                 f.file_name().unwrap().to_string_lossy().to_string()
             };
+            if let Some(first) = seen.insert(name.clone(), f.clone()) {
+                eprintln!(
+                    "sqleq-lean: {} and {} would both be recorded as `{name}`; pass --full-names, or each file once",
+                    first.display(),
+                    f.display()
+                );
+                return ExitCode::from(2);
+            }
             match std::fs::read_to_string(&f) {
                 Ok(t) => cases.push(Case::from_file(name, &t)),
                 Err(e) => {

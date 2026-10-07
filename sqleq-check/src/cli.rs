@@ -16,7 +16,8 @@ two SELECTs, or two DELETEs, UPDATEs or INSERTs. A .json input is an already-low
 
 Exit codes:
   0    policy satisfied (see --expect)
-  1    policy not satisfied (some case failed expectation); under --portfolio, any alarm
+  1    policy not satisfied (some case failed expectation), or an alarm in any mode: a proof and a
+       counterexample on one pair
   2    usage / setup error (a missing tool, a bad flag)
   130  interrupted by Ctrl-C (143 by SIGTERM); every backend still running is killed first";
 
@@ -47,10 +48,23 @@ pub enum Expect {
     /// Nonzero exit unless every case is provable -- for validating known-equivalent rewrite pairs
     /// in CI. Under --portfolio, unless every case's verdict is equivalent.
     Equivalent,
-    /// Exit 0 whatever the cases say; under --portfolio an alarm still exits 1.
+    /// Exit 0 whatever the cases say, unless a case is an alarm: a proof and a counterexample on one
+    /// pair always exit 1.
     ReportOnly,
     /// Every case's header pins each axis's answer, and any movement fails (tests/pairs/README.md).
     Pinned,
+}
+
+/// A wall-clock budget in seconds, as `-t` and `--retry-timeout` take it: a positive number, or
+/// `inf` for none. A budget too large for a deadline to be set is none as well. NaN, zero and a
+/// negative number are usage errors: no case can run within them, and under --portfolio a NaN
+/// deadline had passed before a case started, so every case came back `timeout` unrun.
+fn seconds(text: &str) -> Result<f64, String> {
+    let t: f64 = text.parse().map_err(|e| format!("{e}"))?;
+    if t.is_nan() || t <= 0.0 {
+        return Err("expected a positive number of seconds, or inf for no deadline".into());
+    }
+    Ok(t)
 }
 
 fn default_jobs() -> usize {
@@ -109,8 +123,8 @@ pub struct Args {
     pub sqleq_solver_mem_gib: Option<f64>,
 
     /// The retry pass's own wall-clock budget per case, in seconds (default: --timeout): a second,
-    /// longer tier for the cases the first one ran out of time or crashed on.
-    #[arg(long, value_name = "S")]
+    /// longer tier for the cases the first one ran out of time or crashed on. Positive, or `inf`.
+    #[arg(long, value_name = "S", value_parser = seconds)]
     pub retry_timeout: Option<f64>,
 
     /// The retry pass's QED_SMT_TIMEOUT, in ms (default: --smt-timeout).
@@ -144,9 +158,9 @@ pub struct Args {
     #[arg(short = 'j', long, default_value_t = default_jobs())]
     pub jobs: usize,
 
-    /// Per-case wall-clock timeout in seconds. Under --portfolio, the one deadline every backend
-    /// on the case shares.
-    #[arg(short = 't', long, default_value_t = 60.0)]
+    /// Per-case wall-clock timeout in seconds: positive, or `inf` for no deadline. Under
+    /// --portfolio, the one deadline every backend on the case shares.
+    #[arg(short = 't', long, default_value_t = 60.0, value_parser = seconds)]
     pub timeout: f64,
 
     /// Run every asked backend on each case at once, within the one --timeout, and report one
@@ -190,7 +204,9 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub csv: Option<String>,
 
-    /// Keep intermediate .json/.result under DIR (default: ephemeral temp dirs, cleaned up).
+    /// Keep intermediate .json/.result under DIR (default: ephemeral temp dirs, cleaned up). Each
+    /// case's directory under DIR is emptied before the case runs, so a re-run never reads the
+    /// files a previous run left there.
     #[arg(long, value_name = "DIR")]
     pub keep: Option<String>,
 
@@ -223,7 +239,8 @@ pub struct Args {
 
     /// Also ask sqleq-solver (a Rust rewrite of SQLSolver) about every case that lowered, over the
     /// same Input JSON the QED prover gets. Outside --portfolio and --expect pinned it never
-    /// changes the exit code, and its NEQ is never a refutation. See docs/SQLSOLVER.md.
+    /// changes the exit code, unless its proof meets a fuzz counterexample (an alarm), and its NEQ
+    /// is never a refutation. See docs/SQLSOLVER.md.
     #[arg(long, conflicts_with = "sqlsolver_jvm")]
     pub sqleq_solver: bool,
 

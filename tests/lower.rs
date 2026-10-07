@@ -823,7 +823,7 @@ fn arithmetic_on_an_undeclared_result_stays_uninterpreted() {
     // The consequence of the line above, and the reason it matters: `f(x) + 1` must not become
     // integer addition, because the prover would then apply integer laws to whatever `f` returns.
     let v = ok(&same(r#"SELECT timestamp_trunc("a", "b") + 1 FROM "t""#));
-    let plus = find_op(&v, "+").expect("the addition is in the IR");
+    let plus = find_op(&v, "q_arith_add_varbinary_integer").expect("the addition is an uninterpreted function");
     assert_eq!(plus["type"], "VARBINARY", "opaque operand must make the result opaque");
 }
 
@@ -1389,7 +1389,7 @@ fn the_raw_ddl_wins_over_the_create_tables_in_the_input() {
     let v = sqleq_frontend::lower_with_ddl(&src, RAW, sqleq_frontend::CatalogSource::Declared)
         .expect("lowers against the raw DDL");
     assert_eq!(v["schemas"].as_array().unwrap().len(), 1);
-    assert_eq!(v["schemas"][0]["types"], serde_json::json!(["VARCHAR", "INTEGER", "REAL"]));
+    assert_eq!(v["schemas"][0]["types"], serde_json::json!(["VARCHAR", "INTEGER", "VARBINARY"]));
 }
 
 #[test]
@@ -2177,8 +2177,13 @@ fn a_pair_naming_no_system_column_is_untouched() {
 fn an_appended_system_column_carries_no_key_and_no_not_null() {
     let v = ok(&same(r#"SELECT "t"."ctid" FROM "t""#));
     assert_eq!(v["schemas"][0]["nullable"], serde_json::json!([true, true, true, true]));
-    // The declared UNIQUE(a) is still there, and still index 0 — appending at the end is what keeps
-    // the existing key indices valid.
+    // The declared UNIQUE(a) is not sent at all, because `a` may be NULL.
+    assert_eq!(v["schemas"][0]["key"], serde_json::json!([]));
+    // With `a` NOT NULL it is, and still index 0 — appending at the end is what keeps the existing
+    // key indices valid.
+    let ddl = r#"create table "t" ("a" INTEGER NOT NULL, "b" VARCHAR, "c" VARBINARY, unique ("a"));"#;
+    let q = r#"SELECT "t"."ctid" FROM "t""#;
+    let v = ok(&format!("{ddl}\n{q};\n{q};"));
     assert_eq!(v["schemas"][0]["key"], serde_json::json!([[0]]));
 }
 

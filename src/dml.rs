@@ -210,6 +210,9 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
         (0..statements.len()).filter(|&i| as_update(&statements[i]).is_some()).collect();
     let inserts: Vec<usize> =
         (0..statements.len()).filter(|&i| as_insert(&statements[i]).is_some()).collect();
+    for &i in deletes.iter().chain(&updates).chain(&inserts) {
+        no_default_keyword(&statements[i])?;
+    }
 
     match deletes.len() {
         0 => {}
@@ -255,6 +258,28 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
             install(&mut statements[j], qb)?;
         }
         _ => return Err(unsupported("INSERT paired with non-INSERT")),
+    }
+    Ok(())
+}
+
+/// Refuse a DML statement that uses the keyword `DEFAULT` as a value.
+///
+/// In `UPDATE t SET a = DEFAULT`, and in an `INSERT`'s `VALUES` row, `DEFAULT` stands for the
+/// column's default. sqlparser gives it there as a plain unquoted identifier, and lowering would
+/// resolve that as a column like any other: refused when the table has none of that name, but over a
+/// table with a column `"default"`, `SET a = DEFAULT` would lower like `SET a = "default"`. The
+/// reductions do not model a default, so the keyword is refused wherever it appears. `DEFAULT` is
+/// reserved in Postgres, so an unquoted one is never a column reference (the quoted `"default"`, and
+/// the qualified `t.default`, are), and refusing it costs no statement that reads a column.
+fn no_default_keyword(st: &Statement) -> Result<()> {
+    let found = visit_expressions(st, |e| match e {
+        Expr::Identifier(id) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    });
+    if found.is_break() {
+        return Err(unsupported("DEFAULT as a value (a column default is not modelled)"));
     }
     Ok(())
 }
@@ -526,7 +551,7 @@ fn same_target(a: &TableWithJoins, b: &TableWithJoins) -> Result<()> {
 /// This is the language's rule and not a normalisation of convenience, because it decides whether
 /// two `RETURNING` lists are the same projection — folding too much is a false proof, folding too
 /// little is a refusal.
-fn fold_ident(id: &Ident) -> String {
+pub(crate) fn fold_ident(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
         None => id.value.to_lowercase(),

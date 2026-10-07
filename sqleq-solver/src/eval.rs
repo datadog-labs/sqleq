@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use crate::translate::NUMERIC_EQ_KEY;
 use crate::uterm::{PredKind, UConst, UTerm, UVar};
 
 pub struct Db {
@@ -39,32 +40,25 @@ pub type Env = HashMap<u32, Vec<UConst>>;
 /// More assignments than this in one `Sum` means the test chose too large a universe.
 const MAX_ASSIGNMENTS: usize = 1_000_000;
 
-fn as_number(c: &UConst) -> Option<f64> {
-    match c {
-        UConst::Int(n) => Some(*n as f64),
-        UConst::Decimal(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
-/// Identity: `Null` equals `Null`, numbers compare numerically, strings by value, and mixed kinds
-/// never match. This is the `Pred::Eq` of the term algebra, not SQL `=`.
+/// Identity: `Null` equals `Null`, and two constants match only when they are the same value of the
+/// same type ([`UConst::same_value`]), so the integer `1` and the decimal `1.0` do not. This is the
+/// `Pred::Eq` of the term algebra, not SQL `=`, which the translator reads through a key where the
+/// two differ (and this evaluator interprets the numeric one).
 fn identical(a: &UConst, b: &UConst) -> bool {
-    match (as_number(a), as_number(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
+    a.same_value(b) == Some(true)
 }
 
 /// Both numbers or both strings: the pairs an order comparison is defined on (`Null` is in neither).
 fn ordered(a: &UConst, b: &UConst) -> bool {
-    matches!((a, b), (UConst::Str(_), UConst::Str(_))) || (as_number(a).is_some() && as_number(b).is_some())
+    matches!((a, b), (UConst::Str(_), UConst::Str(_))) || (a.number().is_some() && b.number().is_some())
 }
 
+/// Numbers by exact value; strings by bytes, one interpretation of an order the IR leaves to a
+/// collation it does not carry.
 fn less(a: &UConst, b: &UConst) -> bool {
     match (a, b) {
         (UConst::Str(x), UConst::Str(y)) => x < y,
-        _ => matches!((as_number(a), as_number(b)), (Some(x), Some(y)) if x < y),
+        _ => matches!((a.number(), b.number()), (Some(x), Some(y)) if x < y),
     }
 }
 
@@ -113,6 +107,12 @@ impl Db {
                 };
                 UConst::Int(holds as i64)
             }
+            UTerm::Func { name, args } if name == NUMERIC_EQ_KEY => {
+                // The one interpreted symbol: SQL's numeric `=` compares exact values.
+                let [a] = args.as_slice() else { return Err("numeric key arity".into()) };
+                let v = self.eval(a, env)?;
+                v.numeric_canonical().unwrap_or(v)
+            }
             UTerm::Func { name, args } => {
                 // Some fixed interpretation of the uninterpreted symbol; any one will do, since a
                 // sound rewrite must hold under all of them.
@@ -135,19 +135,24 @@ impl Db {
                 }
             }
             UTerm::Mul(ts) => {
-                let vals: Vec<UConst> = ts.iter().map(|c| self.eval(c, env)).collect::<Result<_, _>>()?;
-                if vals.contains(&UConst::Int(0)) {
-                    UConst::Int(0)
-                } else {
-                    let rest: Vec<UConst> = vals.into_iter().filter(|v| *v != UConst::Int(1)).collect();
-                    match rest.as_slice() {
-                        [] => UConst::Int(1),
-                        [one] => one.clone(),
-                        many => UConst::Int(many.iter().try_fold(1i64, |acc, v| match v {
-                            UConst::Int(n) => acc.checked_mul(*n).ok_or("overflow"),
-                            _ => Err("non-integer factor"),
-                        })?),
+                // A zero factor annihilates the rest unevaluated, so a guarded value (a CASE branch,
+                // a comparison under its operands' not-null guard) is read only where its guard
+                // holds; a scalar subquery's value, a sum, has no reading where it is NULL.
+                let mut vals: Vec<UConst> = Vec::with_capacity(ts.len());
+                for c in ts {
+                    match self.eval(c, env)? {
+                        UConst::Int(0) => return Ok(UConst::Int(0)),
+                        v => vals.push(v),
                     }
+                }
+                let rest: Vec<UConst> = vals.into_iter().filter(|v| *v != UConst::Int(1)).collect();
+                match rest.as_slice() {
+                    [] => UConst::Int(1),
+                    [one] => one.clone(),
+                    many => UConst::Int(many.iter().try_fold(1i64, |acc, v| match v {
+                        UConst::Int(n) => acc.checked_mul(*n).ok_or("overflow"),
+                        _ => Err("non-integer factor"),
+                    })?),
                 }
             }
             UTerm::Squash(c) => UConst::Int((self.count(c, env)? != 0) as i64),

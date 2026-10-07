@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use sqlparser::ast::visit_expressions;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
     Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
     Subscript, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue, Values,
@@ -45,27 +45,66 @@ const BUILTIN_AGGS: [&str; 5] = ["COUNT", "SUM", "AVG", "MIN", "MAX"];
 /// a `declare aggregate function` line produces, without needing the line — paired with the type
 /// they return.
 ///
-/// Without this, `bool_or` matches nothing: it is not in [`BUILTIN_AGGS`] and nobody declared it, so
-/// [`is_agg_call`] says no, the query never takes the Group path, and the call is lowered as an
-/// ordinary per-row scalar. That silently turns one output row into one row per input row — a
-/// cardinality mis-lowering of the same class as [`SET_RETURNING`], reached from the other side.
+/// SOUNDNESS GUARD. An aggregate on none of the lists here matches nothing: [`is_agg_call`] says no,
+/// the query never takes the Group path, and the call is lowered as an ordinary per-row scalar. That
+/// turns the one row an aggregate without `GROUP BY` returns into one row per input row — a
+/// cardinality mis-lowering of the same class as [`SET_RETURNING`], reached from the other side — and
+/// it is a false-proof channel: `SELECT count(*) FROM (SELECT var_pop(a) FROM t) q` returns 1 on an
+/// empty `t`, and `SELECT count(*) FROM t` returns 0, yet the per-row reading made the two one query.
 ///
-/// The demonstrated effect is lost coverage: `SELECT DISTINCT bool_or(b) FROM t` against
-/// `SELECT bool_or(b) FROM t` is the same one row and now proves, where the demoted form compared a
-/// DISTINCT over N rows against N rows and could not. No false-proof witness was found for the
-/// demotion, which is why this is not filed as a soundness fix — but getting the cardinality of an
-/// aggregate wrong is not a thing to leave standing on the strength of having failed to exploit it.
+/// So every built-in Postgres aggregate is classified, and none is left to the scalar path: the
+/// prover-native five are [`BUILTIN_AGGS`]; the ones whose result the bag of input values determines
+/// are here; the ones it does not determine are [`ORDER_SENSITIVE_AGGS`] and [`UNMODELLED_AGGS`],
+/// both refused. (An aggregate a user defines and the input does not declare is still a name nobody
+/// can tell from a function's; see [`contains_agg`].)
 ///
-/// The preprocessor refuses these instead, for a reason that does not apply here: sqlglot parses them
+/// An uninterpreted aggregate symbol is a *function of the bag*, so an entry here must be one:
+/// `bool_or` and `bit_or` fold with an operation that is commutative, associative and idempotent,
+/// `range_agg` and `range_intersect_agg` with union and intersection, and the statistical ones are
+/// functions of sums over the bag. Over floating-point input the rounding of those sums can depend on
+/// the order rows arrive in, as it can for `sum` and `avg`; that is how the frontend reads floating
+/// point everywhere (a `double precision` column is the prover's exact `REAL`), not something this
+/// list adds.
+///
+/// The return types are Postgres's own where it has one: `bool_or`/`bool_and`/`every` return
+/// `boolean`, `regr_count` returns `bigint`, and `corr`, `covar_*` and the other `regr_*` return
+/// `double precision`, whatever they are given. Where the type follows the argument (`bit_and(int2)`
+/// is `int2`, `var_pop(int)` is `numeric` and `var_pop(float8)` is `float8`, `range_agg` returns the
+/// multirange of its range) the entry is [`UNDECLARED_RET`], opaque, for the reason that constant
+/// gives. Null-handling is *not* asserted: `ignoreNulls` stays `false` and `FILTER` stays refused,
+/// both of which are the incomplete-not-unsound direction.
+///
+/// The preprocessor refuses these instead, for a reason that does not apply here: sqlglot parses some
 /// into dedicated node types that render as a plain call, so its downstream had no way to say
 /// "aggregate". Nothing stops us saying it.
-///
-/// The return types are definitional rather than guessed — `bool_or`/`bool_and`/`every` return a
-/// boolean in every dialect that has them — so stating them is not the kind of assumption
-/// [`UNDECLARED_RET`] is careful about. Null-handling is *not* asserted: `ignoreNulls` stays `false`
-/// and `FILTER` stays refused, both of which are the incomplete-not-unsound direction.
-const OPAQUE_AGGS: [(&str, &str); 3] =
-    [("BOOL_OR", "BOOLEAN"), ("BOOL_AND", "BOOLEAN"), ("EVERY", "BOOLEAN")];
+const OPAQUE_AGGS: [(&str, &str); 26] = [
+    ("BOOL_OR", "BOOLEAN"),
+    ("BOOL_AND", "BOOLEAN"),
+    ("EVERY", "BOOLEAN"),
+    ("BIT_AND", UNDECLARED_RET),
+    ("BIT_OR", UNDECLARED_RET),
+    ("BIT_XOR", UNDECLARED_RET),
+    ("STDDEV", UNDECLARED_RET),
+    ("STDDEV_POP", UNDECLARED_RET),
+    ("STDDEV_SAMP", UNDECLARED_RET),
+    ("VARIANCE", UNDECLARED_RET),
+    ("VAR_POP", UNDECLARED_RET),
+    ("VAR_SAMP", UNDECLARED_RET),
+    ("CORR", "REAL"),
+    ("COVAR_POP", "REAL"),
+    ("COVAR_SAMP", "REAL"),
+    ("REGR_AVGX", "REAL"),
+    ("REGR_AVGY", "REAL"),
+    ("REGR_COUNT", "INTEGER"),
+    ("REGR_INTERCEPT", "REAL"),
+    ("REGR_R2", "REAL"),
+    ("REGR_SLOPE", "REAL"),
+    ("REGR_SXX", "REAL"),
+    ("REGR_SXY", "REAL"),
+    ("REGR_SYY", "REAL"),
+    ("RANGE_AGG", UNDECLARED_RET),
+    ("RANGE_INTERSECT_AGG", UNDECLARED_RET),
+];
 
 /// Aggregates whose result is not determined by the bag of values they fold over.
 ///
@@ -97,41 +136,148 @@ const OPAQUE_AGGS: [(&str, &str); 3] =
 ///
 /// The preprocessor demotes these to `qa_*` aggregate symbols instead, which fixes the cardinality
 /// and takes on the bag-determinism assumption. That is the trade being declined here.
-const ORDER_SENSITIVE_AGGS: [&str; 9] = [
+///
+/// The `_strict` and `_unique` variants of the `json*_agg` family are here with their base forms, and
+/// so are the SQL/JSON spellings `json_arrayagg` and `json_objectagg`.
+const ORDER_SENSITIVE_AGGS: [&str; 19] = [
     "ARRAY_AGG",
     "STRING_AGG",
     "GROUP_CONCAT",
     "LISTAGG",
     "JSON_AGG",
+    "JSON_AGG_STRICT",
     "JSONB_AGG",
+    "JSONB_AGG_STRICT",
     "JSON_OBJECT_AGG",
+    "JSON_OBJECT_AGG_STRICT",
+    "JSON_OBJECT_AGG_UNIQUE",
+    "JSON_OBJECT_AGG_UNIQUE_STRICT",
     "JSONB_OBJECT_AGG",
+    "JSONB_OBJECT_AGG_STRICT",
+    "JSONB_OBJECT_AGG_UNIQUE",
+    "JSONB_OBJECT_AGG_UNIQUE_STRICT",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
     "XMLAGG",
 ];
 
-/// Functions whose result can differ between two calls with the same arguments.
+/// The other built-in aggregates that are not a function of the bag of values they fold over, or that
+/// cannot be called without a clause the lowering does not read.
+///
+/// SOUNDNESS GUARD, refused wherever a call is lowered, as [`ORDER_SENSITIVE_AGGS`] is and for the
+/// same two reasons: in aggregate position the bag would be taken to determine the result, and in
+/// scalar position, where these used to land, the cardinality is wrong outright.
+///
+/// * `any_value` returns an arbitrary one of its inputs, so two calls over one bag need not agree.
+/// * `mode`, `percentile_cont` and `percentile_disc` are ordered-set aggregates, and `rank`,
+///   `dense_rank`, `percent_rank` and `cume_dist` (without `OVER`) hypothetical-set ones: the values
+///   they fold over are in `WITHIN GROUP (ORDER BY ...)`, which [`call_parts`] refuses anyway.
+const UNMODELLED_AGGS: [&str; 8] = [
+    "ANY_VALUE",
+    "MODE",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "RANK",
+    "DENSE_RANK",
+    "PERCENT_RANK",
+    "CUME_DIST",
+];
+
+/// The functions Postgres declares `VOLATILE`: their result can differ between two calls with the
+/// same arguments. Lowercase, as Postgres spells them, and sorted.
 ///
 /// SOUNDNESS GUARD. Every other unknown call is modelled as an uninterpreted *function*, and the
 /// whole force of that word is that equal arguments give equal results — which is what lets both
 /// sides of a rewrite share one symbol. These do not have that property: `random()` twice is two
 /// values, `nextval` advances a sequence, `clock_timestamp()` moves during the statement. Modelling
 /// one as a function asserts an equality the database does not honour, so a pair that differs only
-/// in how many times it calls one would come out equivalent.
+/// in how many times it calls one would come out equivalent. Lowering refuses every call to one, and
+/// [`reflexive`](crate::reflexive) declines a pair where inlining a `WITH` binding would copy one.
+///
+/// The list is every function `pg_proc` marks volatile (`provolatile = 'v'`) in Postgres 17, plus the
+/// volatile functions of the `pgcrypto` and `uuid-ossp` extensions, plus `uuidv4` and `uuidv7`
+/// (Postgres 18) and the `pg_uuidv7` extension's `uuid_generate_v7`. Left out are the functions whose
+/// result type no call in a query can produce (`trigger`, `event_trigger`, `internal` and the
+/// `*_handler` types). It is matched on a call's unqualified name in any case, which can only refuse
+/// more than Postgres would. It is a denylist all the same: a volatile function a user defines is a
+/// name nobody can tell from any other.
 ///
 /// Not to be confused with the statement-stable clocks — `now()`, `current_timestamp`,
 /// `transaction_timestamp()`, `localtimestamp` — which are fixed for the duration of a statement and
-/// so *are* faithful as shared constants. They are deliberately absent from this list.
-const NONDETERMINISTIC: [&str; 10] = [
-    "RANDOM",
-    "GEN_RANDOM_UUID",
-    "UUID_GENERATE_V1",
-    "UUID_GENERATE_V4",
-    "UUID",
-    "RANDOM_UUID",
-    "NEXTVAL",
-    "CURRVAL",
-    "SETVAL",
-    "CLOCK_TIMESTAMP",
+/// so *are* faithful as shared constants. Postgres declares them `STABLE`, and they are absent here.
+///
+/// Public so that it is the one list of its kind: `sqleq-lean` reads it, and `sqleq-fuzz`, which
+/// does not link this crate, keeps its skip pattern in step with it.
+pub const VOLATILE_FUNCTIONS: &[&str] = &[
+    "amvalidate", "array_sample", "array_shuffle", "binary_upgrade_add_sub_rel_state",
+    "binary_upgrade_create_empty_extension", "binary_upgrade_logical_slot_has_caught_up",
+    "binary_upgrade_replorigin_advance", "binary_upgrade_set_missing_value",
+    "binary_upgrade_set_next_array_pg_type_oid", "binary_upgrade_set_next_heap_pg_class_oid",
+    "binary_upgrade_set_next_heap_relfilenode", "binary_upgrade_set_next_index_pg_class_oid",
+    "binary_upgrade_set_next_index_relfilenode",
+    "binary_upgrade_set_next_multirange_array_pg_type_oid",
+    "binary_upgrade_set_next_multirange_pg_type_oid", "binary_upgrade_set_next_pg_authid_oid",
+    "binary_upgrade_set_next_pg_enum_oid", "binary_upgrade_set_next_pg_tablespace_oid",
+    "binary_upgrade_set_next_pg_type_oid", "binary_upgrade_set_next_toast_pg_class_oid",
+    "binary_upgrade_set_next_toast_relfilenode", "binary_upgrade_set_record_init_privs",
+    "brin_desummarize_range", "brin_summarize_new_values", "brin_summarize_range",
+    "clock_timestamp", "current_query", "currtid2", "currval", "cursor_to_xml",
+    "cursor_to_xmlschema", "gen_random_bytes", "gen_random_uuid", "gen_salt",
+    "gin_clean_pending_list", "lastval", "lo_close", "lo_creat", "lo_create", "lo_export",
+    "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_lseek64", "lo_open", "lo_put",
+    "lo_tell", "lo_tell64", "lo_truncate", "lo_truncate64", "lo_unlink", "loread", "lowrite",
+    "nextval", "pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock",
+    "pg_advisory_unlock_all", "pg_advisory_unlock_shared", "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared", "pg_available_wal_summaries", "pg_backup_start",
+    "pg_backup_stop", "pg_blocking_pids", "pg_cancel_backend", "pg_collation_actual_version",
+    "pg_control_checkpoint", "pg_control_init", "pg_control_recovery", "pg_control_system",
+    "pg_copy_logical_replication_slot", "pg_copy_physical_replication_slot",
+    "pg_create_logical_replication_slot", "pg_create_physical_replication_slot",
+    "pg_create_restore_point", "pg_current_logfile", "pg_current_wal_flush_lsn",
+    "pg_current_wal_insert_lsn", "pg_current_wal_lsn", "pg_database_collation_actual_version",
+    "pg_database_size", "pg_drop_replication_slot", "pg_export_snapshot",
+    "pg_extension_config_dump", "pg_get_backend_memory_contexts", "pg_get_multixact_members",
+    "pg_get_shmem_allocations", "pg_get_wait_events", "pg_get_wal_replay_pause_state",
+    "pg_get_wal_resource_managers", "pg_get_wal_summarizer_state", "pg_hba_file_rules",
+    "pg_ident_file_mappings", "pg_import_system_collations", "pg_indexes_size", "pg_is_in_recovery",
+    "pg_is_wal_replay_paused", "pg_isolation_test_session_is_blocked", "pg_jit_available",
+    "pg_last_committed_xact", "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp", "pg_lock_status", "pg_log_backend_memory_contexts",
+    "pg_log_standby_snapshot", "pg_logical_emit_message", "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_get_changes", "pg_logical_slot_peek_binary_changes",
+    "pg_logical_slot_peek_changes", "pg_ls_archive_statusdir", "pg_ls_dir", "pg_ls_logdir",
+    "pg_ls_logicalmapdir", "pg_ls_logicalsnapdir", "pg_ls_replslotdir", "pg_ls_tmpdir",
+    "pg_ls_waldir", "pg_nextoid", "pg_notification_queue_usage", "pg_notify",
+    "pg_partition_ancestors", "pg_partition_tree", "pg_prepared_xact", "pg_promote",
+    "pg_read_binary_file", "pg_read_file", "pg_relation_size", "pg_reload_conf",
+    "pg_replication_origin_advance", "pg_replication_origin_create", "pg_replication_origin_drop",
+    "pg_replication_origin_progress", "pg_replication_origin_session_is_setup",
+    "pg_replication_origin_session_progress", "pg_replication_origin_session_reset",
+    "pg_replication_origin_session_setup", "pg_replication_origin_xact_reset",
+    "pg_replication_origin_xact_setup", "pg_replication_slot_advance", "pg_rotate_logfile",
+    "pg_safe_snapshot_blocking_pids", "pg_sequence_last_value", "pg_show_all_file_settings",
+    "pg_show_replication_origin_status", "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    "pg_stat_clear_snapshot", "pg_stat_file", "pg_stat_force_next_flush", "pg_stat_get_io",
+    "pg_stat_get_recovery_prefetch", "pg_stat_get_xact_blocks_fetched",
+    "pg_stat_get_xact_blocks_hit", "pg_stat_get_xact_function_calls",
+    "pg_stat_get_xact_function_self_time", "pg_stat_get_xact_function_total_time",
+    "pg_stat_get_xact_numscans", "pg_stat_get_xact_tuples_deleted",
+    "pg_stat_get_xact_tuples_fetched", "pg_stat_get_xact_tuples_hot_updated",
+    "pg_stat_get_xact_tuples_inserted", "pg_stat_get_xact_tuples_newpage_updated",
+    "pg_stat_get_xact_tuples_returned", "pg_stat_get_xact_tuples_updated", "pg_stat_have_stats",
+    "pg_stat_reset", "pg_stat_reset_replication_slot", "pg_stat_reset_shared",
+    "pg_stat_reset_single_function_counters", "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_slru", "pg_stat_reset_subscription_stats", "pg_stop_making_pinned_objects",
+    "pg_switch_wal", "pg_sync_replication_slots", "pg_table_size", "pg_tablespace_size",
+    "pg_terminate_backend", "pg_total_relation_size", "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock", "pg_try_advisory_xact_lock_shared",
+    "pg_wal_replay_pause", "pg_wal_replay_resume", "pg_wal_summary_contents",
+    "pg_xact_commit_timestamp", "pg_xact_commit_timestamp_origin", "pg_xact_status",
+    "pgp_pub_encrypt", "pgp_pub_encrypt_bytea", "pgp_sym_encrypt", "pgp_sym_encrypt_bytea",
+    "plpgsql_inline_handler", "plpgsql_validator", "query_to_xml", "query_to_xml_and_xmlschema",
+    "query_to_xmlschema", "random", "random_normal", "set_config", "setseed", "setval", "timeofday",
+    "ts_rewrite", "ts_stat", "txid_status", "uuid_generate_v1", "uuid_generate_v1mc",
+    "uuid_generate_v4", "uuid_generate_v7", "uuidv4", "uuidv7",
 ];
 
 /// Set-returning functions: the ones that expand one input row into *many* output rows.
@@ -241,10 +387,15 @@ fn reject_qualified_builtin_agg(full: &str, bare: &str) -> Result<()> {
     Ok(())
 }
 
-/// SOUNDNESS GUARD: see [`NONDETERMINISTIC`]. Matched on the *bare* name, because `pg_catalog.random`
-/// is still `random` and widening a refusal can only ever cost completeness.
+/// Whether `name`, a function's unqualified name in any case, is on [`VOLATILE_FUNCTIONS`].
+pub fn is_volatile(name: &str) -> bool {
+    VOLATILE_FUNCTIONS.iter().any(|v| v.eq_ignore_ascii_case(name))
+}
+
+/// SOUNDNESS GUARD: see [`VOLATILE_FUNCTIONS`]. Matched on the *bare* name, because
+/// `pg_catalog.random` is still `random` and widening a refusal can only ever cost completeness.
 fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {
-    if NONDETERMINISTIC.contains(&bare) {
+    if is_volatile(bare) {
         return Err(unsupported(format!("non-deterministic function {full}")));
     }
     Ok(())
@@ -264,6 +415,15 @@ fn reject_order_sensitive_agg(full: &str, bare: &str) -> Result<()> {
     Ok(())
 }
 
+/// SOUNDNESS GUARD: see [`UNMODELLED_AGGS`]. Bare-name matched and called wherever a call is lowered,
+/// as [`reject_order_sensitive_agg`] is.
+fn reject_unmodelled_agg(full: &str, bare: &str) -> Result<()> {
+    if UNMODELLED_AGGS.contains(&bare) {
+        return Err(unsupported(format!("unmodelled aggregate {full}")));
+    }
+    Ok(())
+}
+
 /// Lower a top-level query to a `Relation` Value.
 pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<Value> {
     Ok(lower_query_ctx(cat, fns, q, &[])?.0)
@@ -273,6 +433,12 @@ pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<Value> {
 /// returning the relation and its output columns. The output columns are needed when the query is a
 /// derived table or subquery so the enclosing query can resolve its columns.
 fn lower_query_ctx(cat: &Catalog, fns: &Fns, q: &Query, outer: &[Binding]) -> Result<(Value, OutCols)> {
+    // `normalize::inline_ctes` replaces every binding it can with its definition and leaves the
+    // `WITH` in place when one is recursive or writes. Nothing here reads a binding, so lowering past
+    // it would resolve its name as whatever base table has that name, and drop its effect.
+    if q.with.is_some() {
+        return Err(unsupported("WITH clause that is not inlined (RECURSIVE, or a data-modifying binding)"));
+    }
     // Every query node passes through here, so this is the one place a lock clause can be caught.
     // Identical ones were already dropped by `normalize::strip_identical_locks`; any left differ
     // between the sides, and the prover has no concurrency to tell them apart.
@@ -865,6 +1031,10 @@ fn lower_select_ctx(
     }
     if s.qualify.is_some() {
         return Err(unsupported("QUALIFY"));
+    }
+    // `SELECT ... INTO t` is `CREATE TABLE t AS SELECT ...`: it returns no rows and creates a table.
+    if s.into.is_some() {
+        return Err(unsupported("SELECT ... INTO"));
     }
     if s.from.is_empty() {
         let (rel, cols) = lower_fromless_select(cat, fns, s, outer)?;
@@ -1522,6 +1692,14 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 }
                 a.columns.iter().zip(out_cols).map(|(c, (_, t))| (c.name.value.to_lowercase(), t)).collect()
             };
+            // Every name here is lower-cased, quoted or not, and a reference finds the first column
+            // of its name. So `"b"` and `"B"`, two columns in Postgres, would become two `b`s, and
+            // `s."B"` would read the first. The case is lost by the time a name is stored here (a
+            // `*` reads it from the catalog, which folds every declaration), so this refuses any
+            // two columns that share a name, as `Catalog::check_case_collisions` does for a table's.
+            if let Some(i) = (1..cols.len()).find(|&i| cols[..i].iter().any(|(m, _)| *m == cols[i].0)) {
+                return Err(unsupported(format!("derived table with two columns named {} up to case", cols[i].0)));
+            }
             // No `table`: a derived table has no declared keys, so nothing it outputs can be shown
             // functionally dependent on a GROUP BY key.
             // A derived table's columns are its output, so all of them are visible.
@@ -1812,18 +1990,94 @@ struct Agg {
     filter: Option<Expr>,
 }
 
-/// Extract a function call's positional argument list, plus whether it carries DISTINCT or an
-/// ORDER BY clause. Returns an error for a sole-subquery argument (which we don't lower).
-fn fn_args(f: &Function) -> Result<(&[FunctionArg], bool, bool)> {
-    match &f.args {
-        FunctionArguments::List(l) => Ok((
-            &l.args,
-            matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)),
-            l.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))),
-        )),
-        FunctionArguments::None => Ok((&[], false, false)),
-        FunctionArguments::Subquery(_) => Err(unsupported("function with a subquery argument")),
+/// One argument of a call, as lowering reads it.
+enum CallArg<'a> {
+    /// A positional expression.
+    Expr(&'a Expr),
+    /// A bare `*`, which only `count(*)` gives a meaning to.
+    Star,
+}
+
+/// Everything call lowering reads of a [`Function`] besides its name: the arguments, whether they are
+/// `DISTINCT`, and the `FILTER`. The aggregate path ([`agg_of`]) reads all three; the scalar paths
+/// refuse a `DISTINCT`, a `FILTER` and a `*`, each of which says the call is an aggregate.
+struct CallParts<'a> {
+    args: Vec<CallArg<'a>>,
+    distinct: bool,
+    filter: Option<&'a Expr>,
+}
+
+/// Take a call apart into its [`CallParts`], refusing every other part it can carry.
+///
+/// SOUNDNESS GUARD. Each of these changes what a call computes, and none has a place in the IR:
+/// a named argument (`make_interval(days => a)`, and the SQL/JSON `json_object('k' VALUE a)`, which
+/// sqlparser reads as one), a `t.*` argument, `WITHIN GROUP`, an `ORDER BY`, `LIMIT`, `WHERE`,
+/// `HAVING`, `SEPARATOR` or `ON OVERFLOW` inside the parentheses, the SQL/JSON `ABSENT ON NULL` and
+/// `RETURNING`, `IGNORE NULLS`, a second parameter list, the ODBC `{fn ...}` form, and `OVER`. The
+/// call sites used to keep the positional arguments and skip the rest, so `make_interval(days => a)`
+/// and `make_interval(hours => a)` both lowered to `MAKE_INTERVAL()`: one term for two different
+/// calls, which every prover then proves equal.
+///
+/// [`Function`] and its argument list are destructured with no `..`, so a field a parser upgrade adds
+/// is a compile error here rather than one more part of a call that lowering drops.
+fn call_parts(f: &Function) -> Result<CallParts<'_>> {
+    let Function { name, uses_odbc_syntax, parameters, args, within_group, filter, null_treatment, over } =
+        f;
+    if over.is_some() {
+        return Err(unsupported("window function (OVER)"));
     }
+    if *uses_odbc_syntax {
+        return Err(unsupported(format!("ODBC-escaped call {{fn {name}(..)}}")));
+    }
+    if !matches!(parameters, FunctionArguments::None) {
+        return Err(unsupported(format!("second argument list on {name}")));
+    }
+    if !within_group.is_empty() {
+        return Err(unsupported(format!("WITHIN GROUP on {name}")));
+    }
+    if let Some(n) = null_treatment {
+        return Err(unsupported(format!("{n} on {name}")));
+    }
+    let filter = filter.as_deref();
+    let list = match args {
+        FunctionArguments::None => return Ok(CallParts { args: Vec::new(), distinct: false, filter }),
+        FunctionArguments::Subquery(_) => return Err(unsupported("function with a subquery argument")),
+        FunctionArguments::List(l) => l,
+    };
+    let FunctionArgumentList { duplicate_treatment, args, clauses } = list;
+    if let Some(c) = clauses.first() {
+        return Err(unsupported(format!("`{c}` in a call to {name}")));
+    }
+    let args = args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(CallArg::Expr(e)),
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(CallArg::Star),
+            other => Err(unsupported(format!("argument `{other}` in a call to {name}"))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
+    Ok(CallParts { args, distinct, filter })
+}
+
+/// The arguments of a call on a scalar path, where a `DISTINCT`, a `FILTER` or a `*` cannot be lowered.
+///
+/// SOUNDNESS GUARD. Postgres accepts each of the three only on an aggregate, so a call carrying one is
+/// an aggregate this frontend did not recognise, and a per-row reading of it gets the row count wrong.
+/// `DISTINCT` used to be dropped here outright.
+fn scalar_args<'a>(f: &'a Function, name: &str) -> Result<Vec<&'a Expr>> {
+    let parts = call_parts(f)?;
+    if parts.distinct || parts.filter.is_some() {
+        return Err(unsupported(format!("DISTINCT or FILTER on {name}, which is not a known aggregate")));
+    }
+    parts
+        .args
+        .into_iter()
+        .map(|a| match a {
+            CallArg::Expr(e) => Ok(e),
+            CallArg::Star => Err(unsupported(format!("`*` argument to {name}, which is not a known aggregate"))),
+        })
+        .collect()
 }
 
 /// Whether `e` is an aggregate function call: one of the builtins, or a name the input declared with
@@ -1846,10 +2100,15 @@ fn is_agg_call(fns: &Fns, e: &Expr) -> bool {
 /// `SELECT COALESCE(SUM(a), 0) FROM t` is an aggregate query even though the projection item is a
 /// `COALESCE`, so looking only at the top of each item would lower `SUM` as a per-row scalar and
 /// silently produce one output row per input row. Recursion deliberately stops at subqueries (an
-/// aggregate in there belongs to the subquery) and at windowed calls (not aggregates here).
+/// aggregate in there belongs to the subquery, or, when it reads only enclosing columns, is refused
+/// there by [`reads_only_enclosing_columns`]) and at windowed calls (not aggregates here).
 ///
-/// This is a *completeness* aid, not the safety net: any aggregate this misses is still caught by
-/// the refusal in [`lower_expr`]'s function arm, so a gap here costs coverage, never soundness.
+/// This is a *completeness* aid, not the safety net, for every aggregate [`is_agg_call`] recognises:
+/// one this walk misses reaches [`lower_expr`]'s function arm, which refuses it, so that gap costs
+/// coverage, never soundness. Every built-in Postgres aggregate is either recognised or refused by
+/// name there (see [`OPAQUE_AGGS`]), so the guarantee covers them all. What neither can catch is an
+/// aggregate a user defined and the input did not declare: to this frontend it is a name like any
+/// function's, and it is lowered per row.
 fn contains_agg(fns: &Fns, e: &Expr) -> bool {
     if is_agg_call(fns, e) {
         return true;
@@ -1917,29 +2176,28 @@ fn agg_of(e: &Expr) -> Result<Agg> {
     // makes [`is_agg_call`] true and sends the call straight down the Group path. A declaration is a
     // statement about the return type, not permission to assume the bag determines the value.
     reject_order_sensitive_agg(&name, bare_name(&name))?;
-    let (raw_args, distinct, has_order) = fn_args(f)?;
-    if has_order || f.null_treatment.is_some() {
-        return Err(unsupported(format!("aggregate modifier (ORDER BY/null-treatment) in {name}")));
-    }
+    reject_unmodelled_agg(&name, bare_name(&name))?;
+    // SOUNDNESS GUARD: see [`call_parts`]. An `ORDER BY` inside the parentheses, a null treatment and
+    // `WITHIN GROUP` are among what it refuses; `DISTINCT`, `FILTER` and `*` are read below.
+    let CallParts { args: raw_args, distinct, filter } = call_parts(f)?;
     // `FILTER (WHERE p)` is lowered by pushing the predicate into the argument as
     // `CASE WHEN p THEN arg END` (see [`AggCtx::add_agg`]), which is only faithful for aggregates
     // that skip NULL inputs. That is exactly the builtins: for anything else -- a declared
     // aggregate such as `QA_OP_ARRAYAGG` -- the rewrite would feed it a NULL per non-matching row
     // instead of dropping the row, and `array_agg` keeps NULLs. Refuse rather than guess.
-    if f.filter.is_some() && !BUILTIN_AGGS.contains(&name.as_str()) {
+    if filter.is_some() && !BUILTIN_AGGS.contains(&name.as_str()) {
         return Err(unsupported(format!("FILTER on the non-builtin aggregate {name}")));
     }
     let mut args = Vec::new();
     for a in raw_args {
         match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => args.push(e.clone()),
-            other => return Err(unsupported(format!("aggregate argument {other:?}"))),
+            CallArg::Star => {}
+            CallArg::Expr(e) => args.push(e.clone()),
         }
     }
     // `COUNT(*) FILTER (WHERE p)` counts matching rows, so it needs *something* to count; `1` is
     // the standard stand-in and makes the rewrite below `COUNT(CASE WHEN p THEN 1 END)`.
-    if f.filter.is_some() && args.is_empty() {
+    if filter.is_some() && args.is_empty() {
         if name != "COUNT" {
             return Err(unsupported(format!("FILTER on argument-less {name}")));
         }
@@ -1947,7 +2205,7 @@ fn agg_of(e: &Expr) -> Result<Agg> {
             SqlValue::Number("1".to_string(), false).with_empty_span(),
         ));
     }
-    Ok(Agg { op: name, args, distinct, filter: f.filter.as_deref().cloned() })
+    Ok(Agg { op: name, args, distinct, filter: filter.cloned() })
 }
 
 /// State for lowering expressions over a group's *output* scope (keys first, then aggregate results).
@@ -1989,9 +2247,24 @@ impl AggCtx<'_> {
             Some(p) => Some(lower_bool(self.cat, self.scope, self.fns, p)?),
             None => None,
         };
-        let mut operand: Vec<Value> = Vec::new();
+        let mut read = Vec::new();
+        if let Some(p) = &filter {
+            ir_levels(p, &mut read);
+        }
+        let mut lowered = Vec::new();
         for arg in &a.args {
-            let mut v = lower_expr(self.cat, self.scope, self.fns, arg)?;
+            let v = lower_expr(self.cat, self.scope, self.fns, arg)?;
+            ir_levels(&v, &mut read);
+            lowered.push(v);
+        }
+        if reads_only_enclosing_columns(self.scope, &read) {
+            return Err(unsupported(format!(
+                "aggregate {} over columns of an enclosing query only (it belongs to that query)",
+                a.op
+            )));
+        }
+        let mut operand: Vec<Value> = Vec::new();
+        for mut v in lowered {
             if let Some(p) = &filter {
                 // A NULL of the argument's own type, so `make_case` finds the branches already in
                 // agreement and leaves the NULL uncast -- a cast one would stop testing as null.
@@ -2103,19 +2376,15 @@ impl AggCtx<'_> {
                 reject_qualified_builtin_agg(&name, &bare)?;
                 reject_nondeterministic(&name, &bare)?;
                 reject_order_sensitive_agg(&name, &bare)?;
+                reject_unmodelled_agg(&name, &bare)?;
                 // SOUNDNESS GUARD, the same as `lower_expr`'s: a set-returning function over
                 // aggregates is no more a scalar than one over columns, and lowering it as one
                 // understates the row count.
                 if SET_RETURNING.contains(&bare.as_str()) {
                     return Err(unsupported(format!("set-returning function {name} in scalar position")));
                 }
-                let (raw_args, _, _) = fn_args(f)?;
-                let mut operand: Vec<Value> = Vec::new();
-                for a in raw_args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
-                        operand.push(self.lower_post(e)?);
-                    }
-                }
+                let operand =
+                    scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = fn_ret(self.fns, &name, &bare);
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
@@ -2219,6 +2488,26 @@ fn ir_levels(v: &Value, out: &mut Vec<usize>) {
     }
 }
 
+/// Whether an aggregate whose arguments and `FILTER` read the column levels `read` belongs to an
+/// enclosing query rather than to the one being lowered over `scope`.
+///
+/// SOUNDNESS GUARD. Postgres gives an aggregate to the innermost query level its arguments read a
+/// column of: if the arguments and the `FILTER` contain only outer-level variables, "the aggregate
+/// then belongs to the nearest such outer level, and is evaluated over the rows of that query"
+/// (manual, 4.2.7). In `SELECT (SELECT count(t.a) FROM u) FROM t`, `count(t.a)` folds over `t` and
+/// makes the outer query an aggregate one, returning one row. Lowered where it is written, it folds
+/// over `u` instead, once per row of `t`. The IR has no way to say an aggregate is an enclosing
+/// query's, so such a call is refused.
+///
+/// Levels are absolute ([`crate::scope`]), so the test is arithmetic: below [`Scope::base`] is an
+/// enclosing query's column, within this query's own bindings is its own, and above both is a column
+/// bound by a subquery inside the argument, which Postgres does not count either. An aggregate that
+/// reads no column at all (`count(*)`, `count(1)`) is this query's.
+fn reads_only_enclosing_columns(scope: &Scope, read: &[usize]) -> bool {
+    let own = |l: usize| scope.inner().iter().any(|b| l >= b.offset && l < b.offset + b.cols.len());
+    read.iter().any(|&l| l < scope.base) && !read.iter().any(|&l| own(l))
+}
+
 /// Whether a lowered expression takes a single value within each group.
 ///
 /// [`key_determines`] lifted from a column to an expression: an expression is a function of the
@@ -2295,9 +2584,9 @@ fn post_columns(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr, out: &mut Vec
             }
         }
         Expr::Function(f) => {
-            if let Ok((args, _, _)) = fn_args(f) {
-                for a in args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a {
+            if let Ok(parts) = call_parts(f) {
+                for a in parts.args {
+                    if let CallArg::Expr(x) = a {
                         post_columns(cat, scope, fns, x, out);
                     }
                 }
@@ -2546,26 +2835,21 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 let name = obj_name(&f.name).to_uppercase();
                 return Err(unsupported(format!("aggregate {name} in scalar position")));
             }
-            let (raw_args, _distinct, has_order) = fn_args(f)?;
-            if f.filter.is_some() || has_order {
-                return Err(unsupported("function FILTER / ORDER BY"));
-            }
             let (name, bare) = fn_names(f);
             reject_qualified_builtin_agg(&name, &bare)?;
             reject_nondeterministic(&name, &bare)?;
             reject_order_sensitive_agg(&name, &bare)?;
+            reject_unmodelled_agg(&name, &bare)?;
             // SOUNDNESS GUARD: see [`SET_RETURNING`] — these are not scalars and lowering them as
             // one would understate the row count. Matched on the *bare* name: `public.unnest(x)` is
             // still `unnest`, and widening a refusal can only ever cost completeness.
             if SET_RETURNING.contains(&bare.as_str()) {
                 return Err(unsupported(format!("set-returning function {name} in scalar position")));
             }
-            let mut operand: Vec<Value> = Vec::new();
-            for a in raw_args {
-                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
-                    operand.push(lower_expr(cat, scope, fns, e)?);
-                }
-            }
+            let operand = scalar_args(f, &name)?
+                .into_iter()
+                .map(|e| lower_expr(cat, scope, fns, e))
+                .collect::<Result<Vec<_>>>()?;
             Ok(json!({ "operator": name, "operand": operand, "type": fn_ret(fns, &name, &bare) }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
@@ -3165,16 +3449,13 @@ fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     }
 }
 
+/// A literal. Numbers and strings are emitted as `types` encodes constants: see
+/// [`number_literal`] and [`string_literal`].
 fn lower_value(v: &SqlValue) -> Result<Value> {
     use SqlValue::*;
     Ok(match v {
-        Number(n, _) => {
-            let ty = if n.contains('.') { "REAL" } else { "INTEGER" };
-            json!({ "operator": n, "operand": [], "type": ty })
-        }
-        SingleQuotedString(s) | DoubleQuotedString(s) | NationalStringLiteral(s) => {
-            json!({ "operator": s, "operand": [], "type": "VARCHAR" })
-        }
+        Number(n, _) => number_literal(n).map_err(unsupported)?,
+        SingleQuotedString(s) | DoubleQuotedString(s) | NationalStringLiteral(s) => string_literal(s),
         Boolean(b) => {
             json!({ "operator": if *b { "TRUE" } else { "FALSE" }, "operand": [], "type": "BOOLEAN" })
         }

@@ -7,7 +7,7 @@
 name = "sqleq-lean"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Translate INSERT equivalence pairs into Lean 4 and check them with the Lean kernel"
 license = "Apache-2.0"
 publish = false

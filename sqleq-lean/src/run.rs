@@ -10,13 +10,16 @@
 //!   proof states exactly `EquivGather A B` of its own pair, and nothing in the file can change how
 //!   it is checked;
 //! - Lean reported no error inside the pair's lines;
-//! - `#print axioms` printed a line for its `equiv`;
-//! - every axiom on that line is in [`ALLOWED`].
+//! - `#print axioms` printed a report for its `equiv`, its list closed by `]` (Lean wraps a long
+//!   one over several lines);
+//! - every axiom in that list is in [`ALLOWED`].
 //!
 //! The axiom check, not the exit code, says the kernel accepted the proof on its own: a theorem
 //! whose proof failed to elaborate is still added to the environment with `sorryAx`, and
-//! `native_decide` would add `Lean.ofReduceBool`, and both fall outside the allow-list. The audit
-//! says *what* was proved, which the axiom check cannot.
+//! `native_decide` adds an axiom of its own (on the pinned toolchain one named
+//! `<theorem>._native.native_decide.ax_…`; older ones reported `Lean.ofReduceBool`), and all of
+//! these fall outside the allow-list. The audit says *what* was proved, which the axiom check
+//! cannot.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -272,8 +275,10 @@ pub fn outcomes(src: &str, output: &str, entries: &[(Range<usize>, String)]) -> 
 fn read_outcomes(output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcome> {
     // `<file>:<line>:<col>: error: <message>`, lines 1-based.
     let mut errors: Vec<(usize, String)> = Vec::new();
-    let mut axioms: HashMap<String, Vec<String>> = HashMap::new();
-    for l in output.lines() {
+    // A theorem's axioms, or `None` when its report never closed its list.
+    let mut axioms: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    let mut lines = output.lines();
+    while let Some(l) = lines.next() {
         if let Some((head, msg)) = l.split_once(": error") {
             let mut parts = head.rsplitn(3, ':');
             let _col = parts.next();
@@ -283,14 +288,25 @@ fn read_outcomes(output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcom
             }
         }
         if let Some((name, rest)) = l.strip_prefix('\'').and_then(|r| r.split_once('\'')) {
-            if let Some(list) = rest.trim().strip_prefix("depends on axioms: [") {
-                let list = list.trim_end_matches(']');
-                axioms.insert(
-                    name.to_string(),
-                    list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                );
+            if let Some(first) = rest.trim().strip_prefix("depends on axioms: [") {
+                // Lean wraps a list past its line width, one axiom per line, so the list runs to
+                // the first `]`, on whichever line that is.
+                let mut list = first.to_string();
+                while !list.contains(']') {
+                    match lines.next() {
+                        Some(more) => {
+                            list.push(' ');
+                            list.push_str(more);
+                        }
+                        None => break,
+                    }
+                }
+                let read = list.split_once(']').map(|(inside, _)| {
+                    inside.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                });
+                axioms.insert(name.to_string(), read);
             } else if rest.contains("does not depend on any axioms") {
-                axioms.insert(name.to_string(), Vec::new());
+                axioms.insert(name.to_string(), Some(Vec::new()));
             }
         }
     }
@@ -302,7 +318,8 @@ fn read_outcomes(output: &str, entries: &[(Range<usize>, String)]) -> Vec<Outcom
             }
             match axioms.get(theorem) {
                 None => Outcome::Failed("no axiom report for the theorem".into()),
-                Some(ax) => match ax.iter().find(|a| !ALLOWED.contains(&a.as_str())) {
+                Some(None) => Outcome::Failed("the theorem's axiom report never closes its list".into()),
+                Some(Some(ax)) => match ax.iter().find(|a| !ALLOWED.contains(&a.as_str())) {
                     Some(bad) => Outcome::Failed(format!("proof depends on {bad}")),
                     None => Outcome::Proved,
                 },
@@ -357,5 +374,43 @@ mod tests {
         assert!(matches!(&got[2], Outcome::Failed(m) if m.contains("Lean.ofReduceBool")));
         assert_eq!(got[3], Outcome::Proved);
         assert!(matches!(&got[4], Outcome::Failed(m) if m.contains("no axiom report")));
+    }
+
+    mod wrapped_axiom_lists {
+        use super::*;
+
+        fn entries(n: usize) -> Vec<(Range<usize>, String)> {
+            (0..n).map(|i| (i * 10..i * 10 + 9, format!("Q{i}.equiv"))).collect()
+        }
+
+        #[test]
+        fn a_list_lean_wraps_is_read_to_its_closing_bracket() {
+            // What Lean 4 prints for a list past 120 columns: one axiom per line.
+            let out = "\
+'Q0.equiv' depends on axioms: [propext,
+ someAxiomWithAQuiteLongNameNumberFour,
+ someAxiomWithAQuiteLongNameNumberOne,
+ Classical.choice,
+ Quot.sound]
+'Q1.equiv' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+";
+            let got = read_outcomes(out, &entries(2));
+            assert!(matches!(&got[0], Outcome::Failed(m) if m.contains("someAxiomWithAQuiteLongNameNumberFour")), "{got:?}");
+            assert_eq!(got[1], Outcome::Proved);
+        }
+
+        #[test]
+        fn a_list_that_never_closes_is_not_a_proof() {
+            let got = read_outcomes("'Q0.equiv' depends on axioms: [propext,\n Quot.sound,\n", &entries(1));
+            assert!(matches!(&got[0], Outcome::Failed(m) if m.contains("never closes")), "{got:?}");
+        }
+
+        #[test]
+        fn native_decide_as_this_toolchain_reports_it_is_not_allowed() {
+            let out = "'Q0.equiv' depends on axioms: [propext, Q0.equiv._native.native_decide.ax_1_1, Quot.sound]\n";
+            assert!(matches!(&read_outcomes(out, &entries(1))[0], Outcome::Failed(m) if m.contains("native_decide")));
+        }
     }
 }

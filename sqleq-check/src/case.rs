@@ -189,6 +189,34 @@ pub fn classify_refusal(err: &str) -> (String, String) {
     (kind.to_string(), reason)
 }
 
+/// Whether the frontend declined, as opposed to failed: it exits 1 with its reason on stderr for
+/// every refusal (`main` returns `ExitCode::FAILURE`). A panic exits 101, a stack overflow aborts,
+/// a signal leaves no exit code at all, and none of them is a reason to read as a refusal's kind --
+/// a `SIGSEGV` with nothing on stderr would otherwise be filed as a `schema` refusal, and pinned as
+/// one.
+pub fn declined(r: &crate::proc::Run) -> bool {
+    r.rc == 1 && !tail(&r.err).is_empty()
+}
+
+/// What a backend that failed without answering left behind: its exit code, or the signal that
+/// ended it, and the last line it printed (`quiet` when it printed nothing). A Rust panic's last
+/// line is the hint about `RUST_BACKTRACE`, so the line read is the one above it: the panic's
+/// message.
+pub fn failed(who: &str, r: &crate::proc::Run, quiet: &str) -> String {
+    let how = if r.rc < 0 { format!("killed by signal {}", -r.rc) } else { format!("exit {}", r.rc) };
+    let why = r
+        .err
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !l.starts_with("note: run with `RUST_BACKTRACE"))
+        .unwrap_or("");
+    if why.is_empty() {
+        format!("{who} {how} {quiet}")
+    } else {
+        format!("{who} {how}: {why}")
+    }
+}
+
 /// The frontend flags a `.sql` case's `-- catalog:` header asks for (none when absent).
 ///
 /// A pair whose queries use `$N` needs an inferred catalog: under the default, declared one the
@@ -264,11 +292,32 @@ pub struct Workdir {
     cleanup: bool,
 }
 
+/// The name of a case's directory under `--keep`.
+pub fn keep_name(name: &str) -> String {
+    name.replace('/', "__")
+}
+
 impl Workdir {
+    /// A fresh directory for the case: a new temporary one, or under `--keep` the case's own one,
+    /// emptied first. Every stage reads back a file it expects to have just written -- the plan,
+    /// the prover's `.result`, the sqleq-solver row, the Lean record, the corpus report -- so a
+    /// previous run's file left in place would be reported as this run's answer whenever this run
+    /// wrote none: a backend that crashed, was killed, or answered nothing.
     pub fn new(keep_dir: Option<&Path>, name: &str) -> std::io::Result<Workdir> {
         match keep_dir {
             Some(k) => {
-                let p = k.join(name.replace('/', "__"));
+                let p = k.join(keep_name(name));
+                match std::fs::symlink_metadata(&p) {
+                    Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p)?,
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("{} exists and is not a directory", p.display()),
+                        ))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
                 std::fs::create_dir_all(&p)?;
                 Ok(Workdir { path: p, cleanup: false })
             }
@@ -316,6 +365,13 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
             return case;
         }
     };
+    // The second opinion asks about every job in its directory, so a job this run of the case does
+    // not package -- the retry pass re-runs a case, and its frontend may fail the second time -- must
+    // not be left there from the first.
+    let job = st.ss_dir.as_ref().map(|d| d.join(format!("{}.job.jsonl", ss_slug(name))));
+    if let Some(job) = &job {
+        let _ = std::fs::remove_file(job);
+    }
     let Some(json_name) = lower(&mut case, src, &wd.path, &st.frontend, st.catalog.as_deref(), st.timeout) else {
         case.wall = t0.elapsed().as_secs_f64();
         return case;
@@ -325,9 +381,8 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
     // prover runs, so a prover timeout does not also cost the second opinion; its own cost is
     // discounted from `case.wall` so a second-opinion run's timings stay comparable to one without
     // it.
-    if let Some(ss_dir) = &st.ss_dir {
-        let job = ss_dir.join(format!("{}.job.jsonl", ss_slug(name)));
-        t0 += Duration::from_secs_f64(package(&mut case, &st.frontend, &wd.path, &json_name, &job, st.timeout));
+    if let Some(job) = &job {
+        t0 += Duration::from_secs_f64(package(&mut case, &st.frontend, &wd.path, &json_name, job, st.timeout));
     }
 
     let Some(prover) = &st.prover else {
@@ -393,9 +448,16 @@ pub fn lower(
         // JSON is still a case we cannot prove, and silently proving nothing would be worse.
         let empty = std::fs::metadata(&json_path).map_or(true, |m| m.len() == 0);
         if fr.rc != 0 || empty {
-            case.status = s(REFUSED);
-            (case.refuse_kind, case.message) = classify_refusal(&fr.err);
-            case.reflexive = fr.err.lines().any(|l| l.trim() == sqleq_frontend::REFLEXIVE_NOTE);
+            if declined(&fr) {
+                case.status = s(REFUSED);
+                (case.refuse_kind, case.message) = classify_refusal(&fr.err);
+                case.reflexive = fr.err.lines().any(|l| l.trim() == sqleq_frontend::REFLEXIVE_NOTE);
+            } else {
+                // Not a refusal, whatever stderr ends with: a crash says nothing about the pair, so
+                // it must neither be pinned as one nor escape the retry pass.
+                case.status = s(ERROR);
+                case.message = failed("frontend", &fr, "without writing a plan");
+            }
             set_triviality(case, None, src);
             return None;
         }
@@ -494,9 +556,12 @@ fn lower_row(
 
 /// Package the lowered plan as the second opinion's job at `job`: `{name, ir, schema}` built from
 /// *this* JSON -- the same bytes the prover reads -- so nothing re-lowers the case and the two axes
-/// cannot drift apart. A plan the bridge cannot express is `unsupported` on the case. Returns the
-/// wall time it took.
+/// cannot drift apart. A plan the bridge cannot express is `unsupported` on the case; a frontend
+/// that could not read the plan back, write the job or run at all is an `error`, because the bridge
+/// never got to say. Returns the wall time it took.
 pub fn package(case: &mut Case, frontend: &str, workdir: &Path, json_name: &str, job: &Path, timeout: f64) -> f64 {
+    // Only a job this call wrote is read as this case's.
+    let _ = std::fs::remove_file(job);
     let argv = [
         frontend.to_string(),
         s("--sqlsolver"),
@@ -509,9 +574,20 @@ pub fn package(case: &mut Case, frontend: &str, workdir: &Path, json_name: &str,
     ];
     let pack = run_cmd(&argv, workdir, timeout, &[]);
     if pack.rc != 0 || !job.exists() {
-        case.s_bucket = Some(s(crate::axes::solver::UNSUPPORTED));
+        // The bridge's refusal is the frontend's usual one, exit 1 with a reason; it shares that
+        // code with the frontend's own I/O failures, which say `cannot read` or `cannot write`.
         let why = tail(&pack.err);
-        case.s_note = if why.is_empty() { format!("could not package the plan (exit {})", pack.rc) } else { why };
+        let io = why.starts_with("cannot read ") || why.starts_with("cannot write ");
+        if pack.timed_out {
+            case.s_bucket = Some(s(crate::axes::solver::TIMEOUT));
+            case.s_note = s("timed out packaging the plan");
+        } else if declined(&pack) && !io {
+            case.s_bucket = Some(s(crate::axes::solver::UNSUPPORTED));
+            case.s_note = why;
+        } else {
+            case.s_bucket = Some(s(crate::axes::solver::ERROR));
+            case.s_note = failed("could not package the plan: frontend", &pack, "without writing the job");
+        }
     }
     pack.wall
 }

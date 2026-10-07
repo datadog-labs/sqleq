@@ -188,7 +188,10 @@ A proof counts only if both of these checks pass:
     macro or tactic that could change how the file is checked.
 - **How it was proved.** `#print axioms` on the proof lists nothing beyond `propext`,
   `Classical.choice` and `Quot.sound`. A proof that fell back to `sorry` shows `sorryAx`, and
-  `native_decide` shows `Lean.ofReduceBool`; both are rejected.
+  `native_decide` shows an axiom of its own (`<theorem>._native.native_decide.ax_…` on the pinned
+  toolchain, `Lean.ofReduceBool` on older ones); all of them are rejected. The list is read to its
+  closing `]`, since Lean wraps a long one over several lines, and a list that never closes is not
+  a proof.
 
 Lean's own kernel is still trusted. Re-checking the proofs with an independent kernel (for example
 `nanoda` through `lean4export`, as Lean's `comparator` does) is a natural next step.
@@ -215,7 +218,9 @@ deterministic so that both runs see the *same* stream, which is what the theorem
 is fixed, and a random value is drawn from a sequence created within the run: one per default in
 the DDL and per generator in a tail, and one shared by the generators in the `VALUES` clause, so a
 draw on one side only shifts nothing on the other. Schema qualifiers are dropped, which is how
-sqleq resolves a name.
+sqleq resolves a name, except on the targets when the two statements qualify them differently:
+`a.t` and `b.t` are two tables, so their qualifiers are kept, and the run does not prepare rather
+than confirm a pair that writes two tables.
 
 For a pair with generated cells, a probe first runs the `VALUES` clause into a copy of the table
 that has the target's defaults and identities but no constraints, and reads back what the generated
@@ -247,7 +252,9 @@ cargo build --release && cargo build --release -p sqleq-lean
 own positive and negative controls are `lake build SqleqTest` in `lean/`.
 
 `sqleq-lean` can also be run on its own, over pair files, directories of them, or `--csv
-<corpus.csv>`, writing its own per-pair record (`sqleq-lean --help` lists the options). A few
+<corpus.csv>`, writing its own per-pair record (`sqleq-lean --help` lists the options). A pair
+file's record is keyed by its file name, so two files of one name in different directories are
+refused unless `--full-names` keys them by path, as `sqleq-check` always does. A few
 options have no `sqleq-check` counterpart, among them `--batch` (pairs per Lean file) and
 `--translate-only`, which runs no Lean and reports, for each pair, its refusal or the claim it would
 be checked under.

@@ -355,18 +355,6 @@ impl Uf {
 // Postgres type name -> Ty
 // ---------------------------------------------------------------------------
 
-const INT_NAMES: &[&str] = &[
-    "int", "int2", "int4", "int8", "integer", "bigint", "smallint", "tinyint", "mediumint", "serial",
-    "bigserial", "smallserial", "oid",
-];
-const REAL_NAMES: &[&str] =
-    &["numeric", "decimal", "real", "double", "float", "float4", "float8", "money", "number"];
-const STR_NAMES: &[&str] = &[
-    "text", "varchar", "char", "bpchar", "citext", "uuid", "name", "nvarchar", "nchar", "character",
-    "string",
-];
-const BOOL_NAMES: &[&str] = &["bool", "boolean"];
-
 /// The normalized spelling of a type name: trimmed, unquoted, lower-cased.
 ///
 /// One definition with a name, because two callers must agree on when two spellings are the same
@@ -379,7 +367,9 @@ pub fn canon_type_name(txt: &str) -> String {
 
 /// A cast/column type name → [`Ty`], plus whether the target carried a length/precision qualifier.
 ///
-/// `None` means unmappable — `jsonb`, `geometry`, an enum, an array. This function stays silent
+/// `None` means unmappable — `jsonb`, `geometry`, an enum, an array, a float (`double precision`
+/// rounds, and the IR's REAL is exact), `uuid` (its input reads `'{A0EE…}'` and `'a0ee…'` as one
+/// value, which text does not), `citext` and `char(n)`. This function stays silent
 /// rather than guess, and *inference* keeps that silence: an unmappable target contributes no type,
 /// exactly as a column nobody told us about contributes none.
 ///
@@ -396,14 +386,14 @@ pub fn canon_type_name(txt: &str) -> String {
 /// no-op and can be dropped; `x::varchar(8)` is a *truncation* and cannot.
 ///
 /// Quotes are stripped first. A name a dialect does not recognise as a type comes back through
-/// `sqlparser` as a user-defined one and prints the way it was written, so `CAST(x AS "citext")` has
-/// to reach the `citext` entry that `CAST(x AS citext)` reaches — a type is the same type whichever
+/// `sqlparser` as a user-defined one and prints the way it was written, so `CAST(x AS "bpchar")` has
+/// to reach what `CAST(x AS bpchar)` reaches — a type is the same type whichever
 /// way it was spelled, and treating the quoted form as unmappable would refuse the pair over
 /// punctuation.
 pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
     let t = canon_type_name(txt);
-    // `int ARRAY` and `int ARRAY[4]` are the SQL-standard spellings of `int[]`. The leading word is
-    // what the scalar mapping below reads, so without the word test they would come back as `Int`.
+    // `int ARRAY` and `int ARRAY[4]` are the SQL-standard spellings of `int[]`. Without the word test
+    // the scalar mapping below would read them by their element type and they would come back as `Int`.
     let array_word = t.split_whitespace().any(|w| w == "array" || w.starts_with("array["));
     if t.contains("[]")
         || array_word
@@ -424,17 +414,17 @@ pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
         return (ty, qualified);
     }
     let qualified = t.contains('(');
-    let base: &str = t.split(['(', '[', ' ']).next().unwrap_or(&t);
-    let ty = if INT_NAMES.contains(&base) {
-        Some(Ty::Int)
-    } else if REAL_NAMES.contains(&base) {
-        Some(Ty::Real)
-    } else if STR_NAMES.contains(&base) {
-        Some(Ty::Str)
-    } else if BOOL_NAMES.contains(&base) {
-        Some(Ty::Bool)
-    } else {
-        None
+    // The classification is `types::map_type`'s, so a name means one thing to both readers. Of its
+    // classes only four have a `Ty`: a float, a binary type, and anything it does not name are
+    // unmappable, and so is an `UNFAITHFUL` type (`citext`, `char(n)`), which the readers that
+    // need it name through `types::unfaithful_type`.
+    use crate::types::{scalar_class, Scalar};
+    let ty = match scalar_class(&t) {
+        Some(Scalar::Int) => Some(Ty::Int),
+        Some(Scalar::Numeric) => Some(Ty::Real),
+        Some(Scalar::Str) => Some(Ty::Str),
+        Some(Scalar::Bool) => Some(Ty::Bool),
+        Some(Scalar::Float | Scalar::Binary) | None => None,
     };
     (ty, qualified)
 }
@@ -703,19 +693,36 @@ impl<'a> Attributor<'a> {
                             }
                         }
                     }
-                    _ => return Err(schema("ambiguous unqualified column")),
+                    _ => {
+                        let by = bindings(top.base.iter().filter(|(_, t)| declares(cat, t, &col)));
+                        return Err(schema(format!(
+                            "ambiguous unqualified column {col} (declared by {by})"
+                        )));
+                    }
                 }
             }
             None => {
                 if let (0, Some(t)) = (nderiv, sole) {
                     self.record(e, &t, &col);
                 } else if nbase > 1 {
-                    return Err(schema("ambiguous unqualified column"));
+                    let of = bindings(top.base.iter());
+                    return Err(schema(format!(
+                        "ambiguous unqualified column {col} (no catalog says which of {of} declares it)"
+                    )));
                 }
             }
         }
         Ok(())
     }
+}
+
+/// In-scope base tables as the FROM clause binds them (`orders o`, or `orders` unaliased), sorted,
+/// for a refusal that has to say which tables it could not choose between.
+fn bindings<'a>(it: impl Iterator<Item = (&'a String, &'a String)>) -> String {
+    let mut v: Vec<String> =
+        it.map(|(alias, t)| if alias == t { t.clone() } else { format!("{t} {alias}") }).collect();
+    v.sort();
+    v.join(", ")
 }
 
 impl Visitor for Attributor<'_> {
@@ -1566,7 +1573,7 @@ mod tests {
         // The SQL-standard array spellings, which would otherwise map by their leading word.
         assert_eq!(map_type_name("INT ARRAY").0, None);
         assert_eq!(map_type_name("integer ARRAY[4]").0, None);
-        assert_eq!(map_type_name("double precision").0, Some(Ty::Real));
+        assert_eq!(map_type_name("double precision").0, None);
         assert_eq!(map_type_name("geometry").0, None);
         // Mapped, with the length qualifier flagged so an identity cast is not dropped.
         assert_eq!(map_type_name("varchar(8)"), (Some(Ty::Str), true));
@@ -1587,8 +1594,8 @@ mod tests {
         // A type a dialect does not recognise comes back as a user-defined one and prints the way it
         // was written, so the quoted spelling has to reach the same entry the bare one does. Treating
         // it as unmappable would refuse the pair over punctuation.
-        assert_eq!(map_type_name("\"citext\""), map_type_name("citext"));
-        assert_eq!(map_type_name("\"citext\"").0, Some(Ty::Str));
+        assert_eq!(map_type_name("\"text\""), map_type_name("text"));
+        assert_eq!(map_type_name("\"text\"").0, Some(Ty::Str));
     }
 
     #[test]
