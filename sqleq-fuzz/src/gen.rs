@@ -67,6 +67,9 @@ pub const JSONS: [&str; 4] = [
     r#"{"b":2,"c":"c"}"#,
 ];
 
+/// The interval domain, shared by `interval` columns and by `$N::interval` params.
+const INTERVALS: [&str; 3] = ["1 day", "2 hours", "7 days"];
+
 /// Generate a value for a column of type `vt`. Nullable columns are NULL with probability 0.3.
 pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
     if nullable && rng.random_bool(0.3) {
@@ -99,6 +102,8 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
         // A plain string: DuckDB casts a VARCHAR literal to JSON implicitly, on insert and in a
         // comparison alike, so no `Val` variant of its own is needed the way `Uuid` needs one.
         VType::Json => Val::Str((*JSONS.choose(rng).unwrap()).to_string()),
+        // The spellings an `interval` cast is drawn from, which DuckDB reads into its INTERVAL.
+        VType::Interval => Val::Str((*INTERVALS.choose(rng).unwrap()).to_string()),
     }
 }
 
@@ -202,7 +207,7 @@ pub fn randval_cast(ct: CastTarget, rng: &mut StdRng) -> Val {
     let pick = |xs: &[&str], rng: &mut StdRng| Val::Str((*xs.choose(rng).unwrap()).to_string());
     match ct {
         CastTarget::V(v) => randval(v, false, rng),
-        CastTarget::Interval => pick(&["1 day", "2 hours", "7 days"], rng),
+        CastTarget::Interval => pick(&INTERVALS, rng),
         // The same pool the column data is drawn from, which is the whole point of sharing it:
         // `j = $1::json` can only ever match if the param is spelled exactly as the column is.
         CastTarget::Json => pick(&JSONS, rng),
@@ -277,6 +282,7 @@ mod tests {
             notnull: false,
             array: true,
             padded: false,
+            sequenced: false,
         };
         let mut rng = StdRng::seed_from_u64(7);
         let mut saw_list = 0;
@@ -321,6 +327,7 @@ mod tests {
             notnull: true,
             array: false,
             padded: false,
+            sequenced: false,
         };
         assert!(matches!(randval_col(&c, &mut rng), Val::Int(_)));
     }

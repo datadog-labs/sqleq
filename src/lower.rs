@@ -24,7 +24,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
 use crate::error::{schema, unsupported, Result};
-use crate::scope::{Binding, Scope};
+use crate::scope::{is_unnamed, unnamed, Binding, Scope};
 use crate::types::*;
 
 /// Output columns of a (sub)query: `(name, prover type)`.
@@ -939,7 +939,7 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         }
     }
     let out_cols: OutCols =
-        schema_tys.iter().enumerate().map(|(i, t)| (format!("$col{i}"), t.clone())).collect();
+        schema_tys.iter().enumerate().map(|(i, t)| (unnamed(i), t.clone())).collect();
     Ok((json!({ "values": { "schema": schema_tys, "content": content } }), out_cols))
 }
 
@@ -1643,18 +1643,18 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                     return Err(schema(format!("table {tn} has fewer columns than its alias names")));
                 }
                 for (col, c) in cols.iter_mut().zip(&a.columns) {
-                    col.0 = c.name.value.to_lowercase();
+                    col.0 = fold_name(&c.name);
                 }
+                // Up to case, as `Catalog::check_case_collisions` compares a table's own columns.
                 let declared = &cols[..cat.tables[idx].n_declared];
-                if declared.iter().enumerate().any(|(i, (n, _))| declared[..i].iter().any(|(m, _)| m == n)) {
+                let same = |m: &str, n: &str| m.to_lowercase() == n.to_lowercase();
+                if declared.iter().enumerate().any(|(i, (n, _))| declared[..i].iter().any(|(m, _)| same(m, n))) {
                     return Err(schema(format!("table alias leaves two columns of {tn} with one name")));
                 }
             }
-            let alias = alias
-                .as_ref()
-                .map(|a| a.name.value.clone())
-                .unwrap_or_else(|| tn.clone())
-                .to_lowercase();
+            // The name a qualified reference finds this instance by: its alias, which hides the
+            // table's own name, or that name as the query spells it. Folded as Postgres folds both.
+            let alias = alias.as_ref().map(|a| fold_name(&a.name)).unwrap_or_else(|| last_name(name));
             Ok((
                 Binding {
                     alias,
@@ -1682,30 +1682,29 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             let (rel, out_cols) = lower_query_ctx(cat, fns, subquery, outer)?;
             let a = alias.as_ref().ok_or_else(|| schema("derived table requires an alias"))?;
             let cols: OutCols = if a.columns.is_empty() {
-                // Output names keep a quoted alias's case (see [`fold_name`]), but a reference into
-                // the binding is looked up lower-cased ([`Scope::try_resolve`]), so the binding
-                // takes them lower-cased, as it did before output names kept their case.
-                out_cols.into_iter().map(|(n, t)| (n.to_lowercase(), t)).collect()
+                // Output names are already folded as Postgres folds them (see [`fold_name`]), which
+                // is the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
+                out_cols
             } else {
                 if a.columns.len() != out_cols.len() {
                     return Err(schema("derived table column-alias count mismatch"));
                 }
-                a.columns.iter().zip(out_cols).map(|(c, (_, t))| (c.name.value.to_lowercase(), t)).collect()
+                a.columns.iter().zip(out_cols).map(|(c, (_, t))| (fold_name(&c.name), t)).collect()
             };
-            // Every name here is lower-cased, quoted or not, and a reference finds the first column
-            // of its name. So `"b"` and `"B"`, two columns in Postgres, would become two `b`s, and
-            // `s."B"` would read the first. The case is lost by the time a name is stored here (a
-            // `*` reads it from the catalog, which folds every declaration), so this refuses any
-            // two columns that share a name, as `Catalog::check_case_collisions` does for a table's.
-            if let Some(i) = (1..cols.len()).find(|&i| cols[..i].iter().any(|(m, _)| *m == cols[i].0)) {
-                return Err(unsupported(format!("derived table with two columns named {} up to case", cols[i].0)));
+            // Two columns that share a name up to case are refused, as `Catalog::check_case_collisions`
+            // refuses them in a table. A reference now tells `"b"` from `"B"`, so this is no longer
+            // what keeps them apart; it stays because lifting it is a completeness change of its own.
+            let low = |n: &str| n.to_lowercase();
+            if let Some(i) = (1..cols.len()).find(|&i| cols[..i].iter().any(|(m, _)| low(m) == low(&cols[i].0))) {
+                let name = if is_unnamed(&cols[i].0) { "?column?".to_string() } else { low(&cols[i].0) };
+                return Err(unsupported(format!("derived table with two columns named {name} up to case")));
             }
             // No `table`: a derived table has no declared keys, so nothing it outputs can be shown
             // functionally dependent on a GROUP BY key.
             // A derived table's columns are its output, so all of them are visible.
             let n_declared = cols.len();
             Ok((
-                Binding { alias: a.name.value.to_lowercase(), cols, offset, table: None, n_declared },
+                Binding { alias: fold_name(&a.name), cols, offset, table: None, n_declared },
                 rel,
             ))
         }
@@ -1739,10 +1738,7 @@ fn join_op(op: &JoinOperator) -> Result<(&'static str, JoinCond<'_>)> {
         JoinConstraint::On(e) => Ok((kind, JoinCond::On(e))),
         JoinConstraint::None => Ok((kind, JoinCond::Always)),
         JoinConstraint::Using(names) => {
-            let cols = names
-                .iter()
-                .map(|n| obj_name(n).split('.').next_back().unwrap().to_lowercase())
-                .collect();
+            let cols = names.iter().map(last_name).collect();
             Ok((kind, JoinCond::Using(cols)))
         }
         other => Err(unsupported(format!("join constraint {other:?}"))),
@@ -1829,7 +1825,7 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
                         return Err(unsupported("expression.* wildcard"))
                     }
                 };
-                let q = obj_name(name).split('.').next_back().unwrap().to_lowercase();
+                let q = last_name(name);
                 let mut found = false;
                 for b in scope.inner() {
                     if b.alias == q {
@@ -1849,8 +1845,8 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
 }
 
 /// The output name of the unaliased select-list item `e` at position `idx`: the name Postgres gives
-/// it, or, where this frontend cannot tell what that is, a `$col` placeholder no key ever matches
-/// (see [`is_unnamed`]).
+/// it, or, where this frontend cannot tell what that is, an [`unnamed`] placeholder that no key or
+/// reference ever matches.
 ///
 /// Postgres names such an item with `FigureColname`: a column reference after the column, a call
 /// after the function, a cast after what it casts when that is a column or a call (and after the
@@ -1863,23 +1859,21 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
 /// and drop or rewrite some type names. Only shapes those passes leave recognisable are named; any
 /// other is a placeholder, and a key that could have meant it is refused.
 fn expr_name(e: &Expr, idx: usize) -> String {
-    implicit_name(e).unwrap_or_else(|| format!("$col{idx}"))
-}
-
-/// Whether an output column's name is [`expr_name`]'s placeholder for a name not known (or one of
-/// `VALUES`' columns, which Postgres names `column1`, … and this frontend does not).
-fn is_unnamed(name: &str) -> bool {
-    name.starts_with("$col")
+    implicit_name(e).unwrap_or_else(|| unnamed(idx))
 }
 
 /// Postgres's identity for a name: an unquoted identifier folds to lower case, a quoted one is kept
-/// as written, so `A`, `a` and `"a"` are one name and `"A"` is another. The fold is ASCII-only, as
-/// Postgres's is under a multibyte server encoding.
+/// as written, so `A`, `a` and `"a"` are one name and `"A"` is another. The rule is
+/// [`crate::dml::fold_ident`]'s; every name the scope stores or looks up goes through it.
 fn fold_name(id: &sqlparser::ast::Ident) -> String {
-    match id.quote_style {
-        Some(_) => id.value.clone(),
-        None => id.value.to_ascii_lowercase(),
-    }
+    crate::dml::fold_ident(id)
+}
+
+/// The name a relation's last name part folds to: the name a table that has no alias is referred to
+/// by, as `schema.t` is referred to as `t`. A part that is not an identifier leaves the empty string,
+/// which no reference equals.
+fn last_name(n: &sqlparser::ast::ObjectName) -> String {
+    n.0.last().and_then(|p| p.as_ident()).map(fold_name).unwrap_or_default()
 }
 
 /// [`expr_name`]'s `FigureColname`, for the shapes it can still read; `None` for the rest.
@@ -2554,13 +2548,13 @@ fn post_columns(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr, out: &mut Vec
     }
     match e {
         Expr::Identifier(id) => {
-            if let Ok(v) = col_ref(scope, None, &id.value) {
+            if let Ok(v) = col_ref(scope, None, &fold_name(id)) {
                 out.push(v);
             }
         }
         Expr::CompoundIdentifier(parts) => {
             if let [q, col] = &parts[..] {
-                if let Ok(v) = col_ref(scope, Some(&q.value), &col.value) {
+                if let Ok(v) = col_ref(scope, Some(&fold_name(q)), &fold_name(col)) {
                     out.push(v);
                 }
             }
@@ -2689,6 +2683,8 @@ fn extend_with_determined(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select, k
 /// Everything else declines rather than guesses:
 ///
 /// * a **qualified** name (`t.x`) never denotes an output column, so the fallback is not taken;
+/// * nor for a name the FROM scope has but refused to read (an outer `USING`'s merged column), or
+///   that may be a column whose name is not known: either is an input column in Postgres;
 /// * **two select items sharing the alias** is a resolution question with no right answer, refused
 ///   exactly as [`resolve_order_key`] refuses the same ambiguity for `ORDER BY`;
 /// * an alias over an **aggregate** is rejected by Postgres itself, so lowering it would be
@@ -2717,7 +2713,13 @@ fn lower_group_key(
         Err(err) => err,
     };
     let Expr::Identifier(id) = e else { return Err(err) };
-    match alias_target(fns, s, &id.value)? {
+    // Only a name that no input column could be falls back to the select list. One that a binding
+    // has, or that may be a column whose name is not known ([`Scope::try_resolve`]'s `Err`), is an
+    // input column in Postgres, whatever this frontend made of it, so it keeps its refusal.
+    if !matches!(scope.try_resolve(None, &fold_name(id)), Ok(None)) {
+        return Err(err);
+    }
+    match alias_target(fns, s, id)? {
         Some(target) => lower_expr(cat, scope, fns, target),
         None => Err(err),
     }
@@ -2727,12 +2729,10 @@ fn lower_group_key(
 ///
 /// `Ok(None)` means no item carries the alias — the caller keeps its original error. `Err` is for
 /// the two cases where an item does carry it but using it would be wrong.
-fn alias_target<'a>(fns: &Fns, s: &'a Select, name: &str) -> Result<Option<&'a Expr>> {
-    let name = name.to_lowercase();
+fn alias_target<'a>(fns: &Fns, s: &'a Select, id: &sqlparser::ast::Ident) -> Result<Option<&'a Expr>> {
+    let name = fold_name(id);
     let mut found = s.projection.iter().filter_map(|it| match it {
-        SelectItem::ExprWithAlias { expr, alias } if alias.value.to_lowercase() == name => {
-            Some(expr)
-        }
+        SelectItem::ExprWithAlias { expr, alias } if fold_name(alias) == name => Some(expr),
         _ => None,
     });
     match (found.next(), found.next()) {
@@ -2850,11 +2850,11 @@ fn lower_comparison(
 fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value> {
     match e {
         Expr::Nested(inner) => lower_expr(cat, scope, fns, inner),
-        Expr::Identifier(id) => col_ref(scope, None, &id.value),
+        Expr::Identifier(id) => col_ref(scope, None, &fold_name(id)),
         Expr::CompoundIdentifier(parts) => {
-            let col = parts.last().unwrap();
-            let qual = if parts.len() >= 2 { Some(parts[parts.len() - 2].value.as_str()) } else { None };
-            col_ref(scope, qual, &col.value)
+            let col = fold_name(parts.last().unwrap());
+            let qual = (parts.len() >= 2).then(|| fold_name(&parts[parts.len() - 2]));
+            col_ref(scope, qual.as_deref(), &col)
         }
         Expr::Value(v) => lower_value(&v.value),
         Expr::Function(f) => {
@@ -3476,13 +3476,14 @@ fn lower_match(
     Ok(if negated { not_bool(v) } else { v })
 }
 
+/// A column reference, by its folded qualifier and name (see [`fold_name`]).
 fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     // Under an outer `JOIN ... USING`, an unqualified merged name is the preserved side's value
     // (`COALESCE` of both, for FULL) -- not whichever binding resolution happens to reach first.
     if scope.merged_conflict(qual, name) {
         return Err(unsupported(format!("unqualified {name} merged by an outer JOIN ... USING")));
     }
-    match scope.try_resolve(qual, name) {
+    match scope.try_resolve(qual, name)? {
         Some((idx, ty)) => Ok(json!({ "column": idx, "type": ty })),
         None => Err(schema(format!(
             "unresolved column {}{} (correlated subquery or unknown column)",

@@ -158,7 +158,7 @@ statement reductions in `src/dml.rs`).
 | **subqueries** | non-correlated, correlated, and scalar |
 | **set operations** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` |
 | **expressions** | `CASE`, `IN`-lists, row-`IN`, row-constructor comparison, `LIKE`/`ILIKE`/`SIMILAR TO` (as uninterpreted predicates), `BETWEEN`, `CAST`, `IS [NOT] DISTINCT FROM`, the `IS TRUE/FALSE/UNKNOWN` family, comparison type coercion |
-| **schema** | keys and per-column nullability read from the DDL: `PRIMARY KEY`, `UNIQUE`, `NOT NULL` |
+| **schema** | keys and per-column nullability read from the DDL: `PRIMARY KEY`, `UNIQUE` (unless `DEFERRABLE`), `NOT NULL` |
 | **statements** | a pair of `SELECT`s; also a pair of `DELETE`s, of `UPDATE`s, or of `INSERT`s into one table under one explicit column list, each reduced to the query computing its effect |
 
 What it does **not** support, it refuses by name — window functions, `INTERSECT`/`EXCEPT ALL`,
@@ -217,7 +217,8 @@ let input_json = sqleq_frontend::lower_sql(sql_text)?; // serde_json::Value, the
 
 A single file containing, in order:
 
-1. zero or more `CREATE TABLE` statements (the schema; `UNIQUE`/`PRIMARY KEY` become prover keys),
+1. zero or more `CREATE TABLE` statements (the schema; `UNIQUE`/`PRIMARY KEY` become prover keys,
+   unless `DEFERRABLE`),
 2. zero or more `declare {scalar,aggregate} function NAME(args) returns TYPE;` lines (a small DSL
    for typing opaque/parameterized functions; stripped before SQL parsing),
 3. exactly **two** statements — the pair to compare. Normally two `SELECT`s; a pair of `DELETE`s,

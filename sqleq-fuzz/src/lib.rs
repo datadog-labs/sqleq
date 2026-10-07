@@ -34,6 +34,7 @@ pub mod lex;
 pub mod limits;
 pub mod pair;
 pub mod patterns;
+pub mod pgtype;
 pub mod rewrite;
 pub mod schema;
 pub mod shim;
