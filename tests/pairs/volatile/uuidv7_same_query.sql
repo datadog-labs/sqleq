@@ -4,10 +4,10 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: equivalent
--- expect frontend: emit-reflexive
+-- expect frontend: reflexive
 -- expect fuzz: nondet-skip
--- expect qed: proved-literal
--- expect sqleq-solver: proved-literal
+-- expect qed: no-plan
+-- expect sqleq-solver: no-plan
 -- expect lean: unsupported
 -- origin: issue #63: uuidv7() was missing from sqleq-fuzz's list of nondeterministic functions, so two runs of one query were compared
 -- argument: the two sides are the same query

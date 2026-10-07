@@ -5,7 +5,7 @@
 
 -- truth: not-equivalent
 -- expect frontend: refuse:unsupported
--- expect fuzz: no-tables
+-- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported

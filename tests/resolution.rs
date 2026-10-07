@@ -390,8 +390,6 @@ const KNOWN_OPEN: &[(&str, &str)] = &[
     ("from/a-comma-item-is-not-in-scope-of-a-later-on", "#47"),
     ("from/a-different-schema-per-side", "#48"),
     ("from/a-different-schema-per-side-both-declared", "#48"),
-    ("with/a-volatile-binding-used-twice-against-its-inlined-body", "#49"),
-    ("with/an-unlisted-volatile-binding-used-twice-against-its-inlined-body", "#49"),
     ("select/a-quoted-column-against-the-folded-name", "#57"),
     ("from/a-quoted-alias-against-the-folded-name", "#57"),
     ("order-by/a-quoted-output-name-against-the-folded-key", "#57"),
