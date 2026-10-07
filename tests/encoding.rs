@@ -233,9 +233,11 @@ mod integer_division {
     }
 
     #[test]
-    fn other_arithmetic_stays_native() {
-        assert_eq!(target(r#"SELECT "x" / 2 FROM "t""#)["operator"], "/");
-        assert_eq!(target(r#"SELECT "a" / 2.0 FROM "t""#)["operator"], "/");
+    fn other_arithmetic_keeps_its_own_operator() {
+        // A REAL `/` is numeric division, which rounds: it is not native either, but its own
+        // function over REAL operands, never the integer one.
+        assert_eq!(target(r#"SELECT "x" / 2 FROM "t""#)["operator"], "q_arith_div_real_real");
+        assert_eq!(target(r#"SELECT "a" / 2.0 FROM "t""#)["operator"], "q_arith_div_real_real");
         assert_eq!(target(r#"SELECT "a" * 2 FROM "t""#)["operator"], "*");
     }
 }

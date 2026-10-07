@@ -9,9 +9,8 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect lean: unsupported
--- origin: issue #56: an exponent literal reached the QED prover spelled as written, and QED reads a
---   constant cast to text as its spelling, so 1e1::text was '1e1' where Postgres prints '10'
--- witness: t = {(1)}: A yields '10', B yields '1e1'
-create table "t" ("a" INTEGER);
-SELECT CAST(1e1 AS TEXT) FROM "t";
-SELECT '1e1' FROM "t";
+-- origin: issue #58: || over a numeric converts it to text, whose scale REAL does not carry
+-- witness: t = {(2)}: A yields '2.0x', B yields '2.00x'
+create table "t" ("x" NUMERIC);
+SELECT "x" * 1.0 || 'x' FROM "t";
+SELECT "x" * 1.00 || 'x' FROM "t";

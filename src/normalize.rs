@@ -301,9 +301,14 @@ fn demoted(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
     use BinaryOperator::*;
     Some(match op {
         // `->` and `#>` yield json/jsonb, which has no counterpart in the prover's five types, so
-        // the opaque sort it is; `->>` and `#>>` yield text.
-        Arrow | HashArrow => ("q_op_jsonx", false, false),
-        LongArrow | HashLongArrow => ("q_str_jsonx", false, false),
+        // the opaque sort it is; `->>` and `#>>` yield text. `->` looks up one key (or one array
+        // index) and `#>` follows a path, so they are two operations with two symbols: over
+        // `{"a": "x"}`, `j ->> '{a}'` looks for the key `{a}` and finds nothing, while `j #>> '{a}'`
+        // follows the path `[a]` to `x`.
+        Arrow => ("q_op_jsonx", false, false),
+        LongArrow => ("q_str_jsonx", false, false),
+        HashArrow => ("q_op_jsonpath", false, false),
+        HashLongArrow => ("q_str_jsonpath", false, false),
         // Containment, in both directions off one symbol.
         AtArrow => ("q_bool_contains", false, false),
         ArrowAt => ("q_bool_contains", true, false),
@@ -349,41 +354,36 @@ const CLOCKS: [(&str, &str); 7] = [
 
 /// The JSON extraction *functions*, and the symbol each becomes.
 ///
-/// These are the call spellings of the extraction operators in [`demoted`]: `json_extract_path_text(p,
-/// 'a')` and `p #>> 'a'` are one Postgres operation written two ways. Unifying them is the same move
-/// that gives `@>` and `<@` one symbol, and it is what the abstraction requires — a pair that rewrites
-/// between the two spellings otherwise gets two unrelated symbols and can never be proved, though the
-/// rewrite is exactly the kind an optimizer performs.
+/// `json_extract_path(p, 'a', 'b')` follows the path `[a, b]`, as `p #> '{a,b}'` does, and the
+/// `_text` forms do the same and yield `text`. Each gets a symbol of its own, `q_op_jsonpath_elems`
+/// or `q_str_jsonpath_elems`, apart from both operators':
 ///
-/// The return type follows Postgres, so the split is the same one the operators make: the `_text` and
-/// `_scalar` forms yield `text` and take `q_str_`, the rest yield `json`/`jsonb` and take `q_op_`.
+/// * not `->`'s, though with one path element the two agree on an object: over the array `[5]`,
+///   `jsonb_extract_path(j, '0')` follows the path to `5` and `j -> '0'` looks for a key and finds
+///   NULL;
+/// * not `#>`'s, though they are one operation, because their arguments are spelled differently:
+///   `#>` takes the path as one array, the function as one text argument per element. With one
+///   symbol, `j #> '{a}'` and `jsonb_extract_path(j, '{a}')` would be one term, and the first follows
+///   `[a]` while the second follows `["{a}"]`. A pair that rewrites between the two spellings goes
+///   unproved.
 ///
-/// # Why all eight, when the operator spellings are the ones that occur
+/// The return type follows Postgres, so the split is the same one the operators make: the `_text`
+/// forms yield `text` and take `q_str_`, the rest yield `json`/`jsonb` and take `q_op_`.
 ///
-/// Six of these are the names a dialect-aware SQL library will already bucket as JSON extraction;
-/// `jsonb_extract_path` and `jsonb_extract_path_text` are routinely missed, falling through to a
-/// generic "anonymous function" node instead. That omission is an artifact of a dialect table rather
-/// than a decision — they are the exact `jsonb` counterparts of two names that do get bucketed — so
-/// all eight are listed here.
-///
-/// Reach was measured, not assumed: the call spellings are rare next to `->` and `->>`, which is what
-/// real queries overwhelmingly write. So this closes a parity gap and an asymmetry between spellings;
-/// it is not expected to move a verdict on its own.
-const JSON_FNS: [(&str, &str); 8] = [
-    ("JSON_EXTRACT", "q_op_jsonx"),
-    ("JSONB_EXTRACT", "q_op_jsonx"),
-    ("JSON_EXTRACT_PATH", "q_op_jsonx"),
-    ("JSONB_EXTRACT_PATH", "q_op_jsonx"),
-    ("JSON_EXTRACT_SCALAR", "q_str_jsonx"),
-    ("JSONB_EXTRACT_SCALAR", "q_str_jsonx"),
-    ("JSON_EXTRACT_PATH_TEXT", "q_str_jsonx"),
-    ("JSONB_EXTRACT_PATH_TEXT", "q_str_jsonx"),
+/// Only Postgres's own names are here. A `json_extract` or a `json_extract_scalar` is another
+/// dialect's function, which reads a JSONPath string, and Postgres has no function of that name; it
+/// lowers as any other function nobody declared.
+const JSON_FNS: [(&str, &str); 4] = [
+    ("JSON_EXTRACT_PATH", "q_op_jsonpath_elems"),
+    ("JSONB_EXTRACT_PATH", "q_op_jsonpath_elems"),
+    ("JSON_EXTRACT_PATH_TEXT", "q_str_jsonpath_elems"),
+    ("JSONB_EXTRACT_PATH_TEXT", "q_str_jsonpath_elems"),
 ];
 
 /// The symbol a JSON extraction call becomes, if `f` is one.
 ///
 /// Matched on the bare, unqualified name, as [`clock_symbol`] is and for the same reason: a qualified
-/// `myschema.json_extract` is somebody's own function and means nothing to us. Every modifier a call
+/// `myschema.json_extract_path` is somebody's own function and means nothing to us. Every modifier a call
 /// can carry disqualifies it too — `OVER`, `FILTER`, `DISTINCT`, an `ORDER BY`, a named or wildcard
 /// argument. None of them is meaningful on these functions, so one appearing means the call is not
 /// what the name suggests, and leaving it alone costs a proof where rewriting it would risk a wrong
@@ -2185,51 +2185,31 @@ mod tests {
         );
         assert_eq!(
             demoted_sql("SELECT payload #> '{a,b}' FROM t"),
-            "SELECT q_op_jsonx(payload, '{a,b}') FROM t"
+            "SELECT q_op_jsonpath(payload, '{a,b}') FROM t"
         );
         assert_eq!(
             demoted_sql("SELECT payload #>> '{a,b}' FROM t"),
-            "SELECT q_str_jsonx(payload, '{a,b}') FROM t"
+            "SELECT q_str_jsonpath(payload, '{a,b}') FROM t"
         );
     }
 
-    /// The call spellings land on the same two symbols, split the same way by return type.
+    /// The call spellings get symbols of their own, split the same way by return type.
     #[test]
-    fn json_extraction_functions_demote_like_their_operators() {
-        for n in ["json_extract", "jsonb_extract", "json_extract_path", "jsonb_extract_path"] {
+    fn json_extraction_functions_demote_by_return_type() {
+        for n in ["json_extract_path", "jsonb_extract_path"] {
             assert_eq!(
                 demoted_sql(&format!("SELECT {n}(payload, 'a') FROM t")),
-                "SELECT q_op_jsonx(payload, 'a') FROM t",
+                "SELECT q_op_jsonpath_elems(payload, 'a') FROM t",
                 "{n}"
             );
         }
-        for n in [
-            "json_extract_scalar",
-            "jsonb_extract_scalar",
-            "json_extract_path_text",
-            "jsonb_extract_path_text",
-        ] {
+        for n in ["json_extract_path_text", "jsonb_extract_path_text"] {
             assert_eq!(
                 demoted_sql(&format!("SELECT {n}(payload, 'a') FROM t")),
-                "SELECT q_str_jsonx(payload, 'a') FROM t",
+                "SELECT q_str_jsonpath_elems(payload, 'a') FROM t",
                 "{n}"
             );
         }
-    }
-
-    /// The point of the previous test, stated as the property it exists for: the operator and the
-    /// function are one operation, so a pair that rewrites between the spellings has to see one
-    /// symbol. Two symbols here is not a wrong answer, it is a proof that never lands.
-    #[test]
-    fn operator_and_function_spellings_agree() {
-        assert_eq!(
-            demoted_sql("SELECT payload ->> 'a' FROM t"),
-            demoted_sql("SELECT json_extract_path_text(payload, 'a') FROM t")
-        );
-        assert_eq!(
-            demoted_sql("SELECT payload -> 'a' FROM t"),
-            demoted_sql("SELECT jsonb_extract_path(payload, 'a') FROM t")
-        );
     }
 
     /// The path is variadic, so the arity is carried through rather than fixed at two.
@@ -2237,7 +2217,7 @@ mod tests {
     fn json_extraction_keeps_its_arity() {
         assert_eq!(
             demoted_sql("SELECT json_extract_path(payload, 'a', 'b', 'c') FROM t"),
-            "SELECT q_op_jsonx(payload, 'a', 'b', 'c') FROM t"
+            "SELECT q_op_jsonpath_elems(payload, 'a', 'b', 'c') FROM t"
         );
     }
 
@@ -2247,15 +2227,15 @@ mod tests {
     fn only_a_plain_unqualified_call_is_demoted() {
         for sql in [
             // Somebody's own function that happens to share the name.
-            "SELECT myschema.json_extract(payload, 'a') FROM t",
+            "SELECT myschema.json_extract_path(payload, 'a') FROM t",
             // Not the two-argument extraction.
-            "SELECT json_extract(payload) FROM t",
+            "SELECT json_extract_path(payload) FROM t",
             // Modifiers that make it something other than a plain scalar call.
-            "SELECT json_extract(DISTINCT payload, 'a') FROM t",
-            "SELECT json_extract(payload, 'a') OVER () FROM t",
+            "SELECT json_extract_path(DISTINCT payload, 'a') FROM t",
+            "SELECT json_extract_path(payload, 'a') OVER () FROM t",
         ] {
             let out = demoted_sql(sql);
-            assert!(!out.contains("jsonx"), "should have been left alone: {sql} -> {out}");
+            assert!(!out.contains("q_op_json"), "should have been left alone: {sql} -> {out}");
         }
     }
 
@@ -2264,7 +2244,7 @@ mod tests {
     fn a_function_extraction_nests_with_an_operator_one() {
         assert_eq!(
             demoted_sql("SELECT json_extract_path_text(payload -> 'a', 'b') FROM t"),
-            "SELECT q_str_jsonx(q_op_jsonx(payload, 'a'), 'b') FROM t"
+            "SELECT q_str_jsonpath_elems(q_op_jsonx(payload, 'a'), 'b') FROM t"
         );
     }
 
@@ -2300,7 +2280,7 @@ mod tests {
         // entries in the table.
         assert_eq!(
             demoted_sql("SELECT 1 FROM t WHERE payload #>> '{a,b}' <> 'v'"),
-            "SELECT 1 FROM t WHERE q_str_jsonx(payload, '{a,b}') <> 'v'"
+            "SELECT 1 FROM t WHERE q_str_jsonpath(payload, '{a,b}') <> 'v'"
         );
         // The jsonb-returning arrows sit above `=` too, and above `IS NULL`.
         assert_eq!(

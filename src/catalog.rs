@@ -154,13 +154,31 @@ fn index_col_name(ic: &IndexColumn) -> Option<String> {
 
 /// Parse a `declare scalar|aggregate function NAME(args) returns TYPE;` DSL line into
 /// `(uppercased name, declaration)`.
+///
+/// The keywords are found in an ASCII-lowercased copy of the line, which has the line's byte offsets,
+/// so an offset found in one slices the other. A full Unicode lowercasing does not: `İ` grows from two
+/// bytes to three and the Kelvin sign shrinks from three to one, and every offset after one of them
+/// would land in the wrong place, or inside a character. The keywords are ASCII, as SQL's are.
 pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
-    let low = line.to_lowercase();
-    let after_fn = low.find("function")? + "function".len();
+    let low = line.to_ascii_lowercase();
+    let fn_kw = low.find("function")?;
+    let after_fn = fn_kw + "function".len();
     let rest = &line[after_fn..];
     let name: String =
         rest.trim_start().chars().take_while(|c| *c != '(' && !c.is_whitespace()).collect();
-    let ret_kw = low.find("returns")? + "returns".len();
+    // The last `returns` standing as a word: one inside the name, an argument or the type is not
+    // the keyword.
+    let word = |i: usize| {
+        let before = low[..i].chars().next_back().is_some_and(|c| c.is_whitespace() || c == ')');
+        let after = low[i + "returns".len()..].chars().next().is_some_and(char::is_whitespace);
+        before && after
+    };
+    let ret_kw = low[after_fn..]
+        .match_indices("returns")
+        .map(|(i, _)| i + after_fn)
+        .filter(|&i| word(i))
+        .last()?
+        + "returns".len();
     let ret: String = line[ret_kw..].trim().trim_end_matches(';').trim().to_uppercase();
     if name.is_empty() || ret.is_empty() {
         return None;
@@ -168,7 +186,7 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
     // `declare aggregate function ...` vs `declare scalar function ...`. The distinction is
     // load-bearing: an aggregate lowered as a scalar becomes a per-row function over the input,
     // which silently changes the row count.
-    let aggregate = low[..low.find("function")?].contains("aggregate");
+    let aggregate = low[..fn_kw].contains("aggregate");
     let ret = crate::types::normalize_type_name(&ret);
     Some((name.to_uppercase(), FnDecl { ret, aggregate }))
 }

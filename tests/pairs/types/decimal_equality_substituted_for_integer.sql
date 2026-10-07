@@ -4,10 +4,10 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: emit
+-- expect frontend: refuse:unsupported
 -- expect fuzz: counterexample
--- expect qed: no-proof
--- expect sqleq-solver: no-proof
+-- expect qed: no-plan
+-- expect sqleq-solver: no-plan
 -- expect lean: unsupported
 -- origin: issue #61: from a = 2.0, sqleq-solver substituted the decimal constant for the integer column inside a cast
 -- witness: t = {(1, 2)}: a = 2.0 holds, but a is the integer 2, so A yields '2' and B yields '2.0'
