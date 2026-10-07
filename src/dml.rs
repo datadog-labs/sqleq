@@ -110,6 +110,41 @@
 //! [`insert_pair`]. `RETURNING` drops when both lists are the same, for the reason it drops on a
 //! `DELETE`.
 //!
+//! ## The cast an assignment applies
+//!
+//! Postgres stores a value in a column of another type through the assignment cast to the column's
+//! type: `SET s = n`, with `s` text and `n` numeric, stores `n::text`, and so does an
+//! `INSERT INTO t (s)` whose source yields `n`. The two reductions above hand the provers `n`
+//! itself, which they read as its class under `=` ([`equality`][crate::equality]). That is the
+//! stored value only where the cast is a function of the class, and for a type whose `=` is not
+//! identity it need not be: `2.0 = 2.00`, while `'2.0'` and `'2.00'` are two strings. So
+//!
+//! ```text
+//! A: UPDATE t SET s = n WHERE n = m      B: UPDATE t SET s = m WHERE n = m
+//! ```
+//!
+//! reduce to two projections a prover proves equal, and on `t = {(NULL, 2.0, 2.00)}` A stores
+//! `'2.0'` where B stores `'2.00'`.
+//!
+//! So a value an `UPDATE` or an `INSERT` stores is read as the cast that stores it, the way
+//! [`equality`][crate::equality] reads an explicit cast ([`stores_by_value`][crate::equality::stores_by_value]):
+//! a cast to a number type, to a boolean or to another type whose `=` is not identity converts by
+//! value -- a `numeric(10,2)` column rounds `2.0` and `2.00` to the same `2.00` -- and a cast to
+//! text, `json` or any other type is not known to. Where it is not, [`refuse_observed_stores`]
+//! reads the stored value through `q_exact_<type>` if its spelling fixes it, as `SET s = 2.0`'s
+//! does, and refuses the pair otherwise. One modifier does not convert by value: an interval
+//! column's. `interval day` keeps only the days of a value stored in it, so `'1 day'` stays and
+//! `'24 hours'` becomes `0`, and `interval(0)` rounds the seconds away from zero, so
+//! `'1 day -00:00:00.5'` and `'23:59:59.5'` are stored as two intervals `=` tells apart. Hence
+//! [`declared_types`][crate::catalog::Table::declared_types], which keeps the modifier the prover
+//! type drops.
+//!
+//! The check reads the lowered plans, because only there is the stored value's type known. Unlike
+//! [`equality::refuse_observed`][crate::equality::refuse_observed], it is not lifted where the two
+//! sides lower to one plan. One plan stores values of one class, but not always the same member of
+//! it: a `DISTINCT` keeps whichever of `2.0` and `2.00` reaches it first, and the order they reach
+//! it in can be an `ORDER BY` [`strip_dead_order_by`][crate::normalize::strip_dead_order_by] dropped.
+//!
 //! ## Two goals in one query: the tagged `UNION ALL`
 //!
 //! [`collect_queries`][crate::catalog::collect_queries] wants exactly two queries and [`reduce`]
@@ -175,8 +210,11 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::catalog::{obj_name, Catalog};
+use serde_json::Value;
+
+use crate::catalog::{obj_name, Catalog, Table};
 use crate::error::{schema, unsupported, Result};
+use crate::types::coarse_class;
 
 /// Replace every top-level `DELETE`/`UPDATE`/`INSERT` in `statements` with the query that computes
 /// its effect.
@@ -203,7 +241,11 @@ use crate::error::{schema, unsupported, Result};
 /// Fixing `param_cols` there moves the error, not the verdict. And the remainder shrinks again
 /// downstream: DuckDB's binder rejects part of it, and of what does bind, some is skipped as
 /// nondeterministic and some inserts NULL into a NOT NULL column because we do not model `DEFAULT`.
-pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
+///
+/// Returns, for each of the pair's two queries in order, where a reduced `UPDATE` or `INSERT`
+/// stores its outputs, for [`refuse_observed_stores`] to read once they are lowered. Empty for any
+/// other pair.
+pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]> {
     let deletes: Vec<usize> =
         (0..statements.len()).filter(|&i| as_delete(&statements[i]).is_some()).collect();
     let updates: Vec<usize> =
@@ -213,6 +255,9 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
     for &i in deletes.iter().chain(&updates).chain(&inserts) {
         no_default_keyword(&statements[i])?;
     }
+    // A `DELETE` stores nothing. Two kinds reduced at once leave four queries, which
+    // `collect_queries` refuses.
+    let mut stores = [Stores::default(), Stores::default()];
 
     match deletes.len() {
         0 => {}
@@ -242,9 +287,10 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
             let (i, j) = (updates[0], updates[1]);
             target_not_shadowed(&statements[i], &update_at(statements, i).table)?;
             target_not_shadowed(&statements[j], &update_at(statements, j).table)?;
-            let (qa, qb) = update_pair(cat, update_at(statements, i), update_at(statements, j))?;
+            let (qa, qb, sa) = update_pair(cat, update_at(statements, i), update_at(statements, j))?;
             install(&mut statements[i], qa)?;
             install(&mut statements[j], qb)?;
+            stores = sa;
         }
         _ => return Err(unsupported("UPDATE paired with non-UPDATE")),
     }
@@ -253,13 +299,14 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<()> {
         0 => {}
         2 => {
             let (i, j) = (inserts[0], inserts[1]);
-            let (qa, qb) = insert_pair(cat, insert_at(statements, i), insert_at(statements, j))?;
+            let (qa, qb, sa) = insert_pair(cat, insert_at(statements, i), insert_at(statements, j))?;
             install(&mut statements[i], qa)?;
             install(&mut statements[j], qb)?;
+            stores = sa;
         }
         _ => return Err(unsupported("INSERT paired with non-INSERT")),
     }
-    Ok(())
+    Ok(stores)
 }
 
 /// Refuse a DML statement that uses the keyword `DEFAULT` as a value.
@@ -806,8 +853,9 @@ fn may_read(e: &Expr, names: &[String], cols: Option<&[String]>) -> bool {
     .is_break()
 }
 
-/// Reduce a pair of `UPDATE`s to the pair of projections computing their final tables.
-fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query)> {
+/// Reduce a pair of `UPDATE`s to the pair of projections computing their final tables, and say
+/// which of their outputs each side's `SET` stores ([`Stores`]).
+fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [Stores; 2])> {
     let (ta, sets_a, pred_a) = set_map(cat, a)?;
     let (tb, sets_b, pred_b) = set_map(cat, b)?;
     let (pred_a, pred_b) = (pred_a.as_ref(), pred_b.as_ref());
@@ -838,11 +886,22 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query)> 
     }
 
     let (pa, pb) = (project(&cols, &types, &sets_a, pred_a), project(&cols, &types, &sets_b, pred_b));
+    // One output per declared column, after the goal tag where there is one, and each column a side
+    // assigns is stored there: in both blocks of `two_goals`, which share the projection.
+    let stores = |sets: &[(String, &Expr)], pred: Option<&Expr>| Stores {
+        columns: returning
+            .then_some(None)
+            .into_iter()
+            .chain((0..t.n_declared).map(|k| sets.iter().any(|(c, _)| *c == cols[k]).then(|| Store::of(t, k))))
+            .collect(),
+        guarded: pred.is_some(),
+    };
+    let stored = [stores(&sets_a, pred_a), stores(&sets_b, pred_b)];
     // Without a `RETURNING` clause the final table is the whole observable and one goal says it all.
     if !returning {
-        return Ok((select(pa, ta.clone(), None), select(pb, tb.clone(), None)));
+        return Ok((select(pa, ta.clone(), None), select(pb, tb.clone(), None), stored));
     }
-    Ok((two_goals(pa, ta, pred_a), two_goals(pb, tb, pred_b)))
+    Ok((two_goals(pa, ta, pred_a), two_goals(pb, tb, pred_b), stored))
 }
 
 /// The catalog index of a DML target, by qualified name and then by bare name.
@@ -1054,7 +1113,9 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
 /// which the source-bag goal already pins down when `L` is the same list on both sides — the same
 /// argument that lets a `DELETE` drop the clause, and it is `σ`'s row-determinacy that carries it
 /// over to an `INSERT`. So an identical list drops and a differing one is refused.
-fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query)> {
+///
+/// Each listed column stores the source's output in its position ([`Stores`]).
+fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [Stores; 2])> {
     let (na, qa, ca, sa) = insert_shape(a)?;
     let (nb, qb, cb, sb) = insert_shape(b)?;
     let (name, other) = (obj_name(na), obj_name(nb));
@@ -1091,7 +1152,119 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query)> 
             "INSERT omits {col}, whose default is not a function of the row"
         )));
     }
-    Ok((sa.clone(), sb.clone()))
+    let columns: Vec<Option<Store>> =
+        ca.iter().map(|c| declared.iter().position(|(d, _)| d == c).map(|k| Store::of(t, k))).collect();
+    let stored = Stores { columns, guarded: false };
+    Ok((sa.clone(), sb.clone(), [stored.clone(), stored]))
+}
+
+/// Where a reduced `UPDATE` or `INSERT` stores the outputs of the query it became, which is what
+/// [`refuse_observed_stores`] reads once that query is lowered. See the module docs.
+#[derive(Clone, Debug, Default)]
+pub struct Stores {
+    /// Parallel to the query's outputs: the column each one is stored in, or `None` for an output
+    /// no assignment stores -- an `UPDATE`'s goal tag, and every column its `SET` does not name.
+    columns: Vec<Option<Store>>,
+    /// Whether each stored value is the `THEN` of the `CASE` an `UPDATE`'s `WHERE` became
+    /// ([`project`]): the `ELSE` is the column's old value, which is not stored anew.
+    guarded: bool,
+}
+
+/// A column a reduction stores a value in.
+#[derive(Clone, Debug)]
+struct Store {
+    name: String,
+    /// The column's type as the catalog maps it, and as the DDL spells it.
+    ty: String,
+    declared: String,
+}
+
+impl Store {
+    fn of(t: &Table, k: usize) -> Store {
+        Store {
+            name: t.cols[k].0.clone(),
+            ty: t.cols[k].1.clone(),
+            declared: t.declared_types.get(k).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Whether the column's declared type coerces an interval stored in it by a modifier, which does
+    /// not give equal results on intervals `=` calls equal (see the module docs): `interval day`,
+    /// `interval hour to minute`, `interval(0)`, or an array of one. A type no DDL spelled is taken
+    /// to.
+    fn coerces(&self) -> bool {
+        if !matches!(coarse_class(&self.ty), Some("interval" | "interval[]")) {
+            return false;
+        }
+        let up = self.declared.to_uppercase();
+        let element = up.split('[').next().unwrap_or(&up).trim();
+        let element = element.strip_suffix(" ARRAY").unwrap_or(element).trim();
+        self.declared.is_empty()
+            || element.strip_prefix("INTERVAL").is_some_and(|rest| rest.starts_with([' ', '(']))
+    }
+
+    /// The cast that stores a value in this column, for a refusal's message.
+    fn cast(&self) -> String {
+        let ty = if self.declared.is_empty() { &self.ty } else { &self.declared };
+        format!("the assignment cast to {ty} that stores it in {}", self.name)
+    }
+}
+
+/// Refuse a pair whose reduced `UPDATE` or `INSERT` stores a value of a type whose `=` is not
+/// identity through an assignment cast not known to give equal results on values `=` calls equal,
+/// or read the value through `q_exact_<type>` where its spelling fixes it. See the module docs.
+///
+/// `stores` is what [`reduce`] returned, and `types` the output types of each lowered query. Runs
+/// on the lowered input, before [`equality::refuse_observed`][crate::equality::refuse_observed],
+/// which then finds each stored value already read by its spelling.
+///
+/// The value stored in an output is found where one expression computes it for every row: a
+/// projection's item -- under an `UPDATE`'s `WHERE`, the `THEN` of its `CASE` -- a `VALUES` row's
+/// cell, and the same in each branch of a `UNION ALL`, which adds its branches' rows. Below a
+/// `DISTINCT`, a slice, or a bare `SELECT *`, an output is a value read from a row, so the pair is
+/// refused, as it would be for a projection's item that reads one.
+pub fn refuse_observed_stores(input: &mut Value, stores: &[Stores; 2], types: &[Vec<String>; 2]) -> Result<()> {
+    let Some(queries) = input.get_mut("queries").and_then(Value::as_array_mut) else { return Ok(()) };
+    for ((q, stored), types) in queries.iter_mut().zip(stores).zip(types) {
+        for (k, store) in stored.columns.iter().enumerate() {
+            let Some(store) = store else { continue };
+            // An output whose type's `=` is identity holds no value whose `=` is not: a set
+            // operation's and a `VALUES` list's column takes its type from the first branch or row,
+            // and one that would hide such a value under another type is refused in `lower`.
+            let Some(class) = types.get(k).and_then(|t| coarse_class(t)) else { continue };
+            if crate::equality::stores_by_value(&store.ty, store.coerces()) {
+                continue;
+            }
+            stored_at(q, k, stored.guarded, &store.cast(), class)?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply [`refuse_observed_stores`]'s rule to every value the relation `rel` computes for its
+/// output `k`. `class` is the output's, for a refusal where no one expression computes it.
+fn stored_at(rel: &mut Value, k: usize, guarded: bool, cast: &str, class: &str) -> Result<()> {
+    let read = |v: &mut Value| crate::equality::read_stored(v, cast);
+    if let Some(Value::Array(branches)) = rel.get_mut("union") {
+        return branches.iter_mut().try_for_each(|b| stored_at(b, k, guarded, cast, class));
+    }
+    if let Some(Value::Array(rows)) = rel.pointer_mut("/values/content") {
+        return rows.iter_mut().filter_map(|row| row.get_mut(k)).try_for_each(read);
+    }
+    let Some(item) = rel.pointer_mut(&format!("/project/target/{k}")) else {
+        return Err(crate::equality::observed(cast, class));
+    };
+    if !guarded {
+        return read(item);
+    }
+    // `CASE WHEN p THEN v ELSE c END`, as `lower` builds it: `[p, v, c]`. Any other shape is not
+    // the projection this module wrote, and nothing here says which part of it is stored.
+    let case = item.get("operator").and_then(Value::as_str) == Some("CASE")
+        && item.get("operand").and_then(Value::as_array).is_some_and(|ops| ops.len() == 3);
+    match item.pointer_mut("/operand/1") {
+        Some(value) if case => read(value),
+        _ => Err(crate::equality::observed(cast, class)),
+    }
 }
 
 /// Whether the cast rewrite can type `e` from its shape alone: a column, a literal or parameter, or a
@@ -1160,6 +1333,7 @@ mod tests {
             tables: vec![Table {
                 name: name.to_string(),
                 cols: cols.iter().map(|c| (c.to_string(), "INTEGER".to_string())).collect(),
+                declared_types: vec!["INTEGER".to_string(); cols.len()],
                 nullable: vec![true; cols.len()],
                 opaque_identity: vec![false; cols.len()],
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),

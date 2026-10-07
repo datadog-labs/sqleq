@@ -407,6 +407,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         let tname = full.rsplit('.').next().unwrap_or(&full).to_string();
 
         let mut cols: Vec<(String, String)> = Vec::new();
+        let mut declared: Vec<String> = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
         let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
@@ -424,6 +425,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
             // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
             cols.push((crate::dml::fold_ident(&c.name), ty));
+            declared.push(rendered);
             collations.push(collation);
             nullable.push(true);
             determined.push(crate::catalog::row_determined(c));
@@ -497,6 +499,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             name: tname,
             n_declared: cols.len(),
             cols,
+            declared_types: declared,
             nullable,
             opaque_identity: identity,
             row_determined: determined,

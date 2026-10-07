@@ -41,6 +41,10 @@
 //! Except where the two queries lowered to one plan, which [`crate::types::refuse_unfaithful`]
 //! explains for citext: one plan computes one thing however `=` is read.
 //!
+//! An `UPDATE` or an `INSERT` that stores such a value in a column of another type applies a cast
+//! the IR does not spell out, and [`crate::dml`] reads it by the same rule ([`stores_by_value`],
+//! [`read_stored`]), without that exception: it says why.
+//!
 //! What this does not see is a value whose type the frontend does not know: the result of a function
 //! nobody declared is VARBINARY, which is identity here, though `sqrt(i)` is a float. Opaque types
 //! whose `=` is not identity beyond these four -- `numrange`, the geometric types, a domain over
@@ -289,7 +293,9 @@ fn example(class: &str) -> String {
     }
 }
 
-fn observed(op: &str, class: &str) -> FrontendError {
+/// The refusal of a value of type `class` read by `op`, an operation not known to give equal results
+/// on values `=` calls equal.
+pub fn observed(op: &str, class: &str) -> FrontendError {
     unsupported(format!(
         "a value of type {class} read by {op}, which is not known to give equal results on values = calls \
          equal, as it does {}",
@@ -302,4 +308,33 @@ fn hidden(op: &str, class: &str, ty: &str) -> FrontendError {
         "a value of type {class} passed through {op}, whose result type {ty} would not say that = calls {} equal",
         example(class)
     ))
+}
+
+/// Whether Postgres stores a value of a type whose `=` is not identity in a column of type `ty`
+/// through a cast that gives equal results on values `=` calls equal: the assignment cast an `UPDATE`
+/// or an `INSERT` applies and the IR does not spell out ([`crate::dml`]). Judged as [`reads`] judges
+/// an explicit cast: one to a number type, to a boolean or to another type whose `=` is not
+/// identity converts by value, and one to text, `json` or anything else is not known to.
+///
+/// `coerces` says the column's declared type carries a modifier that does not convert by value,
+/// which the prover type `ty` cannot say: an interval's fields or precision. A `numeric` column's
+/// scale rounds the value it is given, which does: `2.0` and `2.00` both become `2.00` in a
+/// `numeric(10,2)`.
+pub fn stores_by_value(ty: &str, coerces: bool) -> bool {
+    !coerces && reads("CAST", ty, &[]) != Read::Observes
+}
+
+/// `v`, a value an `UPDATE` or an `INSERT` stores through a cast not known to give equal results on
+/// values `=` calls equal ([`stores_by_value`]), read as [`refuse_observed`] reads the operand of
+/// such a cast: through `q_exact_<type>` where its spelling fixes it, and refused otherwise, `cast`
+/// naming the cast. A value whose `=` is identity, a NULL and a `q_exact_` term are left alone.
+pub fn read_stored(v: &mut Value, cast: &str) -> Result<()> {
+    let Some(class) = coarse(v) else { return Ok(()) };
+    match exact(v) {
+        Some(e) => {
+            *v = e;
+            Ok(())
+        }
+        None => Err(observed(cast, &class)),
+    }
 }

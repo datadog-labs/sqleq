@@ -1392,6 +1392,8 @@ pub fn build_inferred(
             name: t.clone(),
             n_declared: n,
             cols,
+            // No DDL was read, so no type was spelled. No DML reduction runs on this catalog.
+            declared_types: vec![String::new(); n],
             nullable: vec![true; n],
             // No DDL was read, so no column is known to be of a type whose `=` is identity.
             opaque_identity: vec![false; n],

@@ -205,9 +205,9 @@ fn lower_inner(
 ) -> Result<Value> {
     // 1-2. Split out the `declare ... function` DSL lines, parse, build the declared catalog, reduce
     //      the DML, collect the two queries.
-    let (fns, declared, queries, seen) = parse_input(src, ddl_catalog)?;
+    let (fns, declared, queries, seen, stores) = parse_input(src, ddl_catalog)?;
     // 3-5. Infer, apply what inference concluded, and lower.
-    let (input, misaligned) = pipeline(queries, &fns, &declared, source, Align::Check(&seen))?;
+    let (input, misaligned) = pipeline(queries, &fns, &declared, &stores, source, Align::Check(&seen))?;
     // 6. The pair lowers, so anything left is a statement about the *question* rather than about a
     //    construct: the two queries' `$N` do not correspond, and index binding is not what the caller
     //    means. Raised here so the reason counts only rows nothing else refused.
@@ -253,6 +253,7 @@ fn pipeline(
     mut queries: Vec<sqlparser::ast::Query>,
     fns: &HashMap<String, FnDecl>,
     declared: &catalog::Catalog,
+    stores: &[dml::Stores; 2],
     source: CatalogSource,
     align: Align,
 ) -> Result<(Value, Option<FrontendError>)> {
@@ -302,22 +303,24 @@ fn pipeline(
         declared
     };
 
-    match emit(catalog, &decls, &queries) {
+    match emit(catalog, &decls, &queries, stores) {
         Ok(input) => Ok((input, misaligned)),
         // The pair does not lower. A refusal this misalignment could have manufactured yields to it; a
         // refusal it could not have is what the row reports. See `params::root_cause_lowered`.
         Err(e) => Err(params::root_cause_lowered(misaligned, e, || {
-            lowers_with_split_params(&pristine, fns, declared, source)
+            lowers_with_split_params(&pristine, fns, declared, stores, source)
         })),
     }
 }
 
 /// Steps 4-5: the schemas both queries are lowered against, the two lowered queries, and the check
-/// that the result numbers its variables the way the prover reads them.
+/// that the result numbers its variables the way the prover reads them. `stores` says where a
+/// reduced `UPDATE` or `INSERT` stores each query's outputs ([`dml::reduce`]).
 fn emit(
     catalog: &catalog::Catalog,
     decls: &HashMap<String, FnDecl>,
     queries: &[sqlparser::ast::Query],
+    stores: &[dml::Stores; 2],
 ) -> Result<Value> {
     // The collations of tables neither query names cannot reach the pair; see `collation::narrow`.
     let narrowed = collation::narrow(catalog, queries);
@@ -350,8 +353,8 @@ fn emit(
             schema
         })
         .collect();
-    let q0 = lower::lower_query(catalog, decls, &queries[0])?;
-    let q1 = lower::lower_query(catalog, decls, &queries[1])?;
+    let (q0, types0) = lower::lower_query(catalog, decls, &queries[0])?;
+    let (q1, types1) = lower::lower_query(catalog, decls, &queries[1])?;
 
     let mut input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
     // A column under a collation that may make `=` not identity, and, where a column the pair reads
@@ -363,6 +366,10 @@ fn emit(
     // on the lowered queries, so a column that neither query reads costs nothing, and neither does a
     // pair whose two queries lower to one plan.
     types::refuse_unfaithful(&input)?;
+    // The same, for a value an `UPDATE` or an `INSERT` stores in a column of another type, through a
+    // cast the plan does not spell out. Before the check below, which then finds such a value read
+    // by its spelling already.
+    dml::refuse_observed_stores(&mut input, stores, &[types0, types1])?;
     equality::refuse_observed(&mut input)?;
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
@@ -386,21 +393,28 @@ fn lowers_with_split_params(
     queries: &[sqlparser::ast::Query],
     fns: &HashMap<String, FnDecl>,
     declared: &catalog::Catalog,
+    stores: &[dml::Stores; 2],
     source: CatalogSource,
 ) -> bool {
     match infer::split_params(queries) {
-        Some(split) => pipeline(split, fns, declared, source, Align::Skip).is_ok(),
+        Some(split) => pipeline(split, fns, declared, stores, source, Align::Skip).is_ok(),
         None => false,
     }
 }
 
-/// What [`parse_input`] hands back: the declared functions, the catalog, the two queries, and the `$N`
-/// each of them mentioned *before* the normalizations ran.
+/// What [`parse_input`] hands back: the declared functions, the catalog, the two queries, the `$N`
+/// each of them mentioned *before* the normalizations ran, and where a reduced `UPDATE` or `INSERT`
+/// stores each query's outputs.
 ///
 /// The last is separate from the queries on purpose — see [`params::mentioned`] — because by the time the
 /// pipeline has the trees, a strip may already have deleted a placeholder from one side.
-type ParsedInput =
-    (HashMap<String, FnDecl>, catalog::Catalog, Vec<sqlparser::ast::Query>, Vec<BTreeSet<u32>>);
+type ParsedInput = (
+    HashMap<String, FnDecl>,
+    catalog::Catalog,
+    Vec<sqlparser::ast::Query>,
+    Vec<BTreeSet<u32>>,
+    [dml::Stores; 2],
+);
 
 /// The head of [`parse_input`]: the `declare ... function` DSL lines split off, the rest parsed.
 ///
@@ -829,7 +843,7 @@ fn parse_input(
     // before every rewrite below it, so that nothing downstream of here has to know DML exists.
     let mut catalog = ddl_catalog.unwrap_or_else(|| catalog::scan_ddl(&statements));
     catalog.check_case_collisions()?;
-    dml::reduce(&catalog, &mut statements)?;
+    let stores = dml::reduce(&catalog, &mut statements)?;
     // Then the normalizations, which are rewrites of a correct tree rather than repairs of a
     // wrong one — so each carries its equivalence argument and that argument's guards.
     //
@@ -870,5 +884,5 @@ fn parse_input(
     // Last, so it reads the trees lowering will actually see. After the DML reduction on purpose: an
     // `UPDATE`'s projection is the declared table shape, not the widened one.
     catalog::add_system_columns(&mut catalog, &queries);
-    Ok((fns, catalog, queries, seen))
+    Ok((fns, catalog, queries, seen, stores))
 }
