@@ -3,14 +3,15 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- truth: equivalent
+-- truth: not-equivalent
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issue #62: a bare `numeric` cast target reached DuckDB, which reads it as DECIMAL(18,3)
--- argument: a Postgres numeric with no typmod keeps every digit, so a * 0.0001 > 0 exactly when a > 0
-create table "t" ("id" INTEGER, "a" INTEGER, unique ("id"));
-SELECT "id" FROM "t" WHERE CAST("a" * 0.0001 AS numeric) > 0;
-SELECT "id" FROM "t" WHERE "a" > 0;
+-- origin: issue #56: a string constant compared with a NUMERIC column was cast to REAL as a
+--   constant, which the QED prover parses through f32, where 20000000.5 is 20000000
+-- witness: t = {(20000000.5)}: A yields the row, B yields none
+create table "t" ("x" NUMERIC);
+SELECT "x" FROM "t" WHERE "x" = '20000000.5';
+SELECT "x" FROM "t" WHERE "x" = '20000000.0';

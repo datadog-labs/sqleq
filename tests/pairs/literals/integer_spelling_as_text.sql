@@ -9,8 +9,9 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issues #61 and #56: 2e0 reaches sqleq-solver typed INTEGER, which read it through a float as the integer 2
--- witness: t = {(7)}: 2e0 is numeric, so A yields 3.5 and B yields 3
+-- origin: issue #56: an integer literal reached the QED prover spelled as written, and QED reads a
+--   constant cast to text as its spelling, so 007::text was '007' where Postgres prints '7'
+-- witness: t = {(1)}: A yields '7', B yields '007'
 create table "t" ("a" INTEGER);
-SELECT "a" / 2e0 FROM "t";
-SELECT "a" / 2 FROM "t";
+SELECT CAST(007 AS TEXT) FROM "t";
+SELECT '007' FROM "t";

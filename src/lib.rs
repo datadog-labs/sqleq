@@ -39,6 +39,7 @@ mod casts;
 /// Public because it is an entry point: the `--csv` mode of the CLI reads a corpus row and lowers it
 /// without going through the `.sql` intermediate format at all.
 pub mod corpus;
+mod depth;
 mod dml;
 mod error;
 /// Selected on the shipping path by [`CatalogSource`], off by default.
@@ -329,7 +330,8 @@ fn emit(
                 // no `deny_unknown_fields` (checked), so QED discards the field without noticing it.
                 "name": t.name.clone(),
                 "types": t.cols.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
-                "key": t.keys.clone(),
+                // Only the keys Postgres enforces on every row: see `Table::not_null_keys`.
+                "key": t.not_null_keys().cloned().collect::<Vec<_>>(),
                 "nullable": t.nullable.clone(),
                 "guaranteed": Vec::<Value>::new(),
             })
@@ -396,14 +398,51 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
         }
     }
     let sql = sql_lines.join("\n");
+    check_number_spellings(&sql)?;
     // The default nesting limit (50) is below what generated SQL reaches; the parser's own recursion
     // is stack-protected, and the lowering walks an `AND`/`OR` chain iteratively.
-    let statements = Parser::new(&DIALECT)
-        .with_recursion_limit(1024)
+    let mut statements = Parser::new(&DIALECT)
+        .with_recursion_limit(depth::MAX_DEPTH)
         .try_with_sql(&sql)
         .and_then(|mut p| p.parse_statements())
         .map_err(|e| FrontendError::Parse(e.to_string()))?;
+    // Before any pass that recurses on the tree: a loop in the parser can build one deeper than its
+    // recursion limit.
+    depth::check(&mut statements)?;
     Ok((fns, statements))
+}
+
+/// Refuse a number run into the name after it, with nothing in between: `0b101`, `0o17`, `0X1F`,
+/// `1x`, `5L`.
+///
+/// Postgres reads such a spelling as one token. Since Postgres 16 that token is an integer in base
+/// 2, 8 or 16 (`0b101` is 5, `0o17` is 15, `0x1F` is 31), and any other one is a syntax error
+/// ("trailing junk after numeric literal"). sqlparser splits it instead, into the number `0` and a
+/// name, which in a select list is an alias: `SELECT 0b101` read as `SELECT 0 AS b101`, one query
+/// with `SELECT 0`. Elsewhere the split usually fails to parse, and this refuses it there too, before
+/// the parser runs. A name in quotes, or one after whitespace or a comment, is a separate token in
+/// Postgres as well, and is left alone; `0x1F` itself sqlparser reads as a hex string, which
+/// lowering refuses as a literal it does not model. A tokenizer error is left for the parser to
+/// report.
+fn check_number_spellings(sql: &str) -> Result<()> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&DIALECT, sql).tokenize() else {
+        return Ok(());
+    };
+    for (i, t) in tokens.iter().enumerate() {
+        let Token::Number(n, long) = t else { continue };
+        let name = match tokens.get(i + 1) {
+            // sqlparser folds a trailing `L` into the number (a MySQL long), Postgres does not.
+            _ if *long => "L",
+            Some(Token::Word(w)) if w.quote_style.is_none() => w.value.as_str(),
+            _ => continue,
+        };
+        return Err(error::unsupported(format!(
+            "numeric literal {n}{name}: a number run into a name is one token in Postgres, a prefixed \
+             integer such as 0b101 or a syntax error"
+        )));
+    }
+    Ok(())
 }
 
 /// Which of [`reflexive_with`]'s normalizations are switched on.

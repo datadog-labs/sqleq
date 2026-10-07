@@ -6,7 +6,7 @@
 -- truth: equivalent
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
--- expect qed: proved
+-- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz read UNIQUE NULLS NOT DISTINCT as a plain UNIQUE, which admits many NULLs

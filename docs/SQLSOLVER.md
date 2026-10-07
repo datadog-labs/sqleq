@@ -321,7 +321,8 @@ in one unit and falls through to `varbinary(255)`.
 SQLSolver models `UNIQUE` as "no duplicate rows at all". Postgres allows any number of NULLs in a
 unique column. With a nullable unique `a`, SQLSolver reports `SELECT DISTINCT a FROM t` ≡ `SELECT a
 FROM t` — **false in Postgres**. So the emitter declares `UNIQUE` only when every column of the key
-is `NOT NULL`.
+is `NOT NULL`. The QED prover reads a key the same way, and the IR's schemas carry the same filter
+(`catalog::Table::not_null_keys`, which both emitters use).
 
 #### Schema qualifiers
 

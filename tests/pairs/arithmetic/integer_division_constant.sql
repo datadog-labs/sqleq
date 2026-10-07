@@ -9,8 +9,9 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issues #61 and #56: 2e0 reaches sqleq-solver typed INTEGER, which read it through a float as the integer 2
--- witness: t = {(7)}: 2e0 is numeric, so A yields 3.5 and B yields 3
+-- origin: issue #55: integer / reached the QED prover as z3's Euclidean div, which makes (-7) / 2
+--   -4 where Postgres makes it -3
+-- witness: t = {(1)}: A yields -3 (Postgres truncates toward zero), B yields -4
 create table "t" ("a" INTEGER);
-SELECT "a" / 2e0 FROM "t";
-SELECT "a" / 2 FROM "t";
+SELECT (-7) / 2 FROM "t";
+SELECT -4 FROM "t";

@@ -9,8 +9,9 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: issues #61 and #56: 2e0 reaches sqleq-solver typed INTEGER, which read it through a float as the integer 2
--- witness: t = {(7)}: 2e0 is numeric, so A yields 3.5 and B yields 3
-create table "t" ("a" INTEGER);
-SELECT "a" / 2e0 FROM "t";
-SELECT "a" / 2 FROM "t";
+-- origin: issue #54: a nullable UNIQUE column was sent to the QED prover as a key, which admits one
+--   row per key value, NULL included
+-- witness: t = {(NULL), (NULL)}: A yields two rows, B yields one (UNIQUE admits any number of NULLs)
+create table "t" ("u" INTEGER, unique ("u"));
+SELECT "u" FROM "t";
+SELECT DISTINCT "u" FROM "t";
