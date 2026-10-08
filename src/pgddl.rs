@@ -398,6 +398,7 @@ pub struct Rejected {
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
     let (statements, errors) = parse_statements_reporting(raw);
     let created = crate::collation::created(statements.iter().map(|(st, _)| st));
+    let domains = crate::catalog::Domains::of(statements.iter().map(|(st, _)| st));
     let mut tables = Vec::new();
     for (st, _) in statements {
         let Statement::CreateTable(ct) = st else { continue };
@@ -416,13 +417,16 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
         for c in &ct.columns {
             let idx = cols.len();
             // An opaque type keeps, in its name, whether its `=` is identity: see
-            // `types::opaque_name`. The provers read VARBINARY either way.
-            let rendered = format!("{}", c.data_type);
+            // `types::opaque_name`. The provers read VARBINARY either way. A domain is its base
+            // type (`catalog::Domains`).
+            let rendered = format!("{}", domains.resolve(&c.data_type));
             let ty = map_pg_type(&rendered).unwrap_or_else(|| crate::types::opaque_name(&rendered));
             let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
             // After the collation: a collated opaque column is `COLLATED`, never identity, and an
-            // opaque name that records a coarse `=` (`types::COARSE_OPAQUE`) is not `OPAQUE` either.
-            identity.push(ty == OPAQUE && crate::types::opaque_identity(&rendered));
+            // opaque name that records a coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE`
+            // either. The list `sqleq-solver` reads is `opaque_identity`'s alone: `IDENTITY_OPAQUE`
+            // also names a type with no `=`.
+            identity.push(ty == crate::types::IDENTITY_OPAQUE && crate::types::opaque_identity(&rendered));
             // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
             cols.push((crate::dml::fold_ident(&c.name), ty));
             declared.push(rendered);
@@ -572,7 +576,8 @@ mod tests {
                 ("id".into(), "INTEGER".into()),
                 ("total".into(), "REAL".into()),
                 ("note".into(), "VARCHAR".into()),
-                ("tags".into(), "VARBINARY".into()),
+                // An array of text: opaque, and its `=` is identity.
+                ("tags".into(), crate::types::IDENTITY_OPAQUE.into()),
                 ("created_at".into(), "TIMESTAMP".into()),
             ]
         );

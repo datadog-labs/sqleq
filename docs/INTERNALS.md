@@ -7,7 +7,7 @@ start at the [README](../README.md).
 a SQL pair, resolves names and types, and lowers it to the `Relation`/`Expr` IR the provers read —
 the QED prover directly, and `sqleq-solver`, a Rust rewrite of SQLSolver, through the jobs
 `src/sqlsolver.rs` packages that IR into. The other backends read the pair themselves:
-`sqleq-fuzz` runs the two statements against DuckDB looking for a counterexample and uses no part
+`sqleq-fuzz` runs the two statements on PostgreSQL looking for a counterexample and uses no part
 of the frontend, and `sqleq-lean` parses with the frontend's parser but builds its own Lean terms.
 See [DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
 

@@ -49,7 +49,8 @@
 //! function, so that `a = 2.0` says nothing about what `a` *is* (see `sql_eq`). Deduplication
 //! (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) binds its output to its input by
 //! identity too, so it is translated only over columns whose `=` is identity, and refused over any
-//! other (see `dedup_by_identity`).
+//! other (see `dedup_by_identity`). So does `MAX`/`MIN`, which binds the extremum to an input by
+//! identity, and is refused the same way (see `extremum_by_identity`).
 
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
@@ -168,6 +169,24 @@ fn dedup_by_identity(types: &[Option<EqType>]) -> Result<(), TranslateError> {
     match types.iter().find(|t| !eq_is_identity(**t)) {
         None => Ok(()),
         Some(t) => Err(TranslateError::DedupNotIdentity(t.map_or("unresolved", |t| t.ty.name()).to_string())),
+    }
+}
+
+/// Refuses a `MAX` or `MIN` over a column whose `=` is not identity ([`eq_is_identity`]), for the
+/// reason [`dedup_by_identity`] refuses a deduplication. The translation binds the extremum to an
+/// input by identity: no input is beyond it, and some input is it. Where `=` is identity, one value
+/// per group satisfies both. Where it is not, every input with nothing strictly beyond it does, and
+/// two inputs that `=` calls equal are neither above the other: over `2.0` and `2.00`, `0` and `-0`,
+/// or two `numrange[]` arrays whose bounds differ only in scale, the group has two extrema where
+/// Postgres returns one of them, which one depending on the order it reads them. A cast to text
+/// then tells them apart. Binding the extremum by [`eq_key`]'s key instead would leave it one value
+/// of its class, chosen by that order, so its uninterpreted representative would have to be fresh
+/// for each aggregate call, and no two extrema could then be shown to agree. So the plan is refused.
+fn extremum_by_identity(ty: EqType) -> Result<(), TranslateError> {
+    if eq_is_identity(Some(ty)) {
+        Ok(())
+    } else {
+        Err(TranslateError::ExtremumNotIdentity(ty.ty.name().to_string()))
     }
 }
 
@@ -608,8 +627,11 @@ impl<'s> Translator<'s> {
                 };
                 Ok(value_eq(&outcol, &Value { is_null, value }))
             }
+            // `some_equal` binds the extremum to an input by identity, faithful only where `=` is
+            // identity ([`extremum_by_identity`]).
             "MAX" | "MIN" => {
                 let x = Self::agg_arg(&call.operand, scope)?;
+                extremum_by_identity(scope.eq_type(&call.operand[0]))?;
                 let notnull_x = mk_neg(x.is_null.clone());
                 let some_nonnull =
                     mk_squash(mk_sum(source_exposed.to_vec(), mk_mul([group_by_term.clone(), notnull_x.clone()])));
