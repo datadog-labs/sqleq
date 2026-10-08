@@ -42,6 +42,12 @@ pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax
 pub struct Table {
     pub name: String,
     pub cols: Vec<(String, String)>,
+    /// Parallel to `cols`: each column's type as the DDL spells it, rendered by sqlparser
+    /// (`INTERVAL DAY`, `NUMERIC(10,2)`), and empty where no DDL declared the column. The type in
+    /// `cols` drops the modifier, and an assignment applies it: the DML reductions read this to
+    /// tell an `interval day` column, which keeps only the days of a value stored in it, from a
+    /// plain `interval` one ([`dml`][crate::dml]).
+    pub declared_types: Vec<String>,
     /// Parallel to `cols`: `false` only where the DDL proves the column cannot be NULL.
     ///
     /// Direction matters for soundness. `NOT NULL` *shrinks* the space of instances the prover
@@ -318,6 +324,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         let Statement::CreateTable(ct) = st else { continue };
         let tname = obj_name(&ct.name).to_lowercase();
         let mut cols = Vec::new();
+        let mut declared: Vec<String> = Vec::new();
         let mut nullable: Vec<bool> = Vec::new();
         let mut identity: Vec<bool> = Vec::new();
         let mut determined: Vec<bool> = Vec::new();
@@ -332,6 +339,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             // `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type with no `=`.
             identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&data_type.to_string()));
             cols.push((cname, cty));
+            declared.push(c.data_type.to_string());
             collations.push(collation);
             nullable.push(true);
             determined.push(row_determined(c));
@@ -390,6 +398,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             name: tname,
             n_declared: cols.len(),
             cols,
+            declared_types: declared,
             nullable,
             opaque_identity: identity,
             row_determined: determined,
@@ -505,6 +514,7 @@ pub fn add_system_columns(cat: &mut Catalog, queries: &[Query]) {
                 continue;
             }
             t.cols.push((s.to_string(), Ty::Opaque.sql().to_string()));
+            t.declared_types.push(String::new());
             t.nullable.push(true);
             t.opaque_identity.push(false);
             // A system column is never written, so no `INSERT` can omit it; the value is the

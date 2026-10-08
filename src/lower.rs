@@ -479,9 +479,10 @@ fn reject_float_summing(name: &str, args: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// Lower a top-level query to a `Relation` Value.
-pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<Value> {
-    Ok(lower_query_ctx(cat, fns, q, &[])?.0)
+/// Lower a top-level query to a `Relation` Value, with the type of each of its output columns.
+pub fn lower_query(cat: &Catalog, fns: &Fns, q: &Query) -> Result<(Value, Vec<String>)> {
+    let (rel, cols) = lower_query_ctx(cat, fns, q, &[])?;
+    Ok((rel, cols.into_iter().map(|(_, ty)| ty).collect()))
 }
 
 /// Lower a query in an enclosing context (`outer` = visible enclosing bindings, empty at top level),

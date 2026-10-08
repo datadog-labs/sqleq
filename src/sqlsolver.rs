@@ -155,6 +155,8 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             // the positional spelling instead of emitting a table no scan can address.
             name: s["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("t{i}")),
             cols,
+            // Like `row_determined`: nothing reads it here, and no DDL spelled the types.
+            declared_types: vec![String::new(); n_declared],
             nullable,
             // Like `row_determined`: nothing reads it here, and the conservative value costs nothing.
             opaque_identity: vec![false; n_declared],

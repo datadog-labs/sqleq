@@ -284,14 +284,28 @@ from it to a number or a boolean converts by value, as every such cast in Postgr
 own types without one are either refused (the geometric types above) or have an `=` that is one
 (`path`'s counts points). A type a user or an extension defines is taken to be such a type too.
 
+An `UPDATE` or an `INSERT` that stores such a value in a column of another type applies Postgres's
+assignment cast, which the plan does not spell out, so each stored value is read as that cast
+(`dml::refuse_observed_stores`). A column of a number type, a boolean or another of these four types
+converts it by value — a `numeric(10,2)` column rounds `2.0` and `2.00` alike — and a `text`,
+`varchar`, `char(n)` or `json` column, or one of any other type, is not known to. There the value is
+stored through `q_exact_<type>` where its spelling fixes it, so `SET s = 2.0` and `SET s = 2.00` store
+two terms, and the pair is refused otherwise, as `SET s = n WHERE n = m` against `SET s = m WHERE
+n = m` is. An interval column with a modifier counts as one that is not known to: `interval day`
+keeps only the days of a value, so `'1 day'` is stored as it is and `'24 hours'` as `0`, and
+`interval(0)` rounds the seconds away from zero. Unlike the reads above, this refusal holds where the
+two sides lower to one plan. One plan stores values of one class, not always the same member of it:
+a `DISTINCT` keeps whichever of two equal values reaches it first, and a dead `ORDER BY` the frontend
+drops can decide which.
+
 The cost is those refusals: a pair whose two queries differ and that casts one of these values to
 text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, adds
 an interval column to a date, or passes a column of a type the frontend does not know (a range of
 numerics, an enum, `inet`) or the result of a function nobody declared, read from a row, to any
-function but the ones above, is refused rather than proved. Computed in place from values whose `=`
-is identity, the same value is read through its spelling and still proved: `CAST(round(i, 1) AS
-TEXT)` over `i = j`. One gap remains: the cast an `UPDATE` or `INSERT` applies when it stores one of
-these values in a text column is not modelled.
+function but the ones above, is refused rather than proved, and so is an `UPDATE` or an `INSERT`
+that stores such a value in a column that can tell equal values apart, a text column say. Computed
+in place from values whose `=` is identity, the same value is read through its spelling and still
+proved: `CAST(round(i, 1) AS TEXT)` over `i = j`.
 
 ### Shapes that look like something simpler
 
