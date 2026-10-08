@@ -13,8 +13,11 @@ and the defects it has caught. This page is the narrower question of what any on
 Two queries are equivalent when they return the same bag of rows, where two rows are the same if
 their values are equal under SQL `=`. So `2.0` and `2.00` are one value, though Postgres prints them
 differently, and so are `-0` and `0` as floats, `'1 day'` and `'24 hours'` as intervals, and
-`'{"a": 1.0}'` and `'{"a": 1.00}'` as `jsonb`. That is the comparison the provers can make, since they
-read the IR's `=` as identity, and `sqleq-fuzz` compares numbers by value. What the rule does not allow
+`'{"a": 1.0}'` and `'{"a": 1.00}'` as `jsonb`. A type with no `=` at all (`json`, `xml`, `point`, ...)
+puts no two values in one class, so its values are the same only when they are identical: `true` and
+`1` are two `json` values, and so are `'{"a":1}'` and `'{"a": 1}'`, though they are one `jsonb`. That
+is the comparison the provers can make, since they read the IR's `=` as identity, and `sqleq-fuzz`
+compares numbers by value and a value with no `=` by its text. What the rule does not allow
 is putting one such value for the other *inside* an operation that can tell them apart, such as a cast
 to text; how the frontend keeps that out is [below](#values-that--calls-equal-and-that-are-still-two-values).
 
