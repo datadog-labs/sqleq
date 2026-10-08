@@ -5,7 +5,7 @@
 
 -- truth: not-equivalent
 -- expect frontend: emit
--- expect fuzz: no-counterexample
+-- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
 -- expect lean: unsupported

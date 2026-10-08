@@ -238,7 +238,13 @@ fn a_quoted_table_alias_is_not_its_folded_name() {
     let (upper, lower) = (format!(r#"SELECT "X".a {from}"#), format!("SELECT x.a {from}"));
     assert!(apart(QUOTED, &upper, &lower));
     assert!(!identical(QUOTED, &upper, &lower));
-    assert!(identical(QUOTED, &format!("SELECT X.a {from}"), &format!(r#"SELECT "x".a {from}"#)));
+    // Each side reads `"X"` as well: type inference keeps the two aliases apart, and the seeded
+    // catalog refuses a declared table no column is attributed to (issue #111).
+    assert!(identical(
+        QUOTED,
+        &format!(r#"SELECT X.a, "X".a {from}"#),
+        &format!(r#"SELECT "x".a, "X".a {from}"#)
+    ));
     // A table without an alias is referred to by its name as the query spells it.
     assert!(identical(QUOTED, r#"SELECT M."A" FROM "m""#, r#"SELECT "m"."A" FROM m"#));
 }
