@@ -114,6 +114,19 @@ deterministic, on either engine. The rules:
   differences (which stay deterministic) are trusted — unless the cut's `ORDER BY` is provably a
   total order (it determines a row of every table through a NOT NULL key, the join's equalities and
   the columns `WHERE` pins), in which case the rows it keeps are determined and are compared whole.
+  The cardinality stays deterministic only while nothing above the cut can tell which tied rows it
+  kept. Postgres keeps the tied rows that come first in the order it reads them, so two equivalent
+  sides that read the same rows in different orders (through a join, a `DISTINCT`, a `UNION ALL`)
+  keep different ones, and a `WHERE` above lets a different number of them through. So a cut whose
+  order is not total is compared by cardinality only where how many rows it keeps fixes how many the
+  result has, whichever rows they are: every level above it is parentheses, a `UNION ALL` branch,
+  an `ORDER BY`, or a `SELECT` that reads the cut's rows only in its select list (no `WHERE`, join
+  condition or `LATERAL` entry that reads them, no `GROUP BY`, `HAVING`, `DISTINCT` or
+  set-returning function), up to the statement itself, an `INSERT`'s source with no `ON CONFLICT`,
+  or an `EXISTS`, which reads only whether there is a row. Anywhere else (under a filter or a join
+  on its rows, a grouping or a slice, in an `IN` or scalar subquery, a CTE, an `UPDATE` or a
+  `DELETE`) it makes the pair `NONDET-SKIP`; a bare `$N` count there is compared only on the trials
+  that bind it so that it cuts nothing.
 - **Ties in `DISTINCT ON` and in a window `ORDER BY`.** These choose among tied rows too: the row a
   `DISTINCT ON` keeps per key, and the order an order-sensitive window function (`row_number`,
   `lag`, `first_value`, a `ROWS` frame, ...) numbers or reads them in. Postgres chooses by physical

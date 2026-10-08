@@ -1256,11 +1256,14 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             (*n, v)
         })
         .collect();
-    let cut_nondet = cuts.iter().any(|c| {
+    let open = |c: &limits::Cut| {
         !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
-    });
+    };
+    let cut_nondet = cuts.iter().any(open);
     let choice = limits::choices(a, &schema).max(limits::choices(b, &schema));
-    if choice == limits::Choice::Unbounded {
+    // A cut under a level that can tell its tied rows apart leaves the cardinality open too, as a
+    // `DISTINCT ON` there does ([`limits::Cut::counted`]).
+    if choice == limits::Choice::Unbounded || cuts.iter().any(|c| !c.counted && open(c)) {
         return Verdict::NondetSkip;
     }
     // `array_agg` with no order: DuckDB's path sorts list cells; text cannot be sorted faithfully
@@ -1734,15 +1737,17 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             let _ = finish(db);
             break;
         }
-        let trial_nondet = nondet
-            || cuts
-                .iter()
-                .any(|c| !c.total && c.params.iter().any(|(n, _)| cutting.contains(n)));
+        let cuts_here =
+            |c: &limits::Cut| !c.total && c.params.iter().any(|(n, _)| cutting.contains(n));
+        let trial_nondet = nondet || cuts.iter().any(cuts_here);
+        // A count bound to cut, in a cut whose tied rows a level above can tell apart: nothing to
+        // compare on this trial.
+        let trial_blind = cuts.iter().any(|c| !c.counted && cuts_here(c));
         let size = |bags: &[Bag]| bags.iter().map(|b| b.rows.len()).sum::<usize>();
         let differs = ra.len() != rb.len()
             || ra.iter().zip(&rb).any(|(x, y)| x.label != y.label || x.keys() != y.keys());
         let mut verdict = None;
-        if differs && !(trial_nondet && size(&ra) == size(&rb)) {
+        if differs && !trial_blind && !(trial_nondet && size(&ra) == size(&rb)) {
             // Text differs. A bag whose sizes differ is a difference whatever the values; one of
             // equal size may still hold the same values under `=`.
             let mut real = false;

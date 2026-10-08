@@ -8,7 +8,11 @@
 //!
 //! A cut over rows whose order leaves ties keeps an arbitrary choice among the tied rows, so two
 //! runs of the *same* query can return different bags. [`crate::pair::test_pair`] then trusts only a
-//! difference in cardinality, which no tie-break can change. Two things narrow that rule back down:
+//! difference in cardinality, which no tie-break can change -- so long as nothing above the cut can
+//! tell which rows it kept. A level above that filters them, joins on them, groups or deduplicates
+//! them, or tests membership in them can turn the choice into a difference in cardinality as well,
+//! so a cut under one leaves nothing to compare and makes the pair `NONDET-SKIP` ([`Cut::counted`]),
+//! as a `DISTINCT ON` there does ([`Choice::Unbounded`]). Two things narrow the rule back down:
 //!
 //! * a count that is a bare `$N` and nothing else is bound so that it cuts nothing -- a large
 //!   `LIMIT`, an `OFFSET` of 0 -- and a literal `OFFSET 0`, `LIMIT ALL` or `LIMIT NULL` cuts nothing
@@ -24,10 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, Function, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByKind, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableFactor, Value, Visit, Visitor, WindowFrameUnits, WindowSpec, WindowType,
+    BinaryOperator, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, NamedWindowExpr, ObjectName,
+    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Value, Visit, Visitor,
+    WindowFrameUnits, WindowSpec, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::Keyword;
@@ -57,6 +62,12 @@ pub struct Cut {
     /// Whether this level's `ORDER BY` is a total order on its rows, so the rows any count keeps are
     /// determined ([`is_total`]).
     pub total: bool,
+    /// Whether the levels above this one see no more of its rows than how many there are, so the
+    /// choice among tied rows can change which rows the statement returns but not how many: it sits
+    /// at the top of the statement, or under an `EXISTS`, behind levels that read its rows only in
+    /// their select lists (`counted_queries` lists them). Under a `WHERE` or a join condition that
+    /// reads them, a `GROUP BY` or an `IN`, the choice decides the cardinality too (issue #124).
+    pub counted: bool,
 }
 
 /// The cuts in `sql`, one per query level that has one, subqueries and CTEs included.
@@ -71,6 +82,7 @@ pub fn cuts(sql: &str, schema: &Schema) -> Vec<Cut> {
     let mut finder = Finder {
         schema,
         ctes: ctes.0,
+        counted: counted_queries(&stmts),
         out: Vec::new(),
     };
     for st in &stmts {
@@ -79,9 +91,9 @@ pub fn cuts(sql: &str, schema: &Schema) -> Vec<Cut> {
     finder.out
 }
 
-/// A statement the parser rejected: any `LIMIT`/`OFFSET`/`FETCH` keyword is one cut that cuts and is
-/// not known to be ordered, which leaves only the cardinality comparison -- sound whatever the
-/// clause turns out to say.
+/// A statement the parser rejected: any `LIMIT`/`OFFSET`/`FETCH` keyword is one cut that cuts, is
+/// not known to be ordered, and may sit anywhere, which leaves nothing to compare -- sound whatever
+/// the clause turns out to say.
 fn unparsed(sql: &str) -> Vec<Cut> {
     let has = significant(sql)
         .map(|toks| {
@@ -100,9 +112,265 @@ fn unparsed(sql: &str) -> Vec<Cut> {
             params: Vec::new(),
             fixed: true,
             total: false,
+            counted: false,
         }]
     } else {
         Vec::new()
+    }
+}
+
+/// The queries whose number of rows fixes the statement's, or an `EXISTS`'s answer, whichever rows
+/// they are, by address, which is what the visitor sees: however such a query settles its ties, the
+/// cardinality of the result is a function of how many rows it returns, and an `EXISTS` reads
+/// nothing but whether it returns one.
+///
+/// The descent starts at the statement's own query, at an `INSERT`'s source when no `ON CONFLICT`
+/// can turn a row away, and at every `EXISTS` subquery, and passes down through
+///
+/// * parentheses, and both branches of a `UNION ALL`;
+/// * a subquery in the `FROM` of a `SELECT` that nothing at that level reads to decide which rows
+///   it returns ([`passed_on`]): a select list over it, or a join whose conditions read none of its
+///   columns, which pairs every row it returns with the same rows of the other side;
+/// * an `ORDER BY`, but not a cut: it stops at a query with a `LIMIT`, `OFFSET` or `FETCH` of its
+///   own, since a query below one is not handed on whole.
+///
+/// It goes nowhere else: not under a `WHERE` or a join condition that reads the subquery, a `GROUP
+/// BY`, `DISTINCT` or `UNION`, into an `IN`, `ANY` or scalar subquery, a CTE, or an `UPDATE` or
+/// `DELETE`. Leaving a query out only makes a cut in it skip the pair, so every approximation here
+/// is a sound one. It is the walk [`top_selects`] makes for `DISTINCT ON`, widened by the `FROM`
+/// subqueries and the `EXISTS`.
+fn counted_queries(stmts: &[Statement]) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    for st in stmts {
+        match st {
+            Statement::Query(q) => counted_query(q, &mut out),
+            Statement::Insert(ins) if ins.on.is_none() => {
+                if let Some(src) = &ins.source {
+                    counted_query(src, &mut out);
+                }
+            }
+            _ => {}
+        }
+        let _ = Statement::visit(st, &mut ExistsRoots(&mut out));
+    }
+    out
+}
+
+/// Every `EXISTS` subquery is a root of [`counted_queries`]'s descent.
+struct ExistsRoots<'a>(&'a mut HashSet<usize>);
+
+impl Visitor for ExistsRoots<'_> {
+    type Break = ();
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Exists { subquery, .. } = e {
+            counted_query(subquery, self.0);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn counted_query(q: &Query, out: &mut HashSet<usize>) {
+    out.insert(q as *const Query as usize);
+    let own = clauses(q);
+    if own.fixed || !own.params.is_empty() {
+        return;
+    }
+    counted_body(&q.body, out);
+}
+
+fn counted_body(body: &SetExpr, out: &mut HashSet<usize>) {
+    match body {
+        SetExpr::Query(q) => counted_query(q, out),
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            left,
+            right,
+        } => {
+            counted_body(left, out);
+            counted_body(right, out);
+        }
+        SetExpr::Select(sel) => {
+            for q in passed_on(sel) {
+                counted_query(q, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The subqueries in a `SELECT` level's `FROM` whose number of rows fixes the level's, whichever
+/// rows they are.
+///
+/// The level must not choose among its rows by anything: no `WHERE` that reads the subquery, no
+/// `GROUP BY`, `HAVING` or `DISTINCT`, and no set-returning function in its select list, which can
+/// return several rows for one. An aggregate with no `GROUP BY` returns one row however many it is
+/// handed, so it needs no test. A subquery then qualifies when nothing else at the level reads its
+/// columns: no join condition, and no other `FROM` entry that can see it (a `LATERAL` subquery, a
+/// function, a join nested in parentheses). A join whose condition does not read the subquery pairs
+/// each of its rows with one set of rows of the other side, and an outer join adds a row for each
+/// that pairs with nothing, so the count is a function of how many rows the subquery returns -- for
+/// a `LATERAL` one, of how many it returns for each row it is evaluated for. A join `USING` columns
+/// or `NATURAL` reads columns by name, and stops every subquery at its level.
+fn passed_on(sel: &Select) -> Vec<&Query> {
+    let mut srf = HasSetReturning::default();
+    for item in &sel.projection {
+        let _ = item.visit(&mut srf);
+    }
+    let plain = !srf.0
+        && sel.distinct.is_none()
+        && sel.top.is_none()
+        && sel.prewhere.is_none()
+        && sel.lateral_views.is_empty()
+        && sel.connect_by.is_empty()
+        && matches!(&sel.group_by, GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty())
+        && sel.having.is_none()
+        && sel.qualify.is_none();
+    if !plain {
+        return Vec::new();
+    }
+    let mut entries: Vec<&TableFactor> = Vec::new();
+    let mut conditions: Vec<&Expr> = sel.selection.iter().collect();
+    for twj in &sel.from {
+        entries.push(&twj.relation);
+        for j in &twj.joins {
+            let constraint = match &j.join_operator {
+                JoinOperator::Join(c)
+                | JoinOperator::Inner(c)
+                | JoinOperator::Left(c)
+                | JoinOperator::LeftOuter(c)
+                | JoinOperator::Right(c)
+                | JoinOperator::RightOuter(c)
+                | JoinOperator::FullOuter(c)
+                | JoinOperator::CrossJoin(c) => c,
+                _ => return Vec::new(),
+            };
+            match constraint {
+                JoinConstraint::On(e) => conditions.push(e),
+                JoinConstraint::None => {}
+                JoinConstraint::Using(_) | JoinConstraint::Natural => return Vec::new(),
+            }
+            entries.push(&j.relation);
+        }
+    }
+    let mut out = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let TableFactor::Derived {
+            subquery,
+            alias,
+            sample: None,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let mut reads = ReadsSubquery {
+            alias: alias.as_ref().map(|a| a.name.value.to_lowercase()),
+            columns: match alias {
+                Some(a) if !a.columns.is_empty() => Some(
+                    a.columns
+                        .iter()
+                        .map(|c| c.name.value.to_lowercase())
+                        .collect(),
+                ),
+                _ => output_columns(&subquery.body),
+            },
+            hit: false,
+        };
+        for e in &conditions {
+            let _ = e.visit(&mut reads);
+        }
+        for (k, other) in entries.iter().enumerate() {
+            // A plain table, or a subquery that is not `LATERAL`, cannot see another entry.
+            let blind = matches!(
+                other,
+                TableFactor::Table { args: None, .. } | TableFactor::Derived { lateral: false, .. }
+            );
+            if k != i && !blind {
+                let _ = other.visit(&mut reads);
+            }
+        }
+        if !reads.hit {
+            out.push(&**subquery);
+        }
+    }
+    out
+}
+
+/// The names of the columns a query body returns, lowercased; `None` where one is not a bare name
+/// or an alias, or a `*` stands in the select list.
+fn output_columns(body: &SetExpr) -> Option<HashSet<String>> {
+    match body {
+        SetExpr::Select(sel) => sel
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.to_lowercase()),
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => Some(id.value.to_lowercase()),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                    parts.last().map(|id| id.value.to_lowercase())
+                }
+                _ => None,
+            })
+            .collect(),
+        SetExpr::Query(q) => output_columns(&q.body),
+        SetExpr::SetOperation { left, .. } => output_columns(left),
+        _ => None,
+    }
+}
+
+/// Whether anything visited may read a `FROM` subquery's columns: a name qualified by its alias, the
+/// alias itself (a whole-row reference), or a bare name it returns -- any bare name, when the names
+/// it returns are not known.
+struct ReadsSubquery {
+    alias: Option<String>,
+    columns: Option<HashSet<String>>,
+    hit: bool,
+}
+
+impl ReadsSubquery {
+    fn names_it(&self, id: &sqlparser::ast::Ident) -> bool {
+        self.alias.as_deref() == Some(id.value.to_lowercase().as_str())
+    }
+}
+
+impl Visitor for ReadsSubquery {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        let hit = match e {
+            Expr::Identifier(id) => {
+                self.names_it(id)
+                    || self
+                        .columns
+                        .as_ref()
+                        .is_none_or(|c| c.contains(&id.value.to_lowercase()))
+            }
+            Expr::CompoundIdentifier(parts) => parts.iter().any(|p| self.names_it(p)),
+            Expr::QualifiedWildcard(name, _) => name.0.iter().any(|p| {
+                matches!(p, ObjectNamePart::Identifier(id) if self.names_it(id))
+            }),
+            Expr::Function(f) => match &f.args {
+                FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    let arg = match a {
+                        FunctionArg::Unnamed(arg)
+                        | FunctionArg::Named { arg, .. }
+                        | FunctionArg::ExprNamed { arg, .. } => arg,
+                    };
+                    matches!(arg, FunctionArgExpr::QualifiedWildcard(name)
+                        if name.0.iter().any(|p| {
+                            matches!(p, ObjectNamePart::Identifier(id) if self.names_it(id))
+                        }))
+                }),
+                _ => false,
+            },
+            _ => false,
+        };
+        if hit {
+            self.hit = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -126,6 +394,8 @@ impl Visitor for CteNames {
 struct Finder<'a> {
     schema: &'a Schema,
     ctes: HashSet<String>,
+    /// [`counted_queries`].
+    counted: HashSet<usize>,
     out: Vec<Cut>,
 }
 
@@ -153,39 +423,47 @@ fn count_of(e: &Expr) -> CountExpr {
     }
 }
 
+/// The counts of `q`'s own `LIMIT`, `OFFSET` and `FETCH`: [`Cut::params`] and [`Cut::fixed`], the
+/// rest left at its default.
+fn clauses(q: &Query) -> Cut {
+    let mut cut = Cut::default();
+    let add = |e: &Expr, kind: Count, cut: &mut Cut| match count_of(e) {
+        CountExpr::Param(n) => cut.params.push((n, kind)),
+        CountExpr::Nothing => {}
+        CountExpr::Other => cut.fixed = true,
+    };
+    match &q.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+            if let Some(l) = limit {
+                add(l, Count::Limit, &mut cut);
+            }
+            if let Some(o) = offset {
+                add(&o.value, Count::Offset, &mut cut);
+            }
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            add(limit, Count::Limit, &mut cut);
+            add(offset, Count::Offset, &mut cut);
+        }
+        None => {}
+    }
+    if let Some(f) = &q.fetch {
+        match &f.quantity {
+            Some(e) => add(e, Count::Limit, &mut cut),
+            None => cut.fixed = true, // `FETCH FIRST ROW ONLY` keeps one row
+        }
+    }
+    cut
+}
+
 impl Visitor for Finder<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-        let mut cut = Cut::default();
-        let add = |e: &Expr, kind: Count, cut: &mut Cut| match count_of(e) {
-            CountExpr::Param(n) => cut.params.push((n, kind)),
-            CountExpr::Nothing => {}
-            CountExpr::Other => cut.fixed = true,
-        };
-        match &q.limit_clause {
-            Some(LimitClause::LimitOffset { limit, offset, .. }) => {
-                if let Some(l) = limit {
-                    add(l, Count::Limit, &mut cut);
-                }
-                if let Some(o) = offset {
-                    add(&o.value, Count::Offset, &mut cut);
-                }
-            }
-            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                add(limit, Count::Limit, &mut cut);
-                add(offset, Count::Offset, &mut cut);
-            }
-            None => {}
-        }
-        if let Some(f) = &q.fetch {
-            match &f.quantity {
-                Some(e) => add(e, Count::Limit, &mut cut),
-                None => cut.fixed = true, // `FETCH FIRST ROW ONLY` keeps one row
-            }
-        }
+        let mut cut = clauses(q);
         if cut.fixed || !cut.params.is_empty() {
             cut.total = is_total(q, self.schema, &self.ctes);
+            cut.counted = self.counted.contains(&(q as *const Query as usize));
             self.out.push(cut);
         }
         ControlFlow::Continue(())
@@ -1112,7 +1390,8 @@ mod tests {
             vec![Cut {
                 params: vec![],
                 fixed: true,
-                total: false
+                total: false,
+                counted: false
             }]
         );
     }
@@ -1187,6 +1466,130 @@ mod tests {
             ] {
                 assert_eq!(c(sql), Choice::Unbounded, "{sql}");
             }
+        }
+    }
+
+    /// A cut whose tied rows a level above can tell apart (issue #124).
+    mod nested_cuts {
+        use super::super::cuts;
+        use crate::schema::parse_schema;
+
+        const T: &str = "create table t (id int primary key, g int, v int); \
+                         create table u (id int primary key, x int)";
+
+        /// Whether each open cut in `sql` is counted, in the order the visitor finds them.
+        fn counted(sql: &str) -> Vec<bool> {
+            cuts(sql, &parse_schema(T))
+                .iter()
+                .filter(|c| !c.total)
+                .map(|c| c.counted)
+                .collect()
+        }
+
+        #[test]
+        fn a_cut_only_whose_count_reaches_the_result_is_counted() {
+            for sql in [
+                "SELECT id FROM t ORDER BY g LIMIT 1",
+                "SELECT id FROM t ORDER BY g LIMIT $1",
+                "SELECT id FROM t WHERE v = 1 ORDER BY g FETCH FIRST ROW ONLY",
+                "(SELECT id FROM t ORDER BY g LIMIT 1)",
+                "SELECT id FROM t UNION ALL (SELECT id FROM t ORDER BY g LIMIT 1)",
+                "WITH c AS (SELECT 1) SELECT id FROM t ORDER BY g LIMIT 1",
+                // A select list over the cut, sorted or not, keeps each of its rows.
+                "SELECT id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s",
+                "SELECT id, v + 1 FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s ORDER BY v",
+                "SELECT * FROM (SELECT * FROM (SELECT * FROM t ORDER BY g LIMIT 2) a) b",
+                "SELECT id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s UNION ALL SELECT id FROM u",
+                // A join that reads none of its columns makes a number of rows that only the number
+                // the cut keeps decides, for each row a `LATERAL` cut is evaluated for.
+                "SELECT s.id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, u",
+                "SELECT s.id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s JOIN u ON u.x = 1",
+                "SELECT s.id FROM u LEFT JOIN (SELECT id FROM t ORDER BY g LIMIT 1) AS s ON u.x > 0",
+                "SELECT * FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, u WHERE u.x = 1",
+                "SELECT u.id, l.v FROM u CROSS JOIN LATERAL \
+                 (SELECT v FROM t WHERE t.g = u.x ORDER BY v DESC LIMIT 1) AS l",
+                "SELECT u.id, l.v FROM u LEFT JOIN LATERAL \
+                 (SELECT v FROM t WHERE t.g = u.x ORDER BY v DESC LIMIT 1) AS l ON true WHERE u.x = $1",
+                "SELECT i.k, l.w FROM unnest($1::int[]) AS i(k) CROSS JOIN LATERAL \
+                 (SELECT v AS w FROM t WHERE t.g = i.k ORDER BY v DESC LIMIT 1) AS l",
+                // One row whatever it is handed.
+                "SELECT count(*) FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s",
+                // `EXISTS` reads only whether there is a row.
+                "SELECT id FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.g = u.x LIMIT 1)",
+                "DELETE FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.g = u.x ORDER BY v LIMIT 1)",
+                // An `INSERT` without `ON CONFLICT` writes each row of its source.
+                "INSERT INTO u SELECT id, g FROM t ORDER BY g LIMIT 1",
+            ] {
+                assert_eq!(counted(sql), [true], "{sql}");
+            }
+        }
+
+        #[test]
+        fn a_cut_under_a_level_that_can_tell_its_rows_apart_is_not() {
+            for sql in [
+                // The issue's pair, and its neighbours.
+                "SELECT id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s WHERE v = 1",
+                "SELECT id FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s WHERE v = 1",
+                "SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY g LIMIT 1)",
+                "SELECT id FROM t WHERE id = ANY (SELECT id FROM t ORDER BY g LIMIT 1)",
+                "SELECT (SELECT v FROM t ORDER BY g LIMIT 1)",
+                "SELECT s.id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s JOIN u ON u.id = s.id",
+                "SELECT s.id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s JOIN u USING (id)",
+                "SELECT s.id FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s NATURAL JOIN u",
+                "SELECT l.v FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, \
+                 LATERAL (SELECT x AS v FROM u WHERE u.id = s.id) AS l",
+                "SELECT e FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, unnest(ARRAY[s.v]) AS e",
+                "SELECT 1 FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, u WHERE row(s.*) IS NOT NULL",
+                // A bare name the subquery returns, or one it may return.
+                "SELECT k FROM (SELECT id AS k FROM t ORDER BY g LIMIT 1) AS s, u WHERE k = u.x",
+                "SELECT 1 FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s, u WHERE x = 1",
+                "SELECT u.id FROM u LEFT JOIN LATERAL \
+                 (SELECT v FROM t WHERE t.g = u.x ORDER BY v LIMIT 1) AS l ON true WHERE v IS NULL",
+                "SELECT v, count(*) FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s GROUP BY v",
+                "SELECT count(*) FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s HAVING max(v) = 1",
+                "SELECT DISTINCT v FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s",
+                "SELECT unnest(ARRAY[v, v]) FROM (SELECT * FROM t ORDER BY g LIMIT 1) AS s",
+                "(SELECT id FROM t ORDER BY g LIMIT 1) UNION (SELECT id FROM u)",
+                "(SELECT id FROM t ORDER BY g LIMIT 1) EXCEPT (SELECT id FROM u)",
+                // A CTE is not followed to where it is read.
+                "WITH c AS (SELECT * FROM t ORDER BY g LIMIT 1) SELECT * FROM c",
+                // Writes that the kept rows choose.
+                "DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY g LIMIT 1)",
+                "UPDATE t SET v = 0 WHERE id IN (SELECT id FROM t ORDER BY g LIMIT 1)",
+                "INSERT INTO u SELECT id, g FROM t ORDER BY g LIMIT 1 ON CONFLICT DO NOTHING",
+                // Under an `EXISTS`, but behind a filter.
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM (SELECT * FROM t ORDER BY g LIMIT 1) s WHERE v = 1)",
+                // Unparsed: the cut may be anywhere.
+                "SELECT id FROM t ORDER BY g LIMIT 1 ;;; nonsense (",
+            ] {
+                assert_eq!(counted(sql), [false], "{sql}");
+            }
+        }
+
+        #[test]
+        fn each_cut_is_placed_on_its_own() {
+            assert_eq!(
+                counted("(SELECT id FROM t ORDER BY g LIMIT 1) UNION ALL (SELECT id FROM u LIMIT 1)"),
+                [true, true]
+            );
+            // A slice above a cut keeps only some of its rows.
+            assert_eq!(
+                counted("SELECT * FROM (SELECT * FROM t ORDER BY g LIMIT 3) AS s ORDER BY v LIMIT 1"),
+                [true, false]
+            );
+            // The outer cut is at the top; the inner one is under the outer one's filter.
+            assert_eq!(
+                counted(
+                    "SELECT id FROM (SELECT * FROM t ORDER BY g LIMIT 2) AS s WHERE v = 1 \
+                     ORDER BY id LIMIT 1"
+                ),
+                [true, false]
+            );
+            // A total cut is determined wherever it is, and so is not an open one.
+            assert_eq!(
+                counted("SELECT id FROM (SELECT * FROM t ORDER BY id LIMIT 1) AS s WHERE v = 1"),
+                Vec::<bool>::new()
+            );
         }
     }
 }
