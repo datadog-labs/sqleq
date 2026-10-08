@@ -358,6 +358,12 @@ const SET_RETURNING: [&str; 14] = [
 /// This was measured rather than assumed. Over a corpus of lowered cases, switching the default from
 /// one to the other moved **zero verdicts** — the same pairs proved, case by case and not merely in
 /// total. The weaker assumption is free here, so it is taken.
+///
+/// It is not faithful by itself for `=`, which both provers read as identity on VARBINARY: the
+/// function may return a `numeric` or a float, two of whose values `=` calls equal and a cast to text
+/// tells apart (`round(i, 1)` and `round(i, 2)`, `-sqrt(0)` and `sqrt(0)`). So the frontend reads
+/// plain VARBINARY as a value whose `=` is not known to be identity ([`coarse_class`]), and
+/// [`crate::equality`] refuses an operation that could tell two equal ones apart.
 const UNDECLARED_RET: &str = "VARBINARY";
 
 /// The two names a call answers to: its qualified spelling and its bare final component.
@@ -3494,11 +3500,11 @@ fn array_shape(arr: &sqlparser::ast::Array) -> Result<()> {
 ///
 /// An array of values whose `=` is not identity compares its elements with that `=`, so it is named
 /// after them ([`COARSE_OPAQUE`]): VARBINARY to the provers, and to [`crate::equality`] an array of
-/// `numeric`.
+/// `numeric`. An array of values whose `=` is identity is [`IDENTITY_OPAQUE`].
 fn array_call(elems: Vec<Value>) -> Value {
     let ty = elems.iter().map(ty_of).reduce(|a, b| common_type(&a, &b)).unwrap_or_else(|| "VARBINARY".into());
     let operand: Vec<Value> = elems.into_iter().map(|v| cast_to(v, &ty)).collect();
-    let array = coarse_class(&ty).map_or_else(|| "VARBINARY".to_string(), |c| format!("{COARSE_OPAQUE}{c}[]"));
+    let array = coarse_class(&ty).map_or_else(|| IDENTITY_OPAQUE.to_string(), |c| format!("{COARSE_OPAQUE}{c}[]"));
     json!({ "operator": format!("q_array_{}", name_part(&ty).to_lowercase()), "operand": operand, "type": array })
 }
 
@@ -3522,12 +3528,14 @@ fn subscript_indices(chain: &[AccessExpr]) -> Result<Vec<&Expr>> {
 /// whatever it holds).
 ///
 /// An element of an array whose elements' `=` is not identity, or a part of a `jsonb`, is such a
-/// value too, and named after it ([`COARSE_OPAQUE`]).
+/// value too, and named after it ([`COARSE_OPAQUE`]). Any other is a value of a type the frontend does
+/// not know, plain VARBINARY, though the array's `=` is identity: what a subscript yields is not
+/// always an element of the same kind, and `point`'s `p[0]` is a float.
 fn subscript_call(operand: Vec<Value>) -> Value {
     let types: Vec<String> = operand.iter().map(|v| name_part(&ty_of(v)).to_lowercase()).collect();
     let element = operand
         .first()
-        .and_then(|base| coarse_class(&ty_of(base)).map(|c| format!("{COARSE_OPAQUE}{}", c.trim_end_matches("[]"))))
+        .and_then(|base| coarse_class(&ty_of(base)).map(|c| opaque_of_class(c.trim_end_matches("[]"))))
         .unwrap_or_else(|| "VARBINARY".to_string());
     json!({ "operator": format!("q_subscript_{}", types.join("_")), "operand": operand, "type": element })
 }

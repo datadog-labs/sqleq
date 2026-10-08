@@ -11,9 +11,15 @@
 //! and the one the IR's provers can take: both read the IR's `=` as identity and deduplicate by it,
 //! so a value in the IR stands for a class of Postgres values under `=`.
 //!
-//! For most types the class has one member. For `numeric`, the floats, `interval` and `jsonb` it has
-//! more: `2.0 = 2.00`, `-0 = 0`, `'1 day' = '24 hours'` (and `'1 mon' = '30 days'`), and
-//! `'{"a": 1.0}' = '{"a": 1.00}'`, and an array of one of them compares its elements the same way.
+//! For some types the class has one member: the integers, text, `boolean`, the temporal types but
+//! `interval`, and the opaque types on [`crate::types::opaque_identity`]'s list (`bytea`, `uuid`,
+//! arrays of the others). For `numeric`, the floats, `interval` and `jsonb` it has more: `2.0 =
+//! 2.00`, `-0 = 0`, `'1 day' = '24 hours'` (and `'1 mon' = '30 days'`), and `'{"a": 1.0}' =
+//! '{"a": 1.00}'`, and an array of one of them compares its elements the same way. For any other
+//! type it may: `numrange` compares its bounds as `numeric`s, a domain over `numeric` is a
+//! `numeric`, and the result of a function nobody declared may be either (`round(i, 1)` is a
+//! `numeric`, `sqrt(i)` a float). So identity is what has to be established, and a type the frontend
+//! does not know is one whose `=` is not identity ([`crate::types::coarse_class`]).
 //! Reading such a value as its class is faithful while every operation on it gives equal results on
 //! equal arguments. It is not faithful for one that does not: a cast to text, `||`, `concat`,
 //! `scale`, `->>`, numeric division (whose scale follows its operands', so `1.0 / 3` and
@@ -28,8 +34,11 @@
 //!   `count`, `min`, `max`, `sum`, `+`, `-`, `*`, `%`, float arithmetic, a cast to a number or a
 //!   boolean, `coalesce`, `abs`, `round`, `->`, `@>`, a subscript and the like. Nothing to do. Where
 //!   the result is a value of the same kind (`coalesce(x, 0)`), its type says so: the lowering names
-//!   it with [`COARSE_OPAQUE`] where it would otherwise be VARBINARY, so a read of it further up, in
-//!   another query block included, is sorted the same way.
+//!   it with [`COARSE_OPAQUE`](crate::types::COARSE_OPAQUE) where it would otherwise be VARBINARY,
+//!   so a read of it further up, in another query block included, is sorted the same way. Over a
+//!   value of a type the frontend does not know, fewer operations are known to: the ones that
+//!   compare it, count it, return it or cast it to a number ([`unknown`]), since all that is known
+//!   of such a type is that its `=` is an equivalence relation.
 //! * by any other operation. If the value is *fixed by its spelling* -- computed by one expression
 //!   from literals, parameters, clocks and values of types whose `=` is identity -- the operation
 //!   reads it through `q_exact_<type>(<that expression>, <those values>)`. Postgres evaluates one
@@ -41,15 +50,20 @@
 //! Except where the two queries lowered to one plan, which [`crate::types::refuse_unfaithful`]
 //! explains for citext: one plan computes one thing however `=` is read.
 //!
-//! What this does not see is a value whose type the frontend does not know: the result of a function
-//! nobody declared is VARBINARY, which is identity here, though `sqrt(i)` is a float. Opaque types
-//! whose `=` is not identity beyond these four -- `numrange`, the geometric types, a domain over
-//! `numeric` -- are read as identity too.
+//! What a class cannot stand for is a value whose `=` is not an equivalence relation: `box`,
+//! `circle`, `lseg` and `line` compare within a tolerance, so `a = b` and `b = c` do not make
+//! `a = c`, and no operation needs to observe anything for a prover's reading to be wrong. Those are
+//! [`crate::types::UNFAITHFUL`], refused wherever they reach a plan, and so is the result of a core
+//! function that returns one ([`call_type`]). A type a user or an extension defines is taken to have
+//! an `=` that is an equivalence relation, as a btree operator class makes it.
 
 use serde_json::{json, Value};
 
 use crate::error::{unsupported, FrontendError, Result};
-use crate::types::{coarse_class, name_part, rename_emitted_types, ty_of, COARSE_OPAQUE};
+use crate::types::{
+    coarse_class, known_class, name_part, opaque_of_class, rename_emitted_types, ty_of, unfaithful_result,
+    IDENTITY_OPAQUE, UNKNOWN_CLASS,
+};
 
 /// The functions whose result is computed from their arguments' values, or is one of their
 /// arguments: `coalesce`, `nullif`, `greatest` and `least` return an argument, `abs`, `ceil`,
@@ -76,14 +90,50 @@ pub const PASS_THROUGH: [&str; 13] = [
     "Q_OP_JSONPATH_ELEMS",
 ];
 
-/// The type of a call to `name` over `operand`, given the type `ret` it would otherwise have: a
-/// [`PASS_THROUGH`] function nobody declared returns VARBINARY, which would hide that
-/// `coalesce(x, 0)` over a `numeric` `x` is a `numeric`, so it gets `x`'s class as a
-/// [`COARSE_OPAQUE`] name instead. VARBINARY to the provers either way.
+/// The [`PASS_THROUGH`] functions that return one of their arguments. Over a value of a type the
+/// frontend does not know they still read it by its class ([`unknown`]).
+const SELECTS: [&str; 4] = ["COALESCE", "NULLIF", "GREATEST", "LEAST"];
+
+/// The [`PASS_THROUGH`] functions whose result is of their first argument's type, or of the common
+/// type of all of them: the [`SELECTS`], and `->`, `#>` and `json_extract_path`, which take a part
+/// of a `json` as a `json` (and of a `jsonb` as a `jsonb`). Their result's `=` is identity where
+/// every argument's is. `round(i)` is not here: it is a float.
+const SAME_TYPE: [&str; 7] =
+    ["COALESCE", "NULLIF", "GREATEST", "LEAST", "Q_OP_JSONX", "Q_OP_JSONPATH", "Q_OP_JSONPATH_ELEMS"];
+
+/// The type of a call to `name` over `operand`, given the type `ret` it would otherwise have. A
+/// function nobody declared returns VARBINARY, a value of a type the frontend does not know, whose
+/// `=` is not taken to be identity. Four calls say more:
+///
+/// * a core function that returns `box`, `circle`, `lseg` or `line` returns that type
+///   ([`crate::types::unfaithful_result`]), whose `=` is not even transitive;
+/// * a symbol whose name says it returns text or a boolean (`q_str_jsonx`, which `->>` becomes, and
+///   the other `q_str_` and `q_bool_` names) returns a value whose `=` is identity,
+///   [`IDENTITY_OPAQUE`];
+/// * a [`PASS_THROUGH`] function over a value whose `=` is not identity returns a value of the same
+///   kind, so `coalesce(x, 0)` over a `numeric` `x` gets `x`'s class as a
+///   [`COARSE_OPAQUE`](crate::types::COARSE_OPAQUE) name;
+/// * one of [`SAME_TYPE`] over values whose `=` is identity returns one, [`IDENTITY_OPAQUE`].
+///
+/// VARBINARY to the provers in all but the first, which is refused unless the two plans are one.
 pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
-    if ret == "VARBINARY" && PASS_THROUGH.contains(&name) {
-        if let Some(class) = operand.iter().find_map(|v| coarse_class(&ty_of(v)).map(str::to_string)) {
-            return format!("{COARSE_OPAQUE}{class}");
+    if ret != "VARBINARY" {
+        return ret;
+    }
+    if let Some(t) = unfaithful_result(name) {
+        return t.to_string();
+    }
+    if matches!(crate::infer::builtin_rtype(name), Some(crate::infer::Ty::Str | crate::infer::Ty::Bool)) {
+        return IDENTITY_OPAQUE.to_string();
+    }
+    if PASS_THROUGH.contains(&name) {
+        let types: Vec<String> = operand.iter().map(ty_of).collect();
+        let classes = || types.iter().filter_map(|t| coarse_class(t));
+        if let Some(class) = classes().find(|c| known_class(c)).or_else(|| classes().next()) {
+            return opaque_of_class(class);
+        }
+        if SAME_TYPE.contains(&name) && !operand.is_empty() {
+            return IDENTITY_OPAQUE.to_string();
         }
     }
     ret
@@ -106,7 +156,7 @@ pub fn refuse_observed(input: &mut Value) -> Result<()> {
 }
 
 /// How an operation reads a value of a type whose `=` is not identity.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Read {
     /// Equal arguments give equal results, of a type whose `=` is identity: a comparison, `count`,
     /// a cast to an integer.
@@ -145,9 +195,37 @@ fn reads(op: &str, ty: &str, types: &[String]) -> Read {
         // above all -- is not known to.
         _ if is_cast(op) => match ty {
             "INTEGER" | "BOOLEAN" => Read::Value,
-            t if coarse_class(t).is_some() => Read::Through,
+            t if coarse_class(t).is_some_and(known_class) => Read::Through,
             _ => Read::Observes,
         },
+        _ => Read::Observes,
+    }
+}
+
+/// How the operation `op`, which [`reads`] reads a `numeric` as `read`, reads a value of a type the
+/// frontend does not know ([`known_class`] is false for its class): a column of a type no reader
+/// names, a domain over one, the result of a function nobody declared.
+///
+/// All that is known of such a type is that its `=` is an equivalence relation, and that its order,
+/// where it has one, agrees with it, as a btree operator class makes them. So a comparison, a null
+/// test, `count`, `min` and `max` still read it by its class, and so do the operations that return
+/// one of their operands or a part of an array ([`SELECTS`], `CASE`, a subscript, an array
+/// constructor). So does a cast to a number or a boolean: every type Postgres 17 casts to one (the
+/// integers, `numeric`, the floats, `boolean`, `money`, `jsonb`, `bit`, `"char"`, `oid` and the
+/// `reg` types, and text through its input function) converts by value, and a cast a user defines
+/// is taken to, as its order is. Everything else that [`reads`]
+/// knows to read a `numeric` by its value, `+`, `round`, `@>`, `sum`, is a function of the value's
+/// class only because of what it is over a `numeric`, and is not known to be one here.
+fn unknown(op: &str, read: Read) -> Read {
+    let by_order = !matches!(op, "Q_BOOL_CONTAINS" | "Q_BOOL_OVERLAP");
+    let selects = SELECTS.contains(&op)
+        || op == "CASE"
+        || op.starts_with("q_subscript_")
+        || op.starts_with("q_array_")
+        || is_cast(op);
+    match read {
+        Read::Value if by_order => Read::Value,
+        Read::Through if selects => Read::Through,
         _ => Read::Observes,
     }
 }
@@ -201,10 +279,11 @@ fn walk(v: &mut Value) -> Result<()> {
                 _ => None,
             };
             if let Some((op, ty, types)) = node {
-                let read = reads(&op, &ty, &types);
+                let known = reads(&op, &ty, &types);
                 if let Some(Value::Array(operands)) = m.get_mut("operand") {
                     for operand in operands.iter_mut() {
                         let Some(class) = coarse(operand) else { continue };
+                        let read = if known_class(&class) { known } else { unknown(&op, known) };
                         match read {
                             Read::Value => {}
                             Read::Through if coarse_class(&ty).is_some() => {}
@@ -289,7 +368,25 @@ fn example(class: &str) -> String {
     }
 }
 
+/// What a refusal calls a value of the class `class`.
+fn value_of(class: &str) -> String {
+    if class == UNKNOWN_CLASS {
+        "a value of a type the frontend does not know (an opaque column, or the result of a function nobody \
+         declared)"
+            .to_string()
+    } else {
+        format!("a value of type {}", class.to_lowercase())
+    }
+}
+
 fn observed(op: &str, class: &str) -> FrontendError {
+    if !known_class(class) {
+        return unsupported(format!(
+            "{} read by {op}, which is not known to give equal results on values = calls equal; that type's = \
+             is not known to be identity",
+            value_of(class)
+        ));
+    }
     unsupported(format!(
         "a value of type {class} read by {op}, which is not known to give equal results on values = calls \
          equal, as it does {}",
@@ -299,7 +396,8 @@ fn observed(op: &str, class: &str) -> FrontendError {
 
 fn hidden(op: &str, class: &str, ty: &str) -> FrontendError {
     unsupported(format!(
-        "a value of type {class} passed through {op}, whose result type {ty} would not say that = calls {} equal",
+        "{} passed through {op}, whose result type {ty} would not say that = calls {} equal",
+        value_of(class),
         example(class)
     ))
 }
