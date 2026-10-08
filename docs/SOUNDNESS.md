@@ -236,27 +236,13 @@ a `VALUES` list whose column takes an integer's type from its first branch or ro
 `numeric` from a later one is refused, since a read of the column would take the value for one whose
 `=` is identity.
 
-An `UPDATE` or an `INSERT` that stores such a value in a column of another type applies Postgres's
-assignment cast, which the plan does not spell out, so each stored value is read as that cast
-(`dml::refuse_observed_stores`). A column of a number type, a boolean or another of these four types
-converts it by value — a `numeric(10,2)` column rounds `2.0` and `2.00` alike — and a `text`,
-`varchar`, `char(n)` or `json` column, or one of any other type, is not known to. There the value is
-stored through `q_exact_<type>` where its spelling fixes it, so `SET s = 2.0` and `SET s = 2.00` store
-two terms, and the pair is refused otherwise, as `SET s = n WHERE n = m` against `SET s = m WHERE
-n = m` is. An interval column with a modifier counts as one that is not known to: `interval day`
-keeps only the days of a value, so `'1 day'` is stored as it is and `'24 hours'` as `0`, and
-`interval(0)` rounds the seconds away from zero. Unlike the reads above, this refusal holds where the
-two sides lower to one plan. One plan stores values of one class, not always the same member of it:
-a `DISTINCT` keeps whichever of two equal values reaches it first, and a dead `ORDER BY` the frontend
-drops can decide which.
-
 The cost is those refusals: a pair whose two queries differ and that casts one of these values to
 text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, or adds
-an interval column to a date, is refused rather than proved, and so is an `UPDATE` or an `INSERT`
-that stores a `numeric` column's value in a text column. Two gaps remain. A value whose type the frontend does not know is read as one
-whose `=` is identity: the result of a function nobody declared is VARBINARY, though `sqrt(i)` is a
-float. So are opaque types whose `=` is not identity beyond these four (`numrange`, the geometric
-types, a domain over `numeric`), stored values included.
+an interval column to a date, is refused rather than proved. Three gaps remain. A value whose type
+the frontend does not know is read as one whose `=` is identity: the result of a function nobody
+declared is VARBINARY, though `sqrt(i)` is a float. So are opaque types whose `=` is not identity
+beyond these four (`numrange`, the geometric types, a domain over `numeric`). And the cast an
+`UPDATE` or `INSERT` applies when it stores one of these values in a text column is not modelled.
 
 ### Shapes that look like something simpler
 
