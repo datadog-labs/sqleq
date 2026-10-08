@@ -672,7 +672,7 @@ pub fn main(args: Args) -> i32 {
             report::print_summary(c, &cases, wall, axes.contains(&"qed"));
         }
         let imp = env.ss.as_ref().map_or("sqleq-solver", |d| d.imp.as_str());
-        report::print_second_opinion(c, &cases, &ss_stats, imp);
+        report::print_second_opinion(c, &cases, &ss_stats, imp, axes.contains(&"qed"));
         if let Some(st) = &fuzz_stats {
             report::print_fuzz(c, &cases, st);
         }

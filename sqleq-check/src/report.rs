@@ -254,13 +254,29 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
         outcomes.iter().filter(|(_, o)| o.verdict == portfolio::EQUIVALENT).map(|(_, o)| *o).collect();
     if !eq.is_empty() {
         let has = |o: &portfolio::Outcome, a: &str| o.by.iter().any(|b| b == a);
-        let both = eq.iter().filter(|o| has(o, "qed") && has(o, "sqleq-solver")).count();
-        let qed = eq.iter().filter(|o| has(o, "qed") && !has(o, "sqleq-solver")).count();
-        let ss = eq.iter().filter(|o| has(o, "sqleq-solver") && !has(o, "qed")).count();
+        let n = |f: &dyn Fn(&portfolio::Outcome) -> bool| eq.iter().filter(|o| f(o)).count();
+        // Only the provers that ran: a count for one that was not asked would read as one that
+        // proved nothing.
+        let mut parts = Vec::new();
+        match (backends.contains(&"qed"), backends.contains(&"sqleq-solver")) {
+            (true, true) => {
+                let qed = n(&|o| has(o, "qed") && !has(o, "sqleq-solver"));
+                let ss = n(&|o| has(o, "sqleq-solver") && !has(o, "qed"));
+                let both = n(&|o| has(o, "qed") && has(o, "sqleq-solver"));
+                parts.push(format!("qed alone {qed} · sqleq-solver alone {ss} · both {both}"));
+            }
+            (true, false) => parts.push(format!("qed {}", n(&|o| has(o, "qed")))),
+            (false, true) => parts.push(format!("sqleq-solver {}", n(&|o| has(o, "sqleq-solver")))),
+            (false, false) => {}
+        }
         // Settled with no prover: the frontend found the two sides one query.
-        let refl = eq.iter().filter(|o| !has(o, "qed") && !has(o, "sqleq-solver")).count();
-        let refl = if refl > 0 { format!(" · reflexivity alone {refl}") } else { String::new() };
-        println!("  {:<13} qed alone {qed} · sqleq-solver alone {ss} · both {both}{refl}", c.dim("proved by"));
+        let refl = n(&|o| !has(o, "qed") && !has(o, "sqleq-solver"));
+        if refl > 0 {
+            parts.push(format!("reflexivity alone {refl}"));
+        }
+        if !parts.is_empty() {
+            println!("  {:<13} {}", c.dim("proved by"), parts.join(" · "));
+        }
     }
     let first: Vec<f64> = outcomes.iter().filter_map(|(_, o)| o.first_s).collect();
     let walls: Vec<f64> = outcomes.iter().map(|(x, _)| x.wall).collect();
@@ -401,8 +417,10 @@ pub fn print_summary(c: Color, cases: &[Case], wall: f64, qed: bool) {
     }
 }
 
-/// The second opinion, and the two warnings that have to travel with it.
-pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp: &str) {
+/// The SQLSolver axis, and the warnings that have to travel with it. With the qed axis asked (`qed`)
+/// it is a second opinion, set against the QED prover's proofs on the same pairs; without it there
+/// is nothing to set it against, and its proofs are counted on their own.
+pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp: &str, qed: bool) {
     let who = solver::name(imp);
     let scored: Vec<&Case> = cases.iter().filter(|x| x.s_bucket.is_some()).collect();
     if scored.is_empty() {
@@ -413,7 +431,11 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
         *counts.entry(x.s_bucket.as_deref().unwrap_or("")).or_default() += 1;
     }
     println!();
-    println!("{}{}", c.bold("  Second opinion"), c.dim(&format!("  — {who}, over the same lowered IR")));
+    if qed {
+        println!("{}{}", c.bold("  Second opinion"), c.dim(&format!("  — {who}, over the same lowered IR")));
+    } else {
+        println!("{}{}", c.bold("  SQLSolver axis"), c.dim(&format!("  — {who}, over the lowered IR")));
+    }
     println!("{}", rule(c));
     for b in solver::ORDER {
         if let Some(n) = counts.get(b).filter(|n| **n > 0) {
@@ -427,29 +449,42 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
     // answered by neither -- their `proved-literal` is this harness's `trivial` seen from the
     // other side -- so counting it would inflate both columns and the agreement between them.
     let diff: Vec<&&Case> = scored.iter().filter(|x| x.trivial == Some(false)).collect();
-    let ours: BTreeSet<&str> = diff.iter().filter(|x| x.status == PROVABLE).map(|x| x.name.as_str()).collect();
-    let theirs: BTreeSet<&str> =
-        diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).map(|x| x.name.as_str()).collect();
-    let both = ours.intersection(&theirs).count();
-    let only_p = ours.difference(&theirs).count();
-    let only_s: Vec<&str> = theirs.difference(&ours).copied().collect();
-    let union = ours.union(&theirs).count();
-    println!("  {:<22} {:>5}", "of pairs that differ", diff.len());
-    println!("  {:<22} {both:>5}", "both provers");
-    println!("  {:<22} {only_p:>5}", "only the QED prover");
-    println!(
-        "  {:<22} {}   {}",
-        format!("only {who}"),
-        c.bold(&format!("{:>5}", only_s.len())),
-        c.dim("what the second opinion adds")
-    );
-    for name in only_s.iter().take(10) {
-        println!("{}", c.dim(&format!("  {:<22}       {name}", "")));
+    if qed {
+        let ours: BTreeSet<&str> = diff.iter().filter(|x| x.status == PROVABLE).map(|x| x.name.as_str()).collect();
+        let theirs: BTreeSet<&str> =
+            diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).map(|x| x.name.as_str()).collect();
+        let both = ours.intersection(&theirs).count();
+        let only_p = ours.difference(&theirs).count();
+        let only_s: Vec<&str> = theirs.difference(&ours).copied().collect();
+        let union = ours.union(&theirs).count();
+        println!("  {:<22} {:>5}", "of pairs that differ", diff.len());
+        println!("  {:<22} {both:>5}", "both provers");
+        println!("  {:<22} {only_p:>5}", "only the QED prover");
+        println!(
+            "  {:<22} {}   {}",
+            format!("only {who}"),
+            c.bold(&format!("{:>5}", only_s.len())),
+            c.dim("what the second opinion adds")
+        );
+        for name in only_s.iter().take(10) {
+            println!("{}", c.dim(&format!("  {:<22}       {name}", "")));
+        }
+        if only_s.len() > 10 {
+            println!("{}", c.dim(&format!("  {:<22}       … and {} more", "", only_s.len() - 10)));
+        }
+        println!("  {:<22} {:>5}", "neither", diff.len() - union);
+    } else if diff.is_empty() {
+        println!("  {:<13} n/a           {}", c.bold("proved"), c.dim("no pair here has two differing queries"));
+    } else {
+        let n = diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).count();
+        let pct = 100.0 * n as f64 / diff.len() as f64;
+        println!(
+            "  {:<13} {n}/{}  ({pct:.1}%)   {}",
+            c.bold("proved"),
+            diff.len(),
+            c.dim("pairs whose two queries differ")
+        );
     }
-    if only_s.len() > 10 {
-        println!("{}", c.dim(&format!("  {:<22}       … and {} more", "", only_s.len() - 10)));
-    }
-    println!("  {:<22} {:>5}", "neither", diff.len() - union);
     if let Some(w) = stats.wall_s {
         let mut detail = format!("{w:.2}s over {} row(s)", stats.answered.unwrap_or(0));
         if stats.halts > 0 {
@@ -468,13 +503,15 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
              like its UNKNOWN; only its EQ is a claim, and\n        sqleq-fuzz remains the only disprover here."
         )
     );
-    println!(
-        "{}",
-        c.dim(
-            "        Both opinions come through this repo's frontend, so where they\n        agree they \
-             corroborate the provers, not the lowering."
-        )
-    );
+    if qed {
+        println!(
+            "{}",
+            c.dim(
+                "        Both opinions come through this repo's frontend, so where they\n        agree they \
+                 corroborate the provers, not the lowering."
+            )
+        );
+    }
 }
 
 pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
@@ -487,7 +524,7 @@ pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
         *counts.entry(x.f_verdict.as_deref().unwrap_or("")).or_default() += 1;
     }
     println!();
-    println!("{}{}", c.bold("  Fuzz axis"), c.dim("  — sqleq-fuzz, random instances in DuckDB"));
+    println!("{}{}", c.bold("  Fuzz axis"), c.dim("  — sqleq-fuzz, random instances in PostgreSQL"));
     println!("{}", rule(c));
     for (v, n) in &counts {
         println!("  {v:<22} {n:>5}");
