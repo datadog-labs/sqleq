@@ -150,12 +150,20 @@ pub enum CatalogSource {
     /// adds is the cast rules and the `DECLARE` synthesis — the stages that decide parameter and
     /// unknown-function types, which no DDL declares. On a corpus whose rows carry DDL this is the
     /// production-shaped mode: declared columns, inferred parameters.
+    ///
+    /// No catalog is synthesized, so a table the queries read only through `*`, `count(*)`, a
+    /// constant or a `USING` list lowers as it does under the declared catalog. Inference and the
+    /// stages after it can still refuse for reasons of their own (a type conflict, an ambiguous
+    /// column, a call no declaration can be synthesized for), and inference refuses a pair that
+    /// names two tables one up to case (`"Orders"` and `orders`), which the declared catalog would
+    /// lower by finding both in a declared `orders`.
     InferredSeeded,
     /// Infer from the queries alone and lower against the synthesized catalog.
     ///
     /// The synthesized catalog holds only the columns the queries actually read, with no keys and
-    /// everything nullable, so it does not line up with a declared one column-for-column. This is
-    /// the mode for input that has no DDL at all.
+    /// everything nullable, so it does not line up with a declared one column-for-column, and a
+    /// table no column reference is attributed to cannot be synthesized at all: the pair is refused.
+    /// This is the mode for input that has no DDL at all.
     Inferred,
 }
 
@@ -293,10 +301,14 @@ fn pipeline(
         // is in no position to overrule.
         synth.extend(decls);
         decls = synth;
-        inferred = inf.catalog;
         if source.seeds_declared() {
+            // `infer` synthesized no catalog, as it builds one only when it is given none to seed
+            // from: no seeded pair is refused for a catalog that nothing reads.
             declared
         } else {
+            inferred = inf
+                .catalog
+                .ok_or_else(|| error::unsupported("internal: type inference synthesized no catalog"))?;
             &inferred
         }
     } else {

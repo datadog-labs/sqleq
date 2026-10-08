@@ -42,14 +42,6 @@ fn identical(ddl: &str, q0: &str, q1: &str) -> bool {
     seen[0]
 }
 
-/// Whether the pair lowers to byte-identical queries under the declared catalog alone. For a pair
-/// that type inference refuses, as it refuses a bare name two tables declare up to case.
-fn identical_declared(ddl: &str, q0: &str, q1: &str) -> bool {
-    let v = lower_with(&pair(ddl, q0, q1), CatalogSource::Declared);
-    let v = v.unwrap_or_else(|e| panic!("expected Ok, got {e}"));
-    v["queries"][0] == v["queries"][1]
-}
-
 /// Whether the pair is kept apart in both modes: refused, or lowered to two different queries.
 fn apart(ddl: &str, q0: &str, q1: &str) -> bool {
     MODES.iter().all(|&src| match lower_with(&pair(ddl, q0, q1), src) {
@@ -216,15 +208,15 @@ create table "u" ("id" INTEGER, "a" INTEGER);
 create table "m" ("id" INTEGER, "A" INTEGER);"#;
 
 /// `m = {(1, 10)}`, `t = {(1, 1)}`: the first reads `m."A"` and returns 10, the second folds `A` to
-/// `a`, which only `t` has, and returns 1. The catalog used to fold `"A"` to `a` as well. (Type
-/// inference still attributes a bare name by its lower-cased spelling, so under the inferred-seeded
-/// catalog it refuses both as a name `m` and `t` declare.)
+/// `a`, which only `t` has, and returns 1. The catalog used to fold `"A"` to `a` as well. Type
+/// inference folds names the same way (issue #112), and the inferred-seeded catalog no longer refuses
+/// the table each query reads no column of (issue #111), so both catalog modes lower all of these.
 #[test]
 fn a_quoted_column_is_not_its_folded_name() {
     assert!(apart(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT A FROM "m", "t""#));
-    assert!(!identical_declared(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT A FROM "m", "t""#));
-    assert!(identical_declared(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT "m"."A" FROM "m", "t""#));
-    assert!(identical_declared(QUOTED, r#"SELECT A FROM "m", "t""#, r#"SELECT "t"."a" FROM "m", "t""#));
+    assert!(!identical(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT A FROM "m", "t""#));
+    assert!(identical(QUOTED, r#"SELECT "A" FROM "m", "t""#, r#"SELECT "m"."A" FROM "m", "t""#));
+    assert!(identical(QUOTED, r#"SELECT A FROM "m", "t""#, r#"SELECT "t"."a" FROM "m", "t""#));
     assert!(identical(QUOTED, r#"SELECT "A" FROM "m""#, r#"SELECT "m"."A" FROM "m""#));
     // A query that spells a quoted column unquoted reads a column that does not exist.
     refused(QUOTED, r#"SELECT A FROM "m""#, r#"SELECT "A" FROM "m""#, "schema", "unresolved column a");

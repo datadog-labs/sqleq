@@ -51,7 +51,7 @@
 //! [`crate::params::root_cause`] uses to tell a conflict inference *found* from one a misalignment
 //! *manufactured*.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -547,8 +547,8 @@ fn add_factor(tf: &TableFactor, s: &mut ScopeInfo) -> Result<()> {
             // module synthesizes is looked up by `cat.find` with that string, so agreeing with the
             // consumer matters more here than agreeing with sqlglot's schema-stripped `Table.name`.
             // Prepared cases have no schema qualifiers, so the two coincide anyway. Folded, not
-            // lower-cased: `cat.find` compares up to case, and `build_inferred` refuses two names
-            // that are one up to case, so the lookup cannot merge `"Orders"` with `orders`.
+            // lower-cased: `cat.find` compares up to case, and `refuse_tables_up_to_case` refuses
+            // two names that are one up to case, so the lookup cannot merge `"Orders"` with `orders`.
             let tn = folded_name(name)?;
             let key = alias.as_ref().map(|a| fold_ident(&a.name)).unwrap_or_else(|| tn.clone());
             s.base.insert(key, tn);
@@ -1204,8 +1204,10 @@ fn column_name(e: &Expr) -> Option<String> {
 
 /// What inference concluded about a pair.
 pub struct Inferred {
-    /// The synthesized base-table schema.
-    pub catalog: Catalog,
+    /// The synthesized base-table schema, built only when [`infer`] was given no declared catalog:
+    /// `None` exactly when it was given one, since a pair with a declared catalog is lowered against
+    /// that catalog, and refusing for a catalog nothing reads would refuse pairs lowering can lower.
+    pub catalog: Option<Catalog>,
     /// `$N` → its type, for every parameter either query mentions. No evidence means
     /// [`Ty::Opaque`], the same fail-safe the columns get.
     pub params: std::collections::BTreeMap<u32, Ty>,
@@ -1226,10 +1228,11 @@ pub struct Inferred {
 /// Infer a [`Catalog`] for `queries`, which are assumed to be the two sides of one pair.
 ///
 /// The catalog alone, for tests that assert on the synthesized schema. The shipping path calls
-/// [`infer`] and keeps the rest of the [`Inferred`].
+/// [`infer`] and keeps the rest of the [`Inferred`]. No declared catalog, since only then is one
+/// synthesized.
 #[cfg(test)]
-fn infer_catalog(queries: &[Query], prov: Option<&Catalog>) -> Result<Catalog> {
-    Ok(infer(queries, prov)?.catalog)
+fn infer_catalog(queries: &[Query]) -> Result<Catalog> {
+    Ok(infer(queries, None)?.catalog.expect("synthesized when no catalog is declared"))
 }
 
 /// Infer a schema and parameter types for `queries`, the two sides of one pair.
@@ -1237,7 +1240,10 @@ fn infer_catalog(queries: &[Query], prov: Option<&Catalog>) -> Result<Catalog> {
 /// One [`Uf`] is shared across both sides on purpose: a type the left query states outright must
 /// reach the right query's copy of the same column, or the pair gets two different schemas and the
 /// comparison is meaningless. `prov` supplies a declared schema when one exists, used only to
-/// disambiguate bare columns and to seed authoritative types.
+/// disambiguate bare columns and to seed authoritative types. With one, no catalog is synthesized
+/// ([`Inferred::catalog`] is `None`): the pair is lowered against the declared catalog, which
+/// refuses what it cannot lower for reasons of its own. Without one, [`build_inferred`] synthesizes
+/// it, and refuses a pair it cannot synthesize a table for.
 pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
     let mut at = Attributor::new(prov);
     for q in queries {
@@ -1311,7 +1317,16 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
             Ok(())
         })?;
     }
-    let catalog = build_inferred(&at.all_tables, &at.cols, &mut uf)?;
+    let catalog = match prov {
+        // Attribution reads each table by its folded name under both catalogs, so the check that
+        // no two of the pair's tables are one name up to case holds for both; `build_inferred`
+        // makes it first.
+        Some(_) => {
+            refuse_tables_up_to_case(&at.all_tables, &at.cols)?;
+            None
+        }
+        None => Some(build_inferred(&at.all_tables, &at.cols, &mut uf)?),
+    };
     Ok(Inferred { catalog, params, col: at.col, fn_ret, uf })
 }
 
@@ -1390,30 +1405,22 @@ fn shift_params(q: &mut Query, by: u32) {
     });
 }
 
-/// Assemble a [`Catalog`] from inferred column types.
+/// Refuse a pair that names two tables whose names are one up to case: `"Orders"` and `orders`, or
+/// `"S".t` and `s.t`.
 ///
-/// `cols` lists, per table, the columns the queries actually read — inference only knows about
-/// those, so the synthesized table has exactly them, sorted, matching the preprocessor's rendering
-/// so the two can be compared column by column. `all_tables` is every base table the FROM clauses
-/// mention: one with no attributed column at all cannot be synthesized, and pretending it has no
-/// columns would silently change what `SELECT *` means.
+/// Kept apart they are two tables in Postgres, but lowering finds a table by [`Catalog::find`], up
+/// to case, so found in one slot both sides read one. [`build_inferred`], which stores a
+/// synthesized table under its lower-cased name, makes this check first, as
+/// [`Catalog::check_case_collisions`] refuses a DDL that declares two such tables.
 ///
-/// Everything is nullable and there are no keys: both are constraints that *shrink* the space of
-/// instances the prover quantifies over, so inventing either could turn a non-equivalence into a
-/// proof. Only a declared DDL may supply them.
-///
-/// The tables and columns arrive named as Postgres identifies them (see [`Atom::Col`]). A column
-/// keeps that name, which is the one lowering resolves. A table's name is lower-cased, as the
-/// declared catalog stores it, because lowering finds a table by [`Catalog::find`], up to case. That
-/// is sound only where no two of the pair's tables are one name up to case, so a pair that names
-/// two, `"Orders"` and `orders` or `"S".t` and `s.t`, is refused, as
-/// [`Catalog::check_case_collisions`] refuses a DDL that declares two. Kept apart they are two
-/// tables in Postgres; merged, both sides read one.
-pub fn build_inferred(
+/// [`infer`] makes it under the seeded catalog too, where nothing is synthesized. That is the
+/// conservative choice rather than a necessary one: with only `orders` declared, the declared
+/// catalog lowers a pair that reads `"Orders"` against `orders` by finding both in `orders`, and the
+/// seeded catalog refuses it.
+fn refuse_tables_up_to_case(
     all_tables: &BTreeSet<String>,
     cols: &HashMap<String, BTreeSet<String>>,
-    uf: &mut Uf,
-) -> Result<Catalog> {
+) -> Result<()> {
     let mut stored: HashMap<String, &String> = HashMap::new();
     for t in all_tables.iter().chain(cols.keys()).collect::<BTreeSet<_>>() {
         if let Some(other) = stored.insert(t.to_lowercase(), t) {
@@ -1423,14 +1430,80 @@ pub fn build_inferred(
             )));
         }
     }
+    Ok(())
+}
+
+/// Why [`build_inferred`] has no column to synthesize for the tables in `unread`: no column
+/// reference was attributed to them. And, where the pair names another table with the same last
+/// name, that the two are two tables, since a bare `t` and a qualified `s.t` look like one.
+fn unread_reason(unread: &[&String], all_tables: &BTreeSet<String>) -> String {
+    let them = if unread.len() == 1 { "it" } else { "any of them" };
+    let mut reason = format!(
+        "no column reference is attributed to {them}, as when a table is read only through *, \
+         count(*), a constant or a USING list, so its columns cannot be inferred"
+    );
+    let mut by_last: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for t in all_tables {
+        by_last.entry(t.rsplit('.').next().unwrap_or(t)).or_default().push(t);
+    }
+    for same in by_last.values().filter(|same| same.len() > 1) {
+        if same.iter().any(|t| unread.iter().any(|u| u.as_str() == *t)) {
+            let (last, rest) = same.split_last().expect("more than one");
+            let n = if same.len() == 2 { "two" } else { "different" };
+            reason.push_str(&format!("; {} and {last} are {n} tables", rest.join(", ")));
+        }
+    }
+    reason
+}
+
+/// Assemble a [`Catalog`] from inferred column types: the catalog `--infer` lowers against, when
+/// the pair has no declared one. Under the seeded catalog nothing is synthesized (see [`infer`]).
+///
+/// `cols` lists, per table, the columns the queries actually read — inference only knows about
+/// those, so the synthesized table has exactly them, sorted, matching the preprocessor's rendering
+/// so the two can be compared column by column. `all_tables` is every base table the FROM clauses
+/// mention: one with no attributed column at all cannot be synthesized, and pretending it has no
+/// columns would silently change what `SELECT *` means. So a pair is refused when a table it reads
+/// has none, as when the table is read only through `*`, `count(*)`, a constant or a `USING` list:
+/// as `table without referenced columns`, or, when no table has one, as a schema error. `no base
+/// tables` is reserved for a pair that names no table.
+///
+/// Everything is nullable and there are no keys: both are constraints that *shrink* the space of
+/// instances the prover quantifies over, so inventing either could turn a non-equivalence into a
+/// proof. Only a declared DDL may supply them.
+///
+/// The tables and columns arrive named as Postgres identifies them (see [`Atom::Col`]). A column
+/// keeps that name, which is the one lowering resolves. A table's name is lower-cased, as the
+/// declared catalog stores it, because lowering finds a table by [`Catalog::find`], up to case. That
+/// is sound only where no two of the pair's tables are one name up to case, so a pair that names
+/// two is refused first ([`refuse_tables_up_to_case`]).
+pub fn build_inferred(
+    all_tables: &BTreeSet<String>,
+    cols: &HashMap<String, BTreeSet<String>>,
+    uf: &mut Uf,
+) -> Result<Catalog> {
+    refuse_tables_up_to_case(all_tables, cols)?;
     let mut names: Vec<&String> = cols.keys().filter(|t| !cols[*t].is_empty()).collect();
     // By the name each table is stored under, unique once the check above has passed.
     names.sort_by_key(|t| t.to_lowercase());
+    let unread: Vec<&String> =
+        all_tables.iter().filter(|t| cols.get(*t).is_none_or(BTreeSet::is_empty)).collect();
     if names.is_empty() {
-        return Err(schema("no base tables"));
+        if unread.is_empty() {
+            return Err(schema("no base tables"));
+        }
+        let list: Vec<&str> = unread.iter().map(|t| t.as_str()).collect();
+        return Err(schema(format!(
+            "no base table with a referenced column: {} ({})",
+            list.join(", "),
+            unread_reason(&unread, all_tables)
+        )));
     }
-    if let Some(missing) = all_tables.iter().find(|t| !cols.contains_key(*t) || cols[*t].is_empty()) {
-        return Err(unsupported(format!("table without referenced columns: {missing}")));
+    if let Some(missing) = unread.first() {
+        return Err(unsupported(format!(
+            "table without referenced columns: {missing} ({})",
+            unread_reason(&[missing], all_tables)
+        )));
     }
     let mut tables = Vec::new();
     for t in names {
@@ -1482,7 +1555,7 @@ mod tests {
 
     /// `(table, column, prover type)` for every synthesized column, sorted.
     fn schema_of(sql: &str) -> Vec<(String, String, String)> {
-        let cat = infer_catalog(&parse(sql), None).expect("inferable");
+        let cat = infer_catalog(&parse(sql)).expect("inferable");
         cat.tables
             .iter()
             .flat_map(|t| t.cols.iter().map(|(c, ty)| (t.name.clone(), c.clone(), ty.clone())))
@@ -1490,7 +1563,7 @@ mod tests {
     }
 
     fn err_of(sql: &str) -> String {
-        match infer_catalog(&parse(sql), None) {
+        match infer_catalog(&parse(sql)) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("should refuse: {sql}"),
         }
