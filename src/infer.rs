@@ -61,6 +61,7 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::{obj_name, Catalog, Table};
+use crate::dml::fold_ident;
 use crate::error::{schema, unsupported, FrontendError, Result};
 
 /// The types inference can conclude. A deliberately coarse lattice: the concrete points and a top.
@@ -191,7 +192,10 @@ impl Origin {
 /// function we do not model.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Atom {
-    /// `(table, column)`, both lowercased.
+    /// `(table, column)`, each named as Postgres identifies it: an unquoted name folded to lower
+    /// case, a quoted one as written ([`crate::dml::fold_ident`]), so `"Orders"` and `orders` are
+    /// two tables and `"createdAt"` is not `createdat`. A table is its folded parts joined by `.`
+    /// ([`folded_name`]).
     Col(String, String),
     /// `$N` in the source; `qpN(0)` once the preprocessor has substituted it.
     Param(u32),
@@ -517,24 +521,42 @@ fn factor_alias(tf: &TableFactor) -> Option<String> {
         | TableFactor::JsonTable { alias, .. } => alias.as_ref(),
         _ => None,
     };
-    a.map(|a| a.name.value.to_lowercase())
+    a.map(|a| fold_ident(&a.name))
 }
 
-fn add_factor(tf: &TableFactor, s: &mut ScopeInfo) {
+/// A relation's name as Postgres identifies it: each part folded by [`fold_ident`], joined by `.`
+/// as [`obj_name`] joins them. So `"S".t` is `S.t` and `s.t` is `s.t`, two tables, where a
+/// lower-cased [`obj_name`] made them one.
+///
+/// A part that is not an identifier (a dialect's identifier-generating function) has no spelling
+/// whose quoting can be read, so the name is refused rather than folded by a guess.
+fn folded_name(n: &ObjectName) -> Result<String> {
+    let parts = n
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(fold_ident))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| unsupported(format!("table name {n} with a part that is not an identifier")))?;
+    Ok(parts.join("."))
+}
+
+fn add_factor(tf: &TableFactor, s: &mut ScopeInfo) -> Result<()> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
             // The full dotted name, matching `factor_instance`'s `obj_name(name)` — the catalog this
-            // module synthesizes is looked up by `cat.find` with exactly that string, so agreeing
-            // with the consumer matters more here than agreeing with sqlglot's schema-stripped
-            // `Table.name`. Prepared cases have no schema qualifiers, so the two coincide anyway.
-            let tn = obj_name(name).to_lowercase();
-            let key = alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| tn.clone());
+            // module synthesizes is looked up by `cat.find` with that string, so agreeing with the
+            // consumer matters more here than agreeing with sqlglot's schema-stripped `Table.name`.
+            // Prepared cases have no schema qualifiers, so the two coincide anyway. Folded, not
+            // lower-cased: `cat.find` compares up to case, and `build_inferred` refuses two names
+            // that are one up to case, so the lookup cannot merge `"Orders"` with `orders`.
+            let tn = folded_name(name)?;
+            let key = alias.as_ref().map(|a| fold_ident(&a.name)).unwrap_or_else(|| tn.clone());
             s.base.insert(key, tn);
         }
         // `(a JOIN b)` without an alias contributes *a*'s and *b*'s columns to this same scope,
         // which is what SQL does; with an alias it is opaque, like a derived table.
         TableFactor::NestedJoin { table_with_joins, alias: None } => {
-            add_twj(table_with_joins, s);
+            add_twj(table_with_joins, s)?;
         }
         other => {
             s.nderiv += 1;
@@ -543,21 +565,23 @@ fn add_factor(tf: &TableFactor, s: &mut ScopeInfo) {
             }
         }
     }
+    Ok(())
 }
 
-fn add_twj(twj: &TableWithJoins, s: &mut ScopeInfo) {
-    add_factor(&twj.relation, s);
+fn add_twj(twj: &TableWithJoins, s: &mut ScopeInfo) -> Result<()> {
+    add_factor(&twj.relation, s)?;
     for j in &twj.joins {
-        add_factor(&j.relation, s);
+        add_factor(&j.relation, s)?;
     }
+    Ok(())
 }
 
-fn collect_scope(from: &[TableWithJoins]) -> ScopeInfo {
+fn collect_scope(from: &[TableWithJoins]) -> Result<ScopeInfo> {
     let mut s = ScopeInfo::default();
     for twj in from {
-        add_twj(twj, &mut s);
+        add_twj(twj, &mut s)?;
     }
-    s
+    Ok(s)
 }
 
 /// Walks the statement structure keeping a stack of enclosing [`ScopeInfo`]s, and attributes every
@@ -589,9 +613,13 @@ struct Attributor<'a> {
 }
 
 /// Whether a declared catalog says `table` has `col`.
+///
+/// The table is found as lowering finds it ([`Catalog::find`]), and the column by its exact folded
+/// name, as lowering resolves it: the catalog stores a column under `dml::fold_ident`'s name, and
+/// so does attribution. Compared up to case, `"A"` over `m ("A")` and `t (a)` was declared by both, and
+/// an unquoted `A` (which is `t.a`) was declared by `m` as well.
 pub fn declares(cat: &Catalog, table: &str, col: &str) -> bool {
-    cat.find(table)
-        .is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c.eq_ignore_ascii_case(col)))
+    cat.find(table).is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c == col))
 }
 
 impl<'a> Attributor<'a> {
@@ -647,11 +675,13 @@ impl<'a> Attributor<'a> {
         if self.field_access.contains(&nid(e)) {
             return Ok(());
         }
+        // Folded as Postgres folds them, which is how lowering resolves the same names: a quoted
+        // `"createdAt"` is not `createdat`, and a qualifier `"O"` is not the alias `o`.
         let (qual, col) = match e {
-            Expr::Identifier(id) => (None, id.value.to_lowercase()),
+            Expr::Identifier(id) => (None, fold_ident(id)),
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-                Some(parts[parts.len() - 2].value.to_lowercase()),
-                parts[parts.len() - 1].value.to_lowercase(),
+                Some(fold_ident(&parts[parts.len() - 2])),
+                fold_ident(&parts[parts.len() - 1]),
             ),
             _ => return Ok(()),
         };
@@ -736,9 +766,12 @@ impl Visitor for Attributor<'_> {
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
         let scope = match q.body.as_ref() {
             sqlparser::ast::SetExpr::Select(s) => collect_scope(&s.from),
-            _ => ScopeInfo::default(),
+            _ => Ok(ScopeInfo::default()),
         };
-        self.stack.push(scope);
+        match scope {
+            Ok(scope) => self.stack.push(scope),
+            Err(err) => return ControlFlow::Break(err),
+        }
         ControlFlow::Continue(())
     }
 
@@ -748,7 +781,10 @@ impl Visitor for Attributor<'_> {
     }
 
     fn pre_visit_select(&mut self, s: &Select) -> ControlFlow<Self::Break> {
-        let scope = collect_scope(&s.from);
+        let scope = match collect_scope(&s.from) {
+            Ok(scope) => scope,
+            Err(err) => return ControlFlow::Break(err),
+        };
         self.all_tables.extend(scope.base.values().cloned());
         self.stack.push(scope);
         for c in [s.selection.as_ref(), s.having.as_ref()].into_iter().flatten() {
@@ -1223,9 +1259,9 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
         for (t, cols) in &at.cols {
             if let Some(i) = cat.find(t) {
                 for c in cols {
-                    // `c` is lower-cased, as every attributed name is, and the catalog keeps a quoted
-                    // declaration's case; `Catalog::check_case_collisions` makes the match unique.
-                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n.to_lowercase() == *c) {
+                    // `c` is folded as Postgres folds it, as every attributed name is, and so is the
+                    // catalog's name for a column: an exact match is the column lowering reads.
+                    if let Some((_, ty)) = cat.tables[i].cols.iter().find(|(n, _)| n == c) {
                         // Seeded even when the declared type is one nothing recognises: `Opaque` at
                         // `Schema` confidence is a *fact* -- the DDL says this column holds
                         // something we do not model -- and it has to outrank a name guess, or a
@@ -1365,13 +1401,31 @@ fn shift_params(q: &mut Query, by: u32) {
 /// Everything is nullable and there are no keys: both are constraints that *shrink* the space of
 /// instances the prover quantifies over, so inventing either could turn a non-equivalence into a
 /// proof. Only a declared DDL may supply them.
+///
+/// The tables and columns arrive named as Postgres identifies them (see [`Atom::Col`]). A column
+/// keeps that name, which is the one lowering resolves. A table's name is lower-cased, as the
+/// declared catalog stores it, because lowering finds a table by [`Catalog::find`], up to case. That
+/// is sound only where no two of the pair's tables are one name up to case, so a pair that names
+/// two, `"Orders"` and `orders` or `"S".t` and `s.t`, is refused, as
+/// [`Catalog::check_case_collisions`] refuses a DDL that declares two. Kept apart they are two
+/// tables in Postgres; merged, both sides read one.
 pub fn build_inferred(
     all_tables: &BTreeSet<String>,
     cols: &HashMap<String, BTreeSet<String>>,
     uf: &mut Uf,
 ) -> Result<Catalog> {
+    let mut stored: HashMap<String, &String> = HashMap::new();
+    for t in all_tables.iter().chain(cols.keys()).collect::<BTreeSet<_>>() {
+        if let Some(other) = stored.insert(t.to_lowercase(), t) {
+            return Err(unsupported(format!(
+                "two tables named {} up to case: {other} and {t}",
+                t.to_lowercase()
+            )));
+        }
+    }
     let mut names: Vec<&String> = cols.keys().filter(|t| !cols[*t].is_empty()).collect();
-    names.sort();
+    // By the name each table is stored under, unique once the check above has passed.
+    names.sort_by_key(|t| t.to_lowercase());
     if names.is_empty() {
         return Err(schema("no base tables"));
     }
@@ -1389,7 +1443,7 @@ pub fn build_inferred(
             .collect();
         let n = cols.len();
         tables.push(Table {
-            name: t.clone(),
+            name: t.to_lowercase(),
             n_declared: n,
             cols,
             nullable: vec![true; n],
