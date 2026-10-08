@@ -2485,16 +2485,29 @@ impl AggCtx<'_> {
             d
         } else if let Some(t) = opaque_agg_ret(&a.op) {
             t.to_string()
-        } else if a.op == "AVG" && operand.first().is_some_and(|f| ty_of(f) == "INTEGER") {
+        } else if (a.op == "AVG" || a.op == "SUM")
+            && operand.first().is_some_and(|f| ty_of(f) == "INTEGER")
+        {
             // SOUNDNESS GUARD. `avg` over `smallint`, `integer` or `bigint` returns `numeric`, the
             // IR's REAL: the mean of `{0, 1}` is `0.5`. Typed like its operand, it was an integer to
             // the provers, and QED proved `avg(a) = 0` equivalent to `avg(a) < 1 AND avg(a) > -1`.
             // It has `numeric`'s `=` too, which is not identity: `avg` over `{19999}` prints
             // `19999.0000000000000000` and over `{39998, 0}` `19999.000000000000`, so a read of it
             // that can tell the two apart, a cast to text or a division, is [`crate::equality`]'s.
-            // Over `numeric` the operand's type is already right, over a float the call is refused
-            // ([`FLOAT_SUMMING_AGGS`]), and `sum` over an integer is an integer (`bigint`, or a
-            // `numeric` of scale 0 over `bigint`), so those keep the fallback below.
+            //
+            // `sum` over `smallint` or `integer` returns `bigint`, but over `bigint` it returns
+            // `numeric`, and the IR has one INTEGER for every width, so it cannot tell which. Typed
+            // as an integer, `sum(g) / 2` over a `bigint` was an integer division to the provers,
+            // which `numeric` division is not (`1 / 2` is `0.5`), and QED proved `sum(g) / 2 = 0`
+            // equivalent to `sum(g) / 2 < 1 AND sum(g) / 2 > -1`; `count`, a `bigint`, made a sum
+            // over it the same. So an integer `sum` is typed as the type both results fit: a
+            // `numeric`, whose value is an integer. Every read of it on which a `bigint` and an
+            // integer-valued `numeric` agree, a comparison or `+`, passes [`crate::equality`]; a
+            // division does not, and is refused unless both queries are one plan. The cost is a
+            // `sum` over an `integer` divided, an integer division Postgres would compute.
+            //
+            // Over `numeric` the operand's type is already right, and over a float the call is
+            // refused ([`FLOAT_SUMMING_AGGS`]).
             "REAL".to_string()
         } else if let Some(f) = operand.first() {
             ty_of(f)
