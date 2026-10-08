@@ -4,3 +4,5 @@ guava,https://github.com/google/guava,Apache-2.0,The Guava Authors
 jackson-databind,https://github.com/FasterXML/jackson-databind,Apache-2.0,"Copyright 2007-, Tatu Saloranta"
 SQLSolver,https://github.com/SJTU-IPADS/SQLSolver,Apache-2.0,Copyright 2022 OpenSource
 libz3,https://github.com/Z3Prover/z3,MIT,Copyright (c) Microsoft Corporation
+postgresql,https://github.com/theseus-rs/postgresql-binaries,PostgreSQL,"Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group; Portions Copyright (c) 1994, The Regents of the University of California"
+openssl,https://github.com/openssl/openssl,Apache-2.0,Copyright (c) 1998-2025 The OpenSSL Project Authors

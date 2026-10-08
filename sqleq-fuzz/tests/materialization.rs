@@ -3,8 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! The generated instance is one Postgres would accept, every table is the table Postgres would
-//! resolve, and DuckDB computes Postgres's value on it (issue #64).
+//! The generated instance is one Postgres would accept, and every table is the table Postgres would
+//! resolve (issue #64).
 
 use sqleq_fuzz::schema::parse_schema;
 use sqleq_fuzz::{test_pair, Config};
@@ -185,40 +185,6 @@ fn every_frozen_clock_reads_one_instant() {
 }
 
 #[test]
-fn jsonb_build_object_keys_are_normalized() {
-    let ddl = r#"create table "t" ("id" INTEGER, "a" INTEGER, unique ("id"))"#;
-    for (a, b) in [
-        (
-            r#"jsonb_build_object('a', "a", 'b', "id")"#,
-            r#"jsonb_build_object('b', "id", 'a', "a")"#,
-        ),
-        (
-            r#"jsonb_build_object('a', "id", 'a', "a")"#,
-            r#"jsonb_build_object('a', "a")"#,
-        ),
-    ] {
-        assert_eq!(
-            label(
-                &format!(r#"SELECT "id", {a} AS "j" FROM "t""#),
-                &format!(r#"SELECT "id", {b} AS "j" FROM "t""#),
-                ddl
-            ),
-            "NO-COUNTEREXAMPLE",
-            "{a} / {b}"
-        );
-    }
-    // `json_build_object` keeps order and duplicates, as Postgres's `json` does.
-    assert_eq!(
-        label(
-            r#"SELECT "id", json_build_object('a', "a", 'b', "id")::text AS "j" FROM "t""#,
-            r#"SELECT "id", json_build_object('b', "id", 'a', "a")::text AS "j" FROM "t""#,
-            ddl
-        ),
-        "NOT-EQUIVALENT"
-    );
-}
-
-#[test]
 fn a_record_compares_by_its_values_not_its_field_types() {
     let ddl = r#"create table "t" ("id" INTEGER, "b" BIGINT, unique ("id"))"#;
     assert_eq!(
@@ -238,31 +204,4 @@ fn a_record_compares_by_its_values_not_its_field_types() {
         ),
         "NOT-EQUIVALENT"
     );
-}
-
-#[test]
-fn regex_operators_match_anywhere_and_similar_to_is_withheld() {
-    let ddl = r#"create table "t" ("id" INTEGER, "c" TEXT, unique ("id"))"#;
-    for (a, b) in [
-        (r#""c" || 'x' ~ 'a'"#, r#""c" || 'x' LIKE '%a%'"#),
-        (r#""c" ~* 'A'"#, r#""c" ILIKE '%a%'"#),
-        (r#""c" !~ 'a'"#, r#""c" NOT LIKE '%a%'"#),
-        (r#""c" !~* 'A'"#, r#""c" NOT ILIKE '%a%'"#),
-    ] {
-        assert_eq!(
-            label(
-                &format!(r#"SELECT "id" FROM "t" WHERE {a}"#),
-                &format!(r#"SELECT "id" FROM "t" WHERE {b}"#),
-                ddl
-            ),
-            "NO-COUNTEREXAMPLE",
-            "{a} / {b}"
-        );
-    }
-    let v = label(
-        r#"SELECT "id" FROM "t" WHERE "c" SIMILAR TO 'a%'"#,
-        r#"SELECT "id" FROM "t" WHERE "c" LIKE 'a%'"#,
-        ddl,
-    );
-    assert!(v.starts_with("NOT-COMPARABLE:"), "{v}");
 }

@@ -160,6 +160,9 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The pairs run on the PostgreSQL the build fetches (sqleq-fuzz/build.rs), the one a user
+      # gets; this makes the Postgres tests fail, not skip, if it cannot run on the runner.
+      SQLEQ_PG_REQUIRED: "1"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,7 +173,8 @@ jobs:
           rustc --version && cargo --version
           echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
-      # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library.
+      # Keyed separately from the frontend: this cache also carries the downloaded DuckDB library
+      # and the fetched PostgreSQL.
       # The prefix names the build settings in the job's `env`, as in the frontend job; change it
       # whenever they change.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

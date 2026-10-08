@@ -6,7 +6,7 @@
 //! The fuzz axis.
 //!
 //! sqleq-fuzz is the only axis that can refute: it runs both statements on random instances in
-//! DuckDB and compares the results. It reads the pair file itself and binds `$N` on its own, so it
+//! PostgreSQL and compares the results. It reads the pair file itself and binds `$N` on its own, so it
 //! needs no frontend and ignores the catalog header. The trial budget is always passed explicitly
 //! -- the tool's defaults are free to change, and a pinned `no-counterexample` is only a claim about
 //! one budget.
@@ -23,7 +23,12 @@ use crate::case::Case;
 use crate::inputs::CorpusRow;
 use crate::util::{abspath, tail};
 
-pub const FUZZ_ARGS: [&str; 6] = ["--trials", "120", "--rows", "5", "--seed", "0"];
+/// The engine is named too: only the Postgres engine's verdicts are claims about Postgres. The
+/// DuckDB engine answers as DuckDB evaluates the pair, so a counterexample from it is no evidence for
+/// a portfolio or an alarm, and `SQLEQ_FUZZ_ENGINE` must not be able to swap it in.
+pub const FUZZ_ARGS: [&str; 8] = [
+    "--trials", "120", "--rows", "5", "--seed", "0", "--engine", "postgres",
+];
 
 /// The label's kind is the part before the first `:` (`ERROR:…`, `PARAM-MISALIGNED:…`).
 fn word_of(kind: &str) -> &'static str {
