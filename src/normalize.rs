@@ -67,11 +67,12 @@ use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
     Ident, Interval,
     JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableWithJoins, TypedString, UnaryOperator, Value, Visit, VisitMut,
-    Visitor, VisitorMut,
+    SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableWithJoins, TypedString, UnaryOperator,
+    Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use crate::error::{unsupported, FrontendError, Result};
+use crate::lower::{drops_subquery_order, sees_row_order};
 
 /// Refuse, anywhere in `statements`, the precedence shapes listed in the module documentation.
 pub fn fix_precedence(statements: &mut [Statement]) -> Result<()> {
@@ -963,11 +964,13 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
     }
 }
 
-/// Drop every `ORDER BY`, but only if nothing anywhere in the tree consumes an ordering.
+/// Drop every `ORDER BY` that nothing can observe.
 ///
 /// The prover compares relations as bags, in which row order is not part of the value, so an
-/// `ORDER BY` with nothing downstream to consume it is dead. Two constructs consume one, and either
-/// one anywhere blocks the strip for the whole tree:
+/// `ORDER BY` with nothing to consume it is dead. Two kinds of construct consume one.
+///
+/// The first kind reads the ordering of its own query level, and one of these anywhere blocks the
+/// strip for the whole tree:
 ///
 /// - a **row slice**, which is the opposite of dead — it is what *chooses* the rows the slice keeps;
 /// - **`DISTINCT ON`**, which chooses the surviving row of each key group. It is the subtler of the
@@ -978,16 +981,40 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
 ///
 /// Tree-wide, unlike [`strip_in_exists_distinct`]'s per-node guards, and deliberately so: this
 /// clears orderings at every level at once, including ones above a slice, so "somewhere else" is
-/// exactly the case that has to stop it.
+/// exactly the case that has to stop it. A slice also reads the ordering of a subquery below it, as
+/// the second kind does.
+///
+/// The second kind reads the order in which a subquery hands it its rows, which Postgres keeps from
+/// the subquery's `ORDER BY`: `string_agg` over `(SELECT x FROM t ORDER BY x)` concatenates in that
+/// order, `DISTINCT` and `GROUP BY` keep the first of two values `=` calls equal (`2.0` and `2.00`)
+/// and `max` the last, and `row_number() OVER ()` numbers the rows in it. One of these anywhere
+/// keeps every `ORDER BY` but the outermost query's own:
+///
+/// - an aggregate whose result that order can change ([`sees_row_order`]): an order-sensitive one,
+///   one that adds in floating point, `min`, `max`;
+/// - `DISTINCT`, `GROUP BY`, and a set operation other than `UNION ALL`, which keep one member of
+///   each class of equal values;
+/// - a window function, and a function over a subquery (`ARRAY(SELECT …)`).
+///
+/// This pass has no types, so it cannot tell a `max` over integers, where the member kept is the
+/// only one there is, from one over `numeric`, and takes every one of them to observe the order. The
+/// outermost query's own `ORDER BY` has nothing above it, and each of these acts on its level's rows
+/// before that level's `ORDER BY` sorts them, so it is dead unless the first kind is present. That is
+/// the one the lowering drops without a trace too (`lower::apply_pagination`).
 ///
 /// Only query-level orderings. `ORDER BY` inside a window spec or an ordered-set aggregate is part
 /// of that operator's value and lives on a different node.
 pub fn strip_dead_order_by(queries: &mut [Query]) {
-    let mut find = FindSlice(false);
+    let mut find = FindConsumer(Consumer::None);
     for q in queries.iter() {
-        let _ = q.visit(&mut find);
+        if q.visit(&mut find).is_break() {
+            return;
+        }
     }
-    if find.0 {
+    if find.0 == Consumer::OfRows {
+        for q in queries {
+            q.order_by = None;
+        }
         return;
     }
     let mut strip = StripOrder;
@@ -996,17 +1023,61 @@ pub fn strip_dead_order_by(queries: &mut [Query]) {
     }
 }
 
-struct FindSlice(bool);
+/// The strongest consumer of an ordering [`FindConsumer`] has seen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Consumer {
+    None,
+    /// One that reads the order a subquery hands it its rows: [`strip_dead_order_by`]'s second kind.
+    OfRows,
+}
 
-impl Visitor for FindSlice {
+/// Breaks on a consumer of [`strip_dead_order_by`]'s first kind, and records one of its second.
+struct FindConsumer(Consumer);
+
+impl Visitor for FindConsumer {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
         if has_row_slice(q) || body_has_distinct_on(q.body.as_ref()) {
-            self.0 = true;
             return ControlFlow::Break(());
         }
+        if body_keeps_one_of_equals(q.body.as_ref()) {
+            self.0 = Consumer::OfRows;
+        }
         ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Function(f) = e {
+            // A qualified name is matched on its last part: `pg_catalog.max` is `max`, and a
+            // function of some other schema that is not an aggregate only blocks more.
+            let bare = f.name.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_uppercase());
+            if f.over.is_some()
+                || matches!(f.args, FunctionArguments::Subquery(_))
+                || bare.is_none_or(|b| sees_row_order(&b))
+            {
+                self.0 = Consumer::OfRows;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether a query's own body keeps one member of each class of values `=` calls equal: a `DISTINCT`
+/// or a `GROUP BY` of a select, or a set operation other than `UNION ALL`. Through set operations,
+/// and not into a nested [`Query`], which the walk visits in its own right.
+fn body_keeps_one_of_equals(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(s) => {
+            matches!(s.distinct, Some(Distinct::Distinct))
+                || !matches!(&s.group_by, GroupByExpr::Expressions(v, _) if v.is_empty())
+        }
+        SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            let union_all = matches!(op, SetOperator::Union)
+                && matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+            !union_all || body_keeps_one_of_equals(left) || body_keeps_one_of_equals(right)
+        }
+        _ => false,
     }
 }
 
@@ -1048,7 +1119,18 @@ impl VisitorMut for StripOrder {
 ///
 /// Ties *within* the projected output are not a problem: both sides have the same output bag, so
 /// they have the same set of legal pages, which is all equivalence can mean for a query that does
-/// not pin one.
+/// not pin one. Unless a subquery's `ORDER BY` settles them. Postgres hands the page its input rows
+/// in the order that `ORDER BY` sorted them, so the ties go to the rows it puts first, and those are
+/// not the same rows for two equal bags sorted two ways:
+///
+/// ```text
+/// A: SELECT id FROM (SELECT id FROM t ORDER BY id)      AS s LIMIT 1   -- yields min(id)
+/// B: SELECT id FROM (SELECT id FROM t ORDER BY id DESC) AS s LIMIT 1   -- yields max(id)
+/// ```
+///
+/// So the pagination stays wherever lowering would drop a subquery's `ORDER BY` on either side
+/// ([`drops_subquery_order`]), and lowering decides whether the page is settled without it
+/// (`lower::apply_pagination`).
 ///
 /// # The condition is asked of both sides
 ///
@@ -1088,6 +1170,10 @@ pub fn strip_identical_pagination(queries: &mut [Query]) {
     // A top-level `DISTINCT ON` reads this `ORDER BY` to pick its rows, so it is not just the page's
     // ordering and cannot be dropped along with the page. See [`strip_dead_order_by`].
     if body_has_distinct_on(a.body.as_ref()) || body_has_distinct_on(b.body.as_ref()) {
+        return;
+    }
+    // A subquery's `ORDER BY` decides the ties of this page: see above.
+    if drops_subquery_order(a) || drops_subquery_order(b) {
         return;
     }
     let clauses = |q: &Query| {

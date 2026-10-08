@@ -219,6 +219,34 @@ const UNMODELLED_AGGS: [&str; 8] = [
     "CUME_DIST",
 ];
 
+/// The built-in aggregates whose result neither the order their rows arrive in nor which member of a
+/// class of values `=` calls equal arrives can change: `count` and `regr_count` count rows, and the
+/// others fold booleans, integers or bit strings, whose `=` is identity, with an operation that is
+/// commutative and associative.
+///
+/// SOUNDNESS GUARD for [`crate::normalize::strip_dead_order_by`], which reads it through
+/// [`sees_row_order`]: an aggregate listed here wrongly would let an `ORDER BY` it sees be stripped as
+/// dead. It lists the exceptions rather than the rule, so that an aggregate added to the lists above
+/// is taken to see the order until someone shows it does not.
+const ORDER_BLIND_AGGS: [&str; 8] =
+    ["COUNT", "REGR_COUNT", "BOOL_AND", "BOOL_OR", "EVERY", "BIT_AND", "BIT_OR", "BIT_XOR"];
+
+/// Whether `bare`, a call's unqualified name upper-cased, is a built-in aggregate whose result the
+/// order its rows arrive in can change: every aggregate this module knows but the
+/// [`ORDER_BLIND_AGGS`]. That is the [`ORDER_SENSITIVE_AGGS`] and the [`UNMODELLED_AGGS`]; the ones
+/// that add in floating point ([`FLOAT_SUMMING_AGGS`], [`FLOAT_ONLY_AGGS`]), whose rounding follows
+/// the order; and `min`, `max`, `range_agg` and `range_intersect_agg`, which keep one member of a
+/// class of values `=` calls equal: Postgres's `max` over `2.0` and then `2.00` is `2.00`, and over
+/// `2.00` and then `2.0` it is `2.0`.
+///
+/// [`crate::normalize::strip_dead_order_by`] has no types, so it cannot tell a `max` over integers
+/// from one over `numeric`, nor a `sum` over a float from one over an integer, and takes every one of
+/// these to read the order of the rows below it.
+pub(crate) fn sees_row_order(bare: &str) -> bool {
+    let known = is_known_agg(bare) || ORDER_SENSITIVE_AGGS.contains(&bare) || UNMODELLED_AGGS.contains(&bare);
+    known && !ORDER_BLIND_AGGS.contains(&bare)
+}
+
 /// The functions Postgres declares `VOLATILE`: their result can differ between two calls with the
 /// same arguments. Lowercase, as Postgres spells them, and sorted.
 ///
@@ -511,9 +539,31 @@ fn lower_query_ctx(cat: &Catalog, fns: &Fns, q: &Query, outer: &[Binding]) -> Re
 
 /// Wrap a lowered body in the prover's `Sort` when the query takes a row slice.
 ///
-/// `ORDER BY` on its own does not need a node: without a slice nothing downstream can observe the
-/// order, and bag semantics make it immaterial, so it is dropped exactly as before. A slice is what
-/// makes the order observable, and then the whole clause has to be carried.
+/// A slice is what makes the order observable at its own level, and then the whole clause has to be
+/// carried. `ORDER BY` on its own gets no node and is dropped: bag semantics make the order of a
+/// query's rows immaterial to its own value.
+///
+/// # A dropped subquery `ORDER BY` is still observable above it
+///
+/// Immaterial to the query's value is not immaterial to what reads its rows. Postgres hands an
+/// enclosing query a subquery's rows in the order its `ORDER BY` sorted them, and an operation above
+/// that keeps the first or the last of them sees that order:
+///
+/// - a row slice or `DISTINCT ON` whose own ordering leaves the choice open: `SELECT id FROM
+///   (SELECT id FROM t ORDER BY id) s LIMIT 1` returns the smallest `id`, and with `DESC` the
+///   largest;
+/// - an operation that keeps one member of a class of values `=` calls equal -- `DISTINCT`,
+///   `GROUP BY`, a set operation other than `UNION ALL`, `min`, `max` -- where a later read tells
+///   the members apart (`2.0` and `2.00` are one `numeric` and two strings);
+/// - an aggregate that folds the rows in order: the [`ORDER_SENSITIVE_AGGS`], and the
+///   [`FLOAT_SUMMING_AGGS`] over a float.
+///
+/// So a dropped subquery `ORDER BY` is guarded three ways. A slice or `DISTINCT ON` above it that its
+/// order can decide is refused here ([`refuse_slice_over_dropped_order`],
+/// [`refuse_distinct_on_over_dropped_order`]). The aggregates are refused wherever they are lowered.
+/// And a pair whose queries drop one ([`drops_subquery_order`]) is not taken to be one plan, so the
+/// checks that let a read telling two members apart through when both sides lower alike refuse it
+/// there too (`crate::emit`). The outermost query's `ORDER BY` has nothing above it to observe it.
 ///
 /// # What `Sort` means to the prover, and why an opaque node still proves things
 ///
@@ -558,6 +608,7 @@ fn apply_pagination(
     out_cols: &OutCols,
     sortable: Option<&SortScope>,
 ) -> Result<Value> {
+    refuse_distinct_on_over_dropped_order(q)?;
     let Some((limit, offset)) = row_slice(cat, fns, q)? else { return Ok(rel) };
     let collation = match collation(q, out_cols, sortable.is_none())? {
         CollationPlan::Direct(c) => c,
@@ -570,9 +621,47 @@ fn apply_pagination(
             return sort_sandwich(cat, fns, sortable, q, rel, out_cols, limit, offset);
         }
     };
+    refuse_slice_over_dropped_order(q, &collation, out_cols.len())?;
     Ok(json!({
         "sort": { "collation": collation, "limit": limit, "offset": offset, "source": rel }
     }))
+}
+
+/// SOUNDNESS GUARD: refuse a row slice of `q` that the order of its input rows can decide, where a
+/// query inside `q` sets that order with an `ORDER BY` the lowering drops (see [`apply_pagination`]).
+///
+/// `collation` is the slice's ordering, as [`collation`] or [`sort_sandwich`] built it, and `n_out`
+/// the number of columns `q` returns. The input order cannot decide the slice when the ordering keys
+/// every one of those columns: rows it ties are then equal under `=` in every column the slice
+/// returns, so whichever of them it keeps, the bag of values is the same. Which members of their
+/// classes it keeps can still differ, and a read above that tells them apart is refused because the
+/// pair is not then taken to be one plan. Any other ordering, or none, leaves the choice to the input
+/// order. Which query inside `q` drops its `ORDER BY` is not asked, so one whose rows never reach the
+/// slice (a sibling below a slice of its own, say) refuses too.
+fn refuse_slice_over_dropped_order(q: &Query, collation: &[Value], n_out: usize) -> Result<()> {
+    let keyed = |i: usize| collation.iter().any(|e| e.get(0).and_then(Value::as_u64) == Some(i as u64));
+    if (0..n_out).all(keyed) || !drops_subquery_order(q) {
+        return Ok(());
+    }
+    Err(unsupported(
+        "row slice over a subquery ORDER BY the lowering drops: the order it gives the rows can decide which \
+         rows the slice keeps",
+    ))
+}
+
+/// SOUNDNESS GUARD: refuse a `DISTINCT ON` of `q` over a query inside `q` whose `ORDER BY` the
+/// lowering drops (see [`apply_pagination`]). The order the rows arrive in decides which row of each
+/// key `DISTINCT ON` keeps wherever its own `ORDER BY` leaves a tie, and that is taken to be always,
+/// which refuses more than it has to and asks nothing of the ordering.
+fn refuse_distinct_on_over_dropped_order(q: &Query) -> Result<()> {
+    let distinct_on = matches!(q.body.as_ref(), SetExpr::Select(s) if matches!(s.distinct, Some(Distinct::On(_))));
+    if distinct_on && drops_subquery_order(q) {
+        return Err(unsupported(
+            "DISTINCT ON over a subquery ORDER BY the lowering drops: the order it gives the rows can decide \
+             which row of each key DISTINCT ON keeps",
+        ));
+    }
+    Ok(())
 }
 
 /// Calcite's `Project(trim) <- Sort <- Project(outputs ++ keys)`, for an `ORDER BY` over a value the
@@ -637,6 +726,8 @@ fn sort_sandwich(
         let idx = push_unique(&mut targets, v);
         collation.push(json!([idx, ty, ord_string(&key.options)?]));
     }
+    // The outputs come first in `targets`, so a key on one of them has its position.
+    refuse_slice_over_dropped_order(q, &collation, out_cols.len())?;
 
     // Every key was already an output value (`ORDER BY t.a` over `SELECT t.a`): nothing was
     // appended, so the trim would be the identity and the `Sort` can stand on the body directly —
@@ -709,7 +800,58 @@ fn row_slice(
         });
     }
 
-    Ok((limit.is_some() || offset.is_some()).then_some((limit, offset)))
+    Ok(takes_row_slice(q).then_some((limit, offset)))
+}
+
+/// Whether [`row_slice`] finds a slice in `q`, read off the tree: a `LIMIT` or an `OFFSET` with a
+/// count, or a `FETCH`. [`row_slice`] answers with this, so the two cannot disagree, and
+/// [`drops_subquery_order`] needs the answer without lowering a count.
+fn takes_row_slice(q: &Query) -> bool {
+    use sqlparser::ast::LimitClause;
+
+    let limited = match &q.limit_clause {
+        None => false,
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => limit.is_some() || offset.is_some(),
+        Some(LimitClause::OffsetCommaLimit { .. }) => true,
+    };
+    limited || q.fetch.is_some()
+}
+
+/// Whether lowering `q` drops the `ORDER BY` of a query nested anywhere inside it: a subquery, a
+/// derived table or a parenthesized branch whose own level takes no row slice, and whose `ORDER BY`
+/// no `DISTINCT ON` of that level reads. [`apply_pagination`] drops exactly those, and says why that
+/// is not always harmless.
+///
+/// Read off the tree, and over every query inside `q`, including one in an expression nothing
+/// lowers (an `ORDER BY` key of a query that takes no slice), which can only count more. `q`'s own
+/// `ORDER BY` is not counted.
+pub(crate) fn drops_subquery_order(q: &Query) -> bool {
+    use sqlparser::ast::{OrderByKind, Visit, Visitor};
+
+    /// Skips the query the walk starts at, which is the first one it meets.
+    struct Find {
+        root: bool,
+    }
+    impl Visitor for Find {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if std::mem::replace(&mut self.root, false) {
+                return ControlFlow::Continue(());
+            }
+            let ordered = q
+                .order_by
+                .as_ref()
+                .is_some_and(|o| !matches!(&o.kind, OrderByKind::Expressions(keys) if keys.is_empty()));
+            let distinct_on =
+                matches!(q.body.as_ref(), SetExpr::Select(s) if matches!(s.distinct, Some(Distinct::On(_))));
+            if ordered && !takes_row_slice(q) && !distinct_on {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    q.visit(&mut Find { root: true }).is_break()
 }
 
 /// A `LIMIT`/`OFFSET` count, lowered as an ordinary expression against an empty scope.
@@ -901,8 +1043,9 @@ fn ord_string(o: &sqlparser::ast::OrderByOptions) -> Result<String> {
 /// it: `DISTINCT ON` (see [`distinct_on`]).
 ///
 /// Nothing else in this module reads the clause — [`apply_pagination`] drops it when the query
-/// takes no row slice, because without a slice bag semantics make the order unobservable. For
-/// `DISTINCT ON` it is observable: the clause is what picks the surviving row. The clause hangs off
+/// takes no row slice, because bag semantics make the order immaterial to the query's own value (what
+/// above it can still see a dropped one is on [`apply_pagination`]). For `DISTINCT ON` it is
+/// observable at its own level: the clause is what picks the surviving row. The clause hangs off
 /// the enclosing [`Query`] while `DISTINCT ON` hangs off the [`Select`], so it has to be carried.
 ///
 /// `Unknown` is deliberately distinct from `Known(None)`. A `SELECT` reached through a set

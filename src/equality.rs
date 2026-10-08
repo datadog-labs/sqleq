@@ -47,8 +47,14 @@
 //!   function it reads is the real one. That keeps `ts + INTERVAL '1 day'`, `n / 2.0` over an
 //!   integer `n` and `CAST(2.0 AS TEXT)`. Otherwise the pair is refused.
 //!
-//! Except where the two queries lowered to one plan, which [`crate::types::refuse_unfaithful`]
-//! explains for citext: one plan computes one thing however `=` is read.
+//! Except where the two queries are one plan, which [`crate::types::refuse_unfaithful`] explains
+//! for citext: one plan computes one thing however `=` is read. That needs more than two equal
+//! lowered plans. A `DISTINCT`, a `GROUP BY`, a set operation, `min` or `max` keeps one member of a
+//! class, the first or the last it reads, and the order it reads them in can be a subquery's
+//! `ORDER BY` that the lowering drops: `SELECT CAST(x.n AS TEXT) FROM (SELECT DISTINCT n FROM
+//! (SELECT n FROM u ORDER BY k) s) x` returns `'2.0'` over `u = {(1, 2.0), (2, 2.00)}`, and with
+//! `ORDER BY k DESC` it returns `'2.00'`, from the same plan. So a pair whose queries drop one is not
+//! taken to be one plan (`crate::emit`).
 //!
 //! An `UPDATE` or an `INSERT` that stores such a value in a column of another type applies a cast
 //! the IR does not spell out, and [`crate::dml`] reads it by the same rule ([`stores_by_value`],
@@ -146,9 +152,9 @@ pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
 /// Refuse a lowered pair one of whose operations reads a value of a type whose `=` is not identity
 /// and can tell two values apart that `=` calls equal; read such a value through `q_exact_<type>`
 /// where its spelling fixes it. See the module docs. Mutates `input`, and only when the two queries
-/// lowered to two plans.
-pub fn refuse_observed(input: &mut Value) -> Result<()> {
-    if input["queries"][0] == input["queries"][1] {
+/// are not `one_plan`, as the module docs read that.
+pub fn refuse_observed(input: &mut Value, one_plan: bool) -> Result<()> {
+    if one_plan {
         return Ok(());
     }
     if let Some(queries) = input.get_mut("queries").and_then(Value::as_array_mut) {

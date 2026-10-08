@@ -40,7 +40,9 @@ is an uninterpreted aggregate over the candidate rows and the values that order 
 just duplicates, and an uninterpreted aggregate admits more behaviours than the real operator, never
 fewer. `DISTINCT ON` over an aggregate query or under a set operation is still refused. Both rest on
 one assumption the IR cannot avoid, and it is the one way either lowering can yield a proof the
-database does not license; see [below](#a-row-slice-is-taken-as-deterministic).
+database does not license; see [below](#a-row-slice-is-taken-as-deterministic). An `ORDER BY` without
+a slice is dropped, but a subquery's still reaches what reads the subquery's rows, and the frontend
+takes it to; see [below](#a-subquerys-order-by-is-observable).
 
 Refusing has a price, and it is paid deliberately. The set-returning-function guard, for instance,
 gives up proofs the frontend once made, on pairs whose two sides are textually identical — which is
@@ -132,7 +134,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   their `=` would be the prover's equality, which substitutes equals for equals, so from
   `t.c = u.c` it would conclude `t.c::text = u.c::text`, which citext does not satisfy. A query
   that reads a value of either type is refused, unless the two queries lower to one plan, which
-  computes the same thing however `=` is read; a column of one that no query reads costs nothing.
+  computes the same thing however `=` is read, and no subquery's `ORDER BY` was dropped to get there
+  ([below](#a-subquerys-order-by-is-observable)); a column of one that no query reads costs nothing.
   `SELECT *`, `DELETE` and `UPDATE` read every column of the table they touch.
 - **`box`, `circle`, `lseg` and `line` are refused the same way.** Their `=` compares areas,
   endpoints or coefficients within a tolerance of `1e-6`, so it is not transitive: boxes of area 1,
@@ -271,7 +274,13 @@ So the frontend sorts every read of such a value in the lowered plans (`src/equa
   x = INTERVAL '30 days'` does not make `d + INTERVAL '1 mon'` and `d + INTERVAL '30 days'` one
   term. Otherwise the pair is refused.
 
-A pair whose two queries lower to one plan is lowered regardless, as for `citext`. A set operation or
+A pair whose two queries lower to one plan is lowered regardless, as for `citext`, unless the lowering
+dropped a subquery's `ORDER BY` on either side. A `DISTINCT`, a `GROUP BY`, a set operation, `min` or
+`max` keeps one member of a class, and which one can be decided by that order:
+`SELECT CAST(x.n AS TEXT) FROM (SELECT DISTINCT n FROM (SELECT n FROM u ORDER BY k) s) x` returns
+`'2.0'` over `u = {(1, 2.0), (2, 2.00)}`, and with `ORDER BY k DESC` `'2.00'`, though both lower to
+one plan ([below](#a-subquerys-order-by-is-observable)). Two queries that are one tree when they are
+lowered are still one plan, since they drop the same orderings. A set operation or
 a `VALUES` list whose column takes an integer's type from its first branch or row and holds a
 `numeric` from a later one is refused, since a read of the column would take the value for one whose
 `=` is identity; so is one that holds a value of a type the frontend does not know under such a
@@ -293,10 +302,11 @@ stored through `q_exact_<type>` where its spelling fixes it, so `SET s = 2.0` an
 two terms, and the pair is refused otherwise, as `SET s = n WHERE n = m` against `SET s = m WHERE
 n = m` is. An interval column with a modifier counts as one that is not known to: `interval day`
 keeps only the days of a value, so `'1 day'` is stored as it is and `'24 hours'` as `0`, and
-`interval(0)` rounds the seconds away from zero. Unlike the reads above, this refusal holds where the
-two sides lower to one plan. One plan stores values of one class, not always the same member of it:
-a `DISTINCT` keeps whichever of two equal values reaches it first, and a dead `ORDER BY` the frontend
-drops can decide which.
+`interval(0)` rounds the seconds away from zero. Unlike the reads above, this refusal holds wherever
+the two sides lower to one plan. One plan stores values of one class, not always the same member of
+it: a `DISTINCT` keeps whichever of two equal values reaches it first, and a subquery's `ORDER BY` the
+lowering drops can decide which. The reads decline the exception only where one was dropped; the
+stores decline it everywhere, which refuses more.
 
 The cost is those refusals: a pair whose two queries differ and that casts one of these values to
 text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, adds
@@ -455,6 +465,44 @@ Dates show this at the top of their range. A DATE reaches the year 5874897 and a
 conversion, so `d < ts` and `d::timestamp < ts` lower alike, and they do return the same rows
 wherever the cast succeeds.
 
+## A subquery's `ORDER BY` is observable
+
+SQL does not say in what order a subquery hands its rows to the query around it. Postgres hands them
+on in the order the subquery's `ORDER BY` sorted them, and documents a sorted subquery as a way to
+feed an aggregate its rows in order. The frontend takes that order to be observable, as Postgres
+behaves, by everything above the subquery that can see it:
+
+- an aggregate that folds the rows in order: `string_agg`, `array_agg`, the `json*_agg` family and
+  the other order-sensitive aggregates, and a sum in floating point;
+- a window function, which numbers or frames the rows in the order they arrive, and
+  `ARRAY(SELECT …)`, which builds its array in the order of its query's rows;
+- an operation that keeps one member of a class of values `=` calls equal: `DISTINCT`, `GROUP BY`,
+  a set operation other than `UNION ALL`, `min`, `max`, `range_agg` (it keeps the first or the last
+  it reads, `2.0` or `2.00`);
+- a row slice or `DISTINCT ON` above the subquery whose own ordering leaves the choice open:
+  `SELECT id FROM (SELECT id FROM t ORDER BY id) s LIMIT 1` returns the smallest `id`, and with
+  `DESC` the largest.
+
+The lowering drops an `ORDER BY` without a slice at its own level, so it holds each of these to that
+order another way. The aggregates of the first item are refused wherever they are lowered (a sum
+only over a float), and so are window functions and `ARRAY(SELECT …)`. A slice or `DISTINCT ON`
+over a subquery whose `ORDER BY` the lowering drops is refused, unless the slice's own ordering keys
+every column it returns (`DISTINCT ON` is refused regardless): rows that ordering ties are then
+equal in every column it returns, and whichever it keeps, the values are the same. Which subquery
+drops its `ORDER BY` is not traced, so one anywhere below the slice counts, an `IN` subquery's
+included; and `normalize::strip_identical_pagination` leaves a page shared by both sides in place
+over one. Last, a pair in which the lowering drops one is not taken to be one plan, so a read that
+tells two members of a class apart is refused even where both sides lower alike
+([above](#values-that--calls-equal-and-that-are-still-two-values)). Over the integers or text the
+member kept is the only one there is, and those pairs are still proved.
+
+When a refused pair's two sides normalize to one query, the frontend says so without lowering
+anything (`reflexive`), and stripping an `ORDER BY` nothing reads is one of those normalizations
+(`normalize::strip_dead_order_by`). It has no types, so it cannot tell a `max` over integers from one
+over `numeric`, and keeps every subquery's `ORDER BY` wherever any of the constructs above appears.
+The outermost query's own `ORDER BY` has nothing above it: it is dead, and dropped on both paths,
+unless that query takes a slice or `DISTINCT ON`.
+
 ## A row slice is taken as deterministic
 
 `LIMIT 10` with no `ORDER BY`, or with one that leaves ties, does not say which rows it returns:
@@ -463,7 +511,8 @@ say that. It is a function of its source — equal sources give equal slices —
 the same slice of rows the prover can show equal are proved equal, as if the database made the same
 choice both times. `DISTINCT ON` with no `ORDER BY`, or with one that leaves ties within a key,
 keeps an arbitrary row per key and is read the same way (`src/lower.rs`, `apply_pagination` and
-`distinct_on`).
+`distinct_on`). A choice a subquery's `ORDER BY` settles is not arbitrary, and is not read this way
+([above](#a-subquerys-order-by-is-observable)).
 
 That is the prover's abstraction and the standard one, and the frontend inherits it rather than
 widening it; `normalize::strip_identical_pagination`, which removes a top-level `ORDER BY … LIMIT …`

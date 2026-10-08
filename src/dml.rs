@@ -140,10 +140,12 @@
 //! type drops.
 //!
 //! The check reads the lowered plans, because only there is the stored value's type known. Unlike
-//! [`equality::refuse_observed`][crate::equality::refuse_observed], it is not lifted where the two
+//! [`equality::refuse_observed`][crate::equality::refuse_observed], it is never lifted where the two
 //! sides lower to one plan. One plan stores values of one class, but not always the same member of
 //! it: a `DISTINCT` keeps whichever of `2.0` and `2.00` reaches it first, and the order they reach
-//! it in can be an `ORDER BY` [`strip_dead_order_by`][crate::normalize::strip_dead_order_by] dropped.
+//! it in can be a subquery's `ORDER BY` that the lowering drops. The reads decline their exception
+//! for that reason only where a subquery's `ORDER BY` was dropped (`crate::emit`); this check
+//! declines it everywhere, which refuses more and does not depend on that test.
 //!
 //! ## Two goals in one query: the tagged `UNION ALL`
 //!
