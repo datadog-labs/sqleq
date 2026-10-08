@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use sqleq_frontend::internals::enforced_per_statement;
 use sqlparser::ast::{DataType, Expr, Ident, ObjectName, Statement, Value};
 
 /// A column type, canonical enough that two spellings of one Postgres type compare equal.
@@ -250,6 +251,11 @@ pub struct Unique {
     /// On expressions rather than bare columns: `cols` are the columns the expressions read.
     /// Never inferred as an arbiter.
     pub expr: bool,
+    /// `DEFERRABLE`, or `INITIALLY DEFERRED`, which implies it: the frontend's own test
+    /// (`enforced_per_statement`). Postgres never takes such a constraint as an `ON CONFLICT`
+    /// arbiter, and raises instead (see `translate::conflict`). It still counts for collisions: a
+    /// witness is a run that commits on its own, so a deferred key is checked all the same.
+    pub deferrable: bool,
 }
 
 /// The name Postgres gives an unnamed constraint: `t_pkey`, or `t_a_b_key` for `UNIQUE (a, b)`.
@@ -434,13 +440,15 @@ impl Schema {
                             col.nullable = false;
                             let name = pk.name.as_ref().or(o.name.as_ref()).map(fold)
                                 .or_else(|| Some(default_name(&name, &[], true)));
-                            t.uniques.push(Unique { name, cols: vec![idx], nnd: false, partial: false, expr: false });
+                            let deferrable = !enforced_per_statement(pk.characteristics.as_ref());
+                            t.uniques.push(Unique { name, cols: vec![idx], nnd: false, partial: false, expr: false, deferrable });
                         }
                         O::Unique(uc) => {
                             let name = uc.name.as_ref().or(o.name.as_ref()).map(fold)
                                 .or_else(|| Some(default_name(&name, &[&col.name], false)));
                             let nnd = matches!(uc.nulls_distinct, NullsDistinctOption::NotDistinct);
-                            t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, expr: false });
+                            let deferrable = !enforced_per_statement(uc.characteristics.as_ref());
+                            t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, expr: false, deferrable });
                         }
                         O::Check(_) => t.has_check = true,
                         O::ForeignKey(_) => t.has_fk = true,
@@ -468,9 +476,17 @@ impl Schema {
                 t.columns.push(col);
             }
             for con in &ct.constraints {
-                let (name, cols, nnd, pk) = match con {
-                    C::Unique(uc) => (uc.name.as_ref(), &uc.columns, matches!(uc.nulls_distinct, NullsDistinctOption::NotDistinct), false),
-                    C::PrimaryKey(pk) => (pk.name.as_ref(), &pk.columns, false, true),
+                let (name, cols, nnd, pk, deferrable) = match con {
+                    C::Unique(uc) => (
+                        uc.name.as_ref(),
+                        &uc.columns,
+                        matches!(uc.nulls_distinct, NullsDistinctOption::NotDistinct),
+                        false,
+                        !enforced_per_statement(uc.characteristics.as_ref()),
+                    ),
+                    C::PrimaryKey(pk) => {
+                        (pk.name.as_ref(), &pk.columns, false, true, !enforced_per_statement(pk.characteristics.as_ref()))
+                    }
                     C::Check(_) => {
                         t.has_check = true;
                         continue;
@@ -504,7 +520,7 @@ impl Schema {
                 }
                 let names: Vec<&str> = set.iter().map(|&i| t.columns[i].name.as_str()).collect();
                 let name = name.map(fold).or_else(|| Some(default_name(&t.name, &names, pk)));
-                t.uniques.push(Unique { name, cols: set, nnd, partial: false, expr });
+                t.uniques.push(Unique { name, cols: set, nnd, partial: false, expr, deferrable });
             }
             s.add(t);
         }
@@ -539,6 +555,8 @@ impl Schema {
                 nnd: ci.nulls_distinct == Some(false),
                 partial: ci.predicate.is_some(),
                 expr,
+                // A unique index cannot be deferrable; only a constraint can.
+                deferrable: false,
             });
         }
         s
@@ -796,6 +814,28 @@ mod tests {
         );
         assert!(s.table("r").unwrap().has_exclude, "EXCLUDE parses in sqlparser 0.63 and must be seen");
         assert!(!s.table("q").unwrap().has_exclude);
+    }
+
+    #[test]
+    fn deferrable_keys_are_marked_on_columns_and_tables() {
+        let s = Schema::from_ddl(
+            "CREATE TABLE t (
+               a int PRIMARY KEY DEFERRABLE, b int UNIQUE DEFERRABLE INITIALLY DEFERRED,
+               c int UNIQUE INITIALLY IMMEDIATE, d int UNIQUE NOT DEFERRABLE, e int, f int, g int, h int,
+               CONSTRAINT k_e UNIQUE (e) DEFERRABLE INITIALLY IMMEDIATE, CONSTRAINT k_f UNIQUE (f),
+               CONSTRAINT k_h UNIQUE (h) INITIALLY DEFERRED);
+             CREATE UNIQUE INDEX t_g ON t (g);",
+        );
+        let t = s.table("t").unwrap();
+        let deferrable = |c: &str| {
+            let i = t.column(c).unwrap();
+            t.uniques.iter().find(|u| u.cols == [i]).unwrap_or_else(|| panic!("no key on {c}")).deferrable
+        };
+        // `INITIALLY DEFERRED` implies `DEFERRABLE`; `INITIALLY IMMEDIATE` alone does not.
+        for (c, want) in [("a", true), ("b", true), ("c", false), ("d", false), ("e", true), ("f", false), ("h", true)] {
+            assert_eq!(deferrable(c), want, "{c}");
+        }
+        assert!(!deferrable("g"), "a unique index is never deferrable");
     }
 
     #[test]

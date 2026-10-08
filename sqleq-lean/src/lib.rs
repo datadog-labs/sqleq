@@ -231,7 +231,7 @@ fn explain(p: &LeanPair, w: &str) -> String {
         "unique" => format!("two of its rows collide on {}", uniq(arg)),
         "secondTime" => format!("ON CONFLICT DO UPDATE would update a row the same statement inserted, on {}", uniq(arg)),
         "generated" => format!("it gives GENERATED ALWAYS column {} a value", col(arg)),
-        "noArbiter" => "no unique constraint matches its conflict target".into(),
+        "noArbiter" => "no unique constraint can arbitrate its conflict target: none matches it, or one that does is deferrable".into(),
         "nothingInserted" => "it inserts no row".into(),
         other => format!("the canonical run ends in `{other}`"),
     };

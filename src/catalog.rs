@@ -197,7 +197,10 @@ pub(crate) fn index_col_name(ic: &IndexColumn) -> Option<String> {
 /// query sees the duplicates. `NOT ENFORCED` is not accepted on a key by Postgres, and a constraint
 /// that says it is not enforced is no premise either. The `NOT NULL` a `PRIMARY KEY` implies is a
 /// separate constraint, enforced at once whatever the key's deferrability, so it is kept.
-pub(crate) fn enforced_per_statement(c: Option<&ConstraintCharacteristics>) -> bool {
+///
+/// `sqleq-lean` reads keys with the same test (through `internals`): Postgres never takes a
+/// deferrable constraint as an `ON CONFLICT` arbiter, so its witness model must not either.
+pub fn enforced_per_statement(c: Option<&ConstraintCharacteristics>) -> bool {
     c.is_none_or(|c| {
         c.deferrable != Some(true)
             && c.initially != Some(DeferrableInitial::Deferred)
