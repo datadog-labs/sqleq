@@ -68,7 +68,35 @@ pub const JSONS: [&str; 4] = [
 ];
 
 /// The interval domain, shared by `interval` columns and by `$N::interval` params.
-const INTERVALS: [&str; 3] = ["1 day", "2 hours", "7 days"];
+pub const INTERVALS: [&str; 3] = ["1 day", "2 hours", "7 days"];
+
+/// The date domain.
+pub const DATES: [&str; 3] = ["2020-01-01", "2020-01-02", "2020-01-03"];
+
+/// The timestamp domain: the three days of the date domain, one at midnight -- so a timestamp can
+/// equal a date -- and two not, so that a rewrite which drops the time of day (a cast to `date`, a
+/// `date_trunc('day', ..)`, a date in a `UNION` with a timestamp) can be told apart: midday, and
+/// the last second of a day. A `timestamptz` column takes the same literals, read as instants in the
+/// UTC session.
+pub const TIMESTAMPS: [&str; 3] = [
+    "2020-01-01 00:00:00",
+    "2020-01-02 12:00:00",
+    "2020-01-03 23:59:59",
+];
+
+/// The instants the Postgres engine's clock reads, one per trial in turn: before every generated
+/// date and timestamp, among them, and after them. Against the first and the last, a comparison
+/// with the clock holds for every generated row or for none, so a side that drops or keeps one is
+/// told apart; against the middle one, which is a generated timestamp and whose date is a generated
+/// date, `<` and `<=` differ, and so do windows of a generated interval. The middle one is read off
+/// the domain, so it moves with it.
+pub fn clocks() -> [String; 3] {
+    [
+        "1970-01-01 00:00:00+00".to_string(),
+        format!("{}+00", TIMESTAMPS[TIMESTAMPS.len() / 2]),
+        "2100-01-01 00:00:00+00".to_string(),
+    ]
+}
 
 /// Generate a value for a column of type `vt`. Nullable columns are NULL with probability 0.3.
 pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
@@ -80,27 +108,10 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
         // A `numeric` column draws from the same pool; its DuckDB DECIMAL stores each value exactly.
         VType::Double | VType::Decimal(..) => Val::Dbl(*[0.0f64, 1.0, 2.0].choose(rng).unwrap()),
         VType::Boolean => Val::Bool(*[true, false].choose(rng).unwrap()),
-        VType::Date => Val::Date(
-            (*["2020-01-01", "2020-01-02", "2020-01-03"]
-                .choose(rng)
-                .unwrap())
-            .to_string(),
-        ),
-        // The three days of the date domain, one at midnight -- so a timestamp can equal a date --
-        // and two not, so that a rewrite which drops the time of day (a cast to `date`, a
-        // `date_trunc('day', ..)`, a date in a `UNION` with a timestamp) can be told apart: midday,
-        // and the last second of a day. A `timestamptz` column takes the same literals, read as
-        // instants in the UTC session.
-        VType::Timestamp | VType::TimestampTz => Val::Ts(
-            (*[
-                "2020-01-01 00:00:00",
-                "2020-01-02 12:00:00",
-                "2020-01-03 23:59:59",
-            ]
-            .choose(rng)
-            .unwrap())
-            .to_string(),
-        ),
+        VType::Date => Val::Date((*DATES.choose(rng).unwrap()).to_string()),
+        VType::Timestamp | VType::TimestampTz => {
+            Val::Ts((*TIMESTAMPS.choose(rng).unwrap()).to_string())
+        }
         VType::Varchar => Val::Str((*["a", "b", "c"].choose(rng).unwrap()).to_string()),
         VType::Uuid => Val::Uuid((*UUIDS.choose(rng).unwrap()).to_string()),
         // A plain string: DuckDB casts a VARCHAR literal to JSON implicitly, on insert and in a

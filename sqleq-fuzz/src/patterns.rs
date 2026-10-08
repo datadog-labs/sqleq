@@ -254,6 +254,91 @@ const FROZEN_TS: &str = "TIMESTAMP '2020-06-01 12:00:00'";
 const FROZEN_TIME: &str = "TIME '12:00:00'";
 const FROZEN_DATE: &str = "DATE '2020-06-01'";
 
+// The transaction clock as Postgres spells its reads, for the Postgres engine's own clock
+// ([`clock_reads`]): a function, also under `pg_catalog`, or a keyword with an optional precision.
+// The leading class keeps a quoted column or another schema's function of the same name out.
+re!(
+    CLOCK_FN,
+    r#"(?i)(^|[^\w."])(?:pg_catalog\s*\.\s*)?(?:now|statement_timestamp|transaction_timestamp)\s*\(\s*\)"#
+);
+re!(
+    CLOCK_TIMESTAMPTZ,
+    r#"(?i)(^|[^\w."])current_timestamp\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(
+    CLOCK_TIMESTAMP,
+    r#"(?i)(^|[^\w."])localtimestamp\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(CLOCK_DATE, r#"(?i)(^|[^\w."])current_date\b"#);
+re!(
+    CLOCK_TIMETZ,
+    r#"(?i)(^|[^\w."])current_time\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(CLOCK_TIME, r#"(?i)(^|[^\w."])localtime\b(?:\s*\(\s*\d*\s*\))?"#);
+// `'now'` read as a date or time when the statement runs, as old dumps write a default:
+// `('now'::text)::date`. Cast to anything else it is only text.
+re!(
+    CLOCK_LITERAL,
+    r"(?i)(?:\(\s*'now'\s*::\s*text\s*\)|'now')\s*::\s*(date|timestamptz|timestamp|timetz|time)\b"
+);
+// Any read of the clock, for telling whether a function body reads one.
+re!(
+    CLOCK_ANY,
+    r"(?i)\b(?:now|statement_timestamp|transaction_timestamp)\s*\(|\b(?:current_timestamp|localtimestamp|current_date|current_time|localtime)\b|'(?:now|today|tomorrow|yesterday)'"
+);
+
+/// The schema of the functions every read of the clock becomes under the Postgres engine, which
+/// reads the instant a trial sets.
+pub const CLOCK_SCHEMA: &str = "sqleq_clock";
+
+/// `sql` with every read of the transaction clock -- `now()`, `current_timestamp`, `current_date`,
+/// `localtime`, ... -- replaced by the call of a [`CLOCK_SCHEMA`] function of the same type. A
+/// precision is dropped: every instant the clock is set to is a whole second. Matched over the
+/// [`mask`]ed statement, so a clock in a literal or a comment stays as written; `'now'` read as a
+/// date or time is the one literal that is a read.
+pub fn clock_reads(sql: &str) -> String {
+    let masked = mask(sql).unwrap_or_else(|| sql.to_string());
+    let mut cur = (sql.to_string(), masked);
+    for (re, rep) in [
+        (&*CLOCK_FN, "${1}sqleq_clock.now()"),
+        (&*CLOCK_TIMESTAMPTZ, "${1}sqleq_clock.now()"),
+        (&*CLOCK_TIMESTAMP, "${1}sqleq_clock.local_ts()"),
+        (&*CLOCK_DATE, "${1}sqleq_clock.today()"),
+        (&*CLOCK_TIMETZ, "${1}sqleq_clock.time_tz()"),
+        (&*CLOCK_TIME, "${1}sqleq_clock.local_time()"),
+    ] {
+        cur = replace_outside_literals(&cur.0, &cur.1, re, rep);
+    }
+    let (sql, masked) = cur;
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in CLOCK_LITERAL.captures_iter(&sql) {
+        let m = caps.get(0).unwrap();
+        // A real literal keeps its quote, or the parenthesis before it, in the masked text; inside a
+        // comment or another literal the same bytes are blank.
+        if masked.as_bytes().get(m.start()) == Some(&b' ') {
+            continue;
+        }
+        out.push_str(&sql[last..m.start()]);
+        out.push_str("(sqleq_clock.now())::");
+        out.push_str(&caps[1]);
+        last = m.end();
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
+/// Whether a dollar-quoted body in `sql` -- a function's or a `DO` block's -- reads the clock, which
+/// [`clock_reads`] leaves as written.
+pub fn reads_clock_in_body(sql: &str) -> bool {
+    lex(sql).is_some_and(|toks| {
+        toks.iter().any(|t| match &t.token {
+            Token::DollarQuotedString(d) => CLOCK_ANY.is_match(&d.value),
+            _ => false,
+        })
+    })
+}
+
 /// Freeze runtime time sources to constants and strip row-locking clauses.
 ///
 /// The patterns match over the [`mask`]ed statement and the edits land at the same offsets in the
