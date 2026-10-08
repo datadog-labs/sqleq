@@ -14,7 +14,7 @@
 //!     two statements).
 //!
 //! Options: `--jobs N` (or `-j N`), `--trials N`, `--rows N`, `--seed N`, and `--engine duckdb|postgres`
-//! (default `$SQLEQ_FUZZ_ENGINE`, else `duckdb`; see `sqleq_fuzz::pg`). Any verdict exits 0; an
+//! (default `$SQLEQ_FUZZ_ENGINE`, else `postgres`; see `sqleq_fuzz::pg`). Any verdict exits 0; an
 //! input that cannot be read, or a missing argument, exits 1; no mode, or an unknown one, prints the
 //! usage and exits 2. A panic while testing one pair is that pair's `ERROR:panic: …` verdict, and in
 //! `csv` mode the worker goes on to the next row.
@@ -39,14 +39,14 @@ options:
   --trials N     random instances per pair (default 120)
   --rows N       rows per table per instance (default 5)
   --seed N       RNG seed (default 0)
-  --engine E     where the statements run: duckdb (default; $SQLEQ_FUZZ_ENGINE overrides) or
-                 postgres, a private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH";
+  --engine E     where the statements run: postgres (default; $SQLEQ_FUZZ_ENGINE overrides), a
+                 private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH, or duckdb";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut cfg = Config::default();
     let mut jobs = 1usize;
-    let mut engine = std::env::var("SQLEQ_FUZZ_ENGINE").unwrap_or_else(|_| "duckdb".to_string());
+    let mut engine = std::env::var("SQLEQ_FUZZ_ENGINE").unwrap_or_else(|_| "postgres".to_string());
     let mut pos: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -146,7 +146,8 @@ fn guarded(f: impl FnOnce() -> Verdict) -> Verdict {
 
 /// Where the pairs run: in-process DuckDB, or a private Postgres cluster with a database per worker.
 enum Runner {
-    Duck,
+    /// DuckDB's version, as `SELECT version()` reports it.
+    Duck(String),
     Pg(pg::Server),
 }
 
@@ -154,22 +155,27 @@ impl Runner {
     fn start(engine: &str, workers: usize) -> Result<Runner, String> {
         match engine {
             "postgres" => Ok(Runner::Pg(pg::Server::start(workers)?)),
-            _ => Ok(Runner::Duck),
+            _ => {
+                let version = sqleq_fuzz::duck::open_db()
+                    .and_then(|c| c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)))
+                    .map_err(|e| format!("cannot open DuckDB: {e}"))?;
+                Ok(Runner::Duck(version.trim_start_matches('v').to_string()))
+            }
         }
     }
 
-    /// `postgres 17.11`, for the record a verdict is a claim about; none for DuckDB, whose output is
-    /// as it always was.
-    fn engine(&self) -> Option<String> {
+    /// `postgres 17.11` or `duckdb 1.5.5`: the engine a verdict is a claim about. A DuckDB verdict is
+    /// about DuckDB's semantics, which is why it always says so.
+    fn engine(&self) -> String {
         match self {
-            Runner::Duck => None,
-            Runner::Pg(s) => Some(format!("postgres {}", s.version())),
+            Runner::Duck(v) => format!("duckdb {v}"),
+            Runner::Pg(s) => format!("postgres {}", s.version()),
         }
     }
 
     fn worker(&self, i: usize) -> Result<Worker, String> {
         match self {
-            Runner::Duck => Ok(Worker::Duck),
+            Runner::Duck(_) => Ok(Worker::Duck),
             Runner::Pg(s) => Ok(Worker::Pg(Box::new(s.worker(i)?))),
         }
     }
@@ -291,9 +297,7 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize, engine: &str) -> Result<()
             let mut o = serde_json::Map::new();
             o.insert("verdict".to_string(), serde_json::json!(label));
             o.insert("ms".to_string(), serde_json::json!(ms));
-            if let Some(e) = &engine_tag {
-                o.insert("engine".to_string(), serde_json::json!(e));
-            }
+            o.insert("engine".to_string(), serde_json::json!(engine_tag));
             if let Some(c) = caveat {
                 o.insert("caveat".to_string(), serde_json::json!(c));
             }
@@ -440,11 +444,11 @@ fn push_statement(out: &mut Vec<String>, raw: &str) {
 fn test_one(a: &str, b: &str, ddl: &str, cfg: Config, engine: &str) -> Result<(), String> {
     let runner = Runner::start(engine, 1)?;
     let (v, caveat) = runner.worker(0)?.test(a, b, ddl, cfg);
-    report(&v, runner.engine().as_deref(), caveat.as_deref());
+    report(&v, &runner.engine(), caveat.as_deref());
     Ok(())
 }
 
-fn report(v: &Verdict, engine: Option<&str>, caveat: Option<&str>) {
+fn report(v: &Verdict, engine: &str, caveat: Option<&str>) {
     println!("{}", v.label());
     if let Verdict::NotEquivalent(ce) = v {
         println!("counterexample: {ce}");
@@ -455,9 +459,7 @@ fn report(v: &Verdict, engine: Option<&str>, caveat: Option<&str>) {
     if let Some((ok, err)) = v.partial() {
         println!("partial: {ok} trials compared both sides; last error: {err}");
     }
-    if let Some(e) = engine {
-        println!("engine: {e}");
-    }
+    println!("engine: {engine}");
     if let Some(c) = caveat {
         println!("caveat: {c}");
     }

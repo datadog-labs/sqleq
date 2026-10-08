@@ -196,9 +196,9 @@ the order of `C` and `POSIX` and of no other collation Postgres guarantees.
   operand is neither a column nor a constant (`(c || 'x') < 'y'`) takes its collation from the
   columns it reads, which the frontend does not trace, so in such a pair it is refused too.
 
-`sqleq-fuzz` compares strings by code point, as DuckDB does, so it cannot refute a pair whose two
-sides differ only under another collation; the `witness:` of such a pinned pair names the collation
-it needs.
+`sqleq-fuzz` compares strings by code point — its cluster has the `C` collation, and DuckDB
+compares so too — so it cannot refute a pair whose two sides differ only under another collation;
+the `witness:` of such a pinned pair names the collation it needs.
 
 ### Values that `=` calls equal and that are still two values
 

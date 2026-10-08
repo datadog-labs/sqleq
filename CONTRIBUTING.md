@@ -24,9 +24,11 @@ the `cargo build` line before it makes sure of both opt-in ones. The Lean pins a
 `cargo test -p sqleq-lean`, and the `qed` and `sqlsolver-jvm` pins only where those tools are
 installed.
 
-`cargo test -p sqleq-fuzz` also tests its Postgres engine against a PostgreSQL 17 — the one
-`SQLEQ_PG_BIN` names, or the `postgres` on `PATH` — and skips those tests without one, unless
-`SQLEQ_PG_REQUIRED` is set, as CI sets it. The engine builds a template cluster on its first run, in
+`sqleq-fuzz` runs pairs on a PostgreSQL 17: the one `SQLEQ_PG_BIN` names, else the one its build
+fetched (for Linux and macOS on x86_64 and arm64; `SQLEQ_PG_DOWNLOAD=0` skips the download), else
+the `postgres` on `PATH`. Its pinned pairs need one, as does `sqleq-check --axes fuzz`, and
+`cargo test -p sqleq-fuzz` tests the Postgres engine against it, skipping those tests without one
+unless `SQLEQ_PG_REQUIRED` is set, as CI sets it. CI uses the fetched one. The engine builds a template cluster on its first run, in
 `~/.cache/sqleq` unless `SQLEQ_PG_CACHE` says otherwise.
 
 `cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of

@@ -67,23 +67,55 @@ const EXTENSIONS: &[&str] = &[
 pub const MAJOR: u32 = 17;
 
 /// Bumped whenever what the cached template holds changes, so an old template is never reused.
-const TEMPLATE_FORMAT: u32 = 1;
+const TEMPLATE_FORMAT: u32 = 2;
 
-/// Where the Postgres binaries are: `$SQLEQ_PG_BIN`, else the directory of the `postgres` on `PATH`.
+/// Where the Postgres binaries are: `$SQLEQ_PG_BIN` when it is set, else the PostgreSQL the build
+/// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
+///
+/// The fetched one sits under `target/<profile>/postgresql/`, which this executable finds from its
+/// own directory: `target/<profile>/` for a binary, `target/<profile>/deps/` for a test harness, or
+/// wherever a binary was copied together with that `postgresql/` directory. A Linux build of it uses
+/// the system's own OpenSSL, libxml2, Kerberos, zstd and lz4, so on a machine without one of them
+/// it cannot start, and `PATH` is tried instead.
 pub fn bin_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("SQLEQ_PG_BIN") {
         return Ok(PathBuf::from(dir));
     }
+    let mut fetched_fails = None;
+    if let Some(dir) = fetched() {
+        match version(&dir) {
+            Ok(_) => return Ok(dir),
+            Err(e) => fetched_fails = Some(e),
+        }
+    }
     std::env::var_os("PATH")
         .and_then(|path| {
-            std::env::split_paths(&path).find(|d| d.join("postgres").is_file() && d.join("initdb").is_file())
+            std::env::split_paths(&path)
+                .find(|d| d.join("postgres").is_file() && d.join("initdb").is_file())
         })
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| match fetched_fails {
+            Some(e) => format!(
+                "the PostgreSQL the build fetched cannot run here ({e}), and none is on PATH: \
+                 install the libraries it needs, or set SQLEQ_PG_BIN to a PostgreSQL {MAJOR}"
+            ),
+            None => format!(
                 "no PostgreSQL {MAJOR} found: set SQLEQ_PG_BIN to the directory holding its \
                  `postgres` and `initdb`"
-            )
+            ),
         })
+}
+
+/// The `bin` directory of the PostgreSQL the build fetched, if it can be found from here.
+fn fetched() -> Option<PathBuf> {
+    let rel = option_env!("SQLEQ_PG_FETCHED")?;
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let found = [Some(dir), dir.parent()]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join(rel))
+        .find(|b| b.join("postgres").is_file());
+    found
 }
 
 /// The server's version (`17.11`), refusing any major but [`MAJOR`]: a verdict is a claim about one
@@ -93,6 +125,14 @@ pub fn version(bin: &Path) -> Result<String, String> {
         .arg("--version")
         .output()
         .map_err(|e| format!("cannot run {}: {e}", bin.join("postgres").display()))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "{} does not start: {}",
+            bin.join("postgres").display(),
+            why.lines().next().unwrap_or("").trim()
+        ));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let ver = text
         .split_whitespace()
@@ -226,6 +266,10 @@ impl Postmaster {
                 "log_min_messages=fatal",
                 "-c",
                 "log_min_error_statement=panic",
+                // A pair's DDL creates every table, index and type in one transaction, which can
+                // take more locks than the default lock table holds.
+                "-c",
+                "max_locks_per_transaction=1024",
                 "-c",
             ])
             .arg(format!("max_connections={max_connections}"))
@@ -261,6 +305,25 @@ fn conninfo(sock: &Path, db: &str) -> String {
     format!("host={} port=5432 user=postgres dbname={db}", sock.display())
 }
 
+/// The `uuid-ossp` functions core PostgreSQL computes exactly, defined under their own names where the
+/// extension cannot load: the one a build carries may need a library the system lacks (the fetched
+/// Linux build links OSSP's libuuid), and a schema that calls them must run on every build alike.
+/// `gen_random_uuid()` draws a version-4 uuid as `uuid_generate_v4()` does; the namespace constants
+/// are RFC 4122's.
+const UUID_OSSP_CORE: &str = "\
+    CREATE FUNCTION uuid_generate_v4() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE \
+        AS 'SELECT gen_random_uuid()'; \
+    CREATE FUNCTION uuid_nil() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '00000000-0000-0000-0000-000000000000'::uuid$$; \
+    CREATE FUNCTION uuid_ns_dns() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_url() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_oid() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b812-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
+    CREATE FUNCTION uuid_ns_x500() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+        AS $$SELECT '6ba7b814-9dad-11d1-80b4-00c04fd430c8'::uuid$$;";
+
 /// The template every run copies: an initialised cluster whose `sqleq_tmpl` database carries
 /// [`EXTENSIONS`]. Built once per Postgres version, under `$SQLEQ_PG_CACHE` (default
 /// `~/.cache/sqleq`), and renamed into place whole, so two processes building it at once each get a
@@ -274,7 +337,14 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
             .ok_or("no cache directory: set SQLEQ_PG_CACHE")?
             .join("sqleq"),
     };
-    let dir = cache.join(format!("pg-template-{ver}-v{TEMPLATE_FORMAT}"));
+    // Keyed by where the binaries are too: two builds of one version can be configured differently.
+    let place = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf()).hash(&mut h);
+        h.finish()
+    };
+    let dir = cache.join(format!("pg-template-{ver}-v{TEMPLATE_FORMAT}-{place:016x}"));
     if dir.join("PG_VERSION").is_file() {
         return Ok(dir);
     }
@@ -302,6 +372,13 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
             for ext in EXTENSIONS {
                 // An install that lacks one leaves only the pairs that use it without a schema.
                 let _ = t.batch_execute(&format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\""));
+            }
+            let has_uuid = t
+                .query_one("SELECT to_regprocedure('uuid_generate_v4()') IS NOT NULL", &[])
+                .map(|r| r.get::<_, bool>(0))
+                .unwrap_or(true);
+            if !has_uuid {
+                t.batch_execute(UUID_OSSP_CORE).map_err(|e| msg(&e))?;
             }
         }
         let staged = cache.join(format!(
@@ -551,6 +628,11 @@ static CREATE_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static MISSING_TYPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^type "([^"]+)" does not exist"#).unwrap());
+/// An ICU collation: a provider named `icu`, a predefined `...-x-icu` collation, or an `icu_`
+/// function.
+static ICU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)provider\s*=\s*['"]?icu\b|-x-icu\b|\bicu_[a-z]"#).unwrap()
+});
 static MISSING_FUNCTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^function ([A-Za-z0-9_$.]+)\(\) does not exist").unwrap());
 
@@ -560,7 +642,10 @@ fn drop_defaults(ddl: &str, name: &str) -> Option<String> {
         .split('.')
         .map(|p| format!(r#""?{}"?"#, regex::escape(p)))
         .collect();
-    let re = Regex::new(&format!(r"(?i)\s+DEFAULT\s+{}\s*\(\s*\)", parts.join(r"\s*\.\s*"))).ok()?;
+    // `DEFAULT f()`, `DEFAULT (f())`, either with a cast: `DEFAULT (f())::text`.
+    let call = format!(r"{}\s*\(\s*\)", parts.join(r"\s*\.\s*"));
+    let cast = r#"(?:\s*::\s*"?[A-Za-z_][A-Za-z0-9_$.]*"?(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\s*\[\])?)?"#;
+    let re = Regex::new(&format!(r"(?i)\s+DEFAULT\s+(?:\(\s*{call}\s*\)|{call}){cast}")).ok()?;
     re.is_match(ddl).then(|| re.replace_all(ddl, "").into_owned())
 }
 
@@ -1050,6 +1135,14 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     if pat::has_hard_nondet(a, b) {
         return Verdict::NondetSkip;
     }
+    // Not every PostgreSQL 17 is built with ICU -- the one the build fetches is not -- so a pair that
+    // needs an ICU collation would get a verdict on one machine and an error on another. It gets
+    // neither, on any.
+    if [a, b, ddl].iter().any(|s| ICU.is_match(s)) {
+        return Verdict::NotComparable(
+            "an ICU collation, which not every PostgreSQL build has".to_string(),
+        );
+    }
     let schema = parse_schema(ddl);
     if schema.is_empty() {
         return Verdict::NoSchema;
@@ -1261,6 +1354,29 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     } else {
         String::new()
     };
+    // A column default that calls a volatile function (`gen_random_uuid()`, `clock_timestamp()`, a
+    // user function not declared otherwise) draws a value of its own on each side, so two inserts
+    // that omit the column fill it differently whatever they are; only the number of rows each side
+    // leaves is a fact about the statements. `nextval` is the exception: sequences are reset before
+    // each side. Every function a default calls, built-in or not, is named in its stored expression
+    // tree, as a `:funcid` or an operator's `:opfuncid`; `pg_depend` would miss the built-in ones,
+    // on which no dependency is recorded.
+    let volatile_default = mutates && {
+        let regs: Vec<String> = targets.iter().map(|(_, t)| t.reg.clone()).collect();
+        db.trips += 1;
+        match db.c.query(
+            "SELECT EXISTS (SELECT 1 FROM pg_attrdef ad \
+               CROSS JOIN LATERAL regexp_matches(ad.adbin::text, ':(?:op)?funcid ([0-9]+)', 'g') AS m \
+               JOIN pg_proc p ON p.oid = m[1]::oid \
+              WHERE ad.adrelid = ANY (ARRAY(SELECT r::regclass::oid FROM unnest($1::text[]) AS r)) \
+                AND p.provolatile = 'v' AND p.oid <> 'nextval(regclass)'::regprocedure)",
+            &[&regs],
+        ) {
+            Ok(rows) => rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(true),
+            Err(e) => return Verdict::Error(msg(&e)),
+        }
+    };
+    let nondet = nondet || volatile_default;
     // Each side's parameter types: inferred by Postgres, or failing that, inferred with the
     // heuristics' column links declared as hints. The generator's domain for a placeholder is taken
     // only where both sides agree on it.
@@ -1660,6 +1776,25 @@ mod tests {
     }
 
     #[test]
+    fn an_icu_collation_is_recognised() {
+        for s in [
+            "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+            "CREATE COLLATION c2 (PROVIDER = 'icu', LOCALE = 'de')",
+            r#"SELECT a FROM t ORDER BY a COLLATE "und-x-icu""#,
+            "SELECT icu_unicode_version()",
+        ] {
+            assert!(ICU.is_match(s), "{s}");
+        }
+        for s in [
+            "CREATE COLLATION c3 (provider = libc, locale = 'C')",
+            "SELECT unicode FROM t",
+            r#"SELECT a FROM t ORDER BY a COLLATE "C""#,
+        ] {
+            assert!(!ICU.is_match(s), "{s}");
+        }
+    }
+
+    #[test]
     fn a_default_calling_a_missing_function_is_dropped() {
         let ddl = "CREATE TABLE t (id uuid NOT NULL DEFAULT ext.gen_id(), n int DEFAULT 0);";
         assert_eq!(
@@ -1667,6 +1802,11 @@ mod tests {
             "CREATE TABLE t (id uuid NOT NULL, n int DEFAULT 0);"
         );
         assert!(drop_defaults(ddl, "other").is_none());
+        let cast = "CREATE TABLE t (id text NOT NULL DEFAULT (gen_id())::text, b uuid DEFAULT gen_id()::uuid);";
+        assert_eq!(
+            drop_defaults(cast, "gen_id").unwrap(),
+            "CREATE TABLE t (id text NOT NULL, b uuid);"
+        );
     }
 
     #[test]
