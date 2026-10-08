@@ -8,7 +8,7 @@ name = "sqleq-fuzz"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "License-clean concrete differential tester: a SQL non-equivalence disprover (DuckDB)"
+description = "License-clean concrete differential tester: a SQL non-equivalence disprover (PostgreSQL)"
 license = "Apache-2.0"
 publish = false
 
@@ -35,3 +35,14 @@ rand = "0.10"
 csv = { workspace = true }
 # Batch verdict output.
 serde_json = { workspace = true }
+# The Postgres engine's client: synchronous, matching the std::thread pool.
+postgres = "0.19"
+
+# The build script fetches the PostgreSQL the Postgres engine runs on (build.rs): a download, its
+# SHA-256 check, and the archive's unpacking. These are the versions and features the workspace
+# already builds, for `libduckdb-sys`'s own download and the Postgres client.
+[build-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sha2 = "0.11"
+flate2 = "1"
+tar = "0.4"

@@ -22,23 +22,66 @@ For a query pair `(A, B)` under a schema, it repeatedly:
    match rows) — but only where that consistency is something the row supports, see
    [Parameter binding](#parameter-binding-is-an-assumption-not-a-given) below;
 3. freezes `now()` / `current_*` to one instant and skips truly nondeterministic functions;
-4. runs both statements on **DuckDB** (fetched and linked by the build — nothing to install), set up
-   and fed so that it computes what Postgres computes — or, where it cannot, gives no verdict;
+4. runs both statements on **PostgreSQL 17**, in a private cluster it starts for the run (see
+   [Engines](#engines)) — or, with `--engine duckdb`, on DuckDB, as DuckDB evaluates them;
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
    counts). `SELECT` compares the result set; `UPDATE`/`DELETE`/`INSERT` compares final table state,
    and the returned rows as well when both sides carry `RETURNING`. A pair with no one observable
    to compare — a query against a mutation, `RETURNING` on one side only, or an `EXPLAIN` — is
-   reported `NOT-COMPARABLE` instead of run, and so is a pair DuckDB cannot be made to evaluate as
-   Postgres does (see the rules below).
+   reported `NOT-COMPARABLE` instead of run, and so is a pair the engine cannot evaluate faithfully
+   (see [Engines](#engines) and the rules below).
 
 Any difference on a valid, deterministic instance is a **sound counterexample** ⇒ the pair is
 **non-equivalent**. This is a disprover: it can show non-equivalence (with a witness), never prove
 equivalence.
 
+## Engines
+
+`--engine postgres`, the default, runs both statements on PostgreSQL itself, so there is nothing
+to emulate: what Postgres computes is the answer. `--engine duckdb` runs them on DuckDB instead, as
+DuckDB evaluates them: nothing makes DuckDB compute what Postgres computes, so a DuckDB
+counterexample shows the two statements differ under DuckDB, not that they differ under Postgres
+(DuckDB binds `->>` looser than `AND`, reads a bare `float` as a 4-byte `REAL`, divides integers as
+floats, and has no name for many Postgres functions). It also builds its tables from its own reading
+of the DDL, which enforces `NOT NULL`, primary keys and unique constraints but not `CHECK` or
+`FOREIGN KEY` constraints. Its output always says `engine: duckdb`, and `sqleq-check` runs the
+Postgres engine only.
+The Postgres engine starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, else
+the PostgreSQL the build fetched (a digest-pinned prebuilt PostgreSQL 17 for Linux and macOS on
+x86_64 and arm64, unless `SQLEQ_PG_DOWNLOAD=0`) if it runs there, else the `postgres` on `PATH`; any
+other major version is refused — serves it on a unix socket in a fresh
+temp directory, and stops and removes it when the run ends (or when the process is killed). The
+first run builds a template cluster under `$SQLEQ_PG_CACHE` (default `~/.cache/sqleq`); every later
+one copies it. `$SQLEQ_FUZZ_ENGINE` sets the default, which is how `sqleq-check` picks the engine.
+
+How the Postgres engine differs from the DuckDB one:
+
+- **The DDL runs as written**, once per pair, inside a transaction rolled back at the end, so every
+  constraint it declares — `CHECK` and `FOREIGN KEY` included, which the DuckDB engine does not
+  read — is Postgres's to enforce, and a generated row Postgres refuses is not in the instance.
+  Captured DDL is made to run only in ways that add no constraint: a schema it names is created, an
+  unqualified table that the rest of the DDL names by one schema is created there, a table the
+  queries name by one other schema is moved there, a type nothing declares is read as `text`, and a
+  column default that calls a function nothing declares is dropped. The last two are reported as a
+  `caveat`, since a verdict then rests on more than the DDL says.
+- **Each `$N` is typed as Postgres types it.** Both statements are prepared, and each placeholder
+  gets the type Postgres infers for it — with the column the heuristics link it to declared as a
+  hint where Postgres cannot infer one — and one type across the pair: a side that leaves `$N`
+  untyped, or that Postgres merely reads as `text` (`SELECT $1 AS x`), takes the other side's type;
+  a side that casts it keeps its cast. A `$N` that is an array on one side and a scalar on the
+  other is `NOT-COMPARABLE`. Values are still written into the statement, cast to that type, rather
+  than bound as parameters: captured SQL writes a `$N` where no parameter may stand
+  (`interval $1`).
+- **Rows are compared under Postgres `=`.** Bags whose text is the same are the same; two bags of
+  one size whose text differs are compared again in Postgres, so `1.0` and `1.00` are one value
+  while their text is not. A column type with no `=` (`json`) leaves such a trial undecided.
+- `now()` is one instant for the whole pair (its transaction's start), and each sequence is reset
+  before each side that can write.
+
 ## Soundness rules (a false positive is a bug)
 
 A reported counterexample is only valid if the instance is valid *and* both queries are
-deterministic. The rules:
+deterministic, on either engine. The rules:
 
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
   database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
@@ -78,63 +121,19 @@ deterministic. The rules:
   column the level's select list reads is one the tied rows agree on. Otherwise a `DISTINCT ON` at
   the top level (or in a `UNION ALL` branch of it) is compared by cardinality, which is its number
   of keys, and anything else makes the pair `NONDET-SKIP`.
-- **Evaluate as Postgres does, or not at all.** DuckDB's session runs with `integer_division`
-  (integer `/` truncates), `default_null_order = 'postgres'` (NULLs first under `DESC`) and
-  `TimeZone = 'UTC'` (not the host's), and `timestamptz` columns are DuckDB `TIMESTAMPTZ`. A divisor
-  of `/`, `%` or `mod()` that is not a non-zero literal is wrapped so that a zero raises, as in
-  Postgres, rather than answering `inf` or NULL: a trial in which a side raises is skipped. `~`,
-  `~*`, `!~` and `!~*` match anywhere, as Postgres's do, where DuckDB's `~` is a full match. A
-  `LIKE`, `ILIKE` or `NOT` either with no `ESCAPE` clause gets `ESCAPE '\'`: Postgres's escape
-  character is a backslash, DuckDB's is none. `power`, `pow` and `exp` are renamed to macros that
-  raise where Postgres's `double precision` versions do (a zero base with a negative exponent, a
-  negative base with a fractional one, an overflow or underflow) instead of answering `inf`, `NaN`
-  or `0`. `numeric(p,s)` is `DECIMAL(p,s)`, and a bare `numeric`, as a column or a cast, is
-  `DECIMAL(38,18)` rather than a `DOUBLE` or DuckDB's `DECIMAL(18,3)`. A string literal that meets a
-  `jsonb` value -- compared with one, in an `IN` list, cast to `jsonb`, or written into a json
-  column -- is respelled the one way the generated documents are spelled (keys sorted as `jsonb`
-  sorts them, the last of duplicate keys kept, no whitespace), since DuckDB compares JSON as text.
-  What has no faithful rendering is withheld as `NOT-COMPARABLE`: a `char(n)` or `interval` column
-  the pair reads (blank-padded comparison; interval arithmetic and text DuckDB does not share),
-  `SIMILAR TO`, a regex operator under `ANY`/`ALL`, the operator spellings `~~`, `~~*`, `!~~` and
-  `!~~*` (unless their pattern escapes nothing), a numeric literal DuckDB reads as a number and an
-  alias (Postgres 16's `0b101`, `0o17`, `0x1F`, or `1L`), a division of a `numeric` (DuckDB divides a
-  `DECIMAL` into a `DOUBLE`, and Postgres's result scale can need more digits than its 38),
-  `power`, `pow` or `exp` of a `numeric` and the `^` operator, a `double precision` turned into
-  text by a cast, `||` or `concat` (DuckDB prints `2.0` and `1000000000000000.0` where Postgres
-  prints `2` and `1e+15`), a `jsonb` literal whose value has no exact spelling (a non-integer
-  number), an ordering comparison of json values, and a JSON object or array literal not in that
-  spelling where it may meet a `jsonb`. Types are read conservatively: a name the DDL and the
-  statement's aliases do not settle counts as whichever type is being guarded against.
 - **Canonicalize arrays.** `array_agg`/`unnest` element order is nondeterministic without `ORDER BY`,
   so list elements are sorted before comparison.
 - **Compare numbers by value, not by type.** A declared `bigint` is materialized as DuckDB `INTEGER`,
   so `c` and `c::bigint` come back as different DuckDB types carrying the same number, and a
   `numeric` of another scale does the same. Cells are compared by numeric value, which can only merge
   them, never split them — inside a record, a map or an array as well, where a record's field names
-  are not compared either. An interval is compared by the span Postgres's `=` compares (a month as
-  30 days, a day as 24 hours), so `'1 day'` and `'24 hours'` are one cell.
-- **A bare `float` is `double precision`.** Postgres reads `float` as `double precision`; DuckDB
-  reads it as single-precision `REAL`, so a `::float` cast would compute a different value from the
-  same cast spelled `::double precision`. Bare `float` cast targets are rewritten to `DOUBLE` before
-  anything runs; `float(p)`, `float4`, `float8` and `real` already agree between the two.
+  are not compared either. An interval is compared by its span (a month as 30 days, a day as 24
+  hours), as `=` compares intervals in DuckDB and in Postgres, so `'1 day'` and `'24 hours'` are one
+  cell.
 - **Read placeholders off the tokens.** `$N` is found by the tokenizer, never inside a string literal
   or a comment, and substituted at those positions only. A placeholder Postgres would reject (`$0`,
   a number past `u32`) makes the pair `ERROR`.
 - **Don't invent a parameter correspondence.** See the next section.
-- **Shim a Postgres function only where the mapping is exact.** DuckDB has no name for some of the
-  functions these queries call, and both sides then fail to bind, so `src/shim.rs` supplies them as
-  macros. Applying the same macro to both sides is not enough to make a loose mapping safe: if the
-  two sides call the function on different arguments that Postgres maps to one value, a mapping
-  that keeps them apart refutes an equivalent pair. Anything needing a real translation rather than
-  a rename — format strings, regex semantics, full-text and jsonpath — is left undefined, and the
-  pair keeps reporting an error. `jsonb_build_object` normalizes its object as `jsonb` does (keys by
-  length then bytes, the last of duplicate keys kept); `json_build_object` keeps what it is given.
-- **A shim has to refuse what Postgres refuses.** Refusing an input is part of a function's
-  semantics, and being more permissive is the unsafe direction: Postgres raises for
-  `json_array_elements` of a non-array, where DuckDB answers with an empty list. An error makes the
-  tester skip the trial, so the two sides are never compared; an empty answer instead drops a row,
-  and a pair whose sides differ only in how they treat a dropped row is then refuted on an input
-  Postgres would have rejected. So the set-returning shims check the type and raise.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
 rather than a false counterexample; [`docs/SOUNDNESS.md`](../docs/SOUNDNESS.md) is that argument.
@@ -212,6 +211,9 @@ cargo build -p sqleq-fuzz --release     # first build downloads libduckdb (~40 M
 cargo test  -p sqleq-fuzz               # the self-contained suite below
 ```
 
+Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says — the build fetches one for
+the common platforms; `--engine duckdb` needs none.
+
 `sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
 the defaults below cannot move its answers. On its own:
 
@@ -221,26 +223,28 @@ sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting
 sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER) + exactly two statements
 
 options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
-         --seed N (default 0)
+         --seed N (default 0)  --engine postgres|duckdb (default $SQLEQ_FUZZ_ENGINE, else postgres)
 ```
 
 `row` and `file` print the verdict on the first line. A `NOT-EQUIVALENT` is followed by a
 `counterexample: …` line holding the instance, and a `NO-COUNTEREXAMPLE` that only some trials
 reached by a `partial: K trials compared both sides; last error: …` line. Those lines are what
-`sqleq-check` reads.
+`sqleq-check` reads. An `engine: postgres 17.N` (or `engine: duckdb …`) line follows, and with the
+Postgres engine a `caveat: …` line when the verdict rests on a stood-in type or a dropped default.
 
 `csv` mode takes each name in `names.txt` to the corpus row its digits number (`pairNNNN` is row
 `NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
 only some trials compared both sides), and writes `{ "pairNNNN": { "verdict": "...", "ms": ... } }`
 to `out.json` (default: beside the corpus, its extension replaced by `.fuzz.json`), adding
-`ok_trials` and `trial_error` for a partial run. A name whose digits number no row gets `NO-ROW`. A
+`ok_trials` and `trial_error` for a partial run, `engine`, and with the Postgres engine, where there
+is one, `caveat`. A name whose digits number no row gets `NO-ROW`. A
 panic while testing one row is that row's `ERROR:panic: …`, and the run goes on to the next one.
 
 Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
 `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
 a `:` still bucket correctly for a consumer that splits on the first one. `NOT-COMPARABLE` is a
-withheld verdict: either the two sides share no observable, or DuckDB cannot be made to evaluate them
-as Postgres does.
+withheld verdict: the two sides share no observable, a `$N` is an array on one side and a scalar on
+the other, a pair needs an ICU collation, or the generated instances cannot stand for the DDL.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file without exactly two

@@ -11,8 +11,8 @@
 //! multiset of canonicalised rows (bag semantics: ORDER BY alone never counts). SELECTs compare the
 //! result set; DML compares the final table state.
 //!
-//! The connection is set up to compute what Postgres computes where DuckDB's defaults differ
-//! ([`open_db`]): integer division, the NULL order of `DESC`, and the session time zone.
+//! The statements are evaluated as DuckDB evaluates them; the session's one setting is a fixed time
+//! zone ([`open_db`]), so a verdict does not depend on the machine it ran on.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::ControlFlow;
@@ -261,32 +261,13 @@ fn insert_checked(con: &Connection, qn: &str, row: &str, unindexed: &[&Vec<Strin
 /// was never a soundness risk (`pair.rs` abandons a trial whose side errors, so a refutation
 /// always has two successful sides), but it was a reproducibility one.
 ///
-/// Three session settings make DuckDB compute what Postgres computes, each where DuckDB's default
-/// does not, and each refuting equivalent pairs without it:
-///
-/// * `integer_division`: integer `/` truncates toward zero, as Postgres's does. DuckDB's default
-///   is floating-point division, so `a / 2` and `(a - a % 2) / 2` differ at `a = 1`, and `a / 2`
-///   against `a / 2.0` cannot be told apart. (DuckDB then has no `/` for an interval, so an
-///   `interval / n` side errors: a lost trial, not a different answer.)
-/// * `default_null_order = 'postgres'`: NULLs sort last under `ASC` and **first** under `DESC`.
-///   DuckDB's default puts them last under both, so `ORDER BY a DESC` and `a DESC NULLS FIRST`
-///   number rows differently in a window, or keep different rows under a `LIMIT`.
-/// * `TimeZone = 'UTC'`: a fixed session zone instead of the host's, so a verdict on a pair that
-///   converts between `timestamptz` and local time does not depend on the machine it ran on. Any
-///   one zone is a session Postgres can have, so a difference found under it is a real one.
-///
-/// What no setting fixes is handled in the query text instead (`crate::rewrite`): a zero divisor
-/// is made to raise, a regex match is made a partial one, a `LIKE` is given Postgres's escape
-/// character, `power` and `exp` are made to raise where Postgres's do, and a bare `numeric` cast is
-/// widened. What no rewrite fixes either withholds the pair (`crate::pgtype`).
+/// The session evaluates pairs as DuckDB does, with one setting: `TimeZone = 'UTC'`, a fixed zone
+/// instead of the host's, so a verdict on a pair that converts between `timestamptz` and local time
+/// does not depend on the machine it ran on.
 pub fn open_db() -> duckdb::Result<Connection> {
     let config = Config::default().threads(1)?.enable_autoload_extension(false)?;
     let con = Connection::open_in_memory_with_flags(config)?;
-    con.execute_batch(
-        "SET integer_division = true; \
-         SET default_null_order = 'postgres'; \
-         SET TimeZone = 'UTC';",
-    )?;
+    con.execute_batch("SET TimeZone = 'UTC';")?;
     Ok(con)
 }
 
@@ -716,7 +697,6 @@ mod tests {
             vt: VType::Json,
             notnull: false,
             array,
-            padded: false,
             sequenced: false,
         }
     }

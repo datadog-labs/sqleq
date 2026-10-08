@@ -134,6 +134,17 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   that reads a value of either type is refused, unless the two queries lower to one plan, which
   computes the same thing however `=` is read; a column of one that no query reads costs nothing.
   `SELECT *`, `DELETE` and `UPDATE` read every column of the table they touch.
+- **`avg` over an integer is a `numeric`.** Postgres's `avg` over `smallint`, `integer` or `bigint`
+  returns `numeric`, so its result is REAL, not the integer its operand is: the mean of `{0, 1}` is
+  `0.5`, and an integer mean would make `avg(a) = 0` the same filter as `avg(a) < 1 AND avg(a) > -1`.
+  It has `numeric`'s `=` with the type: the mean of `{19999}` and the mean of `{39998, 0}` are both
+  19999, printed `19999.0000000000000000` and `19999.000000000000`. So what reads it is sorted as
+  [below](#values-that--calls-equal-and-that-are-still-two-values), and a pair whose two queries
+  differ and that casts the mean to text or divides it is refused, as one over a `numeric` column
+  is. `sum` over an integer is integer-valued (`bigint`, or a `numeric` of scale 0 over `bigint`),
+  and `count`, `min` and `max` are integers, so they keep their operand's type. One gap is open
+  there: over `bigint`, `sum` is a `numeric`, so `sum(g) / 2` is a `numeric` division, and the IR,
+  which has one INTEGER for every integer width, reads it as an integer one.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
   inference, read every name from one table, so `uuid` and `money` are opaque in both.
@@ -144,8 +155,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   `opaque_identity`); a type not on it, an enum, a domain or an extension's type included, is of
   the second kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque
   value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
-  only columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it
-  reads `=` and deduplication as identity on every type.
+  and takes a `MAX` or `MIN` only over columns whose `=` is identity, refusing the rest. The QED
+  prover reads no such list: it reads `=` and deduplication as identity on every type.
 - **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
   over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
@@ -196,9 +207,9 @@ the order of `C` and `POSIX` and of no other collation Postgres guarantees.
   operand is neither a column nor a constant (`(c || 'x') < 'y'`) takes its collation from the
   columns it reads, which the frontend does not trace, so in such a pair it is refused too.
 
-`sqleq-fuzz` compares strings by code point, as DuckDB does, so it cannot refute a pair whose two
-sides differ only under another collation; the `witness:` of such a pinned pair names the collation
-it needs.
+`sqleq-fuzz` compares strings by code point — its cluster has the `C` collation, and DuckDB
+compares so too — so it cannot refute a pair whose two sides differ only under another collation;
+the `witness:` of such a pinned pair names the collation it needs.
 
 ### Values that `=` calls equal and that are still two values
 

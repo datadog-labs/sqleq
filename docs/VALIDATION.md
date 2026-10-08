@@ -22,7 +22,7 @@ Query equivalence is undecidable in general, so no tool decides every pair. What
 prover and `sqleq-solver`, a Rust rewrite of [SQLSolver](https://github.com/SJTU-IPADS/SQLSolver),
 both reading the IR the frontend produces, and the Lean axis, which proves one class of `INSERT`
 pair under a parameter rule of its own ([LEAN.md](LEAN.md)). The refuting axis is `sqleq-fuzz`,
-which runs the original SQL against DuckDB on generated instances and reports the first divergence.
+which runs the original SQL on PostgreSQL on generated instances and reports the first divergence.
 It reads no IR, so it checks the frontend's lowering as well as the provers.
 
 The single most important consequence: **"not proved" is not "not equivalent."** It is a statement
