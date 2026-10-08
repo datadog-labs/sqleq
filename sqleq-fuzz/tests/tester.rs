@@ -8,8 +8,13 @@
 use std::collections::HashSet;
 
 use sqleq_fuzz::duck::{ddl_for, table_forms};
-use sqleq_fuzz::gen::{array_element_type, cast_target, CastTarget};
-use sqleq_fuzz::patterns::{array_params, freeze_time, misalignment, param_casts, param_cols};
+use sqleq_fuzz::gen::{
+    array_element_type, cast_target, clocks, CastTarget, DATES, INTERVALS, TIMESTAMPS,
+};
+use sqleq_fuzz::patterns::{
+    array_params, clock_reads, freeze_time, misalignment, param_cast_shapes, param_casts,
+    param_cols, reads_clock_in_body,
+};
 use sqleq_fuzz::schema::{parse_schema, parse_schema_stats, VType};
 use sqleq_fuzz::typing::{param_needs, Need};
 use sqleq_fuzz::{test_pair, Config, Verdict};
@@ -219,6 +224,80 @@ fn param_casts_pin_the_generated_type() {
     assert_eq!(cast_target("INT ARRAY"), None);
     assert_eq!(cast_target("int ARRAY[4]"), None);
     assert_eq!(cast_target("my_custom_enum"), None);
+}
+
+#[test]
+fn param_cast_shapes_read_both_spellings_and_a_schema() {
+    let shapes = param_cast_shapes(
+        "INSERT INTO t SELECT * FROM unnest($1::text[], $2::pg_catalog.date[], CAST($3 AS uuid)) \
+         WHERE $4::int = 1 AND $4::int[] = '{}' AND $5 = 'x'",
+    );
+    assert_eq!(shapes.get(&1).map(String::as_str), Some("text[]"));
+    assert_eq!(shapes.get(&2).map(String::as_str), Some("pg_catalog.date[]"));
+    assert_eq!(shapes.get(&3).map(String::as_str), Some("uuid"));
+    // Casts that disagree on the shape are no evidence, and neither is no cast.
+    assert_eq!(shapes.get(&4), None);
+    assert_eq!(shapes.get(&5), None);
+}
+
+#[test]
+fn clock_reads_become_the_trial_clock_by_type() {
+    assert_eq!(
+        clock_reads("SELECT now(), pg_catalog.now(), CURRENT_TIMESTAMP(3), transaction_timestamp()"),
+        "SELECT sqleq_clock.now(), sqleq_clock.now(), sqleq_clock.now(), sqleq_clock.now()"
+    );
+    assert_eq!(
+        clock_reads("SELECT localtimestamp, current_date, current_time(0), localtime"),
+        "SELECT sqleq_clock.local_ts(), sqleq_clock.today(), sqleq_clock.time_tz(), sqleq_clock.local_time()"
+    );
+    assert_eq!(
+        clock_reads("CREATE TABLE t (d date DEFAULT ('now'::text)::date, ts timestamptz DEFAULT 'now'::timestamptz)"),
+        "CREATE TABLE t (d date DEFAULT (sqleq_clock.now())::date, ts timestamptz DEFAULT (sqleq_clock.now())::timestamptz)"
+    );
+    // Not reads: text that says so, a comment, a quoted column, another schema's function, and
+    // `'now'` that is only text.
+    for sql in [
+        "SELECT 'now()', \"localtime\", app.now() -- current_date",
+        "CREATE TABLE t (s text DEFAULT 'now'::text)",
+    ] {
+        assert_eq!(clock_reads(sql), sql);
+    }
+}
+
+#[test]
+fn a_function_body_that_reads_the_clock_is_found() {
+    assert!(reads_clock_in_body(
+        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN NEW.at := now(); RETURN NEW; END $$ LANGUAGE plpgsql"
+    ));
+    assert!(!reads_clock_in_body(
+        "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql; SELECT now()"
+    ));
+}
+
+#[test]
+fn the_clocks_lie_before_among_and_after_the_generated_instants() {
+    // Days since 1970-01-01 of a `YYYY-MM-DD` prefix.
+    fn day(s: &str) -> i64 {
+        let (y, m, d): (i64, i64, i64) = (s[0..4].parse().unwrap(), s[5..7].parse().unwrap(), s[8..10].parse().unwrap());
+        let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+        365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + d - 719469
+    }
+    let widest = INTERVALS
+        .iter()
+        .map(|i| {
+            let n: i64 = i.split_whitespace().next().unwrap().parse().unwrap();
+            if i.contains("day") { n } else { 1 }
+        })
+        .max()
+        .unwrap();
+    let generated: Vec<&str> = DATES.iter().chain(TIMESTAMPS.iter()).copied().collect();
+    let first = generated.iter().map(|s| day(s)).min().unwrap();
+    let last = generated.iter().map(|s| day(s)).max().unwrap();
+    let [early, middle, late] = clocks();
+    assert!(day(&early) + widest < first, "{early}");
+    assert!(day(&late) - widest > last, "{late}");
+    assert!(TIMESTAMPS.iter().any(|t| middle.starts_with(t)), "{middle}");
+    assert!(DATES.iter().any(|d| middle.starts_with(d)), "{middle}");
 }
 
 #[test]

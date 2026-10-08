@@ -21,7 +21,8 @@ For a query pair `(A, B)` under a schema, it repeatedly:
    toward a value that actually occurs in the column it is compared against (so equality filters
    match rows) — but only where that consistency is something the row supports, see
    [Parameter binding](#parameter-binding-is-an-assumption-not-a-given) below;
-3. freezes `now()` / `current_*` to one instant and skips truly nondeterministic functions;
+3. sets the clock (`now()`, `current_*`) to one instant per trial and skips truly nondeterministic
+   functions;
 4. runs both statements on **PostgreSQL 17**, in a private cluster it starts for the run (see
    [Engines](#engines)) — or, with `--engine duckdb`, on DuckDB, as DuckDB evaluates them;
 5. compares the outputs as **sorted multisets** (bag semantics — an `ORDER BY`-only difference never
@@ -76,8 +77,13 @@ How the Postgres engine differs from the DuckDB one:
   one size whose text differs are compared again in Postgres, so `1.0` and `1.00` are one value
   while their text is not. A column whose type has no `=` (`json`, `xml`, `point`, ...) is compared
   by its text, since no two such values are one under `=`: `true` and `1` are two `json` values.
-- `now()` is one instant for the whole pair (its transaction's start), and each sequence is reset
-  before each side that can write.
+- **The clock is an input of each trial.** Every read of it, in both statements and in the DDL's
+  column defaults, reads one instant the trial sets: in turn, one before every generated date and
+  timestamp (1970), one among them (a generated timestamp, read off the generator's domain), and
+  one after them (2100). Against the first and last, a comparison with the clock holds for every
+  generated row or for none, so a side that drops one is seen; against the middle one, `<` and
+  `<=` differ. A counterexample names its clock. Each sequence is reset before each side that can
+  write.
 
 ## Soundness rules (a false positive is a bug)
 
@@ -100,11 +106,17 @@ deterministic, on either engine. The rules:
   (`s1.t`, `s2.t`) draw rows of their own. Any other second spelling of a table in a mutation pair
   (`s.t` beside a DDL's `t`) is withheld, since a write through one spelling would not show
   through the other.
-- **Freeze time.** `now()`/`statement_timestamp()` and the bare `current_timestamp`/`localtimestamp`
-  keywords are frozen, and so are `current_time`/`localtime`/`current_date` — all to the one instant
-  2020-06-01 12:00:00 UTC, so `now()::time = localtime` holds as in Postgres; otherwise A and B (run
-  microseconds apart) disagree spuriously. A clock spelled inside a string literal or a comment is
-  left alone.
+- **One clock for everything a trial reads.** `now()`/`statement_timestamp()`/
+  `transaction_timestamp()` and the bare `current_timestamp`/`localtimestamp` keywords, and
+  `current_time`/`localtime`/`current_date`, all read one instant, so `now()::time = localtime`
+  holds as in Postgres; otherwise A and B (run microseconds apart) disagree spuriously. A clock
+  spelled inside a string literal or a comment is left alone. On Postgres the instant is the
+  trial's (see [Engines](#engines)), and it is read by the DDL's defaults too, an old dump's
+  `('now'::text)::date` included, so an insert that writes `now()` and one that leaves it to the
+  default agree. A function body that reads the clock (a trigger stamping a row) would read the
+  real one, so a pair that reads the clock is withheld when one does, and so is one whose stored
+  default still reads the real clock. The DuckDB engine freezes the clock at 2020-06-01 12:00:00
+  UTC.
 - **`LIMIT`/`OFFSET` over an unordered set.** The clauses are read off the parse, so `LIMIT (1)`,
   `FETCH FIRST ROW ONLY` and `LIMIT ($1)` count. A count that is a bare `$N` and nothing else is
   bound so that it cuts nothing: a `LIMIT` large, an `OFFSET` to 0 — except in half the

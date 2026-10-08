@@ -40,8 +40,8 @@ use regex::Regex;
 
 use crate::duck::{table_forms, RowData};
 use crate::gen::{
-    array_element_type, cast_target, randval, randval_cast, randval_col, randval_need, CastTarget,
-    Val,
+    array_element_type, cast_target, clocks, randval, randval_cast, randval_col, randval_need,
+    CastTarget, Val,
 };
 use crate::limits::{self, Count};
 use crate::pair::{is_query, small_size, Config, Verdict, SMALL_STREAM};
@@ -67,7 +67,7 @@ const EXTENSIONS: &[&str] = &[
 pub const MAJOR: u32 = 17;
 
 /// Bumped whenever what the cached template holds changes, so an old template is never reused.
-const TEMPLATE_FORMAT: u32 = 2;
+const TEMPLATE_FORMAT: u32 = 3;
 
 /// Where the Postgres binaries are: `$SQLEQ_PG_BIN` when it is set, else the PostgreSQL the build
 /// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
@@ -324,6 +324,22 @@ const UUID_OSSP_CORE: &str = "\
     CREATE FUNCTION uuid_ns_x500() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
         AS $$SELECT '6ba7b814-9dad-11d1-80b4-00c04fd430c8'::uuid$$;";
 
+/// The functions every read of the transaction clock becomes ([`pat::clock_reads`]), one per type a
+/// read can have, each the instant the setting `sqleq.clock` holds -- the one a trial sets -- as
+/// Postgres derives that type from the transaction's start in the UTC session.
+const CLOCK_FUNCTIONS: &str = "\
+    CREATE SCHEMA sqleq_clock; \
+    CREATE FUNCTION sqleq_clock.now() RETURNS timestamptz LANGUAGE sql STABLE PARALLEL SAFE \
+        AS $$SELECT current_setting('sqleq.clock')::timestamptz$$; \
+    CREATE FUNCTION sqleq_clock.local_ts() RETURNS timestamp LANGUAGE sql STABLE PARALLEL SAFE \
+        AS $$SELECT sqleq_clock.now()::timestamp$$; \
+    CREATE FUNCTION sqleq_clock.today() RETURNS date LANGUAGE sql STABLE PARALLEL SAFE \
+        AS $$SELECT sqleq_clock.now()::date$$; \
+    CREATE FUNCTION sqleq_clock.time_tz() RETURNS timetz LANGUAGE sql STABLE PARALLEL SAFE \
+        AS $$SELECT sqleq_clock.now()::timetz$$; \
+    CREATE FUNCTION sqleq_clock.local_time() RETURNS time LANGUAGE sql STABLE PARALLEL SAFE \
+        AS $$SELECT sqleq_clock.now()::time$$;";
+
 /// The template every run copies: an initialised cluster whose `sqleq_tmpl` database carries
 /// [`EXTENSIONS`]. Built once per Postgres version, under `$SQLEQ_PG_CACHE` (default
 /// `~/.cache/sqleq`), and renamed into place whole, so two processes building it at once each get a
@@ -380,6 +396,8 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
             if !has_uuid {
                 t.batch_execute(UUID_OSSP_CORE).map_err(|e| msg(&e))?;
             }
+            t.batch_execute(&format!("SET sqleq.clock = '{}'; {CLOCK_FUNCTIONS}", clocks()[1]))
+                .map_err(|e| msg(&e))?;
         }
         let staged = cache.join(format!(
             "{}.{}",
@@ -448,8 +466,12 @@ impl Server {
 
     fn connect(&self, db: &str) -> Result<Client, String> {
         let mut c = Client::connect(&conninfo(&self.root, db), NoTls).map_err(|e| e.to_string())?;
-        c.batch_execute("SET statement_timeout = '10s'; SET lock_timeout = '2s'")
-            .map_err(|e| msg(&e))?;
+        // A clock outside any trial -- preparing a statement, running the DDL -- reads the middle one.
+        c.batch_execute(&format!(
+            "SET statement_timeout = '10s'; SET lock_timeout = '2s'; SET sqleq.clock = '{}'",
+            clocks()[1]
+        ))
+        .map_err(|e| msg(&e))?;
         Ok(c)
     }
 }
@@ -1137,8 +1159,9 @@ fn compare_under_eq(
     Err("no comparison result".to_string())
 }
 
-/// Render a counterexample: the bound params and the rows Postgres accepted.
-fn describe(binds: &HashMap<u32, Val>, kept: &RowData) -> String {
+/// Render a counterexample: the clock, where the pair reads it, the bound params and the rows Postgres
+/// accepted.
+fn describe(binds: &HashMap<u32, Val>, kept: &RowData, clock: Option<&str>) -> String {
     let mut ps: Vec<(u32, &Val)> = binds.iter().map(|(k, v)| (*k, v)).collect();
     ps.sort_by_key(|(k, _)| *k);
     let params = ps
@@ -1158,11 +1181,15 @@ fn describe(binds: &HashMap<u32, Val>, kept: &RowData) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ");
-    if params.is_empty() {
-        tables
-    } else {
-        format!("params: {params}  |  {tables}")
+    let mut parts = Vec::new();
+    if let Some(c) = clock {
+        parts.push(format!("clock: {c}"));
     }
+    if !params.is_empty() {
+        parts.push(format!("params: {params}"));
+    }
+    parts.push(tables);
+    parts.join("  |  ")
 }
 
 /// Test one pair on Postgres. The connection must not be inside a transaction.
@@ -1179,6 +1206,17 @@ pub fn test_pair_pg(client: &mut Client, a: &str, b: &str, ddl: &str, cfg: Confi
 }
 
 fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut Timing) -> Verdict {
+    // The clock is an input of each trial, like a placeholder: every read of it, in the DDL's
+    // defaults and in both statements, reads the instant the trial sets (see [`clocks`]), as reads
+    // of one transaction's clock agree.
+    let (a, b, ddl) = (pat::clock_reads(a), pat::clock_reads(b), pat::clock_reads(ddl));
+    let (a, b, ddl) = (a.as_str(), b.as_str(), ddl.as_str());
+    let clocked = [a, b, ddl].iter().any(|s| s.contains(pat::CLOCK_SCHEMA));
+    // A function body reads the real clock, not the trial's: a trigger that stamps a row would
+    // stamp it with an instant a statement's own read never sees.
+    if clocked && [a, b, ddl].iter().any(|s| pat::reads_clock_in_body(s)) {
+        return Verdict::NotComparable("clock: a function body reads the clock".to_string());
+    }
     if pat::has_explain(a, b) {
         return Verdict::NotComparable("explain".to_string());
     }
@@ -1427,6 +1465,26 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         }
     };
     let nondet = nondet || volatile_default;
+    // What Postgres stored decides, not the text: a default that still reads the real clock (a
+    // spelling the rewrite does not know) would give an insert an instant no statement reads.
+    if clocked && mutates {
+        let regs: Vec<String> = targets.iter().map(|(_, t)| t.reg.clone()).collect();
+        db.trips += 1;
+        match db.c.query(
+            "SELECT EXISTS (SELECT 1 FROM pg_attrdef ad \
+              WHERE ad.adrelid = ANY (ARRAY(SELECT r::regclass::oid FROM unnest($1::text[]) AS r)) \
+                AND regexp_replace(pg_get_expr(ad.adbin, ad.adrelid), 'sqleq_clock\\.\\w+\\(\\)', '', 'g') \
+                    ~* '\\m(now|statement_timestamp|transaction_timestamp)\\(|\\m(current_timestamp|current_date|current_time|localtimestamp|localtime)\\M|''(now|today|tomorrow|yesterday)''')",
+            &[&regs],
+        ) {
+            Ok(rows) if rows.first().is_some_and(|r| r.get::<_, bool>(0)) => {
+                return Verdict::NotComparable("clock: a column default reads the clock".to_string());
+            }
+            Ok(_) => {}
+            Err(e) => return Verdict::Error(msg(&e)),
+        }
+    }
+    let clocks = clocks();
     // Each side's parameter types: inferred by Postgres, or failing that, inferred with the
     // heuristics' column links declared as hints. The generator's domain for a placeholder is taken
     // only where both sides agree on it.
@@ -1467,9 +1525,17 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     // pairs those placeholders some other way (a row of a VALUES list and an element of an array,
     // say), so no binding by index compares what the caller paired. Postgres would even run such a
     // pair -- an array assigns to a text column as its text -- and refute what it never meant.
+    // Where Postgres cannot type a side, the casts that side writes itself still say which of its
+    // placeholders are arrays.
+    let shapes = |sql: &str, types: &BTreeMap<u32, String>| {
+        let mut out = pat::param_cast_shapes(sql);
+        out.extend(types.iter().map(|(n, t)| (*n, t.clone())));
+        out
+    };
+    let (shapes_a, shapes_b) = (shapes(a, &types_a), shapes(b, &types_b));
     for n in &pnums {
-        if let (Some(x), Some(y)) = (types_a.get(n), types_b.get(n)) {
-            if x.ends_with("[]") != y.ends_with("[]") {
+        if let (Some(x), Some(y)) = (shapes_a.get(n), shapes_b.get(n)) {
+            if x.ends_with(']') != y.ends_with(']') {
                 return Verdict::NotComparable(format!(
                     "param-shape: ${n} is {x} on one side and {y} on the other"
                 ));
@@ -1538,6 +1604,13 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
 
     for i in 0..cfg.total_trials() {
         let t_trial = Instant::now();
+        // By the trial's number, not the generator, so every value drawn is the one it would be.
+        let clock = clocked.then(|| clocks[i % clocks.len()].as_str());
+        if let Some(c) = clock {
+            if let Err(e) = db.exec(&format!("SET LOCAL sqleq.clock = '{c}'")) {
+                return Verdict::Error(e);
+            }
+        }
         let small = i % 5 == 4 && i / 5 < small_trials;
         let rng: &mut StdRng = if small {
             &mut small_rng
@@ -1614,8 +1687,18 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 (Some(_), _) => false,
                 (None, _) => true,
             };
+            // The heuristics' need types a column by its bare name, which may be a same-named
+            // column of another table, so it too decides only where it fits.
+            let need = pneed.get(&n).copied().filter(|need| match need {
+                typing::Need::Type(CastTarget::V(v)) => fits(*v),
+                typing::Need::NumericString => fits(VType::Integer) || fits(VType::Varchar),
+                _ => true,
+            });
+            if need != pneed.get(&n).copied() {
+                typed.insert(n);
+            }
             let mut pick = |rng: &mut StdRng| -> Val {
-                if pneed.get(&n) == Some(&typing::Need::NumericString) {
+                if need == Some(typing::Need::NumericString) {
                     return randval_need(typing::Need::NumericString, rng);
                 }
                 if col_survives_cast && !present.is_empty() && rng.random_bool(0.75) {
@@ -1624,8 +1707,8 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                     randval_cast(ct, rng)
                 } else if let Some((_, _, vt, _)) = loc {
                     randval(*vt, false, rng)
-                } else if let Some(need) = pneed.get(&n) {
-                    randval_need(*need, rng)
+                } else if let Some(need) = need {
+                    randval_need(need, rng)
                 } else if let Some((vt, _)) = pg {
                     // Where `test_pair` falls back to an integer drawn from nothing, the type
                     // Postgres inferred for the placeholder decides the domain.
@@ -1776,7 +1859,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 real = true;
             }
             if real {
-                verdict = Some(Verdict::NotEquivalent(describe(&binds, &kept)));
+                verdict = Some(Verdict::NotEquivalent(describe(&binds, &kept, clock)));
             } else if unknown {
                 timing.uncomparable += 1;
             } else {

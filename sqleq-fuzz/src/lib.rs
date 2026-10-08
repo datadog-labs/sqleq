@@ -8,7 +8,7 @@
 //! For a query pair `(A, B)` under a schema, it generates small **valid** random database instances
 //! (honouring NOT NULL and every UNIQUE / PRIMARY KEY / UNIQUE INDEX, empty tables included), binds
 //! `$N` params to random typed values consistently across A and B, holds `now()`/`current_*` to one
-//! instant and skips nondeterministic functions, runs both statements on PostgreSQL ([`pg`]) — or,
+//! instant per trial and skips nondeterministic functions, runs both statements on PostgreSQL ([`pg`]) — or,
 //! with `--engine duckdb`, on DuckDB, as DuckDB evaluates them ([`test_pair`]) — and
 //! compares outputs as **sorted multisets** (bag semantics — an ORDER BY-only difference never
 //! counts). SELECT pairs compare result sets; UPDATE/DELETE/INSERT pairs compare final table

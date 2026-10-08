@@ -211,6 +211,15 @@ static ARRAY_OP_APP: LazyLock<Regex> = LazyLock::new(|| {
 // that position requires — the only direct type evidence for a param no column comparison reaches.
 static PARAM_CAST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?i)\$(\d+)\s*::\s*({TY})")).unwrap());
+// The same evidence for one statement, in both spellings and with the type's schema, which decides
+// whether the cast is to an array: `$13::pg_catalog.date[]`, `CAST($1 AS uuid)`.
+static PARAM_SHAPE_CAST: LazyLock<Regex> = LazyLock::new(|| {
+    let ty = format!(r#"(?:"?[A-Za-z_]\w*"?\s*\.\s*)?{TY}"#);
+    Regex::new(&format!(
+        r"(?i)\$(\d+)\s*::\s*({ty})|\bcast\s*\(\s*\$(\d+)\s+as\s+({ty})\s*\)"
+    ))
+    .unwrap()
+});
 
 /// Either side an `EXPLAIN` → the pair compares plans, not results, and gets no verdict.
 pub fn has_explain(a: &str, b: &str) -> bool {
@@ -244,6 +253,91 @@ pub fn has_hard_nondet(a: &str, b: &str) -> bool {
 const FROZEN_TS: &str = "TIMESTAMP '2020-06-01 12:00:00'";
 const FROZEN_TIME: &str = "TIME '12:00:00'";
 const FROZEN_DATE: &str = "DATE '2020-06-01'";
+
+// The transaction clock as Postgres spells its reads, for the Postgres engine's own clock
+// ([`clock_reads`]): a function, also under `pg_catalog`, or a keyword with an optional precision.
+// The leading class keeps a quoted column or another schema's function of the same name out.
+re!(
+    CLOCK_FN,
+    r#"(?i)(^|[^\w."])(?:pg_catalog\s*\.\s*)?(?:now|statement_timestamp|transaction_timestamp)\s*\(\s*\)"#
+);
+re!(
+    CLOCK_TIMESTAMPTZ,
+    r#"(?i)(^|[^\w."])current_timestamp\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(
+    CLOCK_TIMESTAMP,
+    r#"(?i)(^|[^\w."])localtimestamp\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(CLOCK_DATE, r#"(?i)(^|[^\w."])current_date\b"#);
+re!(
+    CLOCK_TIMETZ,
+    r#"(?i)(^|[^\w."])current_time\b(?:\s*\(\s*\d*\s*\))?"#
+);
+re!(CLOCK_TIME, r#"(?i)(^|[^\w."])localtime\b(?:\s*\(\s*\d*\s*\))?"#);
+// `'now'` read as a date or time when the statement runs, as old dumps write a default:
+// `('now'::text)::date`. Cast to anything else it is only text.
+re!(
+    CLOCK_LITERAL,
+    r"(?i)(?:\(\s*'now'\s*::\s*text\s*\)|'now')\s*::\s*(date|timestamptz|timestamp|timetz|time)\b"
+);
+// Any read of the clock, for telling whether a function body reads one.
+re!(
+    CLOCK_ANY,
+    r"(?i)\b(?:now|statement_timestamp|transaction_timestamp)\s*\(|\b(?:current_timestamp|localtimestamp|current_date|current_time|localtime)\b|'(?:now|today|tomorrow|yesterday)'"
+);
+
+/// The schema of the functions every read of the clock becomes under the Postgres engine, which
+/// reads the instant a trial sets.
+pub const CLOCK_SCHEMA: &str = "sqleq_clock";
+
+/// `sql` with every read of the transaction clock -- `now()`, `current_timestamp`, `current_date`,
+/// `localtime`, ... -- replaced by the call of a [`CLOCK_SCHEMA`] function of the same type. A
+/// precision is dropped: every instant the clock is set to is a whole second. Matched over the
+/// [`mask`]ed statement, so a clock in a literal or a comment stays as written; `'now'` read as a
+/// date or time is the one literal that is a read.
+pub fn clock_reads(sql: &str) -> String {
+    let masked = mask(sql).unwrap_or_else(|| sql.to_string());
+    let mut cur = (sql.to_string(), masked);
+    for (re, rep) in [
+        (&*CLOCK_FN, "${1}sqleq_clock.now()"),
+        (&*CLOCK_TIMESTAMPTZ, "${1}sqleq_clock.now()"),
+        (&*CLOCK_TIMESTAMP, "${1}sqleq_clock.local_ts()"),
+        (&*CLOCK_DATE, "${1}sqleq_clock.today()"),
+        (&*CLOCK_TIMETZ, "${1}sqleq_clock.time_tz()"),
+        (&*CLOCK_TIME, "${1}sqleq_clock.local_time()"),
+    ] {
+        cur = replace_outside_literals(&cur.0, &cur.1, re, rep);
+    }
+    let (sql, masked) = cur;
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in CLOCK_LITERAL.captures_iter(&sql) {
+        let m = caps.get(0).unwrap();
+        // A real literal keeps its quote, or the parenthesis before it, in the masked text; inside a
+        // comment or another literal the same bytes are blank.
+        if masked.as_bytes().get(m.start()) == Some(&b' ') {
+            continue;
+        }
+        out.push_str(&sql[last..m.start()]);
+        out.push_str("(sqleq_clock.now())::");
+        out.push_str(&caps[1]);
+        last = m.end();
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
+/// Whether a dollar-quoted body in `sql` -- a function's or a `DO` block's -- reads the clock, which
+/// [`clock_reads`] leaves as written.
+pub fn reads_clock_in_body(sql: &str) -> bool {
+    lex(sql).is_some_and(|toks| {
+        toks.iter().any(|t| match &t.token {
+            Token::DollarQuotedString(d) => CLOCK_ANY.is_match(&d.value),
+            _ => false,
+        })
+    })
+}
 
 /// Freeze runtime time sources to constants and strip row-locking clauses.
 ///
@@ -460,6 +554,26 @@ pub fn param_casts(a: &str, b: &str) -> HashMap<u32, String> {
         }
     }
     out
+}
+
+/// Each `$N` that `sql` casts explicitly, to the type it names, where every cast of it there agrees
+/// on whether that type is an array. Evidence of a placeholder's shape where Postgres cannot type the
+/// statement.
+pub fn param_cast_shapes(sql: &str) -> HashMap<u32, String> {
+    let mut seen: HashMap<u32, Vec<String>> = HashMap::new();
+    for caps in PARAM_SHAPE_CAST.captures_iter(&masked(sql)) {
+        let (n, ty) = match (caps.get(1), caps.get(2), caps.get(3), caps.get(4)) {
+            (Some(n), Some(ty), _, _) | (_, _, Some(n), Some(ty)) => (n, ty),
+            _ => continue,
+        };
+        if let Ok(n) = n.as_str().parse() {
+            seen.entry(n).or_default().push(ty.as_str().trim().to_string());
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, tys)| tys.iter().all(|t| t.ends_with(']') == tys[0].ends_with(']')))
+        .map(|(n, mut tys)| (n, tys.swap_remove(0)))
+        .collect()
 }
 
 /// `sql` with its literals and comments blanked ([`mask`]), for the value-biasing patterns; the

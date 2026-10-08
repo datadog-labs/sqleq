@@ -14,7 +14,7 @@
 //! `PATH`) the tests are skipped, unless `$SQLEQ_PG_REQUIRED` is set, as CI sets it.
 
 use sqleq_fuzz::pg::{test_pair_pg, Outcome, Server};
-use sqleq_fuzz::Config;
+use sqleq_fuzz::{Config, Verdict};
 
 /// The budget `sqleq-check` passes.
 const CFG: Config = Config {
@@ -235,11 +235,37 @@ fn a_cast_to_text_is_the_sides_own_choice() {
 }
 
 #[test]
+fn a_placeholder_takes_the_type_postgres_gives_it_over_a_same_named_column() {
+    // `id` is a bigint in `attachments` and a uuid in `docs`: `$1` is compared with the uuid.
+    let ddl = r#"create table "attachments" ("id" BIGINT PRIMARY KEY, "doc_id" UUID NOT NULL);
+create table "docs" ("id" UUID PRIMARY KEY)"#;
+    assert_kind!(
+        r#"SELECT a."id" FROM "attachments" a WHERE a."doc_id" IN (SELECT d."id" FROM "docs" d WHERE d."id" IN ($1))"#,
+        r#"SELECT a."id" FROM "attachments" a WHERE a."doc_id" IN (SELECT DISTINCT d."id" FROM "docs" d WHERE d."id" IN ($1))"#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
 fn an_array_on_one_side_and_a_scalar_on_the_other_is_not_compared() {
     assert_kind!(
         r#"SELECT "id" FROM "t" WHERE "a" = $1"#,
         r#"SELECT "id" FROM "t" WHERE "a" = ANY($1::int[])"#,
         T,
+        "NOT-COMPARABLE"
+    );
+}
+
+#[test]
+fn an_array_on_a_side_postgres_cannot_prepare_is_still_not_compared_with_a_scalar() {
+    // The `unnest` side assigns text to a uuid column, so Postgres types none of its placeholders;
+    // its own casts still say they are arrays.
+    let ddl = r#"create table "s" ("id" UUID PRIMARY KEY, "name" TEXT)"#;
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES (CAST($1 AS UUID), $2)"#,
+        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::text[], $2::pg_catalog.text[])"#,
+        ddl,
         "NOT-COMPARABLE"
     );
 }
@@ -340,6 +366,71 @@ fn a_mutation_that_touches_other_rows_is_refuted() {
         r#"UPDATE "t" SET "a" = "a" + 1"#,
         T,
         "NOT-EQUIVALENT"
+    );
+}
+
+// -- The clock ----------------------------------------------------------------------------------
+
+const EVENTS: &str = r#"create table "e" ("id" INTEGER PRIMARY KEY, "at" TIMESTAMPTZ NOT NULL)"#;
+
+#[test]
+fn a_boundary_at_the_clock_is_refuted() {
+    // The middle clock is a generated instant, so a row stamped with it tells `<` from `<=`.
+    assert_kind!(
+        r#"SELECT "id" FROM "e" WHERE "at" < now()"#,
+        r#"SELECT "id" FROM "e" WHERE "at" <= now()"#,
+        EVENTS,
+        "NOT-EQUIVALENT"
+    );
+}
+
+#[test]
+fn a_comparison_with_the_clock_that_one_side_drops_is_refuted() {
+    // Against a clock after every generated row the comparison holds for all of them; against one
+    // before them, for none. The counterexample names the clock it was found under.
+    if let Some(o) = outcome(
+        r#"SELECT "id" FROM "e" WHERE "at" < current_timestamp - interval '1 day'"#,
+        r#"SELECT "id" FROM "e""#,
+        EVENTS,
+    ) {
+        match o.verdict {
+            Verdict::NotEquivalent(witness) => assert!(witness.contains("clock: "), "{witness}"),
+            v => panic!("{}", v.label()),
+        }
+    }
+}
+
+#[test]
+fn every_read_of_the_clock_in_a_trial_reads_one_instant() {
+    // A default and a statement's own read; `now()`, `current_timestamp` and an old dump's
+    // `('now'::text)::date` against `current_date`.
+    let ddl = r#"create table "e" ("id" INTEGER PRIMARY KEY, "at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "day" DATE DEFAULT ('now'::text)::date)"#;
+    assert_kind!(
+        r#"INSERT INTO "e" ("id", "at", "day") VALUES ($1, now(), current_date)"#,
+        r#"INSERT INTO "e" ("id") VALUES ($1)"#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+    assert_kind!(
+        r#"SELECT "id", now()::time AS "x", now()::date AS "d" FROM "e""#,
+        r#"SELECT "id", localtime AS "x", pg_catalog.now()::date AS "d" FROM "e""#,
+        EVENTS,
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
+fn a_function_body_that_reads_the_clock_is_not_compared() {
+    // The trigger would stamp the row with the real clock, which no statement's own read sees.
+    let ddl = r#"create table "e" ("id" INTEGER PRIMARY KEY, "at" TIMESTAMPTZ);
+create function "stamp"() returns trigger language plpgsql as $$ begin new."at" := now(); return new; end $$;
+create trigger "e_stamp" before update on "e" for each row execute function "stamp"()"#;
+    assert_kind!(
+        r#"UPDATE "e" SET "at" = now() WHERE "id" = $1"#,
+        r#"UPDATE "e" SET "id" = "id" WHERE "id" = $1"#,
+        ddl,
+        "NOT-COMPARABLE"
     );
 }
 
