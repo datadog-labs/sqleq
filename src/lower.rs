@@ -2335,6 +2335,17 @@ impl AggCtx<'_> {
             d
         } else if let Some(t) = opaque_agg_ret(&a.op) {
             t.to_string()
+        } else if a.op == "AVG" && operand.first().is_some_and(|f| ty_of(f) == "INTEGER") {
+            // SOUNDNESS GUARD. `avg` over `smallint`, `integer` or `bigint` returns `numeric`, the
+            // IR's REAL: the mean of `{0, 1}` is `0.5`. Typed like its operand, it was an integer to
+            // the provers, and QED proved `avg(a) = 0` equivalent to `avg(a) < 1 AND avg(a) > -1`.
+            // It has `numeric`'s `=` too, which is not identity: `avg` over `{19999}` prints
+            // `19999.0000000000000000` and over `{39998, 0}` `19999.000000000000`, so a read of it
+            // that can tell the two apart, a cast to text or a division, is [`crate::equality`]'s.
+            // Over `numeric` the operand's type is already right, over a float the call is refused
+            // ([`FLOAT_SUMMING_AGGS`]), and `sum` over an integer is an integer (`bigint`, or a
+            // `numeric` of scale 0 over `bigint`), so those keep the fallback below.
+            "REAL".to_string()
         } else if let Some(f) = operand.first() {
             ty_of(f)
         } else {
