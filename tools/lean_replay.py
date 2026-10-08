@@ -27,7 +27,9 @@ sequences start fresh each time. That is only true because every sequence a run 
 inside it, by the DDL or by this script: sequences are not transactional, so run this against a
 database where none of them already exists. Clocks are fixed and random generators drawn from
 sequences of their own (see `determinise`). Columns the INSERT omits whose default this does not
-recognise as deterministic are left out of the table comparison.
+recognise as deterministic are left out of the table comparison. After the DDL, each run sets
+`SET CONSTRAINTS ALL IMMEDIATE`: a witness is a run that commits on its own, so a deferred key is
+checked at the statement, as the witness model checks it.
 
 **Generated cells.** For a `proved-gather-generated` or `no-witness-generated` pair, the unnest side
 needs the values the VALUES side's generated cells evaluate to, which the claim takes as given. A
@@ -428,6 +430,10 @@ def preamble(plan: dict) -> list[str]:
         out += [f"SAVEPOINT d{i};", d.rstrip().rstrip(";") + "\n;",
                 "\\if :ERROR", f"ROLLBACK TO SAVEPOINT d{i};", f"\\echo @@ddlfail {i} :LAST_ERROR_SQLSTATE",
                 "\\else", f"RELEASE SAVEPOINT d{i};", "\\endif"]
+    # A witness is a run that commits on its own, so a deferred key is checked at the statement, as
+    # the witness model checks every key; without this an `INITIALLY DEFERRED` duplicate would pass
+    # the statement and fail only at a `COMMIT` the run never reaches.
+    out.append("SET CONSTRAINTS ALL IMMEDIATE;")
     return out
 
 

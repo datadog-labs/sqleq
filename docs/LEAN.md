@@ -115,7 +115,9 @@ A pair whose `VALUES` side always errors satisfies `EquivGather` trivially, beca
 the same way every time. Two identical rows under a unique key do this, and so does an omitted NOT
 NULL column with no default. So a proof is only credited together with a **witness**, checked by
 the kernel (`Sqleq.Witness`). The witness is one run of the `VALUES` side, on an empty table, that
-succeeds and inserts at least one row.
+succeeds and inserts at least one row. It is a run that commits on its own, so a key declared
+`DEFERRABLE INITIALLY DEFERRED`, which Postgres checks only at `COMMIT`, counts as checked at the
+statement, as every other key is.
 
 The run gives every parameter its own non-NULL value. That is the strongest choice: with distinct
 parameters, two rows collide only where the statement itself forces equal values (the same
@@ -132,7 +134,9 @@ The model covers:
 - NOT NULL;
 - unique constraints and unique indexes, including `NULLS NOT DISTINCT`;
 - conflict-target inference, `DO NOTHING`, and `DO UPDATE`, which cannot touch a row the same
-  statement inserted;
+  statement inserted. A deferrable constraint is never an arbiter: Postgres raises before reading
+  a row when a column target matches one (even beside a constraint that is not deferrable), when
+  `ON CONSTRAINT` names one, and on a target-less `DO NOTHING` when the table has one;
 - `GENERATED ALWAYS` columns.
 
 CHECK and foreign-key constraints are not modelled; a record carries `unmodelled` when the target
@@ -217,8 +221,10 @@ Every run is a transaction that applies the DDL and is rolled back. Inside it, g
 deterministic so that both runs see the *same* stream, which is what the theorem claims. A clock
 is fixed, and a random value is drawn from a sequence created within the run: one per default in
 the DDL and per generator in a tail, and one shared by the generators in the `VALUES` clause, so a
-draw on one side only shifts nothing on the other. Schema qualifiers are dropped, which is how
-sqleq resolves a name, except on the targets when the two statements qualify them differently:
+draw on one side only shifts nothing on the other. After the DDL the run sets
+`SET CONSTRAINTS ALL IMMEDIATE`, so a deferred key is checked at the statement, as the witness
+model checks it. Schema qualifiers are dropped, which is how sqleq resolves a name, except on the
+targets when the two statements qualify them differently:
 `a.t` and `b.t` are two tables, so their qualifiers are kept, and the run does not prepare rather
 than confirm a pair that writes two tables.
 

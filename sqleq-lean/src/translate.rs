@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use sqlparser::ast::{ConflictTarget, OnConflictAction, OnInsert, Statement};
 
 use crate::recognize::{recognize, Cell, GenKind, Parts, Refusal, Source, Tail, GENERATORS, SEQUENCE_TYPES};
-use crate::schema::{fold, last_name, type_key, DefaultKind, DefaultSource, Schema, Table, TypeKey};
+use crate::schema::{fold, last_name, type_key, DefaultKind, DefaultSource, Schema, Table, TypeKey, Unique};
 
 /// The `VALUES` side's sub-shape, reported so that one shape cannot hide inside another's numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,11 +160,26 @@ pub struct Replay {
 
 /// Resolve the conflict clause to what the witness model needs: which unique constraint is the
 /// arbiter, the way Postgres infers it.
+///
+/// Postgres never takes a deferrable constraint as an arbiter. Where it would have to, it raises
+/// before inserting a row ("ON CONFLICT does not support deferrable unique constraints/exclusion
+/// constraints as arbiters"), which is `NoArbiter` here:
+/// - a column target that any deferrable constraint on exactly those columns matches, even beside
+///   one that is not deferrable;
+/// - `ON CONSTRAINT` naming a deferrable constraint (only the named one is the arbiter, so a
+///   deferrable twin on the same columns does not matter);
+/// - a target-less `DO NOTHING` on a table with any deferrable unique constraint, since without a
+///   target every unique index is an arbiter.
 fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
     let Some(on) = on else { return LConflict::None };
     let OnInsert::OnConflict(oc) = on else { return LConflict::NoArbiter };
     let arbiter = match &oc.conflict_target {
-        None => None,
+        None => {
+            if table.uniques.iter().any(|u| u.deferrable) {
+                return LConflict::NoArbiter;
+            }
+            None
+        }
         Some(ConflictTarget::Columns(ids)) => {
             let mut want: Vec<usize> = Vec::new();
             for id in ids {
@@ -176,12 +191,15 @@ fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
             want.sort_unstable();
             // Inference: a unique index on exactly these columns, not partial (Postgres needs a
             // matching `WHERE`, which this fragment never has) and not on expressions.
-            let found = table.uniques.iter().position(|u| {
+            let matches = |u: &&Unique| {
                 let mut c = u.cols.clone();
                 c.sort_unstable();
                 !u.partial && !u.expr && c == want
-            });
-            match found {
+            };
+            if table.uniques.iter().filter(matches).any(|u| u.deferrable) {
+                return LConflict::NoArbiter;
+            }
+            match table.uniques.iter().position(|u| matches(&u)) {
                 Some(u) => Some(u),
                 None => return LConflict::NoArbiter,
             }
@@ -189,6 +207,7 @@ fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
         Some(ConflictTarget::OnConstraint(name)) => {
             let want = last_name(name);
             match table.uniques.iter().position(|u| u.name.is_some() && u.name == want) {
+                Some(u) if table.uniques[u].deferrable => return LConflict::NoArbiter,
                 Some(u) => Some(u),
                 None => return LConflict::NoArbiter,
             }
@@ -870,6 +889,50 @@ mod tests {
             "INSERT INTO al (id, name) SELECT * FROM unnest($1::int[], $2::text[])",
         );
         assert!(r.contains("read in full"), "{r}");
+    }
+
+    /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.
+    fn conflict_of(ddl: &str, tail: &str) -> LConflict {
+        let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
+        let a = format!("INSERT INTO t (id, a) VALUES ($1, $2), ($3, $4){tail}");
+        let b = format!("INSERT INTO t (id, a) SELECT * FROM unnest($1::int[], $2::int[]){tail}");
+        match translate(&p(&a), &p(&b), &Schema::from_ddl(ddl)).unwrap().witness {
+            Witness::Spec(s) => s.conflict,
+            Witness::Skip(r) => panic!("witness skipped: {r}"),
+        }
+    }
+
+    #[test]
+    fn a_deferrable_constraint_is_never_an_arbiter() {
+        let twins = "CREATE TABLE t (id int, a int, CONSTRAINT t_plain UNIQUE (id), CONSTRAINT t_def UNIQUE (id) DEFERRABLE);";
+        // Postgres raises 55000 on each of these before inserting a row.
+        for (ddl, tail) in [
+            ("CREATE TABLE t (id int PRIMARY KEY DEFERRABLE, a int);", " ON CONFLICT (id) DO NOTHING"),
+            ("CREATE TABLE t (id int PRIMARY KEY, a int UNIQUE DEFERRABLE);", " ON CONFLICT DO NOTHING"),
+            (
+                "CREATE TABLE t (id int, a int, CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED);",
+                " ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING",
+            ),
+            (
+                "CREATE TABLE t (id int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE, a int);",
+                " ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a",
+            ),
+            // Inference meets the deferrable twin too, so a plain key beside it does not help.
+            (twins, " ON CONFLICT (id) DO NOTHING"),
+        ] {
+            assert_eq!(conflict_of(ddl, tail), LConflict::NoArbiter, "{ddl}{tail}");
+        }
+        // But naming the plain twin works, a deferrable key on another column is no arbiter here,
+        // and `INITIALLY IMMEDIATE` alone is not deferrable.
+        assert_eq!(conflict_of(twins, " ON CONFLICT ON CONSTRAINT t_plain DO NOTHING"), LConflict::NothingOn(0));
+        assert_eq!(
+            conflict_of("CREATE TABLE t (id int PRIMARY KEY, a int UNIQUE DEFERRABLE);", " ON CONFLICT (id) DO NOTHING"),
+            LConflict::NothingOn(0)
+        );
+        assert_eq!(
+            conflict_of("CREATE TABLE t (id int PRIMARY KEY INITIALLY IMMEDIATE, a int);", " ON CONFLICT (id) DO NOTHING"),
+            LConflict::NothingOn(0)
+        );
     }
 
     #[test]

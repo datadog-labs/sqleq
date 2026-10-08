@@ -70,7 +70,7 @@ mod verify;
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod internals {
-    pub use crate::catalog::{obj_name, Catalog, SYSTEM_COLUMNS};
+    pub use crate::catalog::{enforced_per_statement, obj_name, Catalog, SYSTEM_COLUMNS};
     pub use crate::infer::{declares, nid};
 
     /// Aliased rather than re-exported: `DIALECT` sits at the crate root, where making it
