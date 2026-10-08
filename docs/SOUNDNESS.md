@@ -134,14 +134,6 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   that reads a value of either type is refused, unless the two queries lower to one plan, which
   computes the same thing however `=` is read; a column of one that no query reads costs nothing.
   `SELECT *`, `DELETE` and `UPDATE` read every column of the table they touch.
-- **`box`, `circle`, `lseg` and `line` are refused the same way.** Their `=` compares areas,
-  endpoints or coefficients within a tolerance of `1e-6`, so it is not transitive: boxes of area 1,
-  1.0000009 and 1.0000018 make `a = b` and `b = c` true and `a = c` false. Both provers read `=` as
-  an equivalence on every type, and would prove `a = b AND b = c` the same filter as `a = b AND
-  b = c AND a = c`, with no cast in sight. So is the result of a core function that returns one of
-  them (`box(point, point)`, `circle(point, double precision)`, `lseg`, `line`, `bound_box` and the
-  rest of `pg_proc`'s list), whether or not the input declares it. A function a user defines that
-  returns one is a name like any other.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
   inference, read every name from one table, so `uuid` and `money` are opaque in both.
@@ -149,19 +141,11 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   where two values `=` calls equal are the same value, and for `double precision`, `jsonb` and
   `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the
   first kind in `opaque_identity`, from an allowlist checked on Postgres 17 (`src/types.rs`,
-  `opaque_identity`); a type not on it, an enum or an extension's type included, is of the second
-  kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque value
-  through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) only
-  columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it reads `=`
-  and deduplication as identity on every type, so the frontend reads the same list for it
-  ([below](#values-that--calls-equal-and-that-are-still-two-values)).
-- **A domain is its base type.** Postgres resolves an operator, a cast and `=` over a domain value
-  as over the type the domain is over, so both readers of a `CREATE TABLE` type a column of a
-  domain the DDL creates (`CREATE DOMAIN d AS numeric`) as that type, through a domain over a
-  domain too. What a domain adds, a `CHECK` or a `NOT NULL`, only narrows the values the column
-  holds, and reading the base type quantifies over more of them. A domain with a `COLLATE`, a name
-  created twice and one Postgres predefines a type under are not read, and their columns are of a
-  type the frontend does not know. A domain's `DEFAULT` is not read.
+  `opaque_identity`); a type not on it, an enum, a domain or an extension's type included, is of
+  the second kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque
+  value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
+  only columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it
+  reads `=` and deduplication as identity on every type.
 - **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
   over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
@@ -220,15 +204,7 @@ it needs.
 
 For `numeric`, the floats, `interval` and `jsonb`, `=` is coarser than identity: `2.0 = 2.00`,
 `-0 = 0`, `'1 day' = '24 hours'` (and `'1 mon' = '30 days'`), `'{"a": 1.0}' = '{"a": 1.00}'`, and an
-array of one of them compares its elements the same way. So it may be for any type the frontend
-does not know: `numrange` compares its bounds as numerics, so `'[1.0,2.0)' = '[1.00,2.00)'`, and
-the result of a function nobody declared is VARBINARY, though `round(i, 1)` is a `numeric` and
-`sqrt(i)` a float. Identity is therefore what has to be established: a value is read as one whose
-`=` is identity only if it is an integer, a string, a boolean, a date, a time or a timestamp, a
-value of an opaque type on the `opaque_identity` list (`bytea`, `uuid`, an array of the others), a
-value of a core type with no `=` at all (`json`, `xml`, `point`, `polygon`, whose values no query
-can put in one class), or the result of `coalesce`, `nullif`, `greatest`, `least`, `->` or `#>` over
-such values, of `->>` or `#>>`, which are text. The IR's values of every other type stand for
+array of one of them compares its elements the same way. The IR's values of these types stand for
 classes of Postgres values under `=`, which is faithful for an operation that gives equal results on
 equal arguments and not for one that does not. From `t.x = u.x`, or from a `GROUP BY`, a `DISTINCT`
 or a `UNION`, which put equal values in one class, a prover concludes `f(t.x) = f(u.x)` for every
@@ -245,12 +221,7 @@ So the frontend sorts every read of such a value in the lowered plans (`src/equa
   `numeric`, float arithmetic, a cast to a number or a boolean, `coalesce`, `nullif`, `greatest`,
   `least`, `abs`, `ceil`, `floor`, `round`, `trunc`, `sign`, `->`, `#>`, `@>`, `&&` or a subscript.
   Nothing to do. A result of the same kind, such as `coalesce(x, 0)`, carries a type that says so,
-  across a query block too, so a read of it further up is sorted the same way. Over a value of a
-  type the frontend does not know, only the operations that compare, count, return or convert it
-  are: a comparison, a null test, `IN`, `count`, `min`, `max`, `coalesce`, `nullif`, `greatest`,
-  `least`, a `CASE`, a subscript, an array built of it, and a cast to a number or a boolean, which
-  every type Postgres casts to one converts by value. `+`, `round` or `@>` over a `numeric` reads
-  its value by what it is over a `numeric`, which says nothing of another type.
+  across a query block too, so a read of it further up is sorted the same way.
 - By any other operation. If the value is fixed by its spelling, computed by one expression from
   literals, parameters, clocks and values of types whose `=` is identity (`INTERVAL '1 day'` in
   `ts + INTERVAL '1 day'`, or `n::numeric` over an integer `n` in `n / 2.0`), the operation reads it
@@ -263,24 +234,15 @@ So the frontend sorts every read of such a value in the lowered plans (`src/equa
 A pair whose two queries lower to one plan is lowered regardless, as for `citext`. A set operation or
 a `VALUES` list whose column takes an integer's type from its first branch or row and holds a
 `numeric` from a later one is refused, since a read of the column would take the value for one whose
-`=` is identity; so is one that holds a value of a type the frontend does not know under such a
-column, unless the column is a date, a time, a timestamp or a boolean, which Postgres keeps whatever
-the other branches hold (or fails the query).
-
-All the frontend assumes of a type it does not know is that its `=` is an equivalence relation, that
-its order, where it has one, agrees with it, as a btree operator class makes them, and that a cast
-from it to a number or a boolean converts by value, as every such cast in Postgres's core does. Postgres's
-own types without one are either refused (the geometric types above) or have an `=` that is one
-(`path`'s counts points). A type a user or an extension defines is taken to be such a type too.
+`=` is identity.
 
 The cost is those refusals: a pair whose two queries differ and that casts one of these values to
-text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, adds
-an interval column to a date, or passes a column of a type the frontend does not know (a range of
-numerics, an enum, `inet`) or the result of a function nobody declared, read from a row, to any
-function but the ones above, is refused rather than proved. Computed in place from values whose `=`
-is identity, the same value is read through its spelling and still proved: `CAST(round(i, 1) AS
-TEXT)` over `i = j`. One gap remains: the cast an `UPDATE` or `INSERT` applies when it stores one of
-these values in a text column is not modelled.
+text, extracts a `jsonb` field as text (`->>`, `#>>`), divides or averages a `numeric` column, or adds
+an interval column to a date, is refused rather than proved. Three gaps remain. A value whose type
+the frontend does not know is read as one whose `=` is identity: the result of a function nobody
+declared is VARBINARY, though `sqrt(i)` is a float. So are opaque types whose `=` is not identity
+beyond these four (`numrange`, the geometric types, a domain over `numeric`). And the cast an
+`UPDATE` or `INSERT` applies when it stores one of these values in a text column is not modelled.
 
 ### Shapes that look like something simpler
 
