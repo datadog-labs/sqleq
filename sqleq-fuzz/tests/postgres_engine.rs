@@ -258,6 +258,19 @@ fn an_array_on_one_side_and_a_scalar_on_the_other_is_not_compared() {
 }
 
 #[test]
+fn an_array_on_a_side_postgres_cannot_prepare_is_still_not_compared_with_a_scalar() {
+    // The `unnest` side assigns text to a uuid column, so Postgres types none of its placeholders;
+    // its own casts still say they are arrays.
+    let ddl = r#"create table "s" ("id" UUID PRIMARY KEY, "name" TEXT)"#;
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES (CAST($1 AS UUID), $2)"#,
+        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::text[], $2::pg_catalog.text[])"#,
+        ddl,
+        "NOT-COMPARABLE"
+    );
+}
+
+#[test]
 fn a_placeholder_where_no_parameter_may_stand_is_a_literal() {
     // `interval $1` is a syntax error with a parameter; captured SQL writes a literal's place so.
     let ddl = r#"create table "t" ("id" INTEGER PRIMARY KEY, "ts" TIMESTAMP)"#;

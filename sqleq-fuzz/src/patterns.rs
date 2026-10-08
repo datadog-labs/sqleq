@@ -211,6 +211,15 @@ static ARRAY_OP_APP: LazyLock<Regex> = LazyLock::new(|| {
 // that position requires — the only direct type evidence for a param no column comparison reaches.
 static PARAM_CAST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?i)\$(\d+)\s*::\s*({TY})")).unwrap());
+// The same evidence for one statement, in both spellings and with the type's schema, which decides
+// whether the cast is to an array: `$13::pg_catalog.date[]`, `CAST($1 AS uuid)`.
+static PARAM_SHAPE_CAST: LazyLock<Regex> = LazyLock::new(|| {
+    let ty = format!(r#"(?:"?[A-Za-z_]\w*"?\s*\.\s*)?{TY}"#);
+    Regex::new(&format!(
+        r"(?i)\$(\d+)\s*::\s*({ty})|\bcast\s*\(\s*\$(\d+)\s+as\s+({ty})\s*\)"
+    ))
+    .unwrap()
+});
 
 /// Either side an `EXPLAIN` → the pair compares plans, not results, and gets no verdict.
 pub fn has_explain(a: &str, b: &str) -> bool {
@@ -460,6 +469,26 @@ pub fn param_casts(a: &str, b: &str) -> HashMap<u32, String> {
         }
     }
     out
+}
+
+/// Each `$N` that `sql` casts explicitly, to the type it names, where every cast of it there agrees
+/// on whether that type is an array. Evidence of a placeholder's shape where Postgres cannot type the
+/// statement.
+pub fn param_cast_shapes(sql: &str) -> HashMap<u32, String> {
+    let mut seen: HashMap<u32, Vec<String>> = HashMap::new();
+    for caps in PARAM_SHAPE_CAST.captures_iter(&masked(sql)) {
+        let (n, ty) = match (caps.get(1), caps.get(2), caps.get(3), caps.get(4)) {
+            (Some(n), Some(ty), _, _) | (_, _, Some(n), Some(ty)) => (n, ty),
+            _ => continue,
+        };
+        if let Ok(n) = n.as_str().parse() {
+            seen.entry(n).or_default().push(ty.as_str().trim().to_string());
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, tys)| tys.iter().all(|t| t.ends_with(']') == tys[0].ends_with(']')))
+        .map(|(n, mut tys)| (n, tys.swap_remove(0)))
+        .collect()
 }
 
 /// `sql` with its literals and comments blanked ([`mask`]), for the value-biasing patterns; the

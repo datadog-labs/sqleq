@@ -9,7 +9,9 @@ use std::collections::HashSet;
 
 use sqleq_fuzz::duck::{ddl_for, table_forms};
 use sqleq_fuzz::gen::{array_element_type, cast_target, CastTarget};
-use sqleq_fuzz::patterns::{array_params, freeze_time, misalignment, param_casts, param_cols};
+use sqleq_fuzz::patterns::{
+    array_params, freeze_time, misalignment, param_cast_shapes, param_casts, param_cols,
+};
 use sqleq_fuzz::schema::{parse_schema, parse_schema_stats, VType};
 use sqleq_fuzz::typing::{param_needs, Need};
 use sqleq_fuzz::{test_pair, Config, Verdict};
@@ -219,6 +221,20 @@ fn param_casts_pin_the_generated_type() {
     assert_eq!(cast_target("INT ARRAY"), None);
     assert_eq!(cast_target("int ARRAY[4]"), None);
     assert_eq!(cast_target("my_custom_enum"), None);
+}
+
+#[test]
+fn param_cast_shapes_read_both_spellings_and_a_schema() {
+    let shapes = param_cast_shapes(
+        "INSERT INTO t SELECT * FROM unnest($1::text[], $2::pg_catalog.date[], CAST($3 AS uuid)) \
+         WHERE $4::int = 1 AND $4::int[] = '{}' AND $5 = 'x'",
+    );
+    assert_eq!(shapes.get(&1).map(String::as_str), Some("text[]"));
+    assert_eq!(shapes.get(&2).map(String::as_str), Some("pg_catalog.date[]"));
+    assert_eq!(shapes.get(&3).map(String::as_str), Some("uuid"));
+    // Casts that disagree on the shape are no evidence, and neither is no cast.
+    assert_eq!(shapes.get(&4), None);
+    assert_eq!(shapes.get(&5), None);
 }
 
 #[test]

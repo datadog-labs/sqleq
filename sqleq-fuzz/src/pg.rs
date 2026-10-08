@@ -1467,9 +1467,17 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     // pairs those placeholders some other way (a row of a VALUES list and an element of an array,
     // say), so no binding by index compares what the caller paired. Postgres would even run such a
     // pair -- an array assigns to a text column as its text -- and refute what it never meant.
+    // Where Postgres cannot type a side, the casts that side writes itself still say which of its
+    // placeholders are arrays.
+    let shapes = |sql: &str, types: &BTreeMap<u32, String>| {
+        let mut out = pat::param_cast_shapes(sql);
+        out.extend(types.iter().map(|(n, t)| (*n, t.clone())));
+        out
+    };
+    let (shapes_a, shapes_b) = (shapes(a, &types_a), shapes(b, &types_b));
     for n in &pnums {
-        if let (Some(x), Some(y)) = (types_a.get(n), types_b.get(n)) {
-            if x.ends_with("[]") != y.ends_with("[]") {
+        if let (Some(x), Some(y)) = (shapes_a.get(n), shapes_b.get(n)) {
+            if x.ends_with(']') != y.ends_with(']') {
                 return Verdict::NotComparable(format!(
                     "param-shape: ${n} is {x} on one side and {y} on the other"
                 ));
