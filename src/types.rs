@@ -468,16 +468,19 @@ pub fn unfaithful_type(name: &str) -> Option<&'static str> {
 /// declared to return one. A column of that type that neither query reads appears only in the
 /// schema, where it costs nothing.
 ///
-/// Except where the two queries lowered to one plan. Every node of a plan carries its type, and a
-/// literal its spelling, so a plan read with citext's own `=` still says what the query computes, and
-/// two queries with one plan compute the same thing however that is read. The provers' misreading
-/// cannot matter to a proof that a plan equals itself.
+/// Except where the two queries are `one_plan`. Every node of a plan carries its type, and a literal
+/// its spelling, so a plan read with citext's own `=` still says what the query computes, and two
+/// queries with one plan compute the same thing however that is read. The provers' misreading cannot
+/// matter to a proof that a plan equals itself. Two equal lowered plans are not enough for that
+/// where the lowering dropped a subquery's `ORDER BY`: a `DISTINCT` above it keeps whichever of `'a'`
+/// and `'A'` that order hands it first, and a cast to text tells the two apart. `crate::emit` says
+/// when they are one plan, and [`crate::equality`] gives the example.
 ///
 /// The types whose `=` is coarser than identity in a way some IR type can still carry -- `numeric`,
 /// the floats, `interval`, `jsonb`, and any other whose `=` is not known to be identity -- are
 /// [`crate::equality`]'s.
-pub fn refuse_unfaithful(input: &Value) -> Result<()> {
-    if input["queries"][0] == input["queries"][1] {
+pub fn refuse_unfaithful(input: &Value, one_plan: bool) -> Result<()> {
+    if one_plan {
         return Ok(());
     }
     fn walk(v: &Value) -> Option<crate::error::FrontendError> {

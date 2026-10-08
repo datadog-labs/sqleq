@@ -357,20 +357,31 @@ fn emit(
     let (q1, types1) = lower::lower_query(catalog, decls, &queries[1])?;
 
     let mut input = json!({ "schemas": schemas, "queries": [q0, q1], "help": ["", ""] });
+    // Whether the two queries are one plan that Postgres runs alike, which lets the three checks below
+    // pass a read they would otherwise refuse: one plan computes one thing however `=` or a collation
+    // is read. Not where the lowering dropped a subquery's `ORDER BY`, on either side. Postgres hands
+    // the rows on in that order, and a `DISTINCT`, a `GROUP BY`, a set operation, `min` or `max` above
+    // keeps whichever of two values `=` calls equal it reads first or last, so two queries that sort
+    // a subquery in two orders lower to one plan and can still return `2.0` and `2.00`, which a cast
+    // to text tells apart. See `lower::apply_pagination`, and `dml`, which never makes the exception.
+    // Unless the two trees lowered are one tree, whose dropped orderings are then the same: that is
+    // the claim `reflexive` makes, resting on the same normalizations.
+    let one_plan = input["queries"][0] == input["queries"][1]
+        && (queries[0] == queries[1] || !queries.iter().any(lower::drops_subquery_order));
     // A column under a collation that may make `=` not identity, and, where a column the pair reads
     // declares a collation, an operation that reads one its symbol does not name. Before the check
     // below, which also sees the first, for the message.
-    collation::refuse(catalog, &input)?;
+    collation::refuse(catalog, &input, one_plan)?;
     // A `citext` or `char(n)` value has an `=` no prover's equality can stand for, and two `numeric`,
     // float, `interval` or `jsonb` values that `=` calls equal can still print differently. Checked
     // on the lowered queries, so a column that neither query reads costs nothing, and neither does a
-    // pair whose two queries lower to one plan.
-    types::refuse_unfaithful(&input)?;
+    // pair whose two queries are one plan.
+    types::refuse_unfaithful(&input, one_plan)?;
     // The same, for a value an `UPDATE` or an `INSERT` stores in a column of another type, through a
     // cast the plan does not spell out. Before the check below, which then finds such a value read
     // by its spelling already.
     dml::refuse_observed_stores(&mut input, stores, &[types0, types1])?;
-    equality::refuse_observed(&mut input)?;
+    equality::refuse_observed(&mut input, one_plan)?;
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
     verify::check_levels(&input)?;
@@ -564,8 +575,11 @@ impl Rewrites {
 /// * A verdict here is exactly as strong as the weakest normalization it rests on. Two are worth
 ///   naming: [`normalize::unnest_in_to_any`], whose claim is NULL-vs-FALSE in filter position rather
 ///   than exact equality, and [`normalize::strip_dead_order_by`], which asserts an ordering is
-///   unobservable. Both already ship on the lowering path, so this widens their reach without adding
-///   a new kind of risk.
+///   unobservable. Both already ship on the lowering path, but there a refusal further down can hide
+///   a rewrite that claims too much, and here nothing is lowered. The lowering refuses `string_agg`
+///   whatever order its rows arrive in; here the strip itself has to keep the `ORDER BY` of a
+///   subquery that feeds one, and it does, for every construct that can see that order. So this
+///   widens their reach without adding a new kind of risk.
 /// * Nondeterminism is a hazard only for a rewrite that changes how many times a call is evaluated.
 ///   If both sides normalize to one tree they are one query, and a query is equivalent to itself
 ///   however many `now()`s or `random()`s it contains — but only if each normalization kept the

@@ -406,11 +406,13 @@ fn blind(op: &str) -> bool {
 /// over a string but the [`BLIND`] operations, and a row slice ordered by a string. See the module
 /// docs.
 ///
-/// Except where the two queries lowered to one plan: every collation an operation uses is
-/// determined by the columns and constants the plan names, so one plan computes one thing however
-/// the collations are read.
-pub fn refuse(cat: &Catalog, input: &Value) -> Result<()> {
-    if input["queries"][0] == input["queries"][1] {
+/// Except where the two queries are `one_plan`: every collation an operation uses is determined by
+/// the columns and constants the plan names, so one plan computes one thing however the collations
+/// are read. Not where the lowering dropped a subquery's `ORDER BY`, though both sides lower alike:
+/// under a collation that calls `'a'` and `'A'` equal, a `DISTINCT` above it keeps whichever that
+/// order hands it first. `crate::emit` says when they are one plan.
+pub fn refuse(cat: &Catalog, input: &Value, one_plan: bool) -> Result<()> {
+    if one_plan {
         return Ok(());
     }
     let varies = varies(cat);
