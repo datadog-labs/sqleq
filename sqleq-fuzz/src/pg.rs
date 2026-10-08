@@ -1034,9 +1034,60 @@ fn result_types(db: &mut Db, stmt: &str) -> Option<Vec<String>> {
     Some(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-/// Whether two bags of one size hold the same rows under Postgres `=`: `Ok(true)` same, `Ok(false)`
-/// different, `Err` when the types have no equality to compare by.
+/// A type Postgres has no `=` for, as its error names it.
+static NO_EQUALITY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"could not identify an equality operator for type (.+)$").unwrap());
+
+/// Whether two bags of one size hold the same rows: `Ok(true)` same, `Ok(false)` different, `Err`
+/// when they cannot be compared.
+///
+/// Rows are the same when their values are equal under Postgres `=`. A type Postgres has no `=` for
+/// (`json`, `xml`, `point`, ...) is compared by its text instead -- what `json` keeps verbatim and
+/// what a client receives -- while every other column is still compared under `=`. Which types
+/// those are is Postgres's to say: each one its error names is read as `text` (an array of it as
+/// `text[]`) and the comparison is asked again. A record holding such a type cannot be read as
+/// text that way, and stays uncomparable.
 fn same_under_eq(db: &mut Db, a: &Bag, ta: &[String], b: &Bag, tb: &[String]) -> Result<bool, String> {
+    let (mut ta, mut tb) = (ta.to_vec(), tb.to_vec());
+    loop {
+        match compare_under_eq(db, a, &ta, b, &tb) {
+            Err(e) => {
+                let Some(t) = NO_EQUALITY.captures(&e).map(|c| c[1].trim().to_string()) else {
+                    return Err(e);
+                };
+                let changed = as_text(&mut ta, &t) | as_text(&mut tb, &t);
+                if !changed {
+                    return Err(e);
+                }
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Read every column of type `t`, or an array of it, as text. Whether any was.
+fn as_text(types: &mut [String], t: &str) -> bool {
+    let mut changed = false;
+    for ty in types.iter_mut() {
+        if ty == t {
+            *ty = "text".to_string();
+            changed = true;
+        } else if ty.strip_suffix("[]") == Some(t) {
+            *ty = "text[]".to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// [`same_under_eq`] with the types as given: `Err` also when one of them has no `=`.
+fn compare_under_eq(
+    db: &mut Db,
+    a: &Bag,
+    ta: &[String],
+    b: &Bag,
+    tb: &[String],
+) -> Result<bool, String> {
     if ta.is_empty() || tb.is_empty() {
         return Ok(true); // no columns: equal sizes are equal bags
     }
@@ -1066,8 +1117,7 @@ fn same_under_eq(db: &mut Db, a: &Bag, ta: &[String], b: &Bag, tb: &[String]) ->
         "SELECT ((SELECT count(*) FROM ({va} EXCEPT ALL {vb}) x) + \
                  (SELECT count(*) FROM ({vb} EXCEPT ALL {va}) y))::text"
     );
-    // Bags whose rows have different widths, or no common type in some column, hold different rows;
-    // only a type with no equality at all leaves the question open.
+    // Bags whose rows have different widths, or no common type in some column, hold different rows.
     let msgs = match db.guarded(|db| db.simple(&sql)) {
         Ok(m) => m,
         Err(e)

@@ -74,7 +74,8 @@ How the Postgres engine differs from the DuckDB one:
   (`interval $1`).
 - **Rows are compared under Postgres `=`.** Bags whose text is the same are the same; two bags of
   one size whose text differs are compared again in Postgres, so `1.0` and `1.00` are one value
-  while their text is not. A column type with no `=` (`json`) leaves such a trial undecided.
+  while their text is not. A column whose type has no `=` (`json`, `xml`, `point`, ...) is compared
+  by its text, since no two such values are one under `=`: `true` and `1` are two `json` values.
 - `now()` is one instant for the whole pair (its transaction's start), and each sequence is reset
   before each side that can write.
 

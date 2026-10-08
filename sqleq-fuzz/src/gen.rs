@@ -86,12 +86,16 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
                 .unwrap())
             .to_string(),
         ),
-        // A `timestamptz` column takes the same literals, read as instants in the UTC session.
+        // The three days of the date domain, one at midnight -- so a timestamp can equal a date --
+        // and two not, so that a rewrite which drops the time of day (a cast to `date`, a
+        // `date_trunc('day', ..)`, a date in a `UNION` with a timestamp) can be told apart: midday,
+        // and the last second of a day. A `timestamptz` column takes the same literals, read as
+        // instants in the UTC session.
         VType::Timestamp | VType::TimestampTz => Val::Ts(
             (*[
                 "2020-01-01 00:00:00",
-                "2020-01-02 00:00:00",
-                "2020-01-03 00:00:00",
+                "2020-01-02 12:00:00",
+                "2020-01-03 23:59:59",
             ]
             .choose(rng)
             .unwrap())

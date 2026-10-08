@@ -122,6 +122,38 @@ fn values_equal_under_equality_are_the_same_rows() {
 }
 
 #[test]
+fn a_value_with_no_equality_is_compared_by_its_text() {
+    // `json` has no `=`, and `true` and `1` are two texts.
+    assert_kind!(
+        r#"SELECT "id", to_json(TRUE) AS "j" FROM "t""#,
+        r#"SELECT "id", to_json(1) AS "j" FROM "t""#,
+        T,
+        "NOT-EQUIVALENT"
+    );
+    // Two spellings of one document are one `jsonb` and two `json` texts.
+    assert_kind!(
+        r#"SELECT "id", '{"a":1}'::json AS "j" FROM "t""#,
+        r#"SELECT "id", '{"a": 1}'::json AS "j" FROM "t""#,
+        T,
+        "NOT-EQUIVALENT"
+    );
+    // Every other column is still compared under `=`: 1.00 and 1.0 are one value beside equal texts.
+    assert_kind!(
+        r#"SELECT CAST("a" AS NUMERIC(10,2)), '{"a":1}'::json FROM "t""#,
+        r#"SELECT CAST("a" AS NUMERIC(10,1)), '{"a":1}'::json FROM "t""#,
+        T,
+        "NO-COUNTEREXAMPLE"
+    );
+    // Not `json` alone: any type with no `=`, here a `point`.
+    assert_kind!(
+        r#"SELECT CAST("a" AS NUMERIC(10,2)), point("a", 0) FROM "t""#,
+        r#"SELECT CAST("a" AS NUMERIC(10,1)), point("a", 0) FROM "t""#,
+        T,
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
 fn an_aggregate_over_integers_is_numeric() {
     // avg of an integer is numeric, so a cast to numeric is the identity.
     assert_kind!(
