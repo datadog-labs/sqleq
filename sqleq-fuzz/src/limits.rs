@@ -194,8 +194,7 @@ impl Visitor for Finder<'_> {
 
 /// Functions that can return several rows from the select list. One of them in the projection
 /// multiplies a source row into rows that share every `ORDER BY` value, so the order is not total
-/// however keyed the tables are. A function DuckDB has no name for cannot run at all, so the list
-/// only needs DuckDB's own and the shims' (`crate::shim`), plus Postgres's for good measure.
+/// however keyed the tables are. The list holds Postgres's and DuckDB's, for both engines.
 const SET_RETURNING: &[&str] = &[
     "unnest",
     "generate_series",

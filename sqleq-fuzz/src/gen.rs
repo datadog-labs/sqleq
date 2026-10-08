@@ -281,7 +281,6 @@ mod tests {
             vt: VType::Varchar,
             notnull: false,
             array: true,
-            padded: false,
             sequenced: false,
         };
         let mut rng = StdRng::seed_from_u64(7);
@@ -326,7 +325,6 @@ mod tests {
             vt: VType::Integer,
             notnull: true,
             array: false,
-            padded: false,
             sequenced: false,
         };
         assert!(matches!(randval_col(&c, &mut rng), Val::Int(_)));
