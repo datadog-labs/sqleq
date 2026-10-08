@@ -1614,8 +1614,18 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 (Some(_), _) => false,
                 (None, _) => true,
             };
+            // The heuristics' need types a column by its bare name, which may be a same-named
+            // column of another table, so it too decides only where it fits.
+            let need = pneed.get(&n).copied().filter(|need| match need {
+                typing::Need::Type(CastTarget::V(v)) => fits(*v),
+                typing::Need::NumericString => fits(VType::Integer) || fits(VType::Varchar),
+                _ => true,
+            });
+            if need != pneed.get(&n).copied() {
+                typed.insert(n);
+            }
             let mut pick = |rng: &mut StdRng| -> Val {
-                if pneed.get(&n) == Some(&typing::Need::NumericString) {
+                if need == Some(typing::Need::NumericString) {
                     return randval_need(typing::Need::NumericString, rng);
                 }
                 if col_survives_cast && !present.is_empty() && rng.random_bool(0.75) {
@@ -1624,8 +1634,8 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                     randval_cast(ct, rng)
                 } else if let Some((_, _, vt, _)) = loc {
                     randval(*vt, false, rng)
-                } else if let Some(need) = pneed.get(&n) {
-                    randval_need(*need, rng)
+                } else if let Some(need) = need {
+                    randval_need(need, rng)
                 } else if let Some((vt, _)) = pg {
                     // Where `test_pair` falls back to an integer drawn from nothing, the type
                     // Postgres inferred for the placeholder decides the domain.

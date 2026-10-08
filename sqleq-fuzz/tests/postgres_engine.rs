@@ -235,6 +235,19 @@ fn a_cast_to_text_is_the_sides_own_choice() {
 }
 
 #[test]
+fn a_placeholder_takes_the_type_postgres_gives_it_over_a_same_named_column() {
+    // `id` is a bigint in `attachments` and a uuid in `docs`: `$1` is compared with the uuid.
+    let ddl = r#"create table "attachments" ("id" BIGINT PRIMARY KEY, "doc_id" UUID NOT NULL);
+create table "docs" ("id" UUID PRIMARY KEY)"#;
+    assert_kind!(
+        r#"SELECT a."id" FROM "attachments" a WHERE a."doc_id" IN (SELECT d."id" FROM "docs" d WHERE d."id" IN ($1))"#,
+        r#"SELECT a."id" FROM "attachments" a WHERE a."doc_id" IN (SELECT DISTINCT d."id" FROM "docs" d WHERE d."id" IN ($1))"#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
 fn an_array_on_one_side_and_a_scalar_on_the_other_is_not_compared() {
     assert_kind!(
         r#"SELECT "id" FROM "t" WHERE "a" = $1"#,
