@@ -144,8 +144,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   `opaque_identity`); a type not on it, an enum, a domain or an extension's type included, is of
   the second kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque
   value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
-  only columns whose `=` is identity, refusing the rest. The QED prover reads no such list: it
-  reads `=` and deduplication as identity on every type.
+  and takes a `MAX` or `MIN` only over columns whose `=` is identity, refusing the rest. The QED
+  prover reads no such list: it reads `=` and deduplication as identity on every type.
 - **An untyped literal takes the type of what it meets.** Postgres reads `'01'` in `a = '01'`
   over an INTEGER `a` as the integer 1, and `'yes'` against a BOOLEAN as `true`. The frontend does
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
