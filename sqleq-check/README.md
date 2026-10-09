@@ -196,7 +196,14 @@ sqleq-check --expect report-only --sqleq-solver -j 8 -t 30 corpus/
 
 The cells below the rule use **the same denominator as `capability`** — pairs whose two queries
 actually differ — so the two tables can be read against each other. `only sqleq-solver` is the whole
-reason the flag exists. The buckets are the `s_bucket` column of the JSON and CSV:
+reason the flag exists.
+
+Without the qed axis (`--axes frontend,sqleq-solver`, under `--expect report-only` or
+`--portfolio`) there is nothing to set its proofs against, so the section is headed
+`SQLSolver axis` instead, and the comparison rows give way to one line on the same footing:
+`proved <n>/<N>`, how many of the pairs whose two queries differ it proved.
+
+The buckets are the `s_bucket` column of the JSON and CSV:
 
 | bucket | meaning |
 |---|---|
@@ -208,7 +215,8 @@ reason the flag exists. The buckets are the `s_bucket` column of the JSON and CS
 | `error` | It threw, or its job could not be packaged: the frontend could not read the plan back (exit 2) or write the job, or it crashed. |
 | `missing` | It never answered — the driver died before reaching the row. |
 
-Two things about the numbers, both printed under the table on every run:
+Two things about the numbers, printed under the table (the second only when the QED prover ran
+too):
 
 * **`no-proof` is not a refutation.** That prover's `NEQ` means "no proof found", exactly like its
   `UNKNOWN`; only `EQ` is a claim. `sqleq-fuzz` is the only disprover in this project.
@@ -289,12 +297,14 @@ on a time budget, and a JVM started per case would cost more than the case.
 
 Output: the per-axis tables as without it, then a `Portfolio` table — the verdict counts,
 `capability` (`equivalent` among the pairs whose two queries differ, the refused pairs found
-reflexive left out), which prover the proofs came from (and how many rest on reflexivity alone), the
-time to the first decisive answer against the case's wall time, which backends were cut off, and
-every alarm by name. Each case's line says which backends its verdict rests on and when each
-answered. `--json` adds a `portfolio` object to each case (`verdict`, `by`, `pending`, `done`,
-`first_s`, `retried`) and `meta.portfolio` (`deadline_s`, `backends`, `counts`, `alarms`,
-`retried`); `--csv` appends `p_verdict`, `p_by`, `p_pending`, `p_first_s` and `p_retried`.
+reflexive left out), which prover the proofs came from (`proved by` names only the provers that
+ran: `qed alone`, `sqleq-solver alone` and `both` when both did, one count when one did) and how
+many rest on reflexivity alone, the time to the first decisive answer against the case's wall time,
+which backends were cut off, and every alarm by name. Each case's line says which backends its
+verdict rests on and when each answered. `--json` adds a `portfolio` object to each case
+(`verdict`, `by`, `pending`, `done`, `first_s`, `retried`) and `meta.portfolio` (`deadline_s`,
+`backends`, `counts`, `alarms`, `retried`); `--csv` appends `p_verdict`, `p_by`, `p_pending`,
+`p_first_s` and `p_retried`.
 
 Three things to know before reading one:
 
