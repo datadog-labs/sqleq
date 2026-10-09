@@ -261,6 +261,22 @@ impl VisitorMut for FoldNames {
     }
 }
 
+/// A type as a message names it.
+fn ty_name(t: Ty) -> &'static str {
+    match t {
+        Ty::Int => "integer",
+        Ty::Real => "numeric",
+        Ty::Str => "text",
+        Ty::Bool => "boolean",
+        Ty::Date => "date",
+        Ty::Time => "time",
+        Ty::Timestamp => "timestamp",
+        Ty::TimestampTz => "timestamptz",
+        Ty::Interval => "interval",
+        Ty::Opaque => "an opaque type",
+    }
+}
+
 /// Read the untouched tree and record what should happen to each cast.
 fn decide(
     queries: &[Query],
@@ -293,7 +309,30 @@ fn decide(
             // `$1::timestamp(0)` rounds, so only an unqualified cast over a parameter is the
             // parameter's type and nothing more. A qualified one takes rule 5b, keyed on the
             // qualified spelling.
-            if placeholder_index(op).is_some() && !qualified {
+            //
+            // And only a cast to the type inference gave the parameter. Postgres types `$N` at its
+            // first use, which inference does not follow, so a cast to another type may be a
+            // conversion it runs: in `n = $1 AND $1::int = 0` over a `numeric` `n`, `$1` is a
+            // `numeric` and `$1::int` rounds it, and dropping the cast made the query one plan with
+            // `n = $1 AND $1 = 0`.
+            if let Some(n) = placeholder_index(op).filter(|_| !qualified) {
+                let own = inf.params.get(&n).copied().unwrap_or(Ty::Opaque);
+                // Inference types an array parameter by its element, so an array cast states the
+                // element's type. A parameter inference has no evidence for at all is left to the
+                // cast, as before: nothing says its type is another. (Inference reads nothing off
+                // `= ANY($N)`, so `n = ANY($1) AND 0 = ANY($1::int[])` is still lowered as if `$1`
+                // were an `integer[]`.)
+                let stated = match crate::normalize::array_elem_type(dt) {
+                    Some(elem) => map_type_name(&elem.to_string()).0.unwrap_or(Ty::Opaque),
+                    None => tq,
+                };
+                if own != Ty::Opaque && own != stated {
+                    return Err(unsupported(format!(
+                        "${n} is cast to {txt} but inferred as {}: Postgres types an untyped \
+                         parameter at its first use, and a cast to another type converts it",
+                        ty_name(own)
+                    )));
+                }
                 dec.insert(nid(e), Decision::Hoist { operand: nid(op) });
                 return Ok(());
             }

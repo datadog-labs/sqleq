@@ -993,11 +993,12 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
 
     // 2. `$N::T` states a parameter's type outright. An unmappable `T` states nothing and is passed
     //    over: the parameter is then typed by whatever other evidence reaches it, or read as
-    //    `Ty::Opaque` further down, which is where that default already lives.
+    //    `Ty::Opaque` further down, which is where that default already lives. `($N)::T` is the same
+    //    cast, as cast rule 1 reads it.
     sweep(q, |e| {
         if let Expr::Cast { expr, data_type, .. } = e {
             if let Some(t) = map_type_name(&data_type.to_string()).0 {
-                if let Some(n) = param_index(expr) {
+                if let Some(n) = param_index(crate::casts::unwrap_nested(expr)) {
                     uf.set_type(&Atom::Param(n), t, Conf::Cast)?;
                 }
             }

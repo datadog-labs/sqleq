@@ -12,6 +12,11 @@
 //! equivalent to `false`. A lowered query in which an inferred integer parameter meets a `numeric` or
 //! float value is now refused (`src/param_types.rs`).
 //!
+//! The same order decides what a cast over a parameter does. In `n = $1 AND $1::int = 0`, `$1` is a
+//! `numeric` and `$1::int` rounds it; the frontend dropped every unqualified cast over a parameter
+//! as its type, which made that query one plan with `n = $1 AND $1 = 0`. A cast to a type other than
+//! the one inference gave the parameter is now refused (`src/casts.rs`, rule 1).
+//!
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/params/` run them.
 
 use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
@@ -128,5 +133,38 @@ fn a_declared_parameter_type_is_the_client_s() {
     );
     if let Err(e) = lower_with(&sql, CatalogSource::InferredSeeded) {
         panic!("expected Ok, got {e}");
+    }
+}
+
+#[test]
+fn a_cast_over_a_parameter_to_another_type_is_refused() {
+    let q0 = r#"SELECT "id" FROM "t" WHERE "n" = $1 AND $1::int = 0"#;
+    let q1 = r#"SELECT "id" FROM "t" WHERE "n" = $1 AND $1 = 0"#;
+    // Under the seeded catalog: the inferring one types `n` from its use, an integer here, which
+    // makes the cast the parameter's own type there.
+    match lower_with(&pair(q0, q1), CatalogSource::InferredSeeded) {
+        Err(FrontendError::Unsupported(m)) => {
+            assert!(m.contains("is cast to INT but inferred as numeric"), "refused for {m:?}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // A cast to the parameter's own type is its type and nothing more, and still dropped.
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "a" = $1::bigint"#, r#"SELECT "id" FROM "t" WHERE "a" = $1"#),
+        (
+            r#"SELECT "id" FROM "t" WHERE "n" > $1::numeric"#,
+            r#"SELECT "id" FROM "t" WHERE "n" >= $1::numeric"#,
+        ),
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" = $1 LIMIT $2::int"#,
+            r#"SELECT "id" FROM "t" WHERE "a" = $1 LIMIT $2"#,
+        ),
+        // An array cast states its element's type, the one inference gives an array parameter.
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" = ANY($1::bigint[])"#,
+            r#"SELECT "id" FROM "t" WHERE "a" = ANY($1::integer[])"#,
+        ),
+    ] {
+        lowers_in(CatalogSource::InferredSeeded, q0, q1);
     }
 }
