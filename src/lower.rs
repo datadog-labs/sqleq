@@ -1832,7 +1832,8 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 return Err(unsupported(format!("table factor with {m}")));
             }
             let tn = obj_name(name);
-            let idx = cat.find(&tn).ok_or_else(|| schema(format!("unknown table {tn}")))?;
+            let unknown = || schema(format!("unknown table {tn}{}", same_last_name(cat, &tn)));
+            let idx = cat.find(&tn).ok_or_else(unknown)?;
             // An alias's column list renames the table's columns in order, and may stop short:
             // `t AS x(p, q)` makes `x.p` the first column. Resolving by the declared names instead
             // would read `x.a` in `t AS x(b, a)` as the table's own `a`.
@@ -2062,6 +2063,23 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
 /// other is a placeholder, and a key that could have meant it is refused.
 fn expr_name(e: &Expr, idx: usize) -> String {
     implicit_name(e).unwrap_or_else(|| unnamed(idx))
+}
+
+/// For an `unknown table` refusal: the catalog's tables whose last dotted name is `tn`'s, up to case
+/// as [`Catalog::find`] compares, as ` (the catalog has s.t)`, or nothing when it has none.
+///
+/// A fact, not a diagnosis. A bare `t` against a declared `s.t` (or the reverse) is two tables, but
+/// the same message is reached when both queries name `s.t` and `strip_schema` stripped them to a
+/// `t` the catalog does not hold.
+fn same_last_name(cat: &Catalog, tn: &str) -> String {
+    let last = |n: &str| n.rsplit('.').next().unwrap_or(n).to_lowercase();
+    let same: Vec<&str> =
+        cat.tables.iter().filter(|t| last(&t.name) == last(tn)).map(|t| t.name.as_str()).collect();
+    if same.is_empty() {
+        String::new()
+    } else {
+        format!(" (the catalog has {})", same.join(", "))
+    }
 }
 
 /// Postgres's identity for a name: an unquoted identifier folds to lower case, a quoted one is kept

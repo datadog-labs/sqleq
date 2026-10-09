@@ -5,3 +5,4 @@ a row with one field
 SELECT $1::int,SELECT $1::int
 SELECT b FROM u,SELECT b FROM u WHERE b = b,"CREATE TABLE u (b INTEGER NOT NULL);
 CREATE INDEX i ON u (b) INCLUDE (b);"
+SELECT row_number() OVER (ORDER BY a) FROM t,select row_number() over (order by a) from t,CREATE TABLE t (a INTEGER);

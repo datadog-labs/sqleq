@@ -153,8 +153,9 @@ fn an_unquoted_non_ascii_column_keeps_its_case() {
 
 const M_T: &str = "create table \"m\" (\"A\" INTEGER);\ncreate table \"t\" (\"a\" INTEGER);\n";
 
-// Each pair below reads a column of both tables. The seeded catalog still refuses a declared table
-// that no column is attributed to (`table without referenced columns`), which is a separate defect.
+// Most pairs below read a column of both tables because the seeded catalog used to refuse a declared
+// table that no column is attributed to (`table without referenced columns`), issue #111. It lowers
+// such a table as the declared catalog does now; `inferred_seeded_catalog.rs` pins that.
 
 /// `"A"` over `m ("A")` and `t (a)` names only `m`'s column. Matched up to case, inference found it
 /// in both tables and refused the column as ambiguous.

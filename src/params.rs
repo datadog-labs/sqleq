@@ -418,10 +418,11 @@ pub fn check_roles(queries: &[Query], inf: &Inferred) -> Result<()> {
 /// pipeline. Three facts make that the right place and none of them holds for the other two:
 ///
 /// * **It is terminal.** The refusals it pre-empts are capability statements: `INSERT … ON CONFLICT`,
-///   `INSERT omits <col>`, `no base tables`. Implementing all three would still not decide these rows,
-///   because no binding makes `$1` simultaneously a `text` and a `text[]`. Reporting a construct here
-///   points the roadmap at work that cannot pay — which is the same objection [`root_cause`] raises
-///   against reporting a manufactured `type conflict`, arriving from the other direction.
+///   `INSERT omits <col>`, and, under `--infer`, a table with no column to synthesize. Implementing
+///   all three would still not decide these rows, because no binding makes `$1` simultaneously a
+///   `text` and a `text[]`. Reporting a construct here points the roadmap at work that cannot pay —
+///   which is the same objection [`root_cause`] raises against reporting a manufactured
+///   `type conflict`, arriving from the other direction.
 /// * **The refusals it pre-empts are raised before [`check_arity`] can run at all.** Two of the three
 ///   are `dml::reduce` refusals, and `reduce` runs inside [`crate::parse_input`] *above*
 ///   [`mentioned`]. So for most of these rows there is no held verdict to order against: the

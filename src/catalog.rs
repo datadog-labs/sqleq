@@ -148,9 +148,10 @@ impl Catalog {
     /// from `s`. Two columns of one table that differ only in case are refused all the same: that
     /// is no longer what keeps them apart, and lifting it is a completeness change of its own.
     ///
-    /// A catalog synthesized by type inference is not checked here: `infer::build_inferred`
-    /// refuses a pair that names two tables up to case, and a synthesized table may hold two such
-    /// columns, since the pair's own references, compared exactly, are what named them.
+    /// A catalog synthesized by type inference is not checked here: type inference refuses a pair
+    /// that names two tables up to case, under both inferred catalogs (`infer::infer`), and a
+    /// synthesized table may hold two such columns, since the pair's own references, compared
+    /// exactly, are what named them.
     pub fn check_case_collisions(&self) -> Result<()> {
         let mut tables = std::collections::HashSet::new();
         for t in &self.tables {
