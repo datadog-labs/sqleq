@@ -5,12 +5,15 @@
 
 -- truth: not-equivalent
 -- expect frontend: emit
--- expect fuzz: counterexample
+-- expect fuzz: nondet-skip
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: the qualified ORDER BY key mismatch, inside IN (SELECT ... LIMIT)
 -- witness: t = {(1, 1), (2, 2)}, u = {(1, 5), (2, 3)}, w = {(1, 5), (2, 3)}: A returns 1, B returns 2
+-- sqleq-fuzz skips the pair since issue #124. Its LIMIT can leave ties, and the IN above it reads the row
+-- the LIMIT keeps, so a difference it finds may be one in which tied row each side kept, which says nothing
+-- about equivalence. The witness has no ties.
 create table "t" ("k" INTEGER, "a" INTEGER);
 create table "u" ("k" INTEGER, "a" INTEGER);
 create table "w" ("id" INTEGER, "x" INTEGER);

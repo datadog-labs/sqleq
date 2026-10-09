@@ -347,14 +347,17 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             (*n, v)
         })
         .collect();
-    let cut_nondet = cuts.iter().any(|c| {
+    let open = |c: &limits::Cut| {
         !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
-    });
+    };
+    let cut_nondet = cuts.iter().any(open);
     // The other arbitrary choices among tied rows: a `DISTINCT ON` or an order-sensitive window
     // function whose order leaves ties the result can see. One that leaves only the cardinality
-    // determined is compared like a cut; one that leaves nothing is not compared at all.
+    // determined is compared like a cut; one that leaves nothing is not compared at all -- and
+    // neither is a cut under a level that can tell its tied rows apart, which leaves the
+    // cardinality open too ([`limits::Cut::counted`]).
     let choice = limits::choices(&a, &schema).max(limits::choices(&b, &schema));
-    if choice == limits::Choice::Unbounded {
+    if choice == limits::Choice::Unbounded || cuts.iter().any(|c| !c.counted && open(c)) {
         return Verdict::NondetSkip;
     }
     // Nondeterministic row selection/content: a cut over rows the order leaves tied, a `DISTINCT
@@ -589,13 +592,15 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
             break;
         }
 
-        let trial_nondet = nondet
-            || cuts
-                .iter()
-                .any(|c| !c.total && c.params.iter().any(|(n, _)| cutting.contains(n)));
+        let cuts_here =
+            |c: &limits::Cut| !c.total && c.params.iter().any(|(n, _)| cutting.contains(n));
+        let trial_nondet = nondet || cuts.iter().any(cuts_here);
+        // A count bound to cut, in a cut whose tied rows a level above can tell apart: nothing to
+        // compare on this trial.
+        let trial_blind = cuts.iter().any(|c| !c.counted && cuts_here(c));
         if ra != rb {
-            if trial_nondet && sa == sb {
-                continue; // equal cardinality + nondeterministic clause -> not a sound counterexample
+            if trial_blind || (trial_nondet && sa == sb) {
+                continue; // blind, or equal cardinality + nondeterministic clause -> not sound
             }
             // Report the rows the database accepted, not the rows we generated: a row violating
             // UNIQUE or NOT NULL never entered the table the trial ran against. Falling back to the
