@@ -61,10 +61,11 @@ How the Postgres engine differs from the DuckDB one:
   constraint it declares — `CHECK` and `FOREIGN KEY` included, which the DuckDB engine does not
   read — is Postgres's to enforce, and a generated row Postgres refuses is not in the instance.
   Captured DDL is made to run only in ways that add no constraint: a schema it names is created, an
-  unqualified table that the rest of the DDL names by one schema is created there, a table the
-  queries name by one other schema is moved there, a type nothing declares is read as `text`, and a
-  column default that calls a function nothing declares is dropped. The last two are reported as a
-  `caveat`, since a verdict then rests on more than the DDL says.
+  unqualified table that the rest of the DDL names by one schema is created there (a schema in which
+  the DDL creates a table of that name itself does not count: an unqualified `t` beside an `s.t` is
+  `public.t`), a table the queries name by one other schema is moved there, a type nothing declares
+  is read as `text`, and a column default that calls a function nothing declares is dropped. The
+  last two are reported as a `caveat`, since a verdict then rests on more than the DDL says.
 - **Each `$N` is typed as Postgres types it.** Both statements are prepared, and each placeholder
   gets the type Postgres infers for it — with the column the heuristics link it to declared as a
   hint where Postgres cannot infer one — and one type across the pair: a side that leaves `$N`
