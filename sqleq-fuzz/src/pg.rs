@@ -15,9 +15,10 @@
 //! * The DDL runs once per pair, inside a transaction rolled back at the end, so every constraint it
 //!   declares is Postgres's to enforce and a generated row Postgres rejects is simply not there.
 //!   Captured DDL is repaired only in ways that add no constraint: a schema it names is created, a
-//!   table the rest of the DDL names by one schema is created there, a table the queries name by one
-//!   schema is moved there, a type nothing declares is a `text` domain, and a column default that
-//!   calls a function nothing declares is dropped ([`Timing::caveat`] reports the last two).
+//!   table the rest of the DDL names by one schema is created there (unless the DDL creates a table
+//!   of that name in that schema itself), a table the queries name by one schema is moved there, a
+//!   type nothing declares is a `text` domain, and a column default that calls a function nothing
+//!   declares is dropped ([`Timing::caveat`] reports the last two).
 //! * Each trial loads its rows under a savepoint and runs each side under a nested one, so nothing is
 //!   re-created per side, and a sequence is reset before each side that can write.
 //! * Each placeholder is written in as a cast to the type Postgres infers for it, one type per `$N`
@@ -648,6 +649,13 @@ static CREATE_TABLE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+/// A schema-qualified `CREATE TABLE s.t (`, which [`CREATE_TABLE`] never matches: its schema and name.
+static CREATE_QUALIFIED_TABLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?("[^".]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*("[^".]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\("#,
+    )
+    .unwrap()
+});
 static MISSING_TYPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^type "([^"]+)" does not exist"#).unwrap());
 /// An ICU collation: a provider named `icu`, a predefined `...-x-icu` collation, or an `icu_`
@@ -684,11 +692,24 @@ fn qualifiers(text: &str) -> BTreeSet<String> {
 
 /// Create an unqualified `CREATE TABLE t` in the one schema `refs` names it by (`CREATE INDEX ... ON
 /// s.t`), as captured DDL drops the schema from the table but not from its indexes.
+///
+/// A schema in which `ddl` itself creates a table of that name (`CREATE TABLE s.t`) does not count:
+/// that `s.t` is another table, and the bare `t` stays where Postgres puts it with no search path,
+/// in `public`. Schema and name are compared case-insensitively here: that can only rule out more
+/// schemas, so at worst a table stays where it was written.
 fn place_tables(ddl: &str, refs: &str) -> String {
+    let own: BTreeSet<(String, String)> = CREATE_QUALIFIED_TABLE
+        .captures_iter(ddl)
+        .map(|c| {
+            let part = |i: usize| c[i].trim_matches('"').to_lowercase();
+            (part(1), part(2))
+        })
+        .collect();
     CREATE_TABLE
         .replace_all(ddl, |m: &regex::Captures| {
             let name = &m[2];
             let bare = name.trim_matches('"');
+            let lower = bare.to_lowercase();
             let re = Regex::new(&format!(
                 r#"(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*\.\s*"?{}"?(?:[^A-Za-z0-9_$]|$)"#,
                 regex::escape(bare)
@@ -698,6 +719,7 @@ fn place_tables(ddl: &str, refs: &str) -> String {
                 .captures_iter(refs)
                 .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()))
                 .filter(|s| !SKIP_SCHEMAS.contains(&s.to_lowercase().as_str()))
+                .filter(|s| !own.contains(&(s.to_lowercase(), lower.clone())))
                 .collect();
             if schemas.len() == 1 {
                 let s = schemas.into_iter().next().unwrap();
@@ -1957,5 +1979,46 @@ mod tests {
         assert_eq!(place_tables(two, two), two);
         let none = "CREATE TABLE t (id int); CREATE INDEX i ON public.t (id);";
         assert_eq!(place_tables(none, none), none);
+    }
+
+    /// A bare `t` beside a `CREATE TABLE s.t` of the DDL's own (issue #125).
+    mod a_table_the_ddl_creates_in_a_schema {
+        use super::super::place_tables;
+
+        #[test]
+        fn does_not_draw_the_bare_one_into_that_schema() {
+            let ddl = r#"create table "t" ("a" INTEGER);
+create table "s"."t" ("a" INTEGER);"#;
+            assert_eq!(place_tables(ddl, ddl), ddl);
+            // Nor does an index that names the same `s.t`.
+            let indexed = format!("{ddl}\nCREATE INDEX i ON s.t (a);");
+            assert_eq!(place_tables(&indexed, &indexed), indexed);
+            // Either header form, with the words `CREATE_TABLE` allows.
+            let unlogged =
+                "CREATE TABLE IF NOT EXISTS t (a int); CREATE UNLOGGED TABLE IF NOT EXISTS s . t (a int);";
+            assert_eq!(place_tables(unlogged, unlogged), unlogged);
+        }
+
+        #[test]
+        fn is_matched_whatever_the_case() {
+            for ddl in [
+                r#"create table "t" ("a" INTEGER); create table "S"."t" ("a" INTEGER);"#,
+                r#"create table "t" ("a" INTEGER); create table S.T ("a" INTEGER); CREATE INDEX i ON S.t (a);"#,
+            ] {
+                assert_eq!(place_tables(ddl, ddl), ddl);
+            }
+        }
+
+        #[test]
+        fn leaves_another_schema_that_names_the_table() {
+            // `s.t` is the DDL's own; `app.t` is the one place the rest of the DDL names `t` by.
+            let ddl = "CREATE TABLE t (id int);\nCREATE TABLE s.t (id int);\nCREATE INDEX i ON app.t (id);";
+            let placed = place_tables(ddl, ddl);
+            assert!(placed.starts_with("CREATE TABLE \"app\".t (id int);"), "{placed}");
+            // A table of another name in that schema does not count.
+            let other = "CREATE TABLE t (id int);\nCREATE TABLE s.u (id int);\nCREATE INDEX i ON s.t (id);";
+            let placed = place_tables(other, other);
+            assert!(placed.starts_with("CREATE TABLE \"s\".t (id int);"), "{placed}");
+        }
     }
 }
