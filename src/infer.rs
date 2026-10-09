@@ -29,6 +29,12 @@
 //! question uninteresting, so the ranking below prefers hard evidence to soft, and anything with no
 //! evidence at all becomes [`Ty::Opaque`](crate::infer::Ty::Opaque) rather than a plausible-looking `INTEGER`.
 //!
+//! The argument covers columns, not parameters. Postgres types an untyped `$N` at its first use, from
+//! the operand it meets, so a parameter's type is part of what the query means, and the ranking
+//! below does not follow that order. Where the type it gives a parameter can be narrower than
+//! Postgres's, the pair is refused downstream (`crate::param_types`, and cast rule 1 in
+//! `crate::casts`).
+//!
 //! ## Evidence ranking
 //!
 //! Every atom (a `(table, column)` pair, a parameter, an unknown function's result) collects typed
@@ -993,11 +999,12 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
 
     // 2. `$N::T` states a parameter's type outright. An unmappable `T` states nothing and is passed
     //    over: the parameter is then typed by whatever other evidence reaches it, or read as
-    //    `Ty::Opaque` further down, which is where that default already lives.
+    //    `Ty::Opaque` further down, which is where that default already lives. `($N)::T` is the same
+    //    cast, as cast rule 1 reads it.
     sweep(q, |e| {
         if let Expr::Cast { expr, data_type, .. } = e {
             if let Some(t) = map_type_name(&data_type.to_string()).0 {
-                if let Some(n) = param_index(expr) {
+                if let Some(n) = param_index(crate::casts::unwrap_nested(expr)) {
                     uf.set_type(&Atom::Param(n), t, Conf::Cast)?;
                 }
             }
@@ -1034,7 +1041,10 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
     })?;
 
     // 4. Arithmetic operands are numeric. Only a name-strength guess: `a - b` over two timestamps is
-    //    an interval, and the corpus has those.
+    //    an interval, and the corpus has those. A parameter is not guessed at: Postgres gives it the
+    //    type of the operand it meets, so it takes a literal's or a cast's type, or a column's whose
+    //    type is known, and next to anything else nothing here. Guessed an integer next to a
+    //    `numeric`, it was narrower than Postgres's, which `param_types` refuses.
     sweep(q, |e| {
         let Expr::BinaryOp { left, op, right } = e else { return Ok(()) };
         if !matches!(
@@ -1048,8 +1058,17 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
             return Ok(());
         }
         let real = [left, right].iter().any(|o| matches!(side_type(o), Ok(Some((Ty::Real, _)))));
-        for o in [left, right] {
-            if let Some(k) = side_key(at, o) {
+        for (o, other) in [(left, right), (right, left)] {
+            let Some(k) = side_key(at, o) else { continue };
+            if matches!(k, Atom::Param(_)) {
+                let partner = match side_type(other)? {
+                    Some((t, _)) => Some(t),
+                    None => side_key(at, other).and_then(|p| uf.get_type(&p)),
+                };
+                if let Some(t @ (Ty::Int | Ty::Real)) = partner {
+                    uf.set_type(&k, t, Conf::Name)?;
+                }
+            } else {
                 uf.set_type(&k, if real { Ty::Real } else { Ty::Int }, Conf::Name)?;
             }
         }
