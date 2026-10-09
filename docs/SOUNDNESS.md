@@ -333,6 +333,18 @@ what it is or refused:
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
   target.
+- **A parameter has the type Postgres gives it at its first use.** A client that sends `$N` without a
+  type leaves it to Postgres, which types it where it first meets it, in the order it analyses the
+  statement: in `n + 0 = $1 AND $1 > 0`, over a `numeric` `n`, `$1` is a `numeric`. Type inference
+  ranks its evidence by confidence instead, and reads no type off an expression, an aggregate or a
+  subquery, so the type it gives a parameter can differ. A wider one (`numeric` where Postgres says
+  integer) quantifies over more values. A narrower one is unfaithful: an integer `$1` makes
+  `$1 > 0 AND $1 < 1` empty. So a parameter inference typed as an integer and that meets a `numeric`
+  or float value in a comparison, arithmetic, `CASE` or `coalesce` and its kin is refused, whatever
+  its other uses say, unless the pair casts it wherever it appears; and a cast over a parameter is
+  dropped only when it is the parameter's own type, since otherwise it is a conversion Postgres runs
+  (`$1::int` rounds a `numeric`). A parameter in arithmetic takes its partner's type when it is
+  known, as Postgres gives it.
 - **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
   where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
   it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.

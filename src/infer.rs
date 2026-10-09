@@ -29,6 +29,12 @@
 //! question uninteresting, so the ranking below prefers hard evidence to soft, and anything with no
 //! evidence at all becomes [`Ty::Opaque`](crate::infer::Ty::Opaque) rather than a plausible-looking `INTEGER`.
 //!
+//! The argument covers columns, not parameters. Postgres types an untyped `$N` at its first use, from
+//! the operand it meets, so a parameter's type is part of what the query means, and the ranking
+//! below does not follow that order. Where the type it gives a parameter can be narrower than
+//! Postgres's, the pair is refused downstream (`crate::param_types`, and cast rule 1 in
+//! `crate::casts`).
+//!
 //! ## Evidence ranking
 //!
 //! Every atom (a `(table, column)` pair, a parameter, an unknown function's result) collects typed

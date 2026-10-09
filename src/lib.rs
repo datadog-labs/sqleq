@@ -130,7 +130,10 @@ pub(crate) const DIALECT: PostgreSqlDialect = PostgreSqlDialect {};
 /// answers a question about a different schema than the pair came from — it cannot make the prover
 /// agree to a false equivalence over the schema it was given. What it can do is make the question
 /// uninteresting, which is why inference prefers hard evidence to soft and yields an uninterpreted
-/// sort rather than a plausible-looking `INTEGER` when it has none.
+/// sort rather than a plausible-looking `INTEGER` when it has none. That argument is about columns.
+/// A parameter's type is not part of the schema: Postgres derives it from the statement, at the
+/// parameter's first use, so a wrong one changes what the query means. Where the inferred one can be
+/// narrower than Postgres's, the pair is refused (`param_types`, and cast rule 1 in `casts`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CatalogSource {
     /// Read the input's `CREATE TABLE`s and nothing else. The default, settled by measuring what
