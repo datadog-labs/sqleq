@@ -16,6 +16,11 @@
 //! for the *original* pair, so an unsound reduction does not fail, it lies. Each reduction carries
 //! its equivalence argument below and every precondition of that argument is a guard in the code.
 //!
+//! One precondition is shared by all three: the table stores what the statement writes, and the
+//! statement writes nothing else. A trigger breaks it (a `BEFORE` trigger rewrites or skips the row,
+//! an `AFTER` one writes other tables), and so does a rule (`DO INSTEAD` is another statement), so a
+//! statement on a table either names is refused ([`no_trigger`]).
+//!
 //! ## `DELETE`
 //!
 //! ```text
@@ -274,6 +279,7 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             check_using(cat, b, db, &qb)?;
             same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "DELETE")?;
             same_target(da, db)?;
+            no_trigger(cat, &obj_name(target_name(da)?))?;
             let (ra, rb) = (delete_to_select(a)?, delete_to_select(b)?);
             install(&mut statements[i], ra)?;
             install(&mut statements[j], rb)?;
@@ -873,6 +879,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
     let name = obj_name(target_name(ta)?);
     let idx = find_target(cat, &name)
         .ok_or_else(|| schema(format!("no declared schema for UPDATE target {name}")))?;
+    no_trigger(cat, &name)?;
     // The declared prefix: an `UPDATE` projects the table's own shape, and a system column
     // `catalog::add_system_columns` appended would change its arity. Independent of the fact that
     // the reduction currently runs before that append, so moving either cannot break this.
@@ -916,6 +923,19 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
 /// is refused, so a mismatch here costs a refusal and never a proof.
 fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
     cat.resolve(name)
+}
+
+/// Refuse a DML statement on a table a trigger or rule names ([`Table::has_trigger`]): the
+/// reductions compare what the two statements write, and a trigger or rule changes what they store,
+/// or writes on its own. Checked once the pair is known to have one target, so either side's name
+/// will do.
+fn no_trigger(cat: &Catalog, name: &str) -> Result<()> {
+    match find_target(cat, name) {
+        Some(i) if cat.tables[i].has_trigger => {
+            Err(unsupported(format!("DML on {}, which a trigger or rule names", cat.tables[i].name)))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// One side's projection: the value each column of the target ends up with.
@@ -1132,6 +1152,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
 
     let idx = find_target(cat, &name)
         .ok_or_else(|| schema(format!("no declared schema for INSERT target {name}")))?;
+    no_trigger(cat, &name)?;
     let t = &cat.tables[idx];
     // The declared prefix, for the reason [`update_pair`] gives: a system column is not written by
     // an `INSERT` and would look to the guard like an omitted one.
@@ -1340,6 +1361,7 @@ mod tests {
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),
                 keys: Vec::new(),
                 primary_key: Vec::new(),
+                has_trigger: false,
                 n_declared: cols.len(),
                 collations: vec![crate::collation::Collation::Default; cols.len()],
             }],

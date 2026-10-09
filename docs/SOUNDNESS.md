@@ -481,6 +481,14 @@ what it is or refused:
   column is refused, and so are `ON CONFLICT`, `DEFAULT VALUES`, an `INSERT` with no column list,
   two lists that differ in content or order, and a `RETURNING` that is not the same list on both
   sides.
+- **A trigger or rule is outside the DML reductions.** All three compare what the two statements
+  write, which is what the table stores only if nothing else acts on the statement. A `BEFORE` row
+  trigger rewrites or skips the row (`NEW.id := nextval(…)` makes two `INSERT`s of one bag in two
+  orders store different tables), an `AFTER` or statement trigger writes other tables, and a rule
+  `DO INSTEAD` runs another statement. So a `DELETE`, `UPDATE` or `INSERT` on a table a trigger or rule
+  names is refused; a query reading the table is not. A rule `ON SELECT` makes the table a view, and
+  the catalog leaves it unread. Raw DDL's `CREATE RULE`, which sqlparser does not parse, is read off
+  its head for the table it names.
 - **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
   two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
   coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.

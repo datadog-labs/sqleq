@@ -165,6 +165,7 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             row_determined: vec![false; n_declared],
             keys,
             primary_key: Vec::new(),
+            has_trigger: false,
             n_declared,
             collations: vec![crate::collation::Collation::Default; n_declared],
         });

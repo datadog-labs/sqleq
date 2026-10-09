@@ -339,6 +339,48 @@ fn serial_and_identity_columns_are_not_null() {
     }
 }
 
+const TRIGGER: &str = "which a trigger or rule names";
+
+#[test]
+fn dml_on_a_table_a_trigger_names_is_refused() {
+    let tables = "CREATE TABLE t (id integer PRIMARY KEY, a integer); CREATE TABLE u (id integer PRIMARY KEY, a integer)";
+    let f = "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ begin return NEW; end $$";
+    let trigger = |on: &str| {
+        format!("{tables}; {f}; CREATE TRIGGER tr BEFORE INSERT OR UPDATE OR DELETE ON {on} FOR EACH ROW EXECUTE FUNCTION f();")
+    };
+    let dml = |t: &str| {
+        [
+            (format!("INSERT INTO {t} (id, a) VALUES (1, 1), (2, 2)"), format!("INSERT INTO {t} (id, a) VALUES (2, 2), (1, 1)")),
+            (format!("UPDATE {t} SET a = 1 WHERE id = 1"), format!("UPDATE {t} SET a = 1 WHERE 1 = id")),
+            (format!("DELETE FROM {t} WHERE a > 1"), format!("DELETE FROM {t} WHERE 1 < a")),
+        ]
+    };
+    let ddl = trigger("t");
+    for (q0, q1) in dml("t") {
+        refused(&ddl, &q0, &q1, TRIGGER);
+    }
+    // Another table's DML is reduced, and a query only reads the table.
+    for (q0, q1) in dml("u") {
+        lowered(&ddl, &q0, &q1);
+    }
+    lowered(&ddl, "SELECT a FROM t WHERE a > 1", "SELECT a FROM t WHERE 1 < a");
+    // The trigger's table is found as a reference finds it; and dropping the table drops its
+    // triggers, where `DROP TRIGGER` is not followed.
+    let [(q0, q1), ..] = dml("t");
+    refused(&trigger("public.t"), &q0, &q1, TRIGGER);
+    lowered(&format!("{} DROP TABLE t; CREATE TABLE t (id integer PRIMARY KEY, a integer);", trigger("t")), &q0, &q1);
+    refused(&format!("{} DROP TRIGGER tr ON t;", trigger("t")), &q0, &q1, TRIGGER);
+    // A bare name two schemas declare marks both.
+    let ddl = format!(
+        "CREATE TABLE a.t (id integer PRIMARY KEY, a integer); CREATE TABLE b.t (id integer PRIMARY KEY, a integer); \
+         {f}; CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
+    );
+    for s in ["a.t", "b.t"] {
+        let [(q0, q1), ..] = dml(s);
+        refused(&ddl, &q0, &q1, TRIGGER);
+    }
+}
+
 // Raw DDL alone: a statement its parser rejects.
 
 fn raw(ddl: &str, q0: &str, q1: &str) -> Result<Value> {
@@ -388,4 +430,16 @@ fn a_rejected_index_statement_only_loses_keys() {
     assert_eq!(key(&format!("{table}; ALTER INDEX i SET (fillfactor = 70) AND MORE;")), json!([]));
     // An index on a partitioned table alone (`ON ONLY`) is rejected, and gives no key.
     assert_eq!(key("CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON ONLY t (id);"), json!([]));
+}
+
+#[test]
+fn a_rule_in_raw_ddl_is_read_off_its_head() {
+    // sqlparser does not parse `CREATE RULE`, so raw DDL rejects it and reads its head.
+    let table = "CREATE TABLE t (id integer PRIMARY KEY, a integer)";
+    let ddl = format!("{table}; CREATE RULE r AS ON DELETE TO t DO INSTEAD NOTHING;");
+    expect_refusal(raw(&ddl, "DELETE FROM t WHERE a > 1", "DELETE FROM t WHERE 1 < a"), TRIGGER, &ddl);
+    raw(&ddl, "SELECT a FROM t WHERE a > 1", "SELECT a FROM t WHERE 1 < a").unwrap();
+    // A rule `ON SELECT` makes the table a view.
+    let ddl = format!(r#"{table}; CREATE RULE "_RETURN" AS ON SELECT TO t DO INSTEAD SELECT 1 AS id, 2 AS a;"#);
+    expect_refusal(raw(&ddl, "SELECT a FROM t WHERE a > 1", "SELECT a FROM t WHERE 1 < a"), UNREAD, &ddl);
 }

@@ -36,14 +36,19 @@ pub enum Rejection {
     Inherited(ObjectName),
     /// `DROP TABLE`.
     Dropped(ObjectName),
+    /// `CREATE TRIGGER … ON t`, or a rule on `t` for an event other than `SELECT`: DML on the table
+    /// may store or touch other rows than it writes.
+    Trigger(ObjectName),
     /// `DROP INDEX` or `ALTER INDEX`: the index's key may be gone.
     Index(ObjectName),
     /// `ALTER DOMAIN`: the domain's default may have changed.
     Domain(ObjectName),
-    /// A statement of one of these kinds whose name is not readable: every table, index or domain.
+    /// A statement of one of these kinds whose name is not readable: every table, index, domain or
+    /// trigger.
     AnyTable,
     AnyIndex,
     AnyDomain,
+    AnyTrigger,
 }
 
 /// The losses `sql`, a statement the parser rejected, may have caused.
@@ -88,14 +93,17 @@ fn any_of_kind(sql: &str) -> Vec<Rejection> {
     match head.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ALTER" | "DROP", "INDEX"] => vec![Rejection::AnyIndex],
         ["ALTER", "DOMAIN"] => vec![Rejection::AnyDomain],
-        ["ALTER" | "DROP", "TABLE"] | ["CREATE", "TABLE" | "VIEW"] => vec![Rejection::AnyTable],
+        ["ALTER" | "DROP", "TABLE"] | ["CREATE", "TABLE" | "VIEW" | "RULE"] => vec![Rejection::AnyTable],
+        ["CREATE", "TRIGGER"] => vec![Rejection::AnyTrigger],
         _ => Vec::new(),
     }
 }
 
-/// The words that may stand between `CREATE` and `TABLE` or `VIEW`.
-const CREATE_MODIFIERS: [&str; 10] =
-    ["OR", "REPLACE", "GLOBAL", "LOCAL", "TEMP", "TEMPORARY", "UNLOGGED", "FOREIGN", "MATERIALIZED", "RECURSIVE"];
+/// The words that may stand between `CREATE` and `TABLE`, `VIEW`, `TRIGGER` or `RULE`.
+const CREATE_MODIFIERS: [&str; 11] = [
+    "OR", "REPLACE", "GLOBAL", "LOCAL", "TEMP", "TEMPORARY", "UNLOGGED", "FOREIGN", "MATERIALIZED", "RECURSIVE",
+    "CONSTRAINT",
+];
 
 struct Reader<'a> {
     toks: &'a [Token],
@@ -248,11 +256,55 @@ impl Reader<'_> {
         altered()
     }
 
+    /// `CREATE TRIGGER name … ON table`, after `TRIGGER`: the table, past the timing and the events
+    /// (`UPDATE OF a, b`), none of which says `ON` outside parentheses.
+    fn trigger_table(&mut self) -> Option<ObjectName> {
+        self.name()?;
+        let toks = self.toks;
+        let mut depth = 0i32;
+        while self.i < toks.len() {
+            match &toks[self.i] {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ if depth == 0 && self.at("ON") => {
+                    self.i += 1;
+                    return self.name();
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        None
+    }
+
+    /// `CREATE RULE name AS ON event TO table`, after `RULE`. A rule `ON SELECT` makes the table a
+    /// view, whose columns are not known; any other rewrites the DML statements on it. `None` for a
+    /// rule whose table is not readable.
+    fn rule(&mut self) -> Option<Vec<Rejection>> {
+        self.name()?;
+        if !self.words(&["AS", "ON"]) {
+            return None;
+        }
+        let select = self.at("SELECT");
+        self.i += 1;
+        if !self.words(&["TO"]) {
+            return None;
+        }
+        let table = self.name()?;
+        Some(vec![if select { Rejection::Altered(table) } else { Rejection::Trigger(table) }])
+    }
+
     /// `CREATE`, after its first word: a table or view whose columns are not known, and the tables
     /// it inherits from. `None` for such a statement whose name is not readable.
     fn create(&mut self) -> Option<Vec<Rejection>> {
         while CREATE_MODIFIERS.iter().any(|k| self.at(k)) {
             self.i += 1;
+        }
+        if self.words(&["TRIGGER"]) {
+            return Some(vec![self.trigger_table().map_or(Rejection::AnyTrigger, Rejection::Trigger)]);
+        }
+        if self.words(&["RULE"]) {
+            return self.rule();
         }
         if !(self.words(&["TABLE"]) || self.words(&["VIEW"])) {
             return Some(Vec::new());
@@ -352,6 +404,30 @@ mod tests {
         assert_eq!(read("CREATE FOREIGN TABLE f (a int) SERVER s"), [Rejection::Created(name("f"))]);
         assert_eq!(read("CREATE SEQUENCE s AS integer START WITH 1 INCREMENT BY 1"), []);
         assert_eq!(read("ALTER SEQUENCE s OWNED BY t.id"), []);
+    }
+
+    #[test]
+    fn a_trigger_or_rule_names_its_table() {
+        assert_eq!(
+            read(
+                "CREATE CONSTRAINT TRIGGER tr AFTER INSERT OR UPDATE OF a, b ON s.t FROM u \
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE f()"
+            ),
+            [Rejection::Trigger(name("s.t"))]
+        );
+        assert_eq!(
+            read("CREATE OR REPLACE RULE r AS ON INSERT TO t DO INSTEAD NOTHING"),
+            [Rejection::Trigger(name("t"))]
+        );
+        assert_eq!(read("CREATE RULE r AS ON UPDATE TO t DO ALSO NOTIFY t"), [Rejection::Trigger(name("t"))]);
+        // A rule `ON SELECT` makes the table a view.
+        assert_eq!(
+            read(r#"CREATE RULE "_RETURN" AS ON SELECT TO v DO INSTEAD SELECT 1 AS a"#),
+            [Rejection::Altered(name("v"))]
+        );
+        assert_eq!(read("CREATE TRIGGER tr BEFORE INSERT ON"), [Rejection::AnyTrigger]);
+        assert_eq!(read("CREATE TRIGGER tr BEFORE INSERT ON t WHEN (a = 'unterminated"), [Rejection::AnyTrigger]);
+        assert_eq!(read("CREATE RULE r AS ON INSERT DO NOTHING"), [Rejection::AnyTable]);
     }
 
     #[test]

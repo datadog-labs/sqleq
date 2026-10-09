@@ -77,6 +77,16 @@ pub struct Table {
     /// accepts `SELECT id, name FROM t GROUP BY id` when `id` is the primary key, and rejects it when
     /// `id` is only `UNIQUE`, or has a unique index (`lower::key_determines`).
     pub primary_key: Vec<usize>,
+    /// Whether a trigger, or a rule other than `ON SELECT`, names the table. A DML statement on it
+    /// may then store other rows than it writes (a `BEFORE` trigger rewrites or skips them), write
+    /// other tables (an `AFTER` trigger), or be another statement altogether (a `DO INSTEAD` rule),
+    /// none of which the DML reductions model, so they refuse it (`dml::reduce`). A query only
+    /// reading the table is what it says.
+    ///
+    /// Direction matters for soundness: a false `false` licenses a proof, so a statement that may name
+    /// the table (a trigger on a bare name two schemas declare) sets it on each, and nothing clears
+    /// it but the table's own `DROP`.
+    pub has_trigger: bool,
     /// Parallel to `cols`: `true` only where the DDL proves the stored value is a function of the
     /// row as written, rather than of the row's *position* in the statement.
     ///
@@ -502,6 +512,9 @@ pub enum Ddl<'a> {
 ///   table's rows, which neither binds.
 /// * A key added to a partitioned table alone (`ALTER TABLE ONLY`) is not read: the partitions,
 ///   whose rows the table reads, need not have it.
+/// * A table a trigger or rule names is marked ([`Table::has_trigger`]), and no DML on it is reduced;
+///   a rule `ON SELECT` makes it a view, unread. `DROP TRIGGER`, `DISABLE TRIGGER` and `DROP RULE`
+///   are not followed: the mark stays.
 /// * A statement raw DDL's parser rejected is read off its head, and only ever as a loss of facts
 ///   about what it names (`rejected_ddl`).
 ///
@@ -647,6 +660,7 @@ impl Builder {
             Statement::CreateTable(ct) => self.create_table(ct),
             Statement::CreateView(v) => self.create_unread(&v.name),
             Statement::CreateIndex(ci) => self.create_index(ci),
+            Statement::CreateTrigger(tr) => self.triggered(&tr.table_name),
             Statement::AlterTable(at) => self.alter_table(at),
             Statement::Drop { object_type, names, .. } => match object_type {
                 ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => {
@@ -726,6 +740,7 @@ impl Builder {
                 opaque_identity: Vec::new(),
                 keys: Vec::new(),
                 primary_key: Vec::new(),
+                has_trigger: false,
                 row_determined: Vec::new(),
                 n_declared: ct.columns.len(),
                 collations: Vec::new(),
@@ -906,6 +921,15 @@ impl Builder {
         }
     }
 
+    /// A trigger or rule on `name`: each table it may name.
+    fn triggered(&mut self, name: &ObjectName) {
+        for i in self.targets(name) {
+            if let Some(t) = self.table(i) {
+                t.table.has_trigger = true;
+            }
+        }
+    }
+
     /// A loss of facts read off a statement the parser rejected.
     fn rejected(&mut self, r: Rejection) {
         match r {
@@ -929,6 +953,8 @@ impl Builder {
                 }
             }
             Rejection::Dropped(n) => self.drop_relation(&n),
+            Rejection::Trigger(n) => self.triggered(&n),
+            Rejection::AnyTrigger => self.tables().for_each(|t| t.table.has_trigger = true),
             Rejection::Index(n) => self.drop_index(&n),
             Rejection::AnyTable => (0..self.rels.len()).for_each(|i| self.unread(i)),
             // A constraint's index is dropped only with the constraint.
