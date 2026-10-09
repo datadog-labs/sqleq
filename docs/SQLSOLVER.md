@@ -339,10 +339,11 @@ sub-schemas — so `public.t` cannot resolve, and `sqleq-fuzz`'s trick of creati
 its qualified name does not transfer. The bridge resolves nothing from SQL text: `IrToRel` scans
 each table under the name the IR's `schemas` carry, which is the name the DDL declares.
 
-That name is only safe when it is unique: if `a.t` and `b.t` both reach the plan as `t` (the
-raw-DDL reader keys tables on the bare name), two distinct relations become one and a
-non-equivalent pair could read as equivalent. A scan names its table by index, so there is no other
-spelling to fall back on, and a plan whose tables share a name is refused outright.
+That name is only safe when it is unique: if two tables reached the plan under one name, two
+distinct relations would become one and a non-equivalent pair could read as equivalent. Both DDL
+readers key a table on its name as declared, qualifier included, so `a.t` and `b.t` stay two names;
+but a scan names its table by index, so there is no other spelling to fall back on, and a plan whose
+tables share a name is refused outright.
 
 ### The IR bridge — feeding it our plans instead of SQL text
 

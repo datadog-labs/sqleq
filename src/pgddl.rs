@@ -13,28 +13,26 @@
 //! becomes a plain `TIMESTAMP`, `numeric` becomes `DOUBLE`, and `integer PRIMARY KEY` becomes
 //! `INTEGER` plus a separate `unique (...)`, each read back in as if it had been declared that way.
 //!
-//! ## Why not `types::map_type`
+//! ## One builder, two parsers
 //!
-//! `types::map_type` only ever had to handle the five types the preprocessor emits
-//! (INTEGER / DOUBLE / VARCHAR / BOOLEAN / VARBINARY). Real Postgres DDL is a much wider surface, and
-//! on it that mapper is wrong in one direction that matters: it classifies by substring, so `text[]`
-//! contains `TEXT` and becomes `VARCHAR` — an array silently typed as a string.
-//! [`crate::pgddl::map_pg_type`] defers instead to `map_type_name`, which matches the *base* name
-//! against fixed sets and treats anything array/struct/map-shaped, or simply unrecognised, as
-//! unmappable — the same rule the preprocessor's `map_type` applies.
+//! The tables are built by `catalog::build`, which a pair file's `CREATE TABLE`s go through
+//! as well, so a table is named, keyed and cleaned up one way whichever input declared it.
+//! What is this module's own is the parse (one statement at a time, with a retry, below) and the
+//! type mapping: [`crate::pgddl::map_pg_type`] defers to `map_type_name`, which matches the *base*
+//! name against fixed sets and treats anything array/struct/map-shaped, or simply unrecognised, as
+//! unmappable, where a pair file keeps an unrecognised type's own name (issue #93).
 //!
 //! Opaque means `VARBINARY`, which the prover treats as an uninterpreted `Custom` sort supporting `=`
 //! only. That is the conservative answer: equality, `IN` and projection keep working, while any
 //! ordering or arithmetic use fails loudly instead of quietly assuming an order that a jsonb or a
 //! geometry column does not have.
 
-use std::collections::HashMap;
 
-use sqlparser::ast::{ColumnOption, Statement, TableConstraint};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{enforced_per_statement, index_col_name, obj_name, Catalog, Table};
+use crate::catalog::Catalog;
 use crate::infer::{map_type_name, Ty};
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
@@ -397,121 +395,8 @@ pub struct Rejected {
 /// learn what the first one choked on, and a production caller can log them.
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
     let (statements, errors) = parse_statements_reporting(raw);
-    let created = crate::collation::created(statements.iter().map(|(st, _)| st));
-    let domains = crate::catalog::Domains::of(statements.iter().map(|(st, _)| st));
-    let mut tables = Vec::new();
-    for (st, _) in statements {
-        let Statement::CreateTable(ct) = st else { continue };
-        // `public.orders` is the table `orders`: the pipeline strips schema qualifiers, so the
-        // catalog is keyed on the bare name.
-        let full = obj_name(&ct.name).to_lowercase();
-        let tname = full.rsplit('.').next().unwrap_or(&full).to_string();
-
-        let mut cols: Vec<(String, String)> = Vec::new();
-        let mut declared: Vec<String> = Vec::new();
-        let mut nullable: Vec<bool> = Vec::new();
-        let mut identity: Vec<bool> = Vec::new();
-        let mut determined: Vec<bool> = Vec::new();
-        let mut keys: Vec<Vec<usize>> = Vec::new();
-        let mut collations = Vec::new();
-        for c in &ct.columns {
-            let idx = cols.len();
-            // An opaque type keeps, in its name, whether its `=` is identity: see
-            // `types::opaque_name`. The provers read VARBINARY either way. A domain is its base
-            // type (`catalog::Domains`).
-            let rendered = format!("{}", domains.resolve(&c.data_type));
-            let ty = map_pg_type(&rendered).unwrap_or_else(|| crate::types::opaque_name(&rendered));
-            let (ty, collation) = crate::collation::column(&c.options, ty.to_string(), &created);
-            // After the collation: a collated opaque column is `COLLATED`, never identity, and an
-            // opaque name that records a coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE`
-            // either. The list `sqleq-solver` reads is `opaque_identity`'s alone: `IDENTITY_OPAQUE`
-            // also names a type with no `=`.
-            identity.push(ty == crate::types::IDENTITY_OPAQUE && crate::types::opaque_identity(&rendered));
-            // The name Postgres stores, as `catalog::scan_ddl` keeps it: see `catalog::Table`.
-            cols.push((crate::dml::fold_ident(&c.name), ty));
-            declared.push(rendered);
-            collations.push(collation);
-            nullable.push(true);
-            determined.push(crate::catalog::row_determined(c));
-            for opt in &c.options {
-                match &opt.option {
-                    // A deferrable key is no key (`catalog::enforced_per_statement`); the NOT NULL a
-                    // PRIMARY KEY implies holds either way.
-                    ColumnOption::Unique(u) => {
-                        if enforced_per_statement(u.characteristics.as_ref()) {
-                            keys.push(vec![idx]);
-                        }
-                    }
-                    ColumnOption::PrimaryKey(pk) => {
-                        if enforced_per_statement(pk.characteristics.as_ref()) {
-                            keys.push(vec![idx]);
-                        }
-                        nullable[idx] = false;
-                    }
-                    ColumnOption::NotNull => nullable[idx] = false,
-                    _ => {}
-                }
-            }
-        }
-        if cols.is_empty() {
-            continue;
-        }
-        let by_name: HashMap<&str, usize> =
-            cols.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
-        for con in &ct.constraints {
-            let (key_cols, pk, enforced) = match con {
-                TableConstraint::Unique(uc) => {
-                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
-                }
-                TableConstraint::PrimaryKey(p) => {
-                    (&p.columns, true, enforced_per_statement(p.characteristics.as_ref()))
-                }
-                _ => continue,
-            };
-            let set: Vec<usize> = key_cols
-                .iter()
-                .filter_map(index_col_name)
-                .filter_map(|n| by_name.get(n.as_str()).copied())
-                .collect();
-            if set.is_empty() {
-                continue;
-            }
-            if pk {
-                for &i in &set {
-                    nullable[i] = false;
-                }
-            }
-            if enforced {
-                keys.push(set);
-            }
-        }
-        // Two spellings of the same key (a column `UNIQUE` also named in a table constraint) are one
-        // key. Order-preserving so the emitted schema is stable.
-        let mut seen: Vec<Vec<usize>> = Vec::new();
-        for k in keys {
-            let mut s = k.clone();
-            s.sort_unstable();
-            if !seen.iter().any(|e| {
-                let mut e = e.clone();
-                e.sort_unstable();
-                e == s
-            }) {
-                seen.push(k);
-            }
-        }
-        tables.push(Table {
-            name: tname,
-            n_declared: cols.len(),
-            cols,
-            declared_types: declared,
-            nullable,
-            opaque_identity: identity,
-            row_determined: determined,
-            keys: seen,
-            collations,
-        });
-    }
-    (Catalog { tables }, errors)
+    let parsed: Vec<&Statement> = statements.iter().map(|(st, _)| st).collect();
+    (crate::catalog::build(&parsed, crate::catalog::TypeMap::Raw), errors)
 }
 
 #[cfg(test)]
@@ -569,7 +454,7 @@ mod tests {
         );
         assert_eq!(cat.tables.len(), 1);
         let t = &cat.tables[0];
-        assert_eq!(t.name, "orders", "schema qualifier is stripped");
+        assert_eq!(t.name, "public.orders", "a table is keyed on its name as declared");
         assert_eq!(
             t.cols,
             vec![
