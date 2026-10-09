@@ -342,8 +342,9 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
     let path = args.first().ok_or("file mode needs <pair.sql>")?;
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // Drop the frontend's `declare ... function` DSL lines (not runnable SQL), then split into
-    // statements: CREATE* and ALTER* form the DDL, the remaining two are the query pair. An
-    // `ALTER TABLE ... ADD PRIMARY KEY` is as much a part of the schema as the CREATE it alters.
+    // statements: CREATE*, ALTER* and DROP* form the DDL, the remaining two are the query pair. An
+    // `ALTER TABLE ... ADD PRIMARY KEY` or a `DROP INDEX` is as much a part of the schema as the
+    // CREATE it alters.
     let cleaned: String = src
         .lines()
         .filter(|l| {
@@ -356,7 +357,7 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
     let mut queries: Vec<String> = Vec::new();
     for s in split_statements(&cleaned) {
         let upper = s.to_uppercase();
-        if upper.starts_with("CREATE") || upper.starts_with("ALTER") {
+        if upper.starts_with("CREATE") || upper.starts_with("ALTER") || upper.starts_with("DROP") {
             ddl_parts.push(s);
         } else {
             queries.push(s);

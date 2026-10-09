@@ -62,11 +62,12 @@ in which inlining would copy a volatile call such as `random()`.
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs
-completeness, not soundness. Two such misses are known: the catalog reads no key from a `CREATE
-UNIQUE INDEX`, and does not treat `SERIAL` as implying `NOT NULL`. Both cost functional-dependence
-refusals — completeness work, in the safe direction. A key is read only over plain columns, every
-one of them the table's: a constraint naming a column the reader cannot find gives no key, not one
-over the columns it found. And a key reaches a prover
+completeness, not soundness. A key is read only over plain columns, every one of them the table's,
+with no operator class or `COLLATE`: a constraint naming a column the reader cannot find, or a
+unique index on `(a, lower(b))`, gives no key, not one over the columns it found. A `CREATE UNIQUE
+INDEX` gives a key unless it is partial (`WHERE`), which makes it unique only over the rows it
+covers, or says `IF NOT EXISTS`, under which Postgres creates nothing if the name is taken. `SERIAL`
+and an identity column are `NOT NULL`. And a key reaches a prover
 only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
 columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
 `SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query. Nor is a key read
