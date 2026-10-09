@@ -60,7 +60,7 @@ $CHECK --portfolio --axes fuzz,sqleq-solver --expect report-only -v examples/
 ```
 
 ```
-  ✗ not-equivalent                   dropped_filter.sql    0.39s  by fuzz 0.39s  — users=[(0,2,2); (NULL,1,0); (1,2,0)]
+  ✗ not-equivalent                   dropped_filter.sql    0.39s  by fuzz 0.39s  — users=[('0','2','2'); (NULL,'1','0'); ('1','2','0')]
   ✓ equivalent                       in_to_join.sql        1.92s  by sqleq-solver 0.01s
   …
   Portfolio  — fuzz, sqleq-solver on each case at once, 60s deadline
@@ -83,7 +83,7 @@ $CHECK --portfolio --expect report-only -v examples/
 ```
 
 ```
-  ✗ not-equivalent                   dropped_filter.sql    0.38s  by fuzz 0.38s  — users=[(0,2,2); (NULL,1,0); (1,2,0)]
+  ✗ not-equivalent                   dropped_filter.sql    0.38s  by fuzz 0.38s  — users=[('0','2','2'); (NULL,'1','0'); ('1','2','0')]
   ✓ equivalent                       in_to_join.sql        1.96s  by sqleq-solver 0.02s, qed 0.11s
   …
   proved by     qed alone 0 · sqleq-solver alone 0 · both 1
