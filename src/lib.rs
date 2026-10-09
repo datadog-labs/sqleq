@@ -217,7 +217,7 @@ fn lower_inner(
 ) -> Result<Value> {
     // 1-2. Split out the `declare ... function` DSL lines, parse, build the declared catalog, reduce
     //      the DML, collect the two queries.
-    let (fns, declared, queries, seen, stores) = parse_input(src, ddl_catalog)?;
+    let (fns, declared, queries, seen, stores) = parse_input(src, ddl_catalog, source.seeds_declared())?;
     // 3-5. Infer, apply what inference concluded, and lower.
     let (input, misaligned) = pipeline(queries, &fns, &declared, &stores, source, Align::Check(&seen))?;
     // 6. The pair lowers, so anything left is a statement about the *question* rather than about a
@@ -869,6 +869,7 @@ fn calls_volatile(q: &sqlparser::ast::Query) -> bool {
 fn parse_input(
     src: &str,
     ddl_catalog: Option<catalog::Catalog>,
+    resolve: bool,
 ) -> Result<ParsedInput> {
     let (fns, mut statements) = parse_statements(src)?;
     // Before anything reads the tree: sqlparser mis-parses `IS [NOT] DISTINCT FROM`, and lowering
@@ -926,7 +927,13 @@ fn parse_input(
         normalize::strip_identical_pagination(&mut queries);
     }
     normalize::strip_dead_order_by(&mut queries);
-    normalize::strip_schema(&mut queries);
+    // Against the declared catalog, where lowering reads one; the inferring catalog is built from the
+    // queries' names, so there the qualifiers are only stripped.
+    if resolve {
+        normalize::resolve_tables(&mut queries, &catalog);
+    } else {
+        normalize::strip_schema(&mut queries);
+    }
     // Last, so it reads the trees lowering will actually see. After the DML reduction on purpose: an
     // `UPDATE`'s projection is the declared table shape, not the widened one.
     catalog::add_system_columns(&mut catalog, &queries);

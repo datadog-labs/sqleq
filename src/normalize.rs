@@ -1479,6 +1479,86 @@ pub fn strip_schema(queries: &mut [Query]) {
     }
 }
 
+/// Resolve each table reference of the pair against the declared catalog, where [`strip_schema`]
+/// strips qualifiers without one.
+///
+/// A reference the catalog declares as written is that table, qualifier and all: with both `t` and
+/// `s.t` declared, `FROM s.t` is `s.t`, and stripping it would read the other table, whose keys and
+/// columns are not `s.t`'s. Any other reference is stripped under [`strip_schema`]'s pair-wide guards
+/// and resolves as a bare name: to a table declared bare, else to `public`'s, else to the one table of
+/// that name in any schema the catalog declares. That last step takes the input's DDL as the tables
+/// its queries read, as the raw-DDL reader always has: `create table s.t` with `FROM t` on both sides
+/// assumes the session's search path finds `s.t`. A bare name two schemas declare, and no bare or
+/// `public` one, stays unresolved, and lowering refuses it. A reference the guards keep qualified is
+/// left as written, so a bare `t` against `s.t` reads two tables or is refused, as before.
+pub fn resolve_tables(queries: &mut [Query], cat: &crate::catalog::Catalog) {
+    let mut names = CollectTableNames(Vec::new());
+    let mut bound = CollectCteNames(Vec::new());
+    for q in queries.iter() {
+        let _ = Visit::visit(q, &mut names);
+        let _ = Visit::visit(q, &mut bound);
+    }
+    let strip = safe_to_strip(&names.0);
+    for q in queries {
+        let _ = q.visit(&mut ResolveTable { cat, strip, bound: &bound.0 });
+    }
+}
+
+/// The names a `WITH` still binds: a reference to one is the binding, never a table to resolve.
+struct CollectCteNames(Vec<String>);
+
+impl Visitor for CollectCteNames {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+        if let Some(w) = &q.with {
+            self.0.extend(w.cte_tables.iter().map(|c| c.alias.name.value.to_lowercase()));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+struct ResolveTable<'a> {
+    cat: &'a crate::catalog::Catalog,
+    strip: bool,
+    bound: &'a [String],
+}
+
+impl VisitorMut for ResolveTable<'_> {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<Self::Break> {
+        let cat = self.cat;
+        if !self.strip || cat.find(&crate::catalog::obj_name(name)).is_some() {
+            return ControlFlow::Continue(());
+        }
+        if name.0.len() > 1 {
+            name.0.drain(..name.0.len() - 1);
+        }
+        let Some(bare) = name.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+            return ControlFlow::Continue(());
+        };
+        if cat.find(&bare).is_some() || self.bound.contains(&bare) {
+            return ControlFlow::Continue(());
+        }
+        let public = format!("public.{bare}");
+        let suffix = format!(".{bare}");
+        let key = if cat.find(&public).is_some() {
+            Some(public)
+        } else {
+            let mut named = cat.tables.iter().filter(|t| t.name.ends_with(&suffix));
+            match (named.next(), named.next()) {
+                (Some(t), None) => Some(t.name.clone()),
+                _ => None,
+            }
+        };
+        if let Some(key) = key {
+            *name = ObjectName(key.split('.').map(|p| ObjectNamePart::Identifier(Ident::new(p))).collect());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 struct CollectTableNames(Vec<ObjectName>);
 
 impl Visitor for CollectTableNames {

@@ -198,17 +198,17 @@ fn under_infer_a_bare_and_a_qualified_name_are_said_to_be_two_tables() {
 
 // --- the declared catalog: an unknown table names the tables with its last name -------------------
 
-/// `s.t` against a DDL that declares `t`, and the reverse, which `strip_schema` also produces when
-/// both queries name `s.t`: the message says what the catalog has, and nothing about why.
+/// `s.t` against a DDL that declares `t`, and a bare `t` that two schemas declare: the message says
+/// what the catalog has, and nothing about why.
 #[test]
 fn an_unknown_table_names_the_declared_tables_with_its_last_name() {
     match refusal(QUALIFIED_UNDECLARED, CatalogSource::Declared) {
         FrontendError::Schema(m) => assert_eq!(m, "unknown table s.t (the catalog has t)"),
         e => panic!("expected a schema refusal, got {e}"),
     }
-    let src = "create table s.t (a INTEGER);\nSELECT a FROM s.t;\nSELECT a FROM s.t WHERE a > 0;";
+    let src = "create table a.t (x INTEGER);\ncreate table b.t (x INTEGER);\nSELECT x FROM t;\nSELECT x FROM t WHERE x > 0;";
     match refusal(src, CatalogSource::Declared) {
-        FrontendError::Schema(m) => assert_eq!(m, "unknown table t (the catalog has s.t)"),
+        FrontendError::Schema(m) => assert_eq!(m, "unknown table t (the catalog has a.t, b.t)"),
         e => panic!("expected a schema refusal, got {e}"),
     }
     // No table of that last name, no hint.

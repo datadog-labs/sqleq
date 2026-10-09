@@ -425,10 +425,15 @@ what it is or refused:
   reaches. A name that misses a relation holding such a column is refused rather than looked for
   further out, since Postgres may have given the column exactly that name; a `GROUP BY` name is
   refused then too, rather than read as a select-list alias.
-- **A schema qualifier is part of a table's name.** Qualifiers are dropped so that `s.t` meets the
-  DDL's `t`, but only when every reference in the pair to one bare name has the same qualifier.
-  `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides read two
-  tables, and a DDL that declares only `t` declares neither of them.
+- **A schema qualifier is part of a table's name.** A reference the DDL declares as written is that
+  table: with both `t` and `s.t` declared, `FROM s.t` reads `s.t`. Any other qualifier is dropped so
+  that `s.t` meets the DDL's `t`, but only when every reference in the pair to one bare name has the
+  same qualifier. `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides
+  read two tables, and a DDL that declares only `t` declares neither of them. A bare name resolves to
+  the table declared bare, else to `public`'s, else to the one table of that name the DDL declares
+  under any schema; that last step takes the input's DDL as the tables its queries read, which
+  assumes the session's search path finds that table. A bare name two schemas declare, with no bare
+  or `public` table of the name, is refused.
 - **`DEFAULT` is a keyword.** In `UPDATE … SET a = DEFAULT`, or a `VALUES` row of an `INSERT`, it
   stands for the column's default, which the reductions do not model, so it is refused rather than
   read as a column named `default`.
