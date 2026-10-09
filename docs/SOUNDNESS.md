@@ -66,8 +66,11 @@ completeness, not soundness. A key is read only over plain columns, every one of
 with no operator class or `COLLATE`: a constraint naming a column the reader cannot find, or a
 unique index on `(a, lower(b))`, gives no key, not one over the columns it found. A `CREATE UNIQUE
 INDEX` gives a key unless it is partial (`WHERE`), which makes it unique only over the rows it
-covers, or says `IF NOT EXISTS`, under which Postgres creates nothing if the name is taken. `SERIAL`
-and an identity column are `NOT NULL`. And a key reaches a prover
+covers, or says `IF NOT EXISTS`, under which Postgres creates nothing if the name is taken. A key is
+followed by its constraint's or index's name as Postgres compares names, an unquoted one folded to
+lower case and a quoted one as written, since reading `"Ix"` and `ix` as one name makes a rename of
+one rename both and a drop of the other miss. A rename that names indexes in two schemas drops
+both keys. `SERIAL` and an identity column are `NOT NULL`. And a key reaches a prover
 only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
 columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
 `SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query. Nor is a key read

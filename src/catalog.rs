@@ -588,8 +588,8 @@ enum ColumnDefault {
 /// A `PRIMARY KEY` or `UNIQUE` constraint, or a unique index.
 struct Key {
     cols: Vec<usize>,
-    /// The constraint's or the index's name, lower-cased; `None` for an unnamed constraint, whose
-    /// name Postgres generates.
+    /// The constraint's or the index's name, folded as Postgres folds an identifier
+    /// ([`key_name`]); `None` for an unnamed one, whose name Postgres generates.
     name: Option<String>,
     primary: bool,
     /// Whether it holds after every statement ([`enforced_per_statement`]). A deferrable primary key
@@ -655,10 +655,19 @@ impl Builder {
                 ObjectType::Index => names.iter().for_each(|n| self.drop_index(n)),
                 _ => {}
             },
+            // An index's name is its schema's, and keys are matched on the bare name, so two
+            // schemas' indexes can answer to one. Renaming both would leave the other's key under a
+            // name a later `DROP INDEX` of it misses: so the rename is followed when one key has the
+            // name, and drops every key that has it otherwise.
             Statement::AlterIndex { name, operation: AlterIndexOperation::RenameIndex { index_name } } => {
                 let (old, new) = (last_name(name), last_name(index_name));
+                let named = self.tables().flat_map(|t| t.keys.iter()).filter(|k| k.name == old).count();
                 for t in self.tables() {
-                    t.keys.iter_mut().filter(|k| k.name == old).for_each(|k| k.name = new.clone());
+                    if named == 1 {
+                        t.keys.iter_mut().filter(|k| k.name == old).for_each(|k| k.name = new.clone());
+                    } else {
+                        t.keys.retain(|k| k.name != old);
+                    }
                 }
             }
             _ => {}
@@ -747,7 +756,7 @@ impl Builder {
             b.defaults.push(column_default(c));
             b.domain_default.push(self.domains.volatile_default(&c.data_type));
             for opt in &c.options {
-                let name = opt.name.as_ref().map(|n| n.value.to_lowercase());
+                let name = opt.name.as_ref().map(key_name);
                 match &opt.option {
                     ColumnOption::Unique(u) => b.keys.push(Key {
                         cols: vec![idx],
@@ -837,14 +846,14 @@ impl Builder {
                         AlterColumnOperation::SetDataType { .. } => self.unread(i),
                     }
                 }
-                Op::DropConstraint { name, .. } => t.drop_constraint(&name.value.to_lowercase()),
+                Op::DropConstraint { name, .. } => t.drop_constraint(&key_name(name)),
                 Op::DropPrimaryKey { .. } => t.keys.retain(|k| !k.primary),
                 Op::DropIndex { name } => {
-                    let name = Some(name.value.to_lowercase());
+                    let name = Some(key_name(name));
                     t.keys.retain(|k| k.name != name)
                 }
                 Op::RenameConstraint { old_name, new_name } => {
-                    let (old, new) = (old_name.value.to_lowercase(), new_name.value.to_lowercase());
+                    let (old, new) = (key_name(old_name), key_name(new_name));
                     for k in t.keys.iter_mut().filter(|k| k.name.as_deref() == Some(old.as_str())) {
                         k.name = Some(new.clone());
                     }
@@ -855,7 +864,8 @@ impl Builder {
                 // The new name is in the table's schema; a name already taken is one Postgres
                 // refuses.
                 Op::RenameTable { table_name: RenameTableNameKind::To(n) | RenameTableNameKind::As(n) } => {
-                    let new = last_name(n).unwrap_or_default();
+                    // A table is keyed lower-cased whatever its quoting, unlike a key's name.
+                    let new = obj_name(n).rsplit('.').next().unwrap_or_default().to_lowercase();
                     let rel = &mut self.rels[i];
                     rel.name = match rel.name.rsplit_once('.') {
                         Some((schema, _)) => format!("{schema}.{new}"),
@@ -943,7 +953,7 @@ impl Builder {
 impl Building {
     /// A table constraint, from the `CREATE TABLE` or an `ALTER TABLE … ADD`.
     fn add_constraint(&mut self, con: &TableConstraint) {
-        let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(|n| n.value.to_lowercase());
+        let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(key_name);
         let (name, parts, primary, enforced) = match con {
             TableConstraint::Unique(uc) => {
                 (lower(&uc.name), &uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
@@ -955,7 +965,7 @@ impl Building {
             // columns `NOT NULL`. Postgres takes no partial or expression index here, and an index
             // the reader took no key from gives none.
             TableConstraint::PrimaryKeyUsingIndex(c) | TableConstraint::UniqueUsingIndex(c) => {
-                let index = Some(c.index_name.value.to_lowercase());
+                let index = Some(key_name(&c.index_name));
                 let primary = matches!(con, TableConstraint::PrimaryKeyUsingIndex(_));
                 if let Some(k) = self.keys.iter_mut().find(|k| k.index && k.name == index) {
                     k.name = lower(&c.name).or(index);
@@ -1025,9 +1035,17 @@ impl Building {
     }
 }
 
-/// The last part of a name, lower-cased: an index's or a constraint's name as [`Key`] keeps it.
+/// A constraint's or an index's name as Postgres compares it: an unquoted one folded to lower case, a
+/// quoted one as written, so `"Ix"` and `ix` are two indexes. Lower-casing both would make them one,
+/// and then renaming one renames both and dropping the other drops neither, leaving a key Postgres
+/// dropped.
+fn key_name(id: &sqlparser::ast::Ident) -> String {
+    crate::dml::fold_ident(id)
+}
+
+/// The last part of a name, as [`key_name`] folds it: an index's name as [`Key`] keeps it.
 fn last_name(n: &ObjectName) -> Option<String> {
-    obj_name(n).rsplit('.').next().map(str::to_lowercase)
+    n.0.last().and_then(|p| p.as_ident()).map(key_name)
 }
 
 /// An `ALTER TABLE` operation that cannot lose a fact the catalog holds: an added constraint or

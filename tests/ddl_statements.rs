@@ -273,6 +273,34 @@ fn a_dropped_or_renamed_unique_index_is_followed() {
 }
 
 #[test]
+fn key_names_are_compared_as_postgres_compares_identifiers() {
+    // `"Ix"` and `ix` are two indexes. Read as one, renaming `"Ix"` renamed both, and dropping `ix`
+    // then dropped neither: the key on `b` outlived its index.
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer NOT NULL, b integer NOT NULL)";
+    let cases = [
+        (r#"CREATE UNIQUE INDEX "Ix" ON t (a); CREATE UNIQUE INDEX "ix" ON t (b); ALTER INDEX "Ix" RENAME TO j; DROP INDEX "ix""#, json!([[1]])),
+        ("CREATE UNIQUE INDEX MyIdx ON t (a); DROP INDEX myidx", json!([])),
+        (r#"ALTER TABLE t ADD CONSTRAINT "Con" UNIQUE (a); ALTER TABLE t ADD CONSTRAINT con UNIQUE (b); ALTER TABLE t DROP CONSTRAINT "Con""#, json!([[2]])),
+    ];
+    for (rest, key) in cases {
+        assert_eq!(keys_and_nullable(&format!("{table}; {rest};")).0, key, "{rest}");
+    }
+    // `USING INDEX "Ix"` takes that index, not `ix`, and makes its column the NOT NULL one.
+    let ddl = r#"CREATE TABLE t (id integer NOT NULL, a integer, b integer); CREATE UNIQUE INDEX "ix" ON t (b);
+                 CREATE UNIQUE INDEX "Ix" ON t (a); ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX "Ix";"#;
+    let [v, w] = lowered(ddl, "SELECT id FROM t", "SELECT id FROM t WHERE a > 1");
+    assert_eq!(schema(&v, "t")["nullable"], json!([false, false, true]));
+    assert_eq!(schema(&w, "t")["nullable"], json!([false, false, true]));
+    // Two schemas' indexes may share a name, which the keys are matched on bare: a rename then
+    // drops both keys, rather than leave the other under the new name for its own DROP to miss.
+    let ddl = "CREATE TABLE s1.t (id integer NOT NULL, a integer NOT NULL); CREATE TABLE s2.u (id integer NOT NULL, a integer NOT NULL); \
+               CREATE UNIQUE INDEX i ON s1.t (a); CREATE UNIQUE INDEX i ON s2.u (a); ALTER INDEX s1.i RENAME TO j; DROP INDEX s2.i;";
+    for v in lowered(ddl, "SELECT a FROM s2.u", "SELECT a FROM s2.u WHERE id > 1") {
+        assert_eq!(schema(&v, "s2.u")["key"], json!([]));
+    }
+}
+
+#[test]
 fn a_constraint_using_an_index_takes_its_key() {
     let ddl = "CREATE TABLE t (id integer, a integer); CREATE UNIQUE INDEX i ON t (id); \
                ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX i;";
