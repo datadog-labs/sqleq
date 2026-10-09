@@ -49,6 +49,7 @@ mod infer;
 mod lower;
 mod normalize;
 /// Where the parameter assumption is checked: `$N` on one side is `$N` on the other.
+mod param_types;
 mod params;
 /// Public because it is an entry point: it reads raw Postgres DDL -- possibly malformed, since a
 /// captured schema is not a schema anyone wrote by hand -- into a `Catalog`, and reports per
@@ -267,6 +268,8 @@ fn pipeline(
 ) -> Result<(Value, Option<FrontendError>)> {
     let mut decls = fns.clone();
     let inferred;
+    // The parameters whose type inference gave, which [`param_types`] checks against Postgres's.
+    let mut inferred_params = BTreeSet::new();
     // Held rather than raised: `params` explains why this one refusal is reported last.
     let mut misaligned = None;
     // Every stage below rewrites `queries` in place, and the counterfactual at the bottom has to start
@@ -297,6 +300,12 @@ fn pipeline(
         }
         casts::substitute_params(&mut queries, &mut inf)?;
         let mut synth = casts::declarations(&queries, &mut inf, &rw)?;
+        inferred_params = inf
+            .params
+            .keys()
+            .map(|n| format!("QP{n}"))
+            .filter(|name| synth.contains_key(name) && !decls.contains_key(name))
+            .collect();
         // A `declare` line in the input still wins: it is a statement about the pair that inference
         // is in no position to overrule.
         synth.extend(decls);
@@ -315,7 +324,7 @@ fn pipeline(
         declared
     };
 
-    match emit(catalog, &decls, &queries, stores) {
+    match emit(catalog, &decls, &queries, stores, &inferred_params) {
         Ok(input) => Ok((input, misaligned)),
         // The pair does not lower. A refusal this misalignment could have manufactured yields to it; a
         // refusal it could not have is what the row reports. See `params::root_cause_lowered`.
@@ -333,6 +342,7 @@ fn emit(
     decls: &HashMap<String, FnDecl>,
     queries: &[sqlparser::ast::Query],
     stores: &[dml::Stores; 2],
+    inferred_params: &BTreeSet<String>,
 ) -> Result<Value> {
     // The collations of tables neither query names cannot reach the pair; see `collation::narrow`.
     let narrowed = collation::narrow(catalog, queries);
@@ -380,6 +390,10 @@ fn emit(
     // the claim `reflexive` makes, resting on the same normalizations.
     let one_plan = input["queries"][0] == input["queries"][1]
         && (queries[0] == queries[1] || !queries.iter().any(lower::drops_subquery_order));
+    // An inferred parameter narrower than the type Postgres gives it at its first use. With no
+    // exception for one plan: the order Postgres types a parameter in is the statement's, so two
+    // queries that lower to one plan can still type it two ways.
+    param_types::refuse_narrowed(&input, inferred_params)?;
     // A column under a collation that may make `=` not identity, and, where a column the pair reads
     // declares a collation, an operation that reads one its symbol does not name. Before the check
     // below, which also sees the first, for the message.
