@@ -1529,7 +1529,7 @@ impl VisitorMut for ResolveTable<'_> {
 
     fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<Self::Break> {
         let cat = self.cat;
-        if !self.strip || cat.find(&crate::catalog::obj_name(name)).is_some() {
+        if !self.strip || cat.declares(&crate::catalog::obj_name(name)) {
             return ControlFlow::Continue(());
         }
         if name.0.len() > 1 {

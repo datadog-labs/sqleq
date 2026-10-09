@@ -62,9 +62,11 @@ in which inlining would copy a volatile call such as `random()`.
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs
-completeness, not soundness. Two such misses are known: `pgddl` does not read keys declared by
-`CREATE UNIQUE INDEX`, and the catalog does not treat `SERIAL` as implying `NOT NULL`. Both cost
-functional-dependence refusals — completeness work, in the safe direction. And a key reaches a prover
+completeness, not soundness. Two such misses are known: the catalog reads no key from a `CREATE
+UNIQUE INDEX`, and does not treat `SERIAL` as implying `NOT NULL`. Both cost functional-dependence
+refusals — completeness work, in the safe direction. A key is read only over plain columns, every
+one of them the table's: a constraint naming a column the reader cannot find gives no key, not one
+over the columns it found. And a key reaches a prover
 only when every one of its columns is `NOT NULL`: a prover reads a key as "two rows agreeing on these
 columns are one row", and Postgres admits any number of rows whose `UNIQUE` column is NULL, so
 `SELECT u` and `SELECT DISTINCT u` over a nullable unique `u` are not one query. Nor is a key read
@@ -72,6 +74,27 @@ from a `DEFERRABLE` constraint (`INITIALLY DEFERRED`, which implies it, included
 it when the transaction commits, or once a transaction defers it, so a query inside the
 transaction can see two rows that agree on it. The `NOT NULL` a deferrable `PRIMARY KEY` implies is
 checked at once, and is kept.
+
+A constraint stands until a later statement drops it. The catalog reads the DDL in order
+(`catalog::build`), so what follows a `CREATE TABLE` can take back what it said: a `DROP
+CONSTRAINT`, a `DROP NOT NULL`, an `ALTER COLUMN … SET DEFAULT nextval(…)`. Missing one of those
+is the unsound direction, so what the reader cannot follow loses facts rather than keeping them:
+
+- An `ALTER TABLE` operation it does not read, one that adds, drops, renames or retypes a column
+  among them, leaves the table *unread*: a query over it is refused.
+- A dropped constraint whose name it does not know, which may be the name Postgres generated for an
+  unnamed key or, from Postgres 18, a `NOT NULL`'s, takes every key and `NOT NULL` of the table.
+- A table another inherits from keeps no key and no `NOT NULL`: a scan of it reads the other
+  table's rows, which neither binds. The inheriting table, whose columns are partly its parent's,
+  is unread, and a key added to a partitioned table alone (`ALTER TABLE ONLY`), which its partitions
+  need not have, is not read.
+- In raw DDL, which is parsed a statement at a time, a statement the parser rejects is read off its
+  first words, as a loss of what it names (`rejected_ddl`). An `ALTER TABLE` that may change
+  columns leaves the table unread, pg_dump's `ALTER COLUMN … ADD GENERATED … (SEQUENCE NAME …)`
+  makes the column an identity column, a `DROP INDEX` drops the index's key, and an `ALTER DOMAIN`
+  makes the domain's default count as a sequence's.
+
+The DDL is taken as what the database ran, every statement in it having succeeded.
 
 ### Dates and timestamps are not one integer
 
@@ -433,7 +456,9 @@ what it is or refused:
   the table declared bare, else to `public`'s, else to the one table of that name the DDL declares
   under any schema; that last step takes the input's DDL as the tables its queries read, which
   assumes the session's search path finds that table. A bare name two schemas declare, with no bare
-  or `public` table of the name, is refused.
+  or `public` table of the name, is refused. A view, or a table whose columns the catalog does not
+  read, keeps its name in this: `FROM t` with a view `t` and a table `s.t` is refused, not read as
+  `s.t`.
 - **`DEFAULT` is a keyword.** In `UPDATE … SET a = DEFAULT`, or a `VALUES` row of an `INSERT`, it
   stands for the column's default, which the reductions do not model, so it is refused rather than
   read as a column named `default`.
@@ -445,11 +470,13 @@ what it is or refused:
   (`dml::insert_pair`): bag addition is cancellative, so the final tables agree exactly when the
   added bags do. That holds only if every column the list omits gets a value fixed by the row — no
   default, a literal, or a clock function, which takes one value per statement and is read, as
-  everywhere in the pipeline, as one value shared by both sides. A `nextval()` default, `SERIAL`
-  included, numbers rows by *position*: the same two rows inserted in two orders have equal source
-  bags and leave different tables. So an `INSERT` omitting such a column is refused, and so are `ON
-  CONFLICT`, `DEFAULT VALUES`, an `INSERT` with no column list, two lists that differ in content or
-  order, and a `RETURNING` that is not the same list on both sides.
+  everywhere in the pipeline, as one value shared by both sides. A `nextval()` default numbers rows
+  by *position*, whether the column has it from its `CREATE TABLE`, a later `SET DEFAULT`, a
+  `SERIAL` (quoted or not), an identity column, or its domain's `DEFAULT`. The same two rows inserted
+  in two orders have equal source bags and leave different tables. So an `INSERT` omitting such a
+  column is refused, and so are `ON CONFLICT`, `DEFAULT VALUES`, an `INSERT` with no column list,
+  two lists that differ in content or order, and a `RETURNING` that is not the same list on both
+  sides.
 - **`USING` merges columns.** `SELECT *` over `JOIN … USING (k)` has one `k` where the `ON` form has
   two, so it is refused. After a `RIGHT` or `FULL` join has merged `k`, the merged column is a
   coalesce of both sides, so a further `USING (k)` is refused rather than compared with one of them.

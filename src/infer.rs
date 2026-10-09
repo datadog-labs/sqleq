@@ -1552,7 +1552,7 @@ pub fn build_inferred(
             collations: vec![crate::collation::Collation::Default; n],
         });
     }
-    Ok(Catalog { tables })
+    Ok(Catalog { tables, unread: Vec::new() })
 }
 
 #[cfg(test)]

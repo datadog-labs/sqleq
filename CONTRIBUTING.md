@@ -6,7 +6,7 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 197 + 9 + 3 + 7 + 13 + 10 + 5 + 7 + 2 + 23 + 2 + 25 + 14 + 12 + 16 + 190 + 16 + 4 + 12 + 5 + 19 + 4 + 3 + 13 + 11 + 11 + 23 + 7 + 3; sqleq-check: 59 + 16 + 12 + 5 + 2 + 7 + 12 + 12
+cargo test                 # the frontend: 202 + 9 + 3 + 7 + 13 + 10 + 5 + 15 + 7 + 2 + 23 + 2 + 25 + 14 + 12 + 16 + 190 + 16 + 4 + 12 + 5 + 19 + 4 + 3 + 13 + 11 + 11 + 23 + 7 + 3; sqleq-check: 59 + 16 + 12 + 5 + 2 + 7 + 12 + 12
 cargo test -p sqleq-fuzz   # the disprover: 49 + 7 + 4 + 5 + 9 + 8 + 26 + 3 + 7 + 56
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 3 + 4 + 4 + 11 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 43 + 1 + 6 (needs Lean, see below)

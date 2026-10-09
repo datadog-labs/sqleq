@@ -259,7 +259,7 @@ pub fn narrow(cat: &Catalog, queries: &[Query]) -> Option<Catalog> {
             cleared = true;
         }
     }
-    cleared.then_some(Catalog { tables })
+    cleared.then_some(Catalog { tables, unread: cat.unread.clone() })
 }
 
 /// An operand stripped of the `COLLATE` it names, and whether it named one: the operand of a
