@@ -1342,6 +1342,7 @@ mod tests {
                 n_declared: cols.len(),
                 collations: vec![crate::collation::Collation::Default; cols.len()],
             }],
+            unread: Vec::new(),
         }
     }
 

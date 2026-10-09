@@ -3,18 +3,20 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! The table catalog, built from the `CREATE TABLE` statements in the input.
+//! The table catalog, built from the input's DDL: its `CREATE TABLE`s and what follows them.
 
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    visit_expressions, ColumnDef, ColumnOption, ConstraintCharacteristics, DataType, DeferrableInitial, Expr,
-    FunctionArguments, IndexColumn, ObjectName, ObjectNamePart, Query, Statement, TableConstraint,
+    visit_expressions, AlterColumnOperation, AlterIndexOperation, AlterTable, AlterTableOperation, ColumnDef,
+    ColumnOption, ConstraintCharacteristics, CreateTable, DataType, DeferrableInitial, Expr, FunctionArguments,
+    IndexColumn, ObjectName, ObjectNamePart, ObjectType, Query, RenameTableNameKind, Statement, TableConstraint,
 };
 
 use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
+use crate::rejected_ddl::Rejection;
 use crate::types::{map_type, opaque_identity, IDENTITY_OPAQUE};
 
 /// Columns Postgres puts on every table and no DDL ever declares.
@@ -53,7 +55,9 @@ pub struct Table {
     /// Direction matters for soundness. `NOT NULL` *shrinks* the space of instances the prover
     /// quantifies over, so claiming it falsely could turn a non-equivalence into a `provable`.
     /// Nullable is therefore the default, and this is set `false` only for an explicit `NOT NULL`
-    /// or a `PRIMARY KEY` (which implies it). Missing the constraint merely costs completeness.
+    /// (in the `CREATE TABLE` or a later `SET NOT NULL`), a `PRIMARY KEY` (which implies it), or an
+    /// identity column, unless a later statement drops it. Missing the constraint merely costs
+    /// completeness.
     pub nullable: Vec<bool>,
     /// Parallel to `cols`: `true` only where the column is the opaque VARBINARY and its declared
     /// Postgres type has an `=` that is identity ([`opaque_identity`]), as `bytea` and `uuid` do and
@@ -81,7 +85,8 @@ pub struct Table {
     /// Direction matters for soundness, the opposite way round from [`Table::nullable`]. A false
     /// `false` costs a refusal; a false `true` licenses a proof. So this is `true` only for a
     /// column with no default, a literal default, or one of the statement-stable clock functions
-    /// (see [`row_determined`]) — and `false` for a catalog built without DDL to read.
+    /// (see `column_default`), or one whose domain's default is one of those — and `false` for a
+    /// catalog built without DDL to read.
     pub row_determined: Vec<bool>,
     /// How many of `cols` the DDL declared. The rest are the system columns
     /// [`add_system_columns`] appended, and the split matters because `cols` means two things:
@@ -118,6 +123,13 @@ impl Table {
 /// All tables declared by the input's `CREATE TABLE`s, in declaration order (the scan index).
 pub struct Catalog {
     pub tables: Vec<Table>,
+    /// The relations the DDL creates whose columns are not read: views, a table created without a
+    /// column list, and a table a later statement changed past what the reader follows. Each is
+    /// named as a table is (lower-cased, qualifier included).
+    ///
+    /// A query over one is refused, and the name still takes its place in resolving a reference, so
+    /// that `FROM t` with a view `t` and a table `s.t` is not read as `s.t`.
+    pub unread: Vec<String>,
 }
 
 /// A function declared by the `declare ... function` DSL: its return type, and whether it is an
@@ -135,26 +147,31 @@ impl Catalog {
         self.tables.iter().position(|t| t.name == n)
     }
 
+    /// Whether the DDL creates a relation of this (case-insensitive) name, its columns read or not.
+    pub fn declares(&self, name: &str) -> bool {
+        let n = name.to_lowercase();
+        self.find(&n).is_some() || self.unread.contains(&n)
+    }
+
+    /// Every relation's name: the tables', at their index, then the unread ones'.
+    fn names(&self) -> impl Iterator<Item = &str> + Clone {
+        self.tables.iter().map(|t| t.name.as_str()).chain(self.unread.iter().map(String::as_str))
+    }
+
     /// The table a reference names: the one declared under that name, else the one its last part
-    /// names as a bare name ([`Catalog::resolve_bare`]).
+    /// names as a bare name ([`Catalog::resolve_bare`]). Nothing if that is a relation whose columns
+    /// are not read.
     pub fn resolve(&self, name: &str) -> Option<usize> {
-        self.find(name).or_else(|| self.resolve_bare(name.rsplit('.').next().unwrap_or(name)))
+        resolve(self.names(), name).filter(|&i| i < self.tables.len())
     }
 
     /// The table a bare name names: the one declared bare, else `public`'s, else the one table of
     /// that name declared under any schema. The last step takes the input's DDL as the tables its
     /// queries read, which assumes the session's search path finds that table. Two schemas declaring
-    /// the name, and no bare or `public` table of it, resolve to nothing.
+    /// the name, and no bare or `public` table of it, resolve to nothing, and so does a name whose
+    /// relation's columns are not read.
     pub fn resolve_bare(&self, bare: &str) -> Option<usize> {
-        let bare = bare.to_lowercase();
-        self.find(&bare).or_else(|| self.find(&format!("public.{bare}"))).or_else(|| {
-            let suffix = format!(".{bare}");
-            let mut named = self.tables.iter().enumerate().filter(|(_, t)| t.name.ends_with(&suffix));
-            match (named.next(), named.next()) {
-                (Some((i, _)), None) => Some(i),
-                _ => None,
-            }
-        })
+        resolve_bare(self.names(), bare).filter(|&i| i < self.tables.len())
     }
 
     /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
@@ -189,6 +206,29 @@ impl Catalog {
     }
 }
 
+/// [`Catalog::resolve`] over relations' `names`: the position of the one `name` names.
+fn resolve<'a>(names: impl Iterator<Item = &'a str> + Clone, name: &str) -> Option<usize> {
+    let name = name.to_lowercase();
+    match names.clone().position(|n| n == name) {
+        Some(i) => Some(i),
+        None => resolve_bare(names, name.rsplit('.').next().unwrap_or(&name)),
+    }
+}
+
+/// [`Catalog::resolve_bare`] over relations' `names`.
+fn resolve_bare<'a>(names: impl Iterator<Item = &'a str> + Clone, bare: &str) -> Option<usize> {
+    let bare = bare.to_lowercase();
+    let exact = |n: &str| names.clone().position(|m| m == n);
+    exact(&bare).or_else(|| exact(&format!("public.{bare}"))).or_else(|| {
+        let suffix = format!(".{bare}");
+        let mut named = names.clone().enumerate().filter(|(_, n)| n.ends_with(&suffix));
+        match (named.next(), named.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    })
+}
+
 /// Render a (possibly qualified) object name as a dotted string.
 pub fn obj_name(n: &ObjectName) -> String {
     n.0.iter()
@@ -200,14 +240,28 @@ pub fn obj_name(n: &ObjectName) -> String {
         .join(".")
 }
 
-/// The column name referenced by an index column, folded as a column's name is (see [`Table`]), if
-/// it's a plain identifier.
-pub(crate) fn index_col_name(ic: &IndexColumn) -> Option<String> {
-    match &ic.column.expr {
-        Expr::Identifier(id) => Some(crate::dml::fold_ident(id)),
-        Expr::CompoundIdentifier(p) => p.last().map(crate::dml::fold_ident),
-        _ => None,
+/// The columns of a key over `parts`, by their index in `cols`: every part a plain column of the
+/// table, with no operator class and no `COLLATE`. Anything else is no key at all.
+///
+/// Not a key over the parts that are plain columns: a unique index on `(a, lower(b))` says nothing
+/// about `a` alone, and one on `(s text_pattern_ops)` compares `s` by another `=` than the column's.
+/// A `COLLATE` is an expression (`Expr::Collate`) here, so it is no plain column either, and a
+/// sort order or a `NULLS FIRST` changes no `=`.
+fn key_columns(parts: &[IndexColumn], cols: &[(String, String)]) -> Option<Vec<usize>> {
+    if parts.is_empty() {
+        return None;
     }
+    parts
+        .iter()
+        .map(|ic| {
+            let name = match &ic.column.expr {
+                Expr::Identifier(id) if ic.operator_class.is_none() => crate::dml::fold_ident(id),
+                Expr::CompoundIdentifier(p) if ic.operator_class.is_none() => crate::dml::fold_ident(p.last()?),
+                _ => return None,
+            };
+            cols.iter().position(|(c, _)| *c == name)
+        })
+        .collect()
 }
 
 /// Whether a `PRIMARY KEY` or `UNIQUE` constraint with these characteristics holds after every
@@ -278,14 +332,27 @@ pub fn parse_declare(line: &str) -> Option<(String, FnDecl)> {
 /// `2.0 = 2.00` and `CAST(x AS TEXT)` included. So both readers of a `CREATE TABLE` type a column of
 /// one as its base type ([`Domains::resolve`]). What a domain adds, a `CHECK` or a `NOT NULL`, only
 /// narrows the values the column holds, and reading the column as the base type quantifies over more
-/// instances than Postgres has, which costs proofs and never makes one. (A domain's `DEFAULT` is not
-/// read, as no column's default is outside the `INSERT` reduction's guard.)
+/// instances than Postgres has, which costs proofs and never makes one.
 ///
 /// Not read as a domain, so that a column of it keeps the domain's name, a type the frontend does not
 /// know: a name created twice, a domain with a `COLLATE` (under which its `=` need not be its base
 /// type's), and a name Postgres predefines a type under ([`PG_CATALOG_TYPES`]), which it resolves to
 /// `pg_catalog`'s type first.
-pub struct Domains(HashMap<String, Option<DataType>>);
+///
+/// A domain's `DEFAULT` is what a column of it with no default of its own stores when an `INSERT`
+/// omits it, so a `nextval()` there is the `INSERT` reduction's business as much as a column's
+/// ([`Table::row_determined`]). That is read off every creation of the name, any of whose defaults,
+/// or its base's, may be the one a column takes ([`Domains::volatile_default`]).
+pub struct Domains {
+    bases: HashMap<String, Option<DataType>>,
+    /// Every creation of each name: the type it is over, and whether it has a default that is not
+    /// the same for every row of a statement.
+    creations: HashMap<String, Vec<(DataType, bool)>>,
+    /// Names a statement the reader could not parse may have given another default (`ALTER DOMAIN`).
+    altered: Vec<String>,
+    /// Whether such a statement's name was not readable, so any domain's default may have changed.
+    any_altered: bool,
+}
 
 /// The types Postgres 17 predefines in `pg_catalog`, but arrays: the names a domain of the same name
 /// does not shadow ([`Domains`]).
@@ -309,15 +376,40 @@ fn domain_key(name: &ObjectName) -> String {
 impl Domains {
     /// The domains `statements` create.
     pub fn of<'a>(statements: impl IntoIterator<Item = &'a Statement>) -> Domains {
-        let mut out: HashMap<String, Option<DataType>> = HashMap::new();
+        let mut bases: HashMap<String, Option<DataType>> = HashMap::new();
+        let mut creations: HashMap<String, Vec<(DataType, bool)>> = HashMap::new();
         for st in statements {
             let Statement::CreateDomain(d) = st else { continue };
             let key = domain_key(&d.name);
+            let volatile = d.default.as_ref().is_some_and(|e| !stable_default(e));
+            creations.entry(key.clone()).or_default().push((d.data_type.clone(), volatile));
             let usable = d.collation.is_none() && !PG_CATALOG_TYPES.contains(&key.as_str());
             let base = usable.then(|| d.data_type.clone());
-            out.entry(key).and_modify(|b| *b = None).or_insert(base);
+            bases.entry(key).and_modify(|b| *b = None).or_insert(base);
         }
-        Domains(out)
+        Domains { bases, creations, altered: Vec::new(), any_altered: false }
+    }
+
+    /// Whether a column declared as `dt`, with no default of its own, may take a default that is not
+    /// the same for every row of a statement: one of a domain it names, followed through a domain
+    /// over a domain and through every creation of a name.
+    pub fn volatile_default(&self, dt: &DataType) -> bool {
+        let mut seen: Vec<String> = Vec::new();
+        let mut todo = vec![dt];
+        while let Some(dt) = todo.pop() {
+            let DataType::Custom(name, _) = dt else { continue };
+            let key = domain_key(name);
+            if seen.contains(&key) {
+                continue;
+            }
+            let Some(made) = self.creations.get(&key) else { continue };
+            if self.any_altered || self.altered.contains(&key) || made.iter().any(|(_, v)| *v) {
+                return true;
+            }
+            todo.extend(made.iter().map(|(base, _)| base));
+            seen.push(key);
+        }
+        false
     }
 
     /// The type a column declared as `dt` holds: `dt`, or the type the domain it names is over,
@@ -325,9 +417,9 @@ impl Domains {
     pub fn resolve<'a>(&'a self, mut dt: &'a DataType) -> &'a DataType {
         // A domain over itself is not one Postgres creates; the bound keeps such an input finite,
         // and leaves its column the domain's name.
-        for _ in 0..=self.0.len() {
+        for _ in 0..=self.bases.len() {
             let DataType::Custom(name, modifiers) = dt else { break };
-            match self.0.get(&domain_key(name)) {
+            match self.bases.get(&domain_key(name)) {
                 Some(Some(base)) if modifiers.is_empty() => dt = base,
                 _ => break,
             }
@@ -343,7 +435,7 @@ impl Domains {
 /// catalog has to exist while the tree still holds `DELETE`/`UPDATE` statements rather than the two
 /// queries they reduce to.
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
-    build(&statements.iter().collect::<Vec<_>>(), TypeMap::Declared)
+    build(&statements.iter().map(Ddl::Parsed).collect::<Vec<_>>(), TypeMap::Declared)
 }
 
 /// Which column-type mapper a catalog's input takes. The two readers still map a type nothing
@@ -371,155 +463,586 @@ impl TypeMap {
     }
 }
 
-/// Build the catalog from `statements`' `CREATE TABLE`s, for both inputs: the pair file's (through
+/// One statement of a DDL, in the order the input gives them: parsed, or the text of one the parser
+/// rejected. Only raw DDL has a rejected one (`pgddl::parse_reporting`); a pair file is parsed whole.
+#[derive(Clone, Copy)]
+pub enum Ddl<'a> {
+    Parsed(&'a Statement),
+    Rejected(&'a str),
+}
+
+/// Build the catalog from a DDL's statements, for both inputs: the pair file's (through
 /// [`scan_ddl`]) and raw DDL's (through `pgddl::parse_reporting`).
 ///
 /// * A table is keyed on its name as declared, qualifier included, lower-cased. A reference finds it
 ///   by that name, or by its bare name ([`Catalog::resolve`]).
-/// * A table with no columns (`CREATE TABLE t ()`, `AS SELECT`, `LIKE`, `PARTITION OF`) is not
-///   read: its shape is not in the statement, and a query over it is refused for naming an unknown
-///   table rather than lowered over no columns.
+/// * A table whose columns are not all in its `CREATE TABLE` (`()`, `AS SELECT`, `LIKE`, `PARTITION
+///   OF`, `INHERITS`) is not read, and neither is a view: each is [unread][Catalog::unread], and a
+///   query over it is refused rather than lowered over the wrong columns.
 /// * A column's declared type is kept with its domain resolved, which is what an assignment to it
 ///   converts to (`dml::Store`).
 /// * Two spellings of one key (a column's `UNIQUE` also named in a table constraint) are one key.
-pub fn build(statements: &[&Statement], map: TypeMap) -> Catalog {
-    let mut catalog = Catalog { tables: Vec::new() };
-    let created = crate::collation::created(statements.iter().copied());
-    let domains = Domains::of(statements.iter().copied());
-    for st in statements {
-        let Statement::CreateTable(ct) = st else { continue };
-        let tname = obj_name(&ct.name).to_lowercase();
-        let mut cols = Vec::new();
-        let mut declared: Vec<String> = Vec::new();
-        let mut nullable: Vec<bool> = Vec::new();
-        let mut identity: Vec<bool> = Vec::new();
-        let mut determined: Vec<bool> = Vec::new();
-        let mut keys: Vec<Vec<usize>> = Vec::new();
-        let mut collations: Vec<Collation> = Vec::new();
+///
+/// **What follows a `CREATE TABLE` is read in order**, each statement finding its table as a query's
+/// reference does ([`Catalog::resolve`]), so that a later statement undoes an earlier one:
+///
+/// * `ALTER TABLE` adds a `PRIMARY KEY` or a `UNIQUE` key, sets or drops a `NOT NULL` or a default,
+///   makes a column an identity column, drops a constraint, and renames a constraint or the table.
+///   Any other operation, one that changes the columns (`ADD`, `DROP` or `RENAME COLUMN`, `TYPE`)
+///   included, leaves the table unread. An `ALTER TABLE` whose table does not resolve (a bare name
+///   two schemas declare) leaves each table of that name unread, unless it only adds facts.
+/// * `DROP TABLE` drops a table or view, and `DROP INDEX` the key an index of that name gave.
+/// * A table another inherits from keeps no key and no `NOT NULL`: a scan of it reads the other
+///   table's rows, which neither binds.
+/// * A key added to a partitioned table alone (`ALTER TABLE ONLY`) is not read: the partitions,
+///   whose rows the table reads, need not have it.
+/// * A statement raw DDL's parser rejected is read off its head, and only ever as a loss of facts
+///   about what it names (`rejected_ddl`).
+///
+/// The DDL is taken as what the database ran, every statement in it having succeeded. A statement
+/// Postgres would refuse, such as a second `PRIMARY KEY`, is read as if it had taken effect.
+pub fn build(ddl: &[Ddl], map: TypeMap) -> Catalog {
+    let parsed: Vec<&Statement> = ddl
+        .iter()
+        .filter_map(|d| match d {
+            Ddl::Parsed(st) => Some(*st),
+            Ddl::Rejected(_) => None,
+        })
+        .collect();
+    let rejected: Vec<Vec<Rejection>> = ddl
+        .iter()
+        .map(|d| match d {
+            Ddl::Rejected(sql) => crate::rejected_ddl::read(sql),
+            Ddl::Parsed(_) => Vec::new(),
+        })
+        .collect();
+    // A domain's default is looked up when a row is inserted, so it is the last one the DDL gives
+    // that counts, wherever the domain's columns are declared: domains are read off the whole DDL.
+    let mut domains = Domains::of(parsed.iter().copied());
+    for r in rejected.iter().flatten() {
+        match r {
+            Rejection::Domain(n) => domains.altered.push(domain_key(n)),
+            Rejection::AnyDomain => domains.any_altered = true,
+            _ => {}
+        }
+    }
+    let created = crate::collation::created(parsed.iter().copied());
+    let mut b = Builder { rels: Vec::new(), map, created, domains };
+    for (d, losses) in ddl.iter().zip(rejected) {
+        match d {
+            Ddl::Parsed(st) => b.statement(st),
+            Ddl::Rejected(_) => losses.into_iter().for_each(|r| b.rejected(r)),
+        }
+    }
+    b.finish()
+}
+
+/// A relation the DDL creates, while [`build`] reads it: its name as a table is keyed, and its table,
+/// if its columns are read.
+struct Rel {
+    name: String,
+    table: Option<Building>,
+}
+
+/// A table while [`build`] reads the statements about it: a [`Table`] whose nullability, keys and
+/// row-determined columns are worked out from what follows only at the end.
+struct Building {
+    /// Every field but `nullable`, `keys` and `row_determined`, which [`Building::finish`] fills.
+    table: Table,
+    /// Parallel to `cols`: a `NOT NULL` of the column's own. A primary key's columns are `NOT NULL`
+    /// too, for as long as it stands.
+    not_null: Vec<bool>,
+    /// Parallel to `cols`: what an `INSERT` that omits the column stores.
+    defaults: Vec<ColumnDefault>,
+    /// Parallel to `cols`: whether the column's domain may give it a default that is not the same for
+    /// every row of a statement ([`Domains::volatile_default`]).
+    domain_default: Vec<bool>,
+    keys: Vec<Key>,
+    /// The names of its `CHECK`, `FOREIGN KEY` and `EXCLUDE` constraints, whose dropping changes
+    /// nothing read here.
+    others: Vec<String>,
+    /// `PARTITION BY`: its rows are its partitions'.
+    partitioned: bool,
+    /// Another table inherits from it, so a scan of it reads that table's rows too.
+    inherited: bool,
+}
+
+/// What an `INSERT` that omits a column stores in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColumnDefault {
+    /// No default of the column's own: NULL, or its domain's default.
+    Absent,
+    /// A default of its own, and whether it is the same for every row of a statement
+    /// ([`stable_default`]). A `SERIAL` is a `nextval()` default.
+    Own(bool),
+    /// An identity column, or a generated one.
+    Generated,
+}
+
+/// A `PRIMARY KEY` or `UNIQUE` constraint, or a unique index.
+struct Key {
+    cols: Vec<usize>,
+    /// The constraint's or the index's name, lower-cased; `None` for an unnamed constraint, whose
+    /// name Postgres generates.
+    name: Option<String>,
+    primary: bool,
+    /// Whether it holds after every statement ([`enforced_per_statement`]). A deferrable primary key
+    /// is no key, and its columns are `NOT NULL` all the same.
+    enforced: bool,
+}
+
+struct Builder {
+    rels: Vec<Rel>,
+    map: TypeMap,
+    created: crate::collation::Created,
+    domains: Domains,
+}
+
+impl Builder {
+    fn names(&self) -> impl Iterator<Item = &str> + Clone {
+        self.rels.iter().map(|r| r.name.as_str())
+    }
+
+    /// The relation `name` names, as a query's reference would find it.
+    fn resolve(&self, name: &ObjectName) -> Option<usize> {
+        resolve(self.names(), &obj_name(name))
+    }
+
+    /// The relations a statement about `name` may have touched: the one it resolves to, else each of
+    /// that bare name, when two schemas declare it and neither is the bare or `public` one.
+    fn targets(&self, name: &ObjectName) -> Vec<usize> {
+        if let Some(i) = self.resolve(name) {
+            return vec![i];
+        }
+        let full = obj_name(name).to_lowercase();
+        let last = full.rsplit('.').next().unwrap_or(&full);
+        (0..self.rels.len()).filter(|&i| self.rels[i].name.rsplit('.').next() == Some(last)).collect()
+    }
+
+    /// The table at `i`, if its columns are read.
+    fn table(&mut self, i: usize) -> Option<&mut Building> {
+        self.rels[i].table.as_mut()
+    }
+
+    fn unread(&mut self, i: usize) {
+        self.rels[i].table = None;
+    }
+
+    /// Every table whose columns are read.
+    fn tables(&mut self) -> impl Iterator<Item = &mut Building> {
+        self.rels.iter_mut().filter_map(|r| r.table.as_mut())
+    }
+
+    fn statement(&mut self, st: &Statement) {
+        match st {
+            Statement::CreateTable(ct) => self.create_table(ct),
+            Statement::CreateView(v) => self.create_unread(&v.name),
+            Statement::AlterTable(at) => self.alter_table(at),
+            Statement::Drop { object_type, names, .. } => match object_type {
+                ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => {
+                    names.iter().for_each(|n| self.drop_relation(n))
+                }
+                ObjectType::Index => names.iter().for_each(|n| self.drop_index(n)),
+                _ => {}
+            },
+            Statement::AlterIndex { name, operation: AlterIndexOperation::RenameIndex { index_name } } => {
+                let (old, new) = (last_name(name), last_name(index_name));
+                for t in self.tables() {
+                    t.keys.iter_mut().filter(|k| k.name == old).for_each(|k| k.name = new.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A relation named `name` whose columns are not known. One already of that exact name is the
+    /// one Postgres refused to create twice, or the one `OR REPLACE` replaced: it is unread too.
+    fn create_unread(&mut self, name: &ObjectName) {
+        let name = obj_name(name).to_lowercase();
+        match self.rels.iter().position(|r| r.name == name) {
+            Some(i) => self.unread(i),
+            None => self.rels.push(Rel { name, table: None }),
+        }
+    }
+
+    fn create_table(&mut self, ct: &CreateTable) {
+        let name = obj_name(&ct.name).to_lowercase();
+        if ct.if_not_exists && self.rels.iter().any(|r| r.name == name) {
+            return;
+        }
+        for parent in ct.inherits.iter().flatten() {
+            for i in self.targets(parent) {
+                if let Some(t) = self.table(i) {
+                    t.inherited = true;
+                }
+            }
+        }
+        // Columns the statement does not list: a `LIKE` (which sqlparser reads, after a column, as a
+        // column named `LIKE`; unquoted, the word is reserved and names no column), an `INHERITS`
+        // parent's, a partition's parent's, or a query's.
+        let like = ct.columns.iter().any(|c| c.name.quote_style.is_none() && c.name.value.eq_ignore_ascii_case("like"));
+        let complete = !ct.columns.is_empty()
+            && !like
+            && ct.like.is_none()
+            && ct.inherits.is_none()
+            && ct.partition_of.is_none()
+            && ct.query.is_none();
+        if !complete {
+            return self.create_unread(&ct.name);
+        }
+        let table = self.read_create_table(ct, name.clone());
+        // A name read again replaces an unread one. A table declared twice is kept twice, so that
+        // `Catalog::check_case_collisions` refuses it.
+        self.rels.retain(|r| r.name != name || r.table.is_some());
+        self.rels.push(Rel { name, table: Some(table) });
+    }
+
+    fn read_create_table(&self, ct: &CreateTable, name: String) -> Building {
+        let mut b = Building {
+            table: Table {
+                name,
+                cols: Vec::new(),
+                declared_types: Vec::new(),
+                nullable: Vec::new(),
+                opaque_identity: Vec::new(),
+                keys: Vec::new(),
+                row_determined: Vec::new(),
+                n_declared: ct.columns.len(),
+                collations: Vec::new(),
+            },
+            not_null: Vec::new(),
+            defaults: Vec::new(),
+            domain_default: Vec::new(),
+            keys: Vec::new(),
+            others: Vec::new(),
+            partitioned: ct.partition_by.is_some(),
+            inherited: false,
+        };
         for c in &ct.columns {
             let cname = crate::dml::fold_ident(&c.name);
-            let data_type = domains.resolve(&c.data_type);
+            let data_type = self.domains.resolve(&c.data_type);
             let rendered = data_type.to_string();
-            let (cty, collation) = crate::collation::column(&c.options, map.column_type(data_type), &created);
-            let idx = cols.len();
+            let (cty, collation) = crate::collation::column(&c.options, self.map.column_type(data_type), &self.created);
+            let idx = b.table.cols.len();
             // A collated column is `COLLATED`, never identity, and an opaque name that records a
             // coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE` either. The list
             // `sqleq-solver` reads is `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type
             // with no `=`.
-            identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&rendered));
-            cols.push((cname, cty));
-            declared.push(rendered);
-            collations.push(collation);
-            nullable.push(true);
-            determined.push(row_determined(c));
+            b.table.opaque_identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&rendered));
+            b.table.cols.push((cname, cty));
+            b.table.declared_types.push(rendered);
+            b.table.collations.push(collation);
+            b.not_null.push(false);
+            b.defaults.push(column_default(c));
+            b.domain_default.push(self.domains.volatile_default(&c.data_type));
             for opt in &c.options {
+                let name = opt.name.as_ref().map(|n| n.value.to_lowercase());
                 match &opt.option {
-                    ColumnOption::Unique(u) => {
-                        if enforced_per_statement(u.characteristics.as_ref()) {
-                            keys.push(vec![idx]);
-                        }
-                    }
+                    ColumnOption::Unique(u) => b.keys.push(Key {
+                        cols: vec![idx],
+                        name,
+                        primary: false,
+                        enforced: enforced_per_statement(u.characteristics.as_ref()),
+                    }),
                     // `PRIMARY KEY` is a key *and* implies `NOT NULL`; the second holds even when
                     // the first is deferrable.
-                    ColumnOption::PrimaryKey(pk) => {
-                        if enforced_per_statement(pk.characteristics.as_ref()) {
-                            keys.push(vec![idx]);
-                        }
-                        nullable[idx] = false;
-                    }
-                    ColumnOption::NotNull => nullable[idx] = false,
+                    ColumnOption::PrimaryKey(pk) => b.keys.push(Key {
+                        cols: vec![idx],
+                        name,
+                        primary: true,
+                        enforced: enforced_per_statement(pk.characteristics.as_ref()),
+                    }),
+                    ColumnOption::NotNull => b.not_null[idx] = true,
+                    ColumnOption::Check(_) | ColumnOption::ForeignKey(_) => b.others.extend(name),
                     _ => {}
                 }
             }
         }
-        if cols.is_empty() {
-            continue;
-        }
-        let name_index: HashMap<String, usize> =
-            cols.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
         for con in &ct.constraints {
-            // UNIQUE and PRIMARY KEY both become a key column-set, unless deferrable; only PRIMARY
-            // KEY also implies its columns are NOT NULL, deferrable or not.
-            let (key_cols, implies_not_null, enforced): (&[IndexColumn], bool, bool) = match con {
-                TableConstraint::Unique(uc) => {
-                    (&uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+            b.add_constraint(con);
+        }
+        b
+    }
+
+    fn alter_table(&mut self, at: &AlterTable) {
+        let Some(i) = self.resolve(&at.name) else {
+            if !at.operations.iter().all(only_adds_facts) {
+                for i in self.targets(&at.name) {
+                    self.unread(i);
                 }
-                TableConstraint::PrimaryKey(pk) => {
-                    (&pk.columns, true, enforced_per_statement(pk.characteristics.as_ref()))
-                }
-                _ => continue,
-            };
-            let set: Vec<usize> = key_cols
-                .iter()
-                .filter_map(|ic| index_col_name(ic).and_then(|n| name_index.get(&n).copied()))
-                .collect();
-            if !set.is_empty() {
-                if implies_not_null {
-                    // Each PK column is individually NOT NULL, so resolving only some of a composite
-                    // key still settles the ones we resolved.
-                    for &i in &set {
-                        nullable[i] = false;
+            }
+            return;
+        };
+        for op in &at.operations {
+            let Some(t) = self.table(i) else { return };
+            use AlterTableOperation as Op;
+            match op {
+                // A key added to a partitioned table alone is not on its partitions.
+                Op::AddConstraint { constraint, .. } if !(at.only && t.partitioned) => t.add_constraint(constraint),
+                Op::AddConstraint { .. } => {}
+                Op::AlterColumn { column_name, op } => {
+                    let name = crate::dml::fold_ident(column_name);
+                    let Some(c) = t.table.cols.iter().position(|(n, _)| *n == name) else {
+                        // A column the reader does not have: the table is not what it read.
+                        self.unread(i);
+                        continue;
+                    };
+                    match op {
+                        AlterColumnOperation::SetNotNull => t.not_null[c] = true,
+                        AlterColumnOperation::DropNotNull => t.not_null[c] = false,
+                        // Postgres refuses both on an identity or a generated column, which keeps
+                        // what it had.
+                        AlterColumnOperation::SetDefault { value } if t.defaults[c] != ColumnDefault::Generated => {
+                            t.defaults[c] = ColumnDefault::Own(stable_default(value))
+                        }
+                        AlterColumnOperation::DropDefault if t.defaults[c] != ColumnDefault::Generated => {
+                            t.defaults[c] = ColumnDefault::Absent
+                        }
+                        AlterColumnOperation::SetDefault { .. } | AlterColumnOperation::DropDefault => {}
+                        // Postgres takes `ADD GENERATED … AS IDENTITY` only on a `NOT NULL` column.
+                        AlterColumnOperation::AddGenerated { .. } => {
+                            t.defaults[c] = ColumnDefault::Generated;
+                            t.not_null[c] = true;
+                        }
+                        AlterColumnOperation::SetDataType { .. } => self.unread(i),
                     }
                 }
-                if enforced {
-                    keys.push(set);
+                Op::DropConstraint { name, .. } => t.drop_constraint(&name.value.to_lowercase()),
+                Op::DropPrimaryKey { .. } => t.keys.retain(|k| !k.primary),
+                Op::DropIndex { name } => {
+                    let name = Some(name.value.to_lowercase());
+                    t.keys.retain(|k| k.name != name)
+                }
+                Op::RenameConstraint { old_name, new_name } => {
+                    let (old, new) = (old_name.value.to_lowercase(), new_name.value.to_lowercase());
+                    for k in t.keys.iter_mut().filter(|k| k.name.as_deref() == Some(old.as_str())) {
+                        k.name = Some(new.clone());
+                    }
+                    for o in t.others.iter_mut().filter(|o| **o == old) {
+                        *o = new.clone();
+                    }
+                }
+                // The new name is in the table's schema; a name already taken is one Postgres
+                // refuses.
+                Op::RenameTable { table_name: RenameTableNameKind::To(n) | RenameTableNameKind::As(n) } => {
+                    let new = last_name(n).unwrap_or_default();
+                    let rel = &mut self.rels[i];
+                    rel.name = match rel.name.rsplit_once('.') {
+                        Some((schema, _)) => format!("{schema}.{new}"),
+                        None => new,
+                    };
+                    if let Some(t) = &mut rel.table {
+                        t.table.name = rel.name.clone();
+                    }
+                }
+                op if changes_nothing_read(op) => {}
+                _ => self.unread(i),
+            }
+        }
+    }
+
+    /// `DROP TABLE` or `DROP VIEW` of `name`: gone, if it resolves; else each relation of that bare
+    /// name may be, and is left unread.
+    fn drop_relation(&mut self, name: &ObjectName) {
+        match self.resolve(name) {
+            Some(i) => {
+                self.rels.remove(i);
+            }
+            None => {
+                for i in self.targets(name) {
+                    self.unread(i);
                 }
             }
         }
+    }
+
+    /// `DROP INDEX` of `name`: the key of that name goes from whichever table has it. An index's name
+    /// is its schema's, so the bare name is compared, which can only drop more keys than the
+    /// database did.
+    fn drop_index(&mut self, name: &ObjectName) {
+        let name = last_name(name);
+        for t in self.tables() {
+            t.keys.retain(|k| k.name != name);
+        }
+    }
+
+    /// A loss of facts read off a statement the parser rejected.
+    fn rejected(&mut self, r: Rejection) {
+        match r {
+            Rejection::Created(n) => self.create_unread(&n),
+            Rejection::Altered(n) => self.targets(&n).into_iter().for_each(|i| self.unread(i)),
+            Rejection::Default(n, col) => {
+                let col = crate::dml::fold_ident(&col);
+                for i in self.targets(&n) {
+                    let Some(t) = self.table(i) else { continue };
+                    match t.table.cols.iter().position(|(c, _)| *c == col) {
+                        Some(c) => t.defaults[c] = ColumnDefault::Own(false),
+                        None => self.unread(i),
+                    }
+                }
+            }
+            Rejection::Inherited(n) => {
+                for i in self.targets(&n) {
+                    if let Some(t) = self.table(i) {
+                        t.inherited = true;
+                    }
+                }
+            }
+            Rejection::Dropped(n) => self.drop_relation(&n),
+            Rejection::Index(n) => self.drop_index(&n),
+            Rejection::AnyTable => (0..self.rels.len()).for_each(|i| self.unread(i)),
+            // The reader takes no key from an index, and a constraint's index is dropped only with
+            // the constraint.
+            Rejection::AnyIndex => {}
+            Rejection::Domain(_) | Rejection::AnyDomain => {}
+        }
+    }
+
+    fn finish(self) -> Catalog {
+        let mut tables = Vec::new();
+        let mut unread = Vec::new();
+        for r in self.rels {
+            match r.table {
+                Some(t) => tables.push(t.finish()),
+                None => unread.push(r.name),
+            }
+        }
+        Catalog { tables, unread }
+    }
+}
+
+impl Building {
+    /// A table constraint, from the `CREATE TABLE` or an `ALTER TABLE … ADD`.
+    fn add_constraint(&mut self, con: &TableConstraint) {
+        let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(|n| n.value.to_lowercase());
+        let (name, parts, primary, enforced) = match con {
+            TableConstraint::Unique(uc) => {
+                (lower(&uc.name), &uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
+            }
+            TableConstraint::PrimaryKey(pk) => {
+                (lower(&pk.name), &pk.columns, true, enforced_per_statement(pk.characteristics.as_ref()))
+            }
+            TableConstraint::Check(c) => return self.others.extend(lower(&c.name)),
+            TableConstraint::ForeignKey(f) => return self.others.extend(lower(&f.name)),
+            TableConstraint::Exclude(e) => return self.others.extend(lower(&e.name)),
+            _ => return,
+        };
+        if let Some(cols) = key_columns(parts, &self.table.cols) {
+            self.keys.push(Key { cols, name, primary, enforced });
+        }
+    }
+
+    /// `DROP CONSTRAINT name`. A name the reader does not know may be an unnamed key's, which
+    /// Postgres generated, or from Postgres 18 a `NOT NULL`'s, so the table keeps no key and no
+    /// `NOT NULL`.
+    fn drop_constraint(&mut self, name: &str) {
+        if self.keys.iter().any(|k| k.name.as_deref() == Some(name)) {
+            self.keys.retain(|k| k.name.as_deref() != Some(name));
+        } else if self.others.iter().any(|o| o == name) {
+            self.others.retain(|o| o != name);
+        } else {
+            self.keys.clear();
+            self.not_null.iter_mut().for_each(|n| *n = false);
+        }
+    }
+
+    fn finish(self) -> Table {
+        let Building { mut table, not_null, defaults, domain_default, keys, inherited, .. } = self;
+        let in_primary = |i: usize| keys.iter().any(|k| k.primary && k.cols.contains(&i));
+        table.nullable = (0..table.cols.len()).map(|i| inherited || !(not_null[i] || in_primary(i))).collect();
+        table.row_determined = defaults
+            .iter()
+            .zip(&domain_default)
+            .map(|(d, from_domain)| match d {
+                ColumnDefault::Absent => !from_domain,
+                ColumnDefault::Own(stable) => *stable,
+                ColumnDefault::Generated => false,
+            })
+            .collect();
         // Two spellings of one key are one key. Order-preserving, so the emitted schema is stable.
         let mut unique: Vec<Vec<usize>> = Vec::new();
-        for k in keys {
-            let mut sorted = k.clone();
+        for k in keys.iter().filter(|k| k.enforced && !inherited) {
+            let mut sorted = k.cols.clone();
             sorted.sort_unstable();
             if !unique.iter().any(|u| {
                 let mut u = u.clone();
                 u.sort_unstable();
                 u == sorted
             }) {
-                unique.push(k);
+                unique.push(k.cols.clone());
             }
         }
-        catalog.tables.push(Table {
-            name: tname,
-            n_declared: cols.len(),
-            cols,
-            declared_types: declared,
-            nullable,
-            opaque_identity: identity,
-            row_determined: determined,
-            keys: unique,
-            collations,
-        });
+        table.keys = unique;
+        table
     }
-    catalog
 }
 
-/// Is this column's stored value a function of the row as written?
+/// The last part of a name, lower-cased: an index's or a constraint's name as [`Key`] keeps it.
+fn last_name(n: &ObjectName) -> Option<String> {
+    obj_name(n).rsplit('.').next().map(str::to_lowercase)
+}
+
+/// An `ALTER TABLE` operation that cannot lose a fact the catalog holds: an added constraint or
+/// `NOT NULL`, and what [`changes_nothing_read`] lists.
+fn only_adds_facts(op: &AlterTableOperation) -> bool {
+    matches!(
+        op,
+        AlterTableOperation::AddConstraint { .. }
+            | AlterTableOperation::AlterColumn { op: AlterColumnOperation::SetNotNull, .. }
+    ) || changes_nothing_read(op)
+}
+
+/// An `ALTER TABLE` operation that changes nothing the catalog reads: ownership, constraint
+/// validation, triggers, rules, row security, replication and logging.
+fn changes_nothing_read(op: &AlterTableOperation) -> bool {
+    use AlterTableOperation as Op;
+    matches!(
+        op,
+        Op::OwnerTo { .. }
+            | Op::ValidateConstraint { .. }
+            | Op::EnableTrigger { .. }
+            | Op::DisableTrigger { .. }
+            | Op::EnableAlwaysTrigger { .. }
+            | Op::EnableReplicaTrigger { .. }
+            | Op::EnableRule { .. }
+            | Op::DisableRule { .. }
+            | Op::EnableAlwaysRule { .. }
+            | Op::EnableReplicaRule { .. }
+            | Op::EnableRowLevelSecurity
+            | Op::DisableRowLevelSecurity
+            | Op::ForceRowLevelSecurity
+            | Op::NoForceRowLevelSecurity
+            | Op::ReplicaIdentity { .. }
+            | Op::SetLogged
+            | Op::SetUnlogged
+    )
+}
+
+/// What an `INSERT` that omits the column stores, by its own declaration.
 ///
 /// See [`Table::row_determined`] for what reads it and why the direction of the answer is the
-/// soundness question. `false` is always safe, so everything not recognised here is `false`.
-pub fn row_determined(c: &ColumnDef) -> bool {
-    // `SERIAL` and friends are sugar for a `nextval()` default, and sqlparser keeps them as a
-    // custom type name rather than desugaring them, so the type has to be read as well as the
-    // options.
-    let ty = format!("{}", c.data_type).to_lowercase();
-    if matches!(
-        ty.as_str(),
-        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
-    ) {
-        return false;
+/// soundness question: anything not recognised here as the same for every row is not.
+fn column_default(c: &ColumnDef) -> ColumnDefault {
+    // `GENERATED ... AS IDENTITY` is a sequence. `GENERATED ... AS (expr) STORED` really is a
+    // function of the row, but nothing in the corpus needs the distinction and refusing both keeps
+    // the rule one line long.
+    if c.options.iter().any(|o| matches!(o.option, ColumnOption::Generated { .. })) {
+        return ColumnDefault::Generated;
     }
-    for opt in &c.options {
-        match &opt.option {
-            // `GENERATED ... AS IDENTITY` is a sequence. `GENERATED ... AS (expr) STORED` really is
-            // a function of the row, but nothing in the corpus needs the distinction and refusing
-            // both keeps the rule one line long.
-            ColumnOption::Generated { .. } => return false,
-            ColumnOption::Default(e) if !stable_default(e) => return false,
-            _ => {}
-        }
+    // `SERIAL` and friends are sugar for a `nextval()` default, and sqlparser keeps them as a custom
+    // type name rather than desugaring them, so the type has to be read as well as the options.
+    // Postgres reads the name quoted or not (`"serial"` is one), so the quotes are dropped.
+    let ty = c.data_type.to_string().replace('"', "").to_lowercase();
+    if matches!(ty.as_str(), "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial") {
+        return ColumnDefault::Own(false);
     }
-    true
+    match c.options.iter().find_map(|o| match &o.option {
+        ColumnOption::Default(e) => Some(e),
+        _ => None,
+    }) {
+        Some(e) => ColumnDefault::Own(stable_default(e)),
+        None => ColumnDefault::Absent,
+    }
 }
 
 /// A `DEFAULT` expression that takes the same value for every row of one statement.

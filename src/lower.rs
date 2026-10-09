@@ -2074,7 +2074,9 @@ fn same_last_name(cat: &Catalog, tn: &str) -> String {
     let last = |n: &str| n.rsplit('.').next().unwrap_or(n).to_lowercase();
     let same: Vec<&str> =
         cat.tables.iter().filter(|t| last(&t.name) == last(tn)).map(|t| t.name.as_str()).collect();
-    if same.is_empty() {
+    if cat.unread.iter().any(|u| *u == tn.to_lowercase()) {
+        " (declared, but its columns are not read)".to_string()
+    } else if same.is_empty() {
         String::new()
     } else {
         format!(" (the catalog has {})", same.join(", "))

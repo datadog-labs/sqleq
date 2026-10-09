@@ -32,7 +32,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Ddl};
 use crate::infer::{map_type_name, Ty};
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
@@ -340,9 +340,10 @@ fn simplify_for_retry(stmt: &str) -> Option<String> {
 /// every table in it to the first index it cannot read. That is not hypothetical: real dumps do
 /// carry such statements, and whole schemas were lost to them before this became statement-at-a-time.
 ///
-/// Statements that are not `CREATE TABLE` — including those standalone `CREATE UNIQUE INDEX`es — are
-/// skipped, so the keys they would contribute are not picked up. That is a completeness gap, not a
-/// soundness one: a missed key only costs proofs.
+/// What follows a `CREATE TABLE` is read in order, as a pair file's is (`catalog::build`), and a
+/// statement that would not parse is not lost: it is read off its first words, as a loss of the facts
+/// about what it names. A standalone `CREATE UNIQUE INDEX` gives no key: that is a completeness gap,
+/// not a soundness one, since a missed key only costs proofs.
 pub fn parse_provided_schema(raw: &str) -> Catalog {
     parse_reporting(raw).0
 }
@@ -356,24 +357,42 @@ pub fn parse_provided_schema(raw: &str) -> Catalog {
 /// unquoted, folded to lower case first (`MyCol` comes back as `"mycol"`), so the result no longer
 /// says which names the DDL quoted.
 pub fn parse_statements_reporting(raw: &str) -> (Vec<(Statement, bool)>, Vec<Rejected>) {
-    let sql = unescape(raw);
-    let mut errors = Vec::new();
-    let statements = split_statements(&sql)
-        .into_iter()
-        .filter_map(|s| match Parser::parse_sql(&PostgreSqlDialect {}, s) {
-            Ok(st) => Some(st.into_iter().map(|st| (st, false)).collect::<Vec<_>>()),
-            Err(e) => {
-                let retry = simplify_for_retry(s)
-                    .and_then(|r| Parser::parse_sql(&PostgreSqlDialect {}, &r).ok());
-                if retry.is_none() {
-                    errors.push(Rejected { message: e.to_string(), statement: s.trim().to_string() });
-                }
-                retry.map(|st| st.into_iter().map(|st| (st, true)).collect())
-            }
-        })
-        .flatten()
-        .collect();
+    let (mut statements, mut errors) = (Vec::new(), Vec::new());
+    for p in parse_in_order(raw) {
+        match p {
+            Parsed::Statement(st, retried) => statements.push((*st, retried)),
+            Parsed::Rejected(r) => errors.push(r),
+        }
+    }
     (statements, errors)
+}
+
+/// One statement of raw DDL: parsed, with whether only the retry parsed it, or rejected.
+enum Parsed {
+    Statement(Box<Statement>, bool),
+    Rejected(Rejected),
+}
+
+/// [`parse_statements_reporting`], each rejection in its place among the parsed statements, which
+/// the catalog needs: a statement after a `CREATE TABLE` can undo what an earlier one said.
+fn parse_in_order(raw: &str) -> Vec<Parsed> {
+    let sql = unescape(raw);
+    let mut out = Vec::new();
+    for s in split_statements(&sql) {
+        match Parser::parse_sql(&PostgreSqlDialect {}, s) {
+            Ok(st) => out.extend(st.into_iter().map(|st| Parsed::Statement(Box::new(st), false))),
+            Err(e) => {
+                match simplify_for_retry(s).and_then(|r| Parser::parse_sql(&PostgreSqlDialect {}, &r).ok()) {
+                    Some(st) => out.extend(st.into_iter().map(|st| Parsed::Statement(Box::new(st), true))),
+                    None => out.push(Parsed::Rejected(Rejected {
+                        message: e.to_string(),
+                        statement: s.trim().to_string(),
+                    })),
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One statement this module could not read, and why.
@@ -394,9 +413,23 @@ pub struct Rejected {
 /// exist so that question stays answerable: a batch harness can route them to a second parser and
 /// learn what the first one choked on, and a production caller can log them.
 pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
-    let (statements, errors) = parse_statements_reporting(raw);
-    let parsed: Vec<&Statement> = statements.iter().map(|(st, _)| st).collect();
-    (crate::catalog::build(&parsed, crate::catalog::TypeMap::Raw), errors)
+    let parsed = parse_in_order(raw);
+    let ddl: Vec<Ddl> = parsed
+        .iter()
+        .map(|p| match p {
+            Parsed::Statement(st, _) => Ddl::Parsed(st),
+            Parsed::Rejected(r) => Ddl::Rejected(&r.statement),
+        })
+        .collect();
+    let catalog = crate::catalog::build(&ddl, crate::catalog::TypeMap::Raw);
+    let errors = parsed
+        .into_iter()
+        .filter_map(|p| match p {
+            Parsed::Rejected(r) => Some(r),
+            Parsed::Statement(..) => None,
+        })
+        .collect();
+    (catalog, errors)
 }
 
 #[cfg(test)]

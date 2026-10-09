@@ -168,7 +168,7 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             collations: vec![crate::collation::Collation::Default; n_declared],
         });
     }
-    emit_mysql(&Catalog { tables })
+    emit_mysql(&Catalog { tables, unread: Vec::new() })
 }
 
 /// Print a catalog as MySQL-dialect DDL, plus whether two tables shared a bare name.
