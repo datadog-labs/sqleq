@@ -19,6 +19,7 @@
 //!
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/params/` run them.
 
+use serde_json::Value;
 use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "n" NUMERIC, "f" DOUBLE PRECISION);"#;
@@ -121,6 +122,18 @@ fn a_parameter_postgres_types_as_an_integer_still_lowers() {
         r#"SELECT "id" FROM "t" WHERE "a" = $1 LIMIT $2"#,
         r#"SELECT "id" FROM "t" WHERE "a" = $1 ORDER BY "id" LIMIT $2"#,
     );
+    // A parameter cast wherever it appears is typed by its cast, whichever use comes first.
+    let (q0, q1) = (
+        r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1::int AND $1::int < 1"#,
+        r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1::int AND $1::int <= 0"#,
+    );
+    lowers_in(seeded, q0, q1);
+    // One bare use is enough for the order to matter again.
+    refused_in(
+        seeded,
+        r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1 AND $1::int < 1"#,
+        r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1 AND $1::int <= 0"#,
+    );
 }
 
 #[test]
@@ -167,4 +180,32 @@ fn a_cast_over_a_parameter_to_another_type_is_refused() {
     ] {
         lowers_in(CatalogSource::InferredSeeded, q0, q1);
     }
+}
+
+/// The type the lowered pair gives `QP1`.
+fn qp1_type(q: &str) -> String {
+    fn find(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(m) if m.get("operator").and_then(Value::as_str) == Some("QP1") => {
+                m.get("type").and_then(Value::as_str).map(str::to_string)
+            }
+            Value::Object(m) => m.values().find_map(find),
+            Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    let v = lower_with(&pair(q, q), CatalogSource::InferredSeeded)
+        .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q}"));
+    find(&v["queries"][0]).unwrap_or_else(|| panic!("no QP1 in {q}"))
+}
+
+#[test]
+fn a_parameter_in_arithmetic_takes_its_partners_type() {
+    // Postgres gives `$1` the type of the operand it meets: a `numeric` column's, a literal's.
+    assert_eq!(qp1_type(r#"SELECT "id" FROM "t" WHERE "n" + $1 > 0"#), "REAL");
+    assert_eq!(qp1_type(r#"SELECT "id" FROM "t" WHERE "a" + $1 > 0"#), "INTEGER");
+    assert_eq!(qp1_type(r#"SELECT "id" FROM "t" WHERE $1 + 1 > "a""#), "INTEGER");
+    // Next to an operand inference cannot type, no guess: an integer here would be narrower than
+    // the `numeric` Postgres gives it.
+    assert_eq!(qp1_type(r#"SELECT sum("n") / $1 FROM "t""#), "VARBINARY");
 }

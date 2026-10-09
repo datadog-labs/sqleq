@@ -268,7 +268,8 @@ fn pipeline(
 ) -> Result<(Value, Option<FrontendError>)> {
     let mut decls = fns.clone();
     let inferred;
-    // The parameters whose type inference gave, which [`param_types`] checks against Postgres's.
+    // The parameters whose type inference gave, which [`param_types`] checks against Postgres's: not
+    // one the pair casts wherever it appears, which Postgres types by that cast.
     let mut inferred_params = BTreeSet::new();
     // Held rather than raised: `params` explains why this one refusal is reported last.
     let mut misaligned = None;
@@ -291,6 +292,7 @@ fn pipeline(
             Ok(inf) => inf,
             Err(e) => return Err(params::root_cause(arity, e, &queries, seeds)),
         };
+        let cast_typed = casts::cast_everywhere(&queries);
         let rw = casts::rewrite_casts(&mut queries, &mut inf)?;
         // The only window where both facts hold: rule 1 has hoisted `$N::T` to a bare `$N`, and the
         // substitution below has not yet deleted the attribution the role check reads. `arity` first,
@@ -303,6 +305,7 @@ fn pipeline(
         inferred_params = inf
             .params
             .keys()
+            .filter(|n| !cast_typed.contains(n))
             .map(|n| format!("QP{n}"))
             .filter(|name| synth.contains_key(name) && !decls.contains_key(name))
             .collect();

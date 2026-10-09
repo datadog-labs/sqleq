@@ -1035,7 +1035,10 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
     })?;
 
     // 4. Arithmetic operands are numeric. Only a name-strength guess: `a - b` over two timestamps is
-    //    an interval, and the corpus has those.
+    //    an interval, and the corpus has those. A parameter is not guessed at: Postgres gives it the
+    //    type of the operand it meets, so it takes a literal's or a cast's type, or a column's whose
+    //    type is known, and next to anything else nothing here. Guessed an integer next to a
+    //    `numeric`, it was narrower than Postgres's, which `param_types` refuses.
     sweep(q, |e| {
         let Expr::BinaryOp { left, op, right } = e else { return Ok(()) };
         if !matches!(
@@ -1049,8 +1052,17 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
             return Ok(());
         }
         let real = [left, right].iter().any(|o| matches!(side_type(o), Ok(Some((Ty::Real, _)))));
-        for o in [left, right] {
-            if let Some(k) = side_key(at, o) {
+        for (o, other) in [(left, right), (right, left)] {
+            let Some(k) = side_key(at, o) else { continue };
+            if matches!(k, Atom::Param(_)) {
+                let partner = match side_type(other)? {
+                    Some((t, _)) => Some(t),
+                    None => side_key(at, other).and_then(|p| uf.get_type(&p)),
+                };
+                if let Some(t @ (Ty::Int | Ty::Real)) = partner {
+                    uf.set_type(&k, t, Conf::Name)?;
+                }
+            } else {
                 uf.set_type(&k, if real { Ty::Real } else { Ty::Int }, Conf::Name)?;
             }
         }

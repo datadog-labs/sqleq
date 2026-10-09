@@ -261,6 +261,33 @@ impl VisitorMut for FoldNames {
     }
 }
 
+/// The parameters every occurrence of which, in either query, is the operand of an unqualified cast:
+/// `$6::int` wherever `$6` appears. Postgres types such a parameter by its first use, which is then a
+/// cast, so its type is the cast's whatever order it reads the statement in. Read before rule 1 drops
+/// the casts.
+pub fn cast_everywhere(queries: &[Query]) -> std::collections::BTreeSet<u32> {
+    let (mut seen, mut cast) = (HashMap::<u32, usize>::new(), HashMap::<u32, usize>::new());
+    for q in queries {
+        let _ = sweep(q, |e| {
+            match e {
+                Expr::Value(_) => {
+                    if let Some(n) = placeholder_index(e) {
+                        *seen.entry(n).or_default() += 1;
+                    }
+                }
+                Expr::Cast { expr, data_type, .. } if !map_type_name(&data_type.to_string()).1 => {
+                    if let Some(n) = placeholder_index(unwrap_nested(expr)) {
+                        *cast.entry(n).or_default() += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+    }
+    seen.into_iter().filter(|(n, k)| cast.get(n) == Some(k)).map(|(n, _)| n).collect()
+}
+
 /// A type as a message names it.
 fn ty_name(t: Ty) -> &'static str {
     match t {
