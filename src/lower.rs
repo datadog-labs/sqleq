@@ -2068,9 +2068,8 @@ fn expr_name(e: &Expr, idx: usize) -> String {
 /// For an `unknown table` refusal: the catalog's tables whose last dotted name is `tn`'s, up to case
 /// as [`Catalog::find`] compares, as ` (the catalog has s.t)`, or nothing when it has none.
 ///
-/// A fact, not a diagnosis. A bare `t` against a declared `s.t` (or the reverse) is two tables, but
-/// the same message is reached when both queries name `s.t` and `strip_schema` stripped them to a
-/// `t` the catalog does not hold.
+/// A fact, not a diagnosis. A bare `t` against a declared `s.t` (or the reverse) is two tables, and
+/// the same message is reached for a bare `t` that two schemas declare and nothing declares bare.
 fn same_last_name(cat: &Catalog, tn: &str) -> String {
     let last = |n: &str| n.rsplit('.').next().unwrap_or(n).to_lowercase();
     let same: Vec<&str> =

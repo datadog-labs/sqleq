@@ -81,6 +81,63 @@ fn one_qualifier_on_both_sides_still_strips() {
     assert!(identical("create table t (a INTEGER);\nSELECT a FROM s1.t;\nSELECT a FROM S1.t;", CatalogSource::Declared));
 }
 
+// --- A reference resolves against the declared catalog ---------------------------------------------
+
+/// The declared tables each query of a lowered pair scans, by name.
+fn scanned(src: &str) -> Vec<Vec<String>> {
+    fn scans(v: &Value, out: &mut Vec<usize>) {
+        match v {
+            Value::Object(m) => {
+                if let Some(i) = m.get("scan").and_then(Value::as_u64) {
+                    out.push(i as usize);
+                }
+                m.values().for_each(|x| scans(x, out));
+            }
+            Value::Array(a) => a.iter().for_each(|x| scans(x, out)),
+            _ => {}
+        }
+    }
+    let v = lowered(src, CatalogSource::Declared);
+    let names: Vec<String> =
+        v["schemas"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    v["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| {
+            let mut out = Vec::new();
+            scans(q, &mut out);
+            out.into_iter().map(|i| names[i].clone()).collect()
+        })
+        .collect()
+}
+
+/// With both `t` and `s.t` declared, `FROM s.t` is `s.t`. Stripped to `t`, both queries read the
+/// keyed `t`, and the `DISTINCT` over `s.t`'s duplicates was provably removable.
+#[test]
+fn a_qualified_reference_is_the_table_declared_under_that_name() {
+    let pair = "create table t (a INTEGER PRIMARY KEY);\ncreate table s.t (a INTEGER);\n\
+                SELECT DISTINCT a FROM s.t;\nSELECT a FROM s.t;";
+    assert_eq!(scanned(pair), [["s.t"], ["s.t"]]);
+    // A table declared only under a schema is found under that name too.
+    let pair = "create table s.t (id INTEGER PRIMARY KEY, a INTEGER);\n\
+                SELECT id FROM s.t WHERE a > 1;\nSELECT id FROM s.t WHERE 1 < a;";
+    assert_eq!(scanned(pair), [["s.t"], ["s.t"]]);
+}
+
+/// A bare reference is the table declared bare, else `public`'s, else the one table of that name.
+#[test]
+fn a_bare_reference_resolves_to_the_one_declared_table_of_its_name() {
+    let q = "SELECT a FROM t;\nSELECT a FROM t WHERE a > 0;";
+    assert_eq!(scanned(&format!("create table s.t (a INTEGER);\n{q}")), [["s.t"], ["s.t"]]);
+    assert_eq!(scanned(&format!("create table public.t (a INTEGER);\ncreate table s.t (a INTEGER);\n{q}")), [["public.t"], ["public.t"]]);
+    assert_eq!(scanned(&format!("create table t (a INTEGER);\ncreate table public.t (a INTEGER);\n{q}")), [["t"], ["t"]]);
+    // Two schemas and no bare or `public` table of that name: not known to be either.
+    refused(&format!("create table a.t (a INTEGER);\ncreate table b.t (a INTEGER);\n{q}"), "unknown table t");
+    // A bare name on one side and a qualified one on the other are still not known to be one table.
+    refused("create table s.t (a INTEGER);\nSELECT a FROM t;\nSELECT a FROM s.t;", "unknown table t");
+}
+
 // --- `DEFAULT` is a keyword, not a column ---------------------------------------------------------
 
 /// `SET a = DEFAULT` stores the column's default. sqlparser gives the keyword as an unquoted
