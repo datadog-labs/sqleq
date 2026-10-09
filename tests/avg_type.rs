@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! `avg` over an integer is a `numeric` (issue #106).
+//! `avg` over an integer is a `numeric` (issue #106), and so is `sum` (issue #121).
 //!
 //! Postgres's `avg` over `smallint`, `integer` or `bigint` returns `numeric`: the mean of `{0, 1}` is
 //! `0.5`. The lowering typed it like its operand, an INTEGER, so the QED prover reasoned about the
@@ -12,6 +12,12 @@
 //! not identity: `avg` over `{19999}` prints `19999.0000000000000000` and over `{39998, 0}`
 //! `19999.000000000000`. So an operation that can tell two such values apart, a cast to text or a
 //! division, reads it as it reads any other `numeric` (`src/equality.rs`).
+//!
+//! `sum` over `smallint` or `integer` returns `bigint`, and over `bigint` it returns `numeric`, which
+//! the IR, with one INTEGER for every width, cannot tell apart: typed like its operand, `sum(g) / 2`
+//! over a `bigint` was an integer division, and QED proved `HAVING sum(g) / 2 = 0` equivalent to
+//! `HAVING sum(g) / 2 < 1 AND sum(g) / 2 > -1`. An integer `sum` is the IR's REAL now too, read the
+//! same way: a `bigint` and an integer-valued `numeric` differ only where a division reads them.
 //!
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/aggregates/` run them.
 
@@ -130,11 +136,23 @@ fn avg_over_an_integer_is_a_numeric() {
             ("REAL".into(), "REAL".into()),
             "{src:?}: {q}"
         );
-        // The neighbours keep an integer's type: `sum` over an integer is one (`bigint`, or a
-        // `numeric` of scale 0 over `bigint`), and so are `count`, `min` and `max`.
+        // `sum` over an integer is a `numeric` too: over `bigint` it is one, and the IR cannot tell
+        // `bigint` from the narrower integers, nor a `count`, which is a `bigint`, from either.
+        for q in [
+            r#"SELECT sum("a") FROM "t""#,
+            r#"SELECT sum("s") FROM "t""#,
+            r#"SELECT sum("g") FROM "t""#,
+            r#"SELECT sum(CAST("a" AS BIGINT)) FROM "t""#,
+            r#"SELECT sum(CASE WHEN "b" > 0 THEN 1 ELSE 0 END) FROM "t""#,
+        ] {
+            assert_eq!(
+                agg_and_output(src, q, "SUM"),
+                ("REAL".into(), "REAL".into()),
+                "{src:?}: {q}"
+            );
+        }
+        // The neighbours keep an integer's type: `count`, `min` and `max` are integers.
         for (q, op) in [
-            (r#"SELECT sum("a") FROM "t""#, "SUM"),
-            (r#"SELECT sum("g") FROM "t""#, "SUM"),
             (r#"SELECT count("a") FROM "t""#, "COUNT"),
             (r#"SELECT min("a") FROM "t""#, "MIN"),
             (r#"SELECT max("s") FROM "t""#, "MAX"),
@@ -158,6 +176,11 @@ fn avg_over_an_integer_is_a_numeric() {
         let v = lower_with_ddl(&format!("{q};\n{q};"), ddl, CatalogSource::Declared).unwrap();
         let mut types = Vec::new();
         agg_types(&v["queries"][0], "AVG", &mut types);
+        assert_eq!(types, ["REAL"], "{q}");
+        let q = format!("SELECT sum({arg}) FROM t");
+        let v = lower_with_ddl(&format!("{q};\n{q};"), ddl, CatalogSource::Declared).unwrap();
+        let mut types = Vec::new();
+        agg_types(&v["queries"][0], "SUM", &mut types);
         assert_eq!(types, ["REAL"], "{q}");
     }
 }
@@ -216,6 +239,64 @@ fn avg_over_an_integer_is_read_as_a_numeric() {
         (
             r#"SELECT coalesce(avg("a"), 0) > 1 FROM "t""#,
             r#"SELECT coalesce(avg("a"), 0) > 1 FROM "u""#,
+        ),
+    ] {
+        lowers(q0, q1);
+    }
+}
+
+#[test]
+fn sum_over_an_integer_is_read_as_a_numeric() {
+    // Two plans, so a division of an integer `sum`, or by one, is refused: over a `bigint` it is a
+    // `numeric` division, and on t = {(1, 1)} `sum(g) / 2` is 0.5.
+    refused(
+        r#"SELECT "id" FROM "t" GROUP BY "id" HAVING sum("g") / 2 = 0"#,
+        r#"SELECT "id" FROM "t" GROUP BY "id" HAVING sum("g") / 2 < 1 AND sum("g") / 2 > -1"#,
+    );
+    for f in [r#"sum("a") / 2"#, r#"sum("a") / count(*)"#] {
+        refused(
+            &format!(r#"SELECT {f} FROM "t""#),
+            &format!(r#"SELECT {f} FROM "u""#),
+        );
+    }
+    // A `count` is a `bigint`, so a `sum` over one is a `numeric`; so is a `sum` over a `sum`.
+    for inner in [r#"count(*)"#, r#"sum("a")"#] {
+        refused(
+            &format!(r#"SELECT sum("m") / 2 FROM (SELECT {inner} AS "m" FROM "t" GROUP BY "id") AS "x""#),
+            &format!(r#"SELECT sum("m") / 2 FROM (SELECT {inner} AS "m" FROM "u" GROUP BY "id") AS "x""#),
+        );
+    }
+    refused(
+        r#"SELECT "id" FROM "t" WHERE "a" / (SELECT sum("a") FROM "u") = 0"#,
+        r#"SELECT "id" FROM "t" WHERE "a" / (SELECT sum("a") FROM "u") < 1"#,
+    );
+    // What a `bigint` and an integer-valued `numeric` agree on still lowers: comparisons, exact
+    // arithmetic, a rounding, a cast to an integer, `coalesce`. A `count` divided is still an
+    // integer division, in Postgres and in the IR.
+    for (q0, q1) in [
+        (
+            r#"SELECT "id" FROM "t" GROUP BY "id" HAVING sum("g") = 0"#,
+            r#"SELECT "id" FROM "t" GROUP BY "id" HAVING sum("g") < 1 AND sum("g") > -1"#,
+        ),
+        (
+            r#"SELECT sum("a") + 1 FROM "t""#,
+            r#"SELECT 1 + sum("a") FROM "t""#,
+        ),
+        (
+            r#"SELECT round(sum("a")) FROM "t""#,
+            r#"SELECT round(sum("a")) FROM "u""#,
+        ),
+        (
+            r#"SELECT CAST(sum("a") AS INTEGER) FROM "t""#,
+            r#"SELECT CAST(sum("a") AS INTEGER) FROM "u""#,
+        ),
+        (
+            r#"SELECT coalesce(sum("a"), 0) > 1 FROM "t""#,
+            r#"SELECT coalesce(sum("a"), 0) > 1 FROM "u""#,
+        ),
+        (
+            r#"SELECT count("a") / 2 FROM "t""#,
+            r#"SELECT count("a") / 2 FROM "u""#,
         ),
     ] {
         lowers(q0, q1);

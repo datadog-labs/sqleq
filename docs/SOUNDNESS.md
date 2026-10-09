@@ -148,17 +148,21 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   them (`box(point, point)`, `circle(point, double precision)`, `lseg`, `line`, `bound_box` and the
   rest of `pg_proc`'s list), whether or not the input declares it. A function a user defines that
   returns one is a name like any other.
-- **`avg` over an integer is a `numeric`.** Postgres's `avg` over `smallint`, `integer` or `bigint`
+- **`avg` and `sum` over an integer are `numeric`s.** Postgres's `avg` over `smallint`, `integer` or `bigint`
   returns `numeric`, so its result is REAL, not the integer its operand is: the mean of `{0, 1}` is
   `0.5`, and an integer mean would make `avg(a) = 0` the same filter as `avg(a) < 1 AND avg(a) > -1`.
   It has `numeric`'s `=` with the type: the mean of `{19999}` and the mean of `{39998, 0}` are both
   19999, printed `19999.0000000000000000` and `19999.000000000000`. So what reads it is sorted as
   [below](#values-that--calls-equal-and-that-are-still-two-values), and a pair whose two queries
   differ and that casts the mean to text or divides it is refused, as one over a `numeric` column
-  is. `sum` over an integer is integer-valued (`bigint`, or a `numeric` of scale 0 over `bigint`),
-  and `count`, `min` and `max` are integers, so they keep their operand's type. One gap is open
-  there: over `bigint`, `sum` is a `numeric`, so `sum(g) / 2` is a `numeric` division, and the IR,
-  which has one INTEGER for every integer width, reads it as an integer one.
+  is. `sum` over `smallint` or `integer` returns `bigint`, but over `bigint` it returns `numeric`,
+  so `sum(g) / 2` over a `bigint` is a `numeric` division (`0.5` for `{1}`). The IR has one INTEGER
+  for every integer width and cannot tell which, and `count`, a `bigint`, makes a sum over it the
+  same. So an integer `sum` is REAL too: integer-valued, but a `numeric`. A `bigint` and an
+  integer-valued `numeric` differ only where a division reads them, which is refused as above when
+  the two queries differ; a comparison or `+` lowers. The cost is a `sum` over an `integer` divided,
+  which Postgres computes as an integer division. `count`, `min` and `max` are integers, so they keep
+  their operand's type.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
   The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
   inference, read every name from one table, so `uuid` and `money` are opaque in both.

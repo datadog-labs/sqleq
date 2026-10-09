@@ -223,8 +223,9 @@ mod integer_division {
         assert_eq!((rem["operator"].as_str(), rem["type"].as_str()), (Some("q_arith_mod_integer_integer"), Some("INTEGER")));
         let lit = target(r#"SELECT (-7) / 2 FROM "t""#);
         assert_eq!(lit["operator"], "q_arith_div_integer_integer");
-        // Over aggregates too.
-        let q = r#"SELECT sum("a") / count(*) FROM "t""#;
+        // Over aggregates too. (Not over a `sum`, which is a `numeric` in the IR: over a `bigint`
+        // it is one in Postgres, and the IR cannot tell a `bigint` apart.)
+        let q = r#"SELECT max("a") / count(*) FROM "t""#;
         let v = lower(NUM, q, q);
         let mut out = Vec::new();
         nodes(&v["queries"][0], &mut out);

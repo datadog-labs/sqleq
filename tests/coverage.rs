@@ -102,11 +102,11 @@ fn ceil_and_floor_are_calls() {
 #[test]
 fn a_shared_conversion_reads_names_as_postgres_does() {
     // Unquoted names fold, so the two casts are one function and the pair cancels.
-    assert!(same("SELECT sum(a)::varchar(2) FROM t", "SELECT SUM(A)::varchar(2) FROM t", SEEDED));
+    assert!(same("SELECT max(a)::varchar(2) FROM t", "SELECT MAX(A)::varchar(2) FROM t", SEEDED));
     // Literals do not, and different operands or targets stay apart.
     assert!(!same("SELECT (s || 'Ab')::varchar(2) FROM t", "SELECT (s || 'ab')::varchar(2) FROM t", SEEDED));
     assert!(!same("SELECT max(s)::int FROM t", "SELECT max(k)::int FROM t", SEEDED));
-    assert!(!same("SELECT sum(a)::varchar(2) FROM t", "SELECT sum(a)::varchar(3) FROM t", SEEDED));
+    assert!(!same("SELECT max(a)::varchar(2) FROM t", "SELECT max(a)::varchar(3) FROM t", SEEDED));
 }
 
 #[test]
