@@ -49,8 +49,8 @@ mod infer;
 mod lower;
 mod normalize;
 /// Where the parameter assumption is checked: `$N` on one side is `$N` on the other.
-mod param_types;
 mod params;
+mod param_types;
 /// Public because it is an entry point: it reads raw Postgres DDL -- possibly malformed, since a
 /// captured schema is not a schema anyone wrote by hand -- into a `Catalog`, and reports per
 /// statement what it could not read rather than dropping it silently.
