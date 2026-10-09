@@ -906,17 +906,16 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
     Ok((two_goals(pa, ta, pred_a), two_goals(pb, tb, pred_b), stored))
 }
 
-/// The catalog index of a DML target, by qualified name and then by bare name.
+/// The catalog index of a DML target, as [`Catalog::resolve`] finds it: by its name as written, then
+/// by its bare name.
 ///
-/// The bare fallback is not a guess: [`pgddl`][crate::pgddl] keys the catalog on bare names by
-/// construction, and [`strip_schema`][crate::normalize::strip_schema] makes the query's own reference
-/// bare before [`lower`][crate::lower] resolves it — so this resolves the target the same way the
-/// rest of the pipeline will. Where `strip_schema` declines to strip (a system schema, or one bare
-/// name reached through two qualifiers) `lower` then fails to resolve the target and the pair is
-/// refused, so a mismatch here costs a refusal and never a proof. A qualified target is common enough
-/// in practice to be worth resolving here rather than refusing.
+/// That is how [`resolve_tables`][crate::normalize::resolve_tables] resolves the queries' own
+/// references before [`lower`][crate::lower] reads them, so this resolves the target the same way the
+/// rest of the pipeline will. Where the pair's guards keep a reference qualified (a system schema, or
+/// one bare name reached through two qualifiers) `lower` then fails to resolve the target and the pair
+/// is refused, so a mismatch here costs a refusal and never a proof.
 fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
-    cat.find(name).or_else(|| cat.find(name.rsplit('.').next().unwrap_or(name)))
+    cat.resolve(name)
 }
 
 /// One side's projection: the value each column of the target ends up with.

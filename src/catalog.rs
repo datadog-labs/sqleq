@@ -135,6 +135,28 @@ impl Catalog {
         self.tables.iter().position(|t| t.name == n)
     }
 
+    /// The table a reference names: the one declared under that name, else the one its last part
+    /// names as a bare name ([`Catalog::resolve_bare`]).
+    pub fn resolve(&self, name: &str) -> Option<usize> {
+        self.find(name).or_else(|| self.resolve_bare(name.rsplit('.').next().unwrap_or(name)))
+    }
+
+    /// The table a bare name names: the one declared bare, else `public`'s, else the one table of
+    /// that name declared under any schema. The last step takes the input's DDL as the tables its
+    /// queries read, which assumes the session's search path finds that table. Two schemas declaring
+    /// the name, and no bare or `public` table of it, resolve to nothing.
+    pub fn resolve_bare(&self, bare: &str) -> Option<usize> {
+        let bare = bare.to_lowercase();
+        self.find(&bare).or_else(|| self.find(&format!("public.{bare}"))).or_else(|| {
+            let suffix = format!(".{bare}");
+            let mut named = self.tables.iter().enumerate().filter(|(_, t)| t.name.ends_with(&suffix));
+            match (named.next(), named.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        })
+    }
+
     /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
     /// only in case.
     ///
@@ -321,9 +343,49 @@ impl Domains {
 /// catalog has to exist while the tree still holds `DELETE`/`UPDATE` statements rather than the two
 /// queries they reduce to.
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
+    build(&statements.iter().collect::<Vec<_>>(), TypeMap::Declared)
+}
+
+/// Which column-type mapper a catalog's input takes. The two readers still map a type nothing
+/// classifies differently: a pair file keeps its name, raw DDL makes it an opaque `VARBINARY` (see
+/// `pgddl::map_pg_type`). Everything else about a table is read one way, by [`build`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeMap {
+    /// A pair file's `CREATE TABLE`s: [`map_type`].
+    Declared,
+    /// Raw Postgres DDL: `pgddl::map_pg_type`, else [`crate::types::opaque_name`].
+    Raw,
+}
+
+impl TypeMap {
+    fn column_type(self, dt: &DataType) -> String {
+        match self {
+            TypeMap::Declared => map_type(dt),
+            TypeMap::Raw => {
+                let rendered = dt.to_string();
+                crate::pgddl::map_pg_type(&rendered)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::types::opaque_name(&rendered).to_string())
+            }
+        }
+    }
+}
+
+/// Build the catalog from `statements`' `CREATE TABLE`s, for both inputs: the pair file's (through
+/// [`scan_ddl`]) and raw DDL's (through `pgddl::parse_reporting`).
+///
+/// * A table is keyed on its name as declared, qualifier included, lower-cased. A reference finds it
+///   by that name, or by its bare name ([`Catalog::resolve`]).
+/// * A table with no columns (`CREATE TABLE t ()`, `AS SELECT`, `LIKE`, `PARTITION OF`) is not
+///   read: its shape is not in the statement, and a query over it is refused for naming an unknown
+///   table rather than lowered over no columns.
+/// * A column's declared type is kept with its domain resolved, which is what an assignment to it
+///   converts to (`dml::Store`).
+/// * Two spellings of one key (a column's `UNIQUE` also named in a table constraint) are one key.
+pub fn build(statements: &[&Statement], map: TypeMap) -> Catalog {
     let mut catalog = Catalog { tables: Vec::new() };
-    let created = crate::collation::created(statements);
-    let domains = Domains::of(statements);
+    let created = crate::collation::created(statements.iter().copied());
+    let domains = Domains::of(statements.iter().copied());
     for st in statements {
         let Statement::CreateTable(ct) = st else { continue };
         let tname = obj_name(&ct.name).to_lowercase();
@@ -337,13 +399,16 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
         for c in &ct.columns {
             let cname = crate::dml::fold_ident(&c.name);
             let data_type = domains.resolve(&c.data_type);
-            let (cty, collation) = crate::collation::column(&c.options, map_type(data_type), &created);
+            let rendered = data_type.to_string();
+            let (cty, collation) = crate::collation::column(&c.options, map.column_type(data_type), &created);
             let idx = cols.len();
-            // A collated column is `COLLATED`, never identity. The list `sqleq-solver` reads is
-            // `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type with no `=`.
-            identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&data_type.to_string()));
+            // A collated column is `COLLATED`, never identity, and an opaque name that records a
+            // coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE` either. The list
+            // `sqleq-solver` reads is `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type
+            // with no `=`.
+            identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&rendered));
             cols.push((cname, cty));
-            declared.push(c.data_type.to_string());
+            declared.push(rendered);
             collations.push(collation);
             nullable.push(true);
             determined.push(row_determined(c));
@@ -366,6 +431,9 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
                     _ => {}
                 }
             }
+        }
+        if cols.is_empty() {
+            continue;
         }
         let name_index: HashMap<String, usize> =
             cols.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
@@ -398,6 +466,19 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
                 }
             }
         }
+        // Two spellings of one key are one key. Order-preserving, so the emitted schema is stable.
+        let mut unique: Vec<Vec<usize>> = Vec::new();
+        for k in keys {
+            let mut sorted = k.clone();
+            sorted.sort_unstable();
+            if !unique.iter().any(|u| {
+                let mut u = u.clone();
+                u.sort_unstable();
+                u == sorted
+            }) {
+                unique.push(k);
+            }
+        }
         catalog.tables.push(Table {
             name: tname,
             n_declared: cols.len(),
@@ -406,7 +487,7 @@ pub fn scan_ddl(statements: &[Statement]) -> Catalog {
             nullable,
             opaque_identity: identity,
             row_determined: determined,
-            keys,
+            keys: unique,
             collations,
         });
     }

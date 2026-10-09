@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn a_postgres_catalog_prints_as_mysql_ddl() {
-        let c = cat(r#"CREATE TABLE public.orders (
+        let c = cat(r#"CREATE TABLE orders (
                          id integer PRIMARY KEY,
                          total numeric,
                          note text,
@@ -274,7 +274,9 @@ mod tests {
 
     #[test]
     fn only_the_first_table_of_a_name_is_emitted_and_the_clash_is_reported() {
-        let (ddl, dup) = emit_mysql(&cat("CREATE TABLE a.t (x integer); CREATE TABLE b.t (y integer);"));
+        // A table is keyed on its name as declared, so `a.t` and `b.t` are two names; one name
+        // declared twice is the clash.
+        let (ddl, dup) = emit_mysql(&cat("CREATE TABLE t (x integer); CREATE TABLE t (y integer);"));
         assert!(dup);
         assert!(ddl.contains("`x`") && !ddl.contains("`y`"), "{ddl}");
     }

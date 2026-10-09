@@ -1538,21 +1538,11 @@ impl VisitorMut for ResolveTable<'_> {
         let Some(bare) = name.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
             return ControlFlow::Continue(());
         };
-        if cat.find(&bare).is_some() || self.bound.contains(&bare) {
+        if self.bound.contains(&bare) {
             return ControlFlow::Continue(());
         }
-        let public = format!("public.{bare}");
-        let suffix = format!(".{bare}");
-        let key = if cat.find(&public).is_some() {
-            Some(public)
-        } else {
-            let mut named = cat.tables.iter().filter(|t| t.name.ends_with(&suffix));
-            match (named.next(), named.next()) {
-                (Some(t), None) => Some(t.name.clone()),
-                _ => None,
-            }
-        };
-        if let Some(key) = key {
+        if let Some(i) = cat.resolve_bare(&bare) {
+            let key = &cat.tables[i].name;
             *name = ObjectName(key.split('.').map(|p| ObjectNamePart::Identifier(Ident::new(p))).collect());
         }
         ControlFlow::Continue(())
