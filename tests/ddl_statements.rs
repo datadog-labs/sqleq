@@ -248,6 +248,15 @@ fn a_unique_index_over_plain_columns_is_a_key() {
 }
 
 #[test]
+fn a_unique_index_is_no_functional_dependence_and_a_primary_key_using_it_is() {
+    // Postgres reads a dependence off a primary key alone, so it rejects the first query.
+    let q = "SELECT id, a FROM t GROUP BY id";
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON t (id)";
+    refused(&format!("{table};"), q, q, "not functionally dependent on GROUP BY");
+    lowered(&format!("{table}; ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX i;"), q, q);
+}
+
+#[test]
 fn a_dropped_or_renamed_unique_index_is_followed() {
     let table = "CREATE TABLE t (id integer NOT NULL, a integer NOT NULL)";
     for (rest, key) in [

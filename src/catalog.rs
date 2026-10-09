@@ -72,6 +72,11 @@ pub struct Table {
     /// `CREATE UNIQUE INDEX` over the whole table, that holds at every statement (see
     /// [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is not here.
     pub keys: Vec<Vec<usize>>,
+    /// The columns of the table's `PRIMARY KEY`, when it has one that holds at every statement;
+    /// empty otherwise. Of all the keys, the only one Postgres reads a functional dependence off: it
+    /// accepts `SELECT id, name FROM t GROUP BY id` when `id` is the primary key, and rejects it when
+    /// `id` is only `UNIQUE`, or has a unique index (`lower::key_determines`).
+    pub primary_key: Vec<usize>,
     /// Parallel to `cols`: `true` only where the DDL proves the stored value is a function of the
     /// row as written, rather than of the row's *position* in the statement.
     ///
@@ -711,6 +716,7 @@ impl Builder {
                 nullable: Vec::new(),
                 opaque_identity: Vec::new(),
                 keys: Vec::new(),
+                primary_key: Vec::new(),
                 row_determined: Vec::new(),
                 n_declared: ct.columns.len(),
                 collations: Vec::new(),
@@ -1010,6 +1016,11 @@ impl Building {
             }
         }
         table.keys = unique;
+        table.primary_key = keys
+            .iter()
+            .find(|k| k.primary && k.enforced && !inherited)
+            .map(|k| k.cols.clone())
+            .unwrap_or_default();
         table
     }
 }

@@ -1339,6 +1339,7 @@ mod tests {
                 opaque_identity: vec![false; cols.len()],
                 row_determined: cols.iter().map(|c| !vol.contains(c)).collect(),
                 keys: Vec::new(),
+                primary_key: Vec::new(),
                 n_declared: cols.len(),
                 collations: vec![crate::collation::Collation::Default; cols.len()],
             }],
