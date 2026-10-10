@@ -374,7 +374,7 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
 }
 
 /// Split a file into statements on top-level `;`, skipping semicolons inside string literals,
-/// quoted identifiers and comments. Each statement comes back with its leading comments removed, so
+/// quoted identifiers, dollar-quoted bodies (a function's) and comments. Each statement comes back with its leading comments removed, so
 /// the caller's `CREATE` test sees the keyword rather than the `--` line above it; text that is only
 /// a comment yields no statement at all.
 fn split_statements(src: &str) -> Vec<String> {
@@ -409,6 +409,21 @@ fn split_statements(src: &str) -> Vec<String> {
                     i += 1;
                 }
                 i = (i + 2).min(b.len());
+            }
+            // `$tag$ ... $tag$`, the tag empty or an identifier: a function body, whose statements
+            // end in `;`. A `$1` is no tag, since a tag is followed by `$`.
+            b'$' => {
+                let tag_end = b[i + 1..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                    .map(|p| i + 1 + p);
+                match tag_end {
+                    Some(e) if b[e] == b'$' => {
+                        let tag = &src[i..=e];
+                        i = src[e + 1..].find(tag).map_or(b.len(), |p| e + 1 + p + tag.len());
+                    }
+                    _ => i += 1,
+                }
             }
             b';' => {
                 push_statement(&mut out, &src[start..i]);
@@ -519,6 +534,18 @@ mod tests {
             split_statements("SELECT 'it''s; fine';"),
             vec!["SELECT 'it''s; fine'"]
         );
+    }
+
+    /// A trigger's function, as a pair pinning a trigger declares it: the body's `;`s used to split
+    /// it into three statements, and the file was rejected for having four queries.
+    #[test]
+    fn semicolons_inside_a_dollar_quoted_body_do_not_split() {
+        let f = "create function f() returns trigger language plpgsql as $$ begin NEW.a := 1; return NEW; end $$";
+        assert_eq!(split_statements(&format!("{f};\nSELECT 1;")), vec![f, "SELECT 1"]);
+        let g = "create function g() returns int language sql as $body$ select 1; $body$";
+        assert_eq!(split_statements(&format!("{g}; SELECT 2;")), vec![g, "SELECT 2"]);
+        // A parameter is no tag.
+        assert_eq!(split_statements("SELECT $1; SELECT $2;"), vec!["SELECT $1", "SELECT $2"]);
     }
 
     #[test]
