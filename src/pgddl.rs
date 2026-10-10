@@ -334,16 +334,16 @@ fn simplify_for_retry(stmt: &str) -> Option<String> {
 /// whose DDL we cannot read is a row with no declared schema, which is a state the rest of the
 /// pipeline already handles.
 ///
-/// **Statements are parsed one at a time**, and one that fails is skipped rather than abandoning the
-/// row. That is not a nicety: these dumps interleave `CREATE TABLE`s with `CREATE INDEX ... INCLUDE
-/// (...)` and other Postgres-isms sqlparser does not accept, and parsing the dump as a unit loses
+/// **Statements are parsed one at a time**, and one that fails does not abandon the row. That is not
+/// a nicety: these dumps interleave `CREATE TABLE`s with `CREATE INDEX ... ON ONLY` and other
+/// Postgres-isms sqlparser does not accept, and parsing the dump as a unit loses
 /// every table in it to the first index it cannot read. That is not hypothetical: real dumps do
 /// carry such statements, and whole schemas were lost to them before this became statement-at-a-time.
 ///
 /// What follows a `CREATE TABLE` is read in order, as a pair file's is (`catalog::build`), and a
 /// statement that would not parse is not lost: it is read off its first words, as a loss of the facts
-/// about what it names. A standalone `CREATE UNIQUE INDEX` gives no key: that is a completeness gap,
-/// not a soundness one, since a missed key only costs proofs.
+/// about what it names. A `CREATE UNIQUE INDEX` the parser rejects (`ON ONLY`, a `TABLESPACE`) gives
+/// no key: that is a completeness gap, not a soundness one, since a missed key only costs proofs.
 pub fn parse_provided_schema(raw: &str) -> Catalog {
     parse_reporting(raw).0
 }
@@ -523,7 +523,7 @@ mod tests {
         // would return nothing at all.
         let cat = parse_provided_schema(
             "CREATE TABLE t (a integer, b integer); \
-             CREATE INDEX i ON public.t USING btree (a) INCLUDE (b) WHERE (a > 0); \
+             CREATE INDEX i ON ONLY public.t USING btree (a); \
              CREATE TABLE u (c text);",
         );
         let names: Vec<&str> = cat.tables.iter().map(|t| t.name.as_str()).collect();

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! What follows a `CREATE TABLE` in the DDL is read, in order (issue #92).
+//! What follows a `CREATE TABLE` in the DDL is read, in order, unique indexes included (issue #92).
 //!
 //! The catalog used to read `CREATE TABLE` and nothing after it, so an `ALTER TABLE` that dropped a
 //! key, a `NOT NULL` or a column, or gave a column a sequence default, was not seen, and every axis
@@ -221,6 +221,124 @@ fn a_key_is_every_part_or_nothing() {
     assert_eq!(keys_and_nullable(ddl).0, json!([]));
 }
 
+#[test]
+fn a_unique_index_over_plain_columns_is_a_key() {
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer NOT NULL)";
+    for (index, key) in [
+        ("CREATE UNIQUE INDEX i ON t (id)", json!([[0]])),
+        ("CREATE UNIQUE INDEX i ON t USING btree (id DESC NULLS LAST, a)", json!([[0, 1]])),
+        ("CREATE UNIQUE INDEX i ON t (id) INCLUDE (a)", json!([[0]])),
+        // An index is found as a query's reference finds its table.
+        ("CREATE UNIQUE INDEX i ON public.t (id)", json!([[0]])),
+        ("CREATE UNIQUE INDEX i ON shop.t (id)", json!([[0]])),
+        ("CREATE UNIQUE INDEX i ON t (id) NULLS NOT DISTINCT", json!([[0]])),
+        ("CREATE UNIQUE INDEX CONCURRENTLY i ON t (id)", json!([[0]])),
+        // Partial, under an operator class or a collation, over an expression, or maybe not created.
+        ("CREATE UNIQUE INDEX i ON t (id) WHERE a > 0", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id int4_ops)", json!([])),
+        ("CREATE UNIQUE INDEX i ON t ((id + 0))", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id, (a + 0))", json!([])),
+        ("CREATE UNIQUE INDEX IF NOT EXISTS i ON t (id)", json!([])),
+        ("CREATE INDEX i ON t (id)", json!([])),
+    ] {
+        assert_eq!(keys_and_nullable(&format!("{table}; {index};")).0, key, "{index}");
+    }
+    let ddl = "CREATE TABLE t (id text NOT NULL, a integer); CREATE UNIQUE INDEX i ON t (id COLLATE \"C\");";
+    assert_eq!(keys_and_nullable(ddl).0, json!([]));
+}
+
+#[test]
+fn a_unique_index_is_no_functional_dependence_and_a_primary_key_using_it_is() {
+    // Postgres reads a dependence off a primary key alone, so it rejects the first query.
+    let q = "SELECT id, a FROM t GROUP BY id";
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON t (id)";
+    refused(&format!("{table};"), q, q, "not functionally dependent on GROUP BY");
+    lowered(&format!("{table}; ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX i;"), q, q);
+}
+
+#[test]
+fn a_dropped_or_renamed_unique_index_is_followed() {
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer NOT NULL)";
+    for (rest, key) in [
+        ("CREATE UNIQUE INDEX i ON t (id); DROP INDEX i", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id); DROP INDEX IF EXISTS public.i CASCADE", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id); ALTER INDEX i RENAME TO j; DROP INDEX j", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id); ALTER INDEX i RENAME TO j; DROP INDEX i", json!([[0]])),
+        // An unnamed index's name is Postgres's to generate, so any DROP INDEX may be of it.
+        ("CREATE UNIQUE INDEX ON t (id); DROP INDEX some_other_index", json!([])),
+        ("CREATE UNIQUE INDEX i ON t (id); DROP INDEX some_other_index", json!([[0]])),
+    ] {
+        assert_eq!(keys_and_nullable(&format!("{table}; {rest};")).0, key, "{rest}");
+    }
+}
+
+#[test]
+fn key_names_are_compared_as_postgres_compares_identifiers() {
+    // `"Ix"` and `ix` are two indexes. Read as one, renaming `"Ix"` renamed both, and dropping `ix`
+    // then dropped neither: the key on `b` outlived its index.
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer NOT NULL, b integer NOT NULL)";
+    let cases = [
+        (r#"CREATE UNIQUE INDEX "Ix" ON t (a); CREATE UNIQUE INDEX "ix" ON t (b); ALTER INDEX "Ix" RENAME TO j; DROP INDEX "ix""#, json!([[1]])),
+        ("CREATE UNIQUE INDEX MyIdx ON t (a); DROP INDEX myidx", json!([])),
+        (r#"ALTER TABLE t ADD CONSTRAINT "Con" UNIQUE (a); ALTER TABLE t ADD CONSTRAINT con UNIQUE (b); ALTER TABLE t DROP CONSTRAINT "Con""#, json!([[2]])),
+    ];
+    for (rest, key) in cases {
+        assert_eq!(keys_and_nullable(&format!("{table}; {rest};")).0, key, "{rest}");
+    }
+    // `USING INDEX "Ix"` takes that index, not `ix`, and makes its column the NOT NULL one.
+    let ddl = r#"CREATE TABLE t (id integer NOT NULL, a integer, b integer); CREATE UNIQUE INDEX "ix" ON t (b);
+                 CREATE UNIQUE INDEX "Ix" ON t (a); ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX "Ix";"#;
+    let [v, w] = lowered(ddl, "SELECT id FROM t", "SELECT id FROM t WHERE a > 1");
+    assert_eq!(schema(&v, "t")["nullable"], json!([false, false, true]));
+    assert_eq!(schema(&w, "t")["nullable"], json!([false, false, true]));
+    // Two schemas' indexes may share a name, which the keys are matched on bare: a rename then
+    // drops both keys, rather than leave the other under the new name for its own DROP to miss.
+    let ddl = "CREATE TABLE s1.t (id integer NOT NULL, a integer NOT NULL); CREATE TABLE s2.u (id integer NOT NULL, a integer NOT NULL); \
+               CREATE UNIQUE INDEX i ON s1.t (a); CREATE UNIQUE INDEX i ON s2.u (a); ALTER INDEX s1.i RENAME TO j; DROP INDEX s2.i;";
+    for v in lowered(ddl, "SELECT a FROM s2.u", "SELECT a FROM s2.u WHERE id > 1") {
+        assert_eq!(schema(&v, "s2.u")["key"], json!([]));
+    }
+}
+
+#[test]
+fn a_constraint_using_an_index_takes_its_key() {
+    let ddl = "CREATE TABLE t (id integer, a integer); CREATE UNIQUE INDEX i ON t (id); \
+               ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX i;";
+    assert_eq!(keys_and_nullable(ddl), (json!([[0]]), json!([false, true])), "a primary key is NOT NULL");
+    assert_eq!(keys_and_nullable(&format!("{ddl} ALTER TABLE t DROP CONSTRAINT t_pk;")).0, json!([]));
+    let ddl = "CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON t (id); \
+               ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i DEFERRABLE;";
+    assert_eq!(keys_and_nullable(ddl).0, json!([]), "a deferrable constraint is no key");
+}
+
+#[test]
+fn serial_and_identity_columns_are_not_null() {
+    let nullable = |ddl: &str| {
+        let [a, b] = lowered(ddl, "SELECT b FROM t", "SELECT b FROM t WHERE b > 1");
+        assert_eq!(schema(&a, "t")["nullable"], schema(&b, "t")["nullable"], "{ddl}");
+        schema(&a, "t")["nullable"].clone()
+    };
+    for col in [
+        "id serial",
+        "id BIGSERIAL",
+        "id smallserial",
+        "id serial8",
+        r#"id "serial""#,
+        "id integer GENERATED ALWAYS AS IDENTITY",
+        "id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 10)",
+    ] {
+        assert_eq!(nullable(&format!("CREATE TABLE t ({col}, b integer);")), json!([false, true]), "{col}");
+    }
+    for col in [
+        "id integer DEFAULT nextval('s')",
+        "id integer GENERATED ALWAYS AS (b + 1) STORED",
+        // Quoted, the upper-case name is not the keyword: some other type.
+        r#"id "SERIAL""#,
+    ] {
+        assert_eq!(nullable(&format!("CREATE TABLE t ({col}, b integer);")), json!([true, true]), "{col}");
+    }
+}
+
 // Raw DDL alone: a statement its parser rejects.
 
 fn raw(ddl: &str, q0: &str, q1: &str) -> Result<Value> {
@@ -258,4 +376,16 @@ fn a_rejected_statement_is_read_as_a_loss_of_what_it_names() {
     let ddl = "CREATE DOMAIN d AS integer; CREATE TABLE t (id d, a integer); ALTER DOMAIN d SET DEFAULT nextval('s');";
     let [q0, q1] = INSERT;
     expect_refusal(raw(ddl, q0, q1), VOLATILE, ddl);
+}
+
+#[test]
+fn a_rejected_index_statement_only_loses_keys() {
+    let table = "CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON t (id)";
+    let q = ["SELECT id FROM t", "SELECT id FROM t WHERE a > 1"];
+    let key = |ddl: &str| schema(&raw(ddl, q[0], q[1]).unwrap(), "t")["key"].clone();
+    assert_eq!(key(&format!("{table};")), json!([[0]]));
+    assert_eq!(key(&format!("{table}; DROP INDEX CONCURRENTLY i;")), json!([]));
+    assert_eq!(key(&format!("{table}; ALTER INDEX i SET (fillfactor = 70) AND MORE;")), json!([]));
+    // An index on a partitioned table alone (`ON ONLY`) is rejected, and gives no key.
+    assert_eq!(key("CREATE TABLE t (id integer NOT NULL, a integer); CREATE UNIQUE INDEX i ON ONLY t (id);"), json!([]));
 }

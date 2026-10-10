@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{
     visit_expressions, AlterColumnOperation, AlterIndexOperation, AlterTable, AlterTableOperation, ColumnDef,
-    ColumnOption, ConstraintCharacteristics, CreateTable, DataType, DeferrableInitial, Expr, FunctionArguments,
-    IndexColumn, ObjectName, ObjectNamePart, ObjectType, Query, RenameTableNameKind, Statement, TableConstraint,
+    ColumnOption, ConstraintCharacteristics, CreateIndex, CreateTable, DataType, DeferrableInitial, Expr,
+    FunctionArguments, GeneratedAs, IndexColumn, ObjectName, ObjectNamePart, ObjectType, Query, RenameTableNameKind, Statement, TableConstraint,
 };
 
 use crate::collation::Collation;
@@ -55,8 +55,8 @@ pub struct Table {
     /// Direction matters for soundness. `NOT NULL` *shrinks* the space of instances the prover
     /// quantifies over, so claiming it falsely could turn a non-equivalence into a `provable`.
     /// Nullable is therefore the default, and this is set `false` only for an explicit `NOT NULL`
-    /// (in the `CREATE TABLE` or a later `SET NOT NULL`), a `PRIMARY KEY` (which implies it), or an
-    /// identity column, unless a later statement drops it. Missing the constraint merely costs
+    /// (in the `CREATE TABLE` or a later `SET NOT NULL`), a `PRIMARY KEY` (which implies it), a
+    /// `SERIAL` or an identity column, unless a later statement drops it. Missing the constraint merely costs
     /// completeness.
     pub nullable: Vec<bool>,
     /// Parallel to `cols`: `true` only where the column is the opaque VARBINARY and its declared
@@ -68,10 +68,15 @@ pub struct Table {
     /// substituting values that `=` calls equal and a cast tells apart, while a false `false`
     /// merely costs proofs. So it is `false` for a catalog built without DDL to read.
     pub opaque_identity: Vec<bool>,
-    /// Column sets the DDL declares unique: every `PRIMARY KEY` and `UNIQUE` constraint that holds
-    /// at every statement (see [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is
-    /// not here.
+    /// Column sets the DDL declares unique: every `PRIMARY KEY` and `UNIQUE` constraint, and every
+    /// `CREATE UNIQUE INDEX` over the whole table, that holds at every statement (see
+    /// [`enforced_per_statement`]). A `DEFERRABLE` one does not, so it is not here.
     pub keys: Vec<Vec<usize>>,
+    /// The columns of the table's `PRIMARY KEY`, when it has one that holds at every statement;
+    /// empty otherwise. Of all the keys, the only one Postgres reads a functional dependence off: it
+    /// accepts `SELECT id, name FROM t GROUP BY id` when `id` is the primary key, and rejects it when
+    /// `id` is only `UNIQUE`, or has a unique index (`lower::key_determines`).
+    pub primary_key: Vec<usize>,
     /// Parallel to `cols`: `true` only where the DDL proves the stored value is a function of the
     /// row as written, rather than of the row's *position* in the statement.
     ///
@@ -491,6 +496,7 @@ pub enum Ddl<'a> {
 ///   Any other operation, one that changes the columns (`ADD`, `DROP` or `RENAME COLUMN`, `TYPE`)
 ///   included, leaves the table unread. An `ALTER TABLE` whose table does not resolve (a bare name
 ///   two schemas declare) leaves each table of that name unread, unless it only adds facts.
+/// * `CREATE UNIQUE INDEX` adds a key over plain columns, unless it is partial or `IF NOT EXISTS`.
 /// * `DROP TABLE` drops a table or view, and `DROP INDEX` the key an index of that name gave.
 /// * A table another inherits from keeps no key and no `NOT NULL`: a scan of it reads the other
 ///   table's rows, which neither binds.
@@ -582,13 +588,16 @@ enum ColumnDefault {
 /// A `PRIMARY KEY` or `UNIQUE` constraint, or a unique index.
 struct Key {
     cols: Vec<usize>,
-    /// The constraint's or the index's name, lower-cased; `None` for an unnamed constraint, whose
-    /// name Postgres generates.
+    /// The constraint's or the index's name, folded as Postgres folds an identifier
+    /// ([`key_name`]); `None` for an unnamed one, whose name Postgres generates.
     name: Option<String>,
     primary: bool,
     /// Whether it holds after every statement ([`enforced_per_statement`]). A deferrable primary key
     /// is no key, and its columns are `NOT NULL` all the same.
     enforced: bool,
+    /// A unique index's, rather than a constraint's. An unnamed one's name is the one Postgres
+    /// generated, which the reader does not work out, so any `DROP INDEX` may be of it.
+    index: bool,
 }
 
 struct Builder {
@@ -637,6 +646,7 @@ impl Builder {
         match st {
             Statement::CreateTable(ct) => self.create_table(ct),
             Statement::CreateView(v) => self.create_unread(&v.name),
+            Statement::CreateIndex(ci) => self.create_index(ci),
             Statement::AlterTable(at) => self.alter_table(at),
             Statement::Drop { object_type, names, .. } => match object_type {
                 ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => {
@@ -645,10 +655,19 @@ impl Builder {
                 ObjectType::Index => names.iter().for_each(|n| self.drop_index(n)),
                 _ => {}
             },
+            // An index's name is its schema's, and keys are matched on the bare name, so two
+            // schemas' indexes can answer to one. Renaming both would leave the other's key under a
+            // name a later `DROP INDEX` of it misses: so the rename is followed when one key has the
+            // name, and drops every key that has it otherwise.
             Statement::AlterIndex { name, operation: AlterIndexOperation::RenameIndex { index_name } } => {
                 let (old, new) = (last_name(name), last_name(index_name));
+                let named = self.tables().flat_map(|t| t.keys.iter()).filter(|k| k.name == old).count();
                 for t in self.tables() {
-                    t.keys.iter_mut().filter(|k| k.name == old).for_each(|k| k.name = new.clone());
+                    if named == 1 {
+                        t.keys.iter_mut().filter(|k| k.name == old).for_each(|k| k.name = new.clone());
+                    } else {
+                        t.keys.retain(|k| k.name != old);
+                    }
                 }
             }
             _ => {}
@@ -706,6 +725,7 @@ impl Builder {
                 nullable: Vec::new(),
                 opaque_identity: Vec::new(),
                 keys: Vec::new(),
+                primary_key: Vec::new(),
                 row_determined: Vec::new(),
                 n_declared: ct.columns.len(),
                 collations: Vec::new(),
@@ -732,17 +752,18 @@ impl Builder {
             b.table.cols.push((cname, cty));
             b.table.declared_types.push(rendered);
             b.table.collations.push(collation);
-            b.not_null.push(false);
+            b.not_null.push(implies_not_null(c));
             b.defaults.push(column_default(c));
             b.domain_default.push(self.domains.volatile_default(&c.data_type));
             for opt in &c.options {
-                let name = opt.name.as_ref().map(|n| n.value.to_lowercase());
+                let name = opt.name.as_ref().map(key_name);
                 match &opt.option {
                     ColumnOption::Unique(u) => b.keys.push(Key {
                         cols: vec![idx],
                         name,
                         primary: false,
                         enforced: enforced_per_statement(u.characteristics.as_ref()),
+                        index: false,
                     }),
                     // `PRIMARY KEY` is a key *and* implies `NOT NULL`; the second holds even when
                     // the first is deferrable.
@@ -751,6 +772,7 @@ impl Builder {
                         name,
                         primary: true,
                         enforced: enforced_per_statement(pk.characteristics.as_ref()),
+                        index: false,
                     }),
                     ColumnOption::NotNull => b.not_null[idx] = true,
                     ColumnOption::Check(_) | ColumnOption::ForeignKey(_) => b.others.extend(name),
@@ -762,6 +784,23 @@ impl Builder {
             b.add_constraint(con);
         }
         b
+    }
+
+    /// `CREATE UNIQUE INDEX`: a key by the rule a constraint's takes ([`key_columns`]), when the
+    /// index is unique over the whole table. A partial one (`WHERE`) is unique only over the rows it
+    /// covers, and its `INCLUDE` columns are carried, not compared. `IF NOT EXISTS` gives no key: a
+    /// relation of that name, which the reader need not know of, may already be there, and then
+    /// Postgres creates nothing. A non-unique index is nothing here.
+    fn create_index(&mut self, ci: &CreateIndex) {
+        if !ci.unique || ci.predicate.is_some() || ci.if_not_exists {
+            return;
+        }
+        let name = ci.name.as_ref().and_then(last_name);
+        let Some(i) = self.resolve(&ci.table_name) else { return };
+        let Some(t) = self.table(i) else { return };
+        if let Some(cols) = key_columns(&ci.columns, &t.table.cols) {
+            t.keys.push(Key { cols, name, primary: false, enforced: true, index: true });
+        }
     }
 
     fn alter_table(&mut self, at: &AlterTable) {
@@ -807,14 +846,14 @@ impl Builder {
                         AlterColumnOperation::SetDataType { .. } => self.unread(i),
                     }
                 }
-                Op::DropConstraint { name, .. } => t.drop_constraint(&name.value.to_lowercase()),
+                Op::DropConstraint { name, .. } => t.drop_constraint(&key_name(name)),
                 Op::DropPrimaryKey { .. } => t.keys.retain(|k| !k.primary),
                 Op::DropIndex { name } => {
-                    let name = Some(name.value.to_lowercase());
+                    let name = Some(key_name(name));
                     t.keys.retain(|k| k.name != name)
                 }
                 Op::RenameConstraint { old_name, new_name } => {
-                    let (old, new) = (old_name.value.to_lowercase(), new_name.value.to_lowercase());
+                    let (old, new) = (key_name(old_name), key_name(new_name));
                     for k in t.keys.iter_mut().filter(|k| k.name.as_deref() == Some(old.as_str())) {
                         k.name = Some(new.clone());
                     }
@@ -825,7 +864,8 @@ impl Builder {
                 // The new name is in the table's schema; a name already taken is one Postgres
                 // refuses.
                 Op::RenameTable { table_name: RenameTableNameKind::To(n) | RenameTableNameKind::As(n) } => {
-                    let new = last_name(n).unwrap_or_default();
+                    // A table is keyed lower-cased whatever its quoting, unlike a key's name.
+                    let new = obj_name(n).rsplit('.').next().unwrap_or_default().to_lowercase();
                     let rel = &mut self.rels[i];
                     rel.name = match rel.name.rsplit_once('.') {
                         Some((schema, _)) => format!("{schema}.{new}"),
@@ -856,13 +896,13 @@ impl Builder {
         }
     }
 
-    /// `DROP INDEX` of `name`: the key of that name goes from whichever table has it. An index's name
-    /// is its schema's, so the bare name is compared, which can only drop more keys than the
-    /// database did.
+    /// `DROP INDEX` of `name`: the key of that name goes from whichever table has it, and so does
+    /// every unnamed index's, whose generated name it may be. An index's name is its schema's, so the
+    /// bare name is compared, which can only drop more keys than the database did.
     fn drop_index(&mut self, name: &ObjectName) {
         let name = last_name(name);
         for t in self.tables() {
-            t.keys.retain(|k| k.name != name);
+            t.keys.retain(|k| k.name != name && !(k.index && k.name.is_none()));
         }
     }
 
@@ -891,9 +931,8 @@ impl Builder {
             Rejection::Dropped(n) => self.drop_relation(&n),
             Rejection::Index(n) => self.drop_index(&n),
             Rejection::AnyTable => (0..self.rels.len()).for_each(|i| self.unread(i)),
-            // The reader takes no key from an index, and a constraint's index is dropped only with
-            // the constraint.
-            Rejection::AnyIndex => {}
+            // A constraint's index is dropped only with the constraint.
+            Rejection::AnyIndex => self.tables().for_each(|t| t.keys.retain(|k| !k.index)),
             Rejection::Domain(_) | Rejection::AnyDomain => {}
         }
     }
@@ -914,7 +953,7 @@ impl Builder {
 impl Building {
     /// A table constraint, from the `CREATE TABLE` or an `ALTER TABLE … ADD`.
     fn add_constraint(&mut self, con: &TableConstraint) {
-        let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(|n| n.value.to_lowercase());
+        let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(key_name);
         let (name, parts, primary, enforced) = match con {
             TableConstraint::Unique(uc) => {
                 (lower(&uc.name), &uc.columns, false, enforced_per_statement(uc.characteristics.as_ref()))
@@ -922,13 +961,27 @@ impl Building {
             TableConstraint::PrimaryKey(pk) => {
                 (lower(&pk.name), &pk.columns, true, enforced_per_statement(pk.characteristics.as_ref()))
             }
+            // The index becomes the constraint, under the constraint's name; a primary key makes its
+            // columns `NOT NULL`. Postgres takes no partial or expression index here, and an index
+            // the reader took no key from gives none.
+            TableConstraint::PrimaryKeyUsingIndex(c) | TableConstraint::UniqueUsingIndex(c) => {
+                let index = Some(key_name(&c.index_name));
+                let primary = matches!(con, TableConstraint::PrimaryKeyUsingIndex(_));
+                if let Some(k) = self.keys.iter_mut().find(|k| k.index && k.name == index) {
+                    k.name = lower(&c.name).or(index);
+                    k.index = false;
+                    k.primary |= primary;
+                    k.enforced &= enforced_per_statement(c.characteristics.as_ref());
+                }
+                return;
+            }
             TableConstraint::Check(c) => return self.others.extend(lower(&c.name)),
             TableConstraint::ForeignKey(f) => return self.others.extend(lower(&f.name)),
             TableConstraint::Exclude(e) => return self.others.extend(lower(&e.name)),
             _ => return,
         };
         if let Some(cols) = key_columns(parts, &self.table.cols) {
-            self.keys.push(Key { cols, name, primary, enforced });
+            self.keys.push(Key { cols, name, primary, enforced, index: false });
         }
     }
 
@@ -973,13 +1026,26 @@ impl Building {
             }
         }
         table.keys = unique;
+        table.primary_key = keys
+            .iter()
+            .find(|k| k.primary && k.enforced && !inherited)
+            .map(|k| k.cols.clone())
+            .unwrap_or_default();
         table
     }
 }
 
-/// The last part of a name, lower-cased: an index's or a constraint's name as [`Key`] keeps it.
+/// A constraint's or an index's name as Postgres compares it: an unquoted one folded to lower case, a
+/// quoted one as written, so `"Ix"` and `ix` are two indexes. Lower-casing both would make them one,
+/// and then renaming one renames both and dropping the other drops neither, leaving a key Postgres
+/// dropped.
+fn key_name(id: &sqlparser::ast::Ident) -> String {
+    crate::dml::fold_ident(id)
+}
+
+/// The last part of a name, as [`key_name`] folds it: an index's name as [`Key`] keeps it.
 fn last_name(n: &ObjectName) -> Option<String> {
-    obj_name(n).rsplit('.').next().map(str::to_lowercase)
+    n.0.last().and_then(|p| p.as_ident()).map(key_name)
 }
 
 /// An `ALTER TABLE` operation that cannot lose a fact the catalog holds: an added constraint or
@@ -1016,6 +1082,37 @@ fn changes_nothing_read(op: &AlterTableOperation) -> bool {
             | Op::SetLogged
             | Op::SetUnlogged
     )
+}
+
+/// Whether a column's declaration makes it `NOT NULL` without saying so: a `SERIAL`, which is
+/// shorthand for `integer NOT NULL DEFAULT nextval(…)`, or an identity column. A stored generated
+/// column is not, and neither is a `DEFAULT nextval(…)` alone.
+///
+/// The `SERIAL` test is Postgres's, not [`column_default`]'s looser one, since claiming a `NOT NULL`
+/// is the unsound direction: the type is one unqualified name, folded as an identifier, so `SERIAL`
+/// and `"serial"` are one and a quoted `"SERIAL"` names some other type.
+fn implies_not_null(c: &ColumnDef) -> bool {
+    let serial = match &c.data_type {
+        DataType::Custom(name, modifiers) if modifiers.is_empty() => match name.0.as_slice() {
+            [ObjectNamePart::Identifier(id)] => matches!(
+                crate::dml::fold_ident(id).as_str(),
+                "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+            ),
+            _ => false,
+        },
+        _ => false,
+    };
+    serial
+        || c.options.iter().any(|o| {
+            matches!(
+                o.option,
+                ColumnOption::Generated {
+                    generated_as: GeneratedAs::Always | GeneratedAs::ByDefault,
+                    generation_expr: None,
+                    ..
+                }
+            )
+        })
 }
 
 /// What an `INSERT` that omits the column stores, by its own declaration.

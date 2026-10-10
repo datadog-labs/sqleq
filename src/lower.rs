@@ -2693,16 +2693,17 @@ fn plain_col(v: &Value) -> Option<usize> {
 /// declared key of the same binding.
 ///
 /// Postgres accepts a non-grouped column when it is functionally dependent on the GROUP BY, and this
-/// is that rule, restricted to the one dependence a `CREATE TABLE` proves: group on a key of a table
-/// and each group holds rows from a single row of that table, so every other column of it is constant
-/// within the group.
+/// is that rule: group on a table's primary key and each group holds rows from a single row of that
+/// table, so every other column of it is constant within the group.
 ///
 /// Both restrictions are load-bearing:
 ///
-///   * **the key's columns must be NOT NULL.** `UNIQUE` alone permits many rows with a NULL key, and
-///     `GROUP BY` puts all of them in one group — so on `T(u UNIQUE, b)` holding `{(NULL,1),
-///     (NULL,2)}`, `GROUP BY u` is one group and `b` is not constant in it. `PRIMARY KEY` implies
-///     NOT NULL, so the common case passes; a nullable `UNIQUE` is refused.
+///   * **the key must be the primary key** ([`crate::catalog::Table::primary_key`]). A `NOT NULL` `UNIQUE` column, or
+///     one with a unique index, makes the column constant in a group just as well, but Postgres reads
+///     no dependence off it and rejects the query (`column must appear in the GROUP BY clause`).
+///     Lowering it would give a proof about a query that does not run. A nullable `UNIQUE` would be
+///     wrong besides: it permits many rows with a NULL key, and `GROUP BY` puts all of them in one
+///     group, so on `T(u UNIQUE, b)` holding `{(NULL,1), (NULL,2)}` `b` is not constant in it.
 ///   * **the key must be grouped on the same binding.** [`Scope::binding_of`] resolves the level to
 ///     a relation *instance*, so under `t AS a JOIN t AS b`, grouping on `a.id` does not license
 ///     reading `b.name`.
@@ -2714,9 +2715,8 @@ fn key_determines(cat: &Catalog, scope: &Scope, grouped: &[usize], level: usize)
     let Some((b, _)) = scope.binding_of(level) else { return false };
     let Some(t) = b.table else { return false };
     let tbl = &cat.tables[t];
-    tbl.keys.iter().any(|k| {
-        !k.is_empty() && k.iter().all(|&ci| !tbl.nullable[ci] && grouped.contains(&(b.offset + ci)))
-    })
+    let pk = &tbl.primary_key;
+    !pk.is_empty() && pk.iter().all(|&ci| !tbl.nullable[ci] && grouped.contains(&(b.offset + ci)))
 }
 
 /// Every column level a lowered expression references.

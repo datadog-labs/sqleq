@@ -1492,16 +1492,20 @@ fn composite_key_must_be_grouped_whole() {
 }
 
 /// A nullable `UNIQUE` is not enough: `GROUP BY u` puts every NULL-keyed row in one group, and on
-/// `{(NULL,1),(NULL,2)}` the dependent column is not constant across it.
+/// `{(NULL,1),(NULL,2)}` the dependent column is not constant across it. Nor is a `NOT NULL` one,
+/// though `b` is constant in each group then: Postgres reads a dependence off a primary key alone, and
+/// rejects the query.
 #[test]
-fn nullable_unique_key_does_not_determine() {
-    let ddl = "create table t (u INTEGER UNIQUE, b VARCHAR);";
+fn only_a_primary_key_determines() {
     let q = "SELECT t.u, t.b FROM t GROUP BY t.u";
-    refused(&format!("{ddl}\n{q};\n{q};"), "not functionally dependent on GROUP BY");
-
-    // The same key, NOT NULL, does determine — so it is the nullability that refused it above.
-    let ddl = "create table t (u INTEGER NOT NULL UNIQUE, b VARCHAR);";
+    for ddl in ["create table t (u INTEGER UNIQUE, b VARCHAR);", "create table t (u INTEGER NOT NULL UNIQUE, b VARCHAR);"] {
+        refused(&format!("{ddl}\n{q};\n{q};"), "not functionally dependent on GROUP BY");
+    }
+    let ddl = "create table t (u INTEGER PRIMARY KEY, b VARCHAR);";
     assert_eq!(ok(&format!("{ddl}\n{q};\n{q};"))["queries"][0]["group"]["keys"].as_array().unwrap().len(), 2);
+    // A deferrable one is no key, and Postgres reads no dependence off it either.
+    let ddl = "create table t (u INTEGER PRIMARY KEY DEFERRABLE, b VARCHAR);";
+    refused(&format!("{ddl}\n{q};\n{q};"), "not functionally dependent on GROUP BY");
 }
 
 /// The key must be grouped on the *same instance*: under a self-join, `a`'s key says nothing about
