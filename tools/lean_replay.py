@@ -22,7 +22,9 @@ replays each pair on Postgres and asks two questions.
    twice: once on the empty table, and once with the statement run twice, so the second run meets
    the first run's rows and exercises the conflict clause against existing rows.
 
-Every run is its own transaction, with the DDL applied inside it and rolled back afterwards, so
+Every run is its own transaction, in the time zone America/New_York rather than UTC (so that a
+timestamp read where a timestamptz was meant shows), with the DDL applied inside it and rolled back
+afterwards, so
 sequences start fresh each time. That is only true because every sequence a run uses is created
 inside it, by the DDL or by this script: sequences are not transactional, so run this against a
 database where none of them already exists. Clocks are fixed and random generators drawn from
@@ -424,6 +426,9 @@ def preamble(plan: dict) -> list[str]:
     """Open the run's transaction, create its generator sequences, and apply the DDL."""
     out = ["\\set ON_ERROR_STOP off", "\\set QUIET on", "\\pset format unaligned", "\\pset tuples_only on",
            "\\pset fieldsep '\\x1f'", "\\pset recordsep '\\x1d'", "\\pset null '\\x1e'", "BEGIN;"]
+    # Not UTC, where a timestamp and a timestamptz read the canonical `+00` values alike: here a
+    # `timestamp` element headed for a `timestamptz` column is read in another zone, and shows.
+    out.append("SET LOCAL TimeZone = 'America/New_York';")
     out += [f"CREATE SEQUENCE {s};" for s in plan.get("sequences", [])]
     for i, d in enumerate(plan["ddl"]):
         # The terminator goes on its own line: a statement can end in a `--` comment.

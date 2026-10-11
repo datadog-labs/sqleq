@@ -217,7 +217,9 @@ pair on a real Postgres:
 The two sides must agree on outcome, row count, `RETURNING` rows in order, and table contents. The
 witness model must agree with Postgres on whether the `VALUES` side succeeds.
 
-Every run is a transaction that applies the DDL and is rolled back. Inside it, generators are made
+Every run is a transaction that applies the DDL and is rolled back. It runs in the time zone
+America/New_York, not UTC, where a `timestamp` and a `timestamptz` read the canonical values alike.
+Inside it, generators are made
 deterministic so that both runs see the *same* stream, which is what the theorem claims. A clock
 is fixed, and a random value is drawn from a sequence created within the run: one per default in
 the DDL and per generator in a tail, and one shared by the generators in the `VALUES` clause, so a
