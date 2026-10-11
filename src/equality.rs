@@ -104,6 +104,11 @@ pub const PASS_THROUGH: [&str; 13] = [
 /// frontend does not know they still read it by its class ([`unknown`]).
 const SELECTS: [&str; 4] = ["COALESCE", "NULLIF", "GREATEST", "LEAST"];
 
+/// Whether `name` is one of the [`SELECTS`], the calls that return one of their arguments.
+pub fn returns_an_argument(name: &str) -> bool {
+    SELECTS.contains(&name)
+}
+
 /// The [`PASS_THROUGH`] functions whose result is of their first argument's type, or of the common
 /// type of all of them: the [`SELECTS`], and `->`, `#>` and `json_extract_path`, which take a part
 /// of a `json` as a `json` (and of a `jsonb` as a `jsonb`). Their result's `=` is identity where

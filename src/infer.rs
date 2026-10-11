@@ -1530,7 +1530,10 @@ pub fn build_inferred(
             .iter()
             .map(|c| {
                 let ty = uf.get_type(&Atom::Col(t.clone(), c.clone())).unwrap_or(Ty::Opaque);
-                (c.clone(), ty.sql().to_string())
+                // A column whose type nothing says is opaque, and two of them need not be of one
+                // type: each is named after itself where a value is coerced into it
+                // (`types::cast_into`).
+                (c.clone(), crate::types::with_tag(ty.sql().to_string(), &format!("? {t:?}.{c:?}")))
             })
             .collect();
         let n = cols.len();
@@ -1580,7 +1583,7 @@ mod tests {
         let cat = infer_catalog(&parse(sql)).expect("inferable");
         cat.tables
             .iter()
-            .flat_map(|t| t.cols.iter().map(|(c, ty)| (t.name.clone(), c.clone(), ty.clone())))
+            .flat_map(|t| t.cols.iter().map(|(c, ty)| (t.name.clone(), c.clone(), crate::types::untag(ty).to_string())))
             .collect()
     }
 
@@ -1779,7 +1782,8 @@ mod tests {
         let all = BTreeSet::from(["t".to_string()]);
         let cat = build_inferred(&all, &refd, &mut uf).unwrap();
         let t = &cat.tables[0];
-        assert_eq!(t.cols, vec![("x".into(), "INTEGER".into()), ("zz".into(), "VARBINARY".into())]);
+        // `zz` is typed by nothing: opaque, and named after itself where a value is coerced into it.
+        assert_eq!(t.cols, vec![("x".into(), "INTEGER".into()), ("zz".into(), r#"VARBINARY@? "t"."zz""#.into())]);
         assert_eq!(t.nullable, vec![true, true]);
         assert!(t.keys.is_empty(), "inventing a key could shrink the instance space");
     }
