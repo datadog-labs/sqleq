@@ -212,7 +212,8 @@ fn lean_one(bin: &str, path: &str, row: Option<&CorpusRow>, workdir: &Path, dead
             argv.push(path.to_string());
             path.to_string()
         }
-        Some(r) => match r.write_csv(workdir) {
+        // Not `row.csv`: the frontend writes and reads that one in this directory at the same time.
+        Some(r) => match r.write_csv(workdir, "lean.row.csv") {
             Ok(csv) => {
                 argv.extend(["--csv".into(), csv.to_string_lossy().into_owned()]);
                 first_row_name()

@@ -167,6 +167,27 @@ fn the_portfolio_credits_a_reflexive_row() {
 }
 
 #[test]
+fn the_portfolio_hands_each_backend_its_own_copy_of_the_row() {
+    // Lean and the frontend start at once, and writing a file truncates it first: handed one file,
+    // either could read the row cut short while the other rewrites it.
+    let f = Fakes::new();
+    let mut r = Run::new(&f);
+    let lean_argv = f.path().join("lean.argv");
+    r.set("FAKE_LEAN_ARGV", &lean_argv.to_string_lossy()).set("FAKE_LEAN", "unsupported");
+    let (ran, cases) = r.cases(&["--portfolio", "--axes", "frontend,lean"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(names(&cases), [row(0), row(2), row(3)]);
+    let csv_of = |l: &str| l.split(' ').skip_while(|a| *a != "--csv").nth(1).map(str::to_string);
+    let fe: Vec<String> = argv_lines(&f).iter().filter_map(|l| csv_of(l)).collect();
+    let lean = std::fs::read_to_string(&lean_argv).unwrap();
+    let ln: Vec<String> = lean.lines().filter_map(csv_of).collect();
+    assert_eq!((fe.len(), ln.len()), (3, 3), "{fe:?} {ln:?}");
+    for p in &ln {
+        assert!(!fe.contains(p), "Lean and the frontend were both handed {p}");
+    }
+}
+
+#[test]
 fn jsonl_streams_every_case_and_resume_skips_the_ones_it_holds() {
     let f = Fakes::new();
     let r = Run::new(&f);

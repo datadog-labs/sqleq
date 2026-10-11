@@ -91,7 +91,7 @@ pub fn fuzz_one(fuzz_bin: &str, pair: Pair, timeout_s: f64) -> Answer {
                 Ok(t) => t,
                 Err(e) => return Answer { word: "error".into(), note: format!("no temporary directory: {e}"), ms: 0, raw: None },
             };
-            if let Err(e) = row.write_csv(tmp.path()) {
+            if let Err(e) = row.write_csv(tmp.path(), "row.csv") {
                 return Answer { word: "error".into(), note: format!("cannot write the row: {e}"), ms: 0, raw: None };
             }
             (vec!["row".into(), "row.csv".into(), "0".into()], tmp.path().to_path_buf())

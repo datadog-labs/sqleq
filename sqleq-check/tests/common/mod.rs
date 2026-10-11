@@ -130,8 +130,9 @@ printf '{"provable": %s, "panicked": false}' "$p" > "${json%.json}.result"
 "#;
 
 /// Answers `$FAKE_LEAN` for every pair file it is given, or under `--csv` for every name in
-/// `--names` (row 0's name without one).
-pub const FAKE_LEAN: &str = r#"out=""; prev=""; body=""; sep=""; csv=""; names=""
+/// `--names` (row 0's name without one); appends its arguments to `$FAKE_LEAN_ARGV` when that is set.
+pub const FAKE_LEAN: &str = r#"[ -n "$FAKE_LEAN_ARGV" ] && printf '%s\n' "$*" >> "$FAKE_LEAN_ARGV"
+out=""; prev=""; body=""; sep=""; csv=""; names=""
 for a in "$@"; do
     [ "$prev" = "--json" ] && out=$a
     [ "$prev" = "--csv" ] && csv=$a
