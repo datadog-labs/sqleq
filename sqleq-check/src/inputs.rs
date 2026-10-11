@@ -39,9 +39,15 @@ impl CorpusRow {
         String::from_utf8(w.into_inner().unwrap_or_default()).unwrap_or_default()
     }
 
-    /// Write [`CorpusRow::csv`] to `dir/row.csv` and return its path.
-    pub fn write_csv(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        let p = dir.join("row.csv");
+    /// Write [`CorpusRow::csv`] to `dir/file` and return its path.
+    ///
+    /// Every backend gets a file of its own. Under `--portfolio` the backends of a case start at
+    /// once, and writing a file truncates it before it writes it again, so a backend reading a file
+    /// another one is rewriting can see the row empty or cut short: its DDL without the statements
+    /// after the cut, or a prefix of its second query, which can lower to a proof the whole row
+    /// does not support.
+    pub fn write_csv(&self, dir: &Path, file: &str) -> std::io::Result<PathBuf> {
+        let p = dir.join(file);
         std::fs::write(&p, self.csv())?;
         Ok(p)
     }

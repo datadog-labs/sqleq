@@ -487,7 +487,7 @@ fn lower_row(
             return None;
         }
     };
-    let csv = match row.write_csv(workdir) {
+    let csv = match row.write_csv(workdir, "row.csv") {
         Ok(p) => p,
         Err(e) => {
             case.message = format!("cannot write the row: {e}");
