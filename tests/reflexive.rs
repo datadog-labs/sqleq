@@ -131,6 +131,16 @@ fn a_special_form_and_its_general_form_are_reflexive() {
     assert!(!reflexive_with(&p, Rewrites::ALL.without(Rewrites::DESUGAR_SPECIAL_FORMS)));
 }
 
+/// A cast to the type its operand already has is the identity, so `$1::uuid::uuid` is `$1::uuid`.
+#[test]
+fn a_repeated_cast_to_one_type_is_reflexive() {
+    let p = pair("UPDATE t SET a = $1 WHERE id = $2::uuid::UUID", "UPDATE t SET a = $1 WHERE id = $2::uuid");
+    assert!(reflexive_with(&p, Rewrites::ALL));
+    assert!(!reflexive_with(&p, Rewrites::ALL.without(Rewrites::COLLAPSE_REPEATED_CASTS)));
+    // Two different targets are two casts.
+    assert!(!reflexive(&pair("SELECT a::VARCHAR(10)::VARCHAR(5) FROM t", "SELECT a::VARCHAR(10) FROM t")));
+}
+
 /// Case *inside* a string literal is a difference, and the parser keeps it — so the AST comparison
 /// gets this right without the special-casing the textual predicate needs.
 #[test]
@@ -173,7 +183,7 @@ fn clearing_a_rewrite_disables_exactly_that_rewrite() {
 /// rewrite missing from `EACH` would be reported as "no rewrite was necessary" for every row it closes.
 #[test]
 fn every_rewrite_is_reachable_from_all() {
-    assert_eq!(Rewrites::EACH.len(), 11);
+    assert_eq!(Rewrites::EACH.len(), 12);
     let rebuilt = Rewrites::EACH.iter().fold(Rewrites::NONE, |acc, (_, b)| acc.with(*b));
     assert_eq!(rebuilt, Rewrites::ALL);
     for (_, bit) in Rewrites::EACH {
