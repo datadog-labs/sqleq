@@ -278,16 +278,20 @@ parameter binding:
 | `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair (or the frontend found its two sides one query) and sqleq-fuzz found a counterexample. One of them is wrong. |
 | `not-equivalent` | sqleq-fuzz found an instance on which the two sides differ. |
 | `equivalent` | The QED prover or sqleq-solver proved the pair (`proved` or `proved-literal`), or the frontend found its two sides one query — lowered to the same IR (`emit-reflexive`), or refused but normalized to the same tree (`reflexive`) — under index binding: the claim `provable` makes. |
+| `not-equivalent-gather` | sqleq-fuzz found an instance on which the two sides differ under the gather rule (`counterexample-gather`), and nothing was decided under index binding. |
 | `equivalent-gather` | Only Lean proved it, under the gather rule. A different claim from `equivalent` — see [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `equivalent-gather-generated` | Only Lean proved it, under the gather rule's weaker generated form. |
 | `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. |
 | `undecided` | Nothing decisive, and every backend finished. |
 
 Lean's `no-witness` is a kernel proof that may be vacuous, so it is never evidence of equivalence:
-alone, it leaves a case `undecided`. Nor can a Lean answer meet a fuzz counterexample in an alarm:
-Lean answers only under the gather rule and sqleq-fuzz only under index binding, which are different
-relations between the two sides' parameters. Neither `timeout` nor `undecided` says the pair is not
-equivalent.
+alone, it leaves a case `undecided`. A Lean answer meets a fuzz counterexample in an alarm only
+when both are about the gather rule: sqleq-fuzz runs a pair of the gather rule's shape under that
+rule and answers `counterexample-gather`, and a Lean proof of such a pair, vacuous or not, with that
+answer beside it is an `alarm`. Its plain `counterexample` is about index binding, a different
+relation between the two sides' parameters, so beside a Lean proof it makes the case
+`not-equivalent`. A case decided under index binding gets that verdict whatever the gather rule
+says. Neither `timeout` nor `undecided` says the pair is not equivalent.
 
 **The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
 case is `equivalent`, so a proof from any prover that reads the IR, or the frontend's reflexivity,
@@ -324,9 +328,10 @@ Three things to know before reading one:
 
 A proof and a counterexample on the same pair mean one of the two backends is wrong: a prover's
 proof (`proved` or `proved-literal`), or the frontend's finding that the two sides are one query
-(`emit-reflexive` or `reflexive`), against a sqleq-fuzz `counterexample`. Every run that asks both
-sides compares them, with or without `--portfolio`, by the same rule its `alarm` verdict uses, and
-under the same parameter binding only. Each alarm is printed by name with the answers that met,
+(`emit-reflexive` or `reflexive`), against a sqleq-fuzz `counterexample`; or a Lean proof
+(`proved-gather` or `no-witness`) against a sqleq-fuzz `counterexample-gather`. Every run that asks
+both sides compares them, with or without `--portfolio`, by the same rule its `alarm` verdict uses,
+and under the same parameter binding only. Each alarm is printed by name with the answers that met,
 `--json` lists the cases in `meta.alarms`, and **an alarm fails the run whatever `--expect` says**,
 `report-only` included.
 
@@ -409,7 +414,9 @@ Two things a pin depends on, though neither is particular to this policy:
 
 * **The fuzz axis.** `fuzz` runs `sqleq-fuzz file` on each pair with its trial budget passed
   explicitly (`--trials 120 --rows 5 --seed 0`), so a change to the tool's defaults cannot move a
-  pin. It reads the pair itself, so `--axes fuzz` alone needs no frontend.
+  pin. It reads the pair itself, so `--axes fuzz` alone needs no frontend. It answers a pair of the
+  gather rule's shape under that rule, as `counterexample-gather` or `no-counterexample-gather`,
+  and those are the answers a `binding: gather` pin judges against its truth.
 * **The catalog header.** A case may say `-- catalog: inferred` or `-- catalog: inferred-seeded`,
   and the frontend is run with the matching flag; any `.sql` input may, not only a pinned one.
 

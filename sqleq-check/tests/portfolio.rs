@@ -192,6 +192,27 @@ fn a_gather_proof_is_its_own_verdict_and_not_equivalent_enough() {
 }
 
 #[test]
+fn a_gather_counterexample_to_a_gather_proof_is_an_alarm() {
+    let f = setup();
+    let mut p = Portfolio::new(&f);
+    p.set("FAKE_LEAN", "proved-gather").set("FAKE_FUZZ", "NOT-EQUIVALENT-GATHER");
+    let (ran, case) = p.case(&["--axes", "fuzz,lean", "--expect", "report-only"]);
+    assert_eq!(verdict(&case), "alarm");
+    // In the order the two answered.
+    let mut by = strings(&case["portfolio"]["by"]);
+    by.sort();
+    assert_eq!(by, ["fuzz", "lean"]);
+    assert_eq!(ran.code, 1, "an alarm fails even a report-only run");
+    // Without the proof it is a refutation under the gather rule, its own verdict.
+    p.set("FAKE_LEAN", "unsupported");
+    let (ran, case) = p.case(&["--axes", "fuzz,lean", "--expect", "report-only"]);
+    assert_eq!((ran.code, verdict(&case)), (0, "not-equivalent-gather"), "{}{}", ran.out, ran.err);
+    let out: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.path().join("out.json")).unwrap()).unwrap();
+    assert_eq!(out["meta"]["portfolio"]["counts"]["not-equivalent-gather"], 1);
+}
+
+#[test]
 fn a_case_left_undecided_by_the_deadline_is_retried_serially() {
     let f = setup();
     let once = f.path().join("slept");

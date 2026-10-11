@@ -34,6 +34,9 @@ use crate::util::tail;
 pub const ALARM: &str = "alarm";
 /// sqleq-fuzz found an instance on which the two sides differ.
 pub const NOT_EQUIVALENT: &str = "not-equivalent";
+/// sqleq-fuzz found one under the gather rule, the binding Lean proves under: the arrays of the
+/// `unnest` side built from the values of the `VALUES` side (docs/LEAN.md).
+pub const NOT_EQUIVALENT_GATHER: &str = "not-equivalent-gather";
 /// A prover proved it under index binding -- `$N` on one side is `$N` on the other -- or the
 /// frontend found the two sides one query (`emit-reflexive`, or refused but `reflexive`).
 pub const EQUIVALENT: &str = "equivalent";
@@ -45,8 +48,18 @@ pub const EQUIVALENT_GATHER_GENERATED: &str = "equivalent-gather-generated";
 pub const TIMEOUT: &str = "timeout";
 /// Nothing decisive, and every backend finished.
 pub const UNDECIDED: &str = "undecided";
-pub const ORDER: [&str; 7] =
-    [ALARM, NOT_EQUIVALENT, EQUIVALENT, EQUIVALENT_GATHER, EQUIVALENT_GATHER_GENERATED, TIMEOUT, UNDECIDED];
+/// The index binding's verdicts come first, then the gather rule's: a case is read under the
+/// binding every axis answers under before the one only some do.
+pub const ORDER: [&str; 8] = [
+    ALARM,
+    NOT_EQUIVALENT,
+    EQUIVALENT,
+    NOT_EQUIVALENT_GATHER,
+    EQUIVALENT_GATHER,
+    EQUIVALENT_GATHER_GENERATED,
+    TIMEOUT,
+    UNDECIDED,
+];
 
 /// Every verdict but these two says something about the pair.
 pub fn decisive(v: &str) -> bool {
@@ -83,21 +96,31 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
     };
     let pending: Vec<String> =
         AXES.iter().filter(|a| word(a) == Some("timeout")).map(|a| a.to_string()).collect();
-    // An answer can contradict another only under the binding both answer under; a Lean proof and
-    // a fuzz counterexample are about different relations between the two sides' parameters.
+    // An answer can contradict another only under the binding both answer under: a Lean proof and
+    // a fuzz counterexample found with `$N` bound alike are about different relations between the
+    // two sides' parameters, and a Lean proof and a fuzz counterexample under the gather rule are
+    // not.
     for b in BINDINGS {
         let claims = saying(b, &|a| suite::claims_equivalent(a, b));
-        let refuted = saying(b, &suite::refutes);
+        let refuted = saying(b, &|a| suite::refutes(a, b));
         if !claims.is_empty() && !refuted.is_empty() {
             let by = AXES.iter().map(|a| a.to_string()).filter(|a| claims.contains(a) || refuted.contains(a)).collect();
             return (ALARM, by, pending);
         }
     }
-    let refuted = saying(INDEX, &suite::refutes);
+    let refuted = saying(INDEX, &|a| suite::refutes(a, INDEX));
     if !refuted.is_empty() {
         return (NOT_EQUIVALENT, refuted, pending);
     }
-    for (b, v) in [(INDEX, EQUIVALENT), (GATHER, EQUIVALENT_GATHER), (GATHER_GENERATED, EQUIVALENT_GATHER_GENERATED)] {
+    let evidence = saying(INDEX, &|a| suite::evidence_equivalent(a, INDEX));
+    if !evidence.is_empty() {
+        return (EQUIVALENT, evidence, pending);
+    }
+    let refuted = saying(GATHER, &|a| suite::refutes(a, GATHER));
+    if !refuted.is_empty() {
+        return (NOT_EQUIVALENT_GATHER, refuted, pending);
+    }
+    for (b, v) in [(GATHER, EQUIVALENT_GATHER), (GATHER_GENERATED, EQUIVALENT_GATHER_GENERATED)] {
         let evidence = saying(b, &|a| suite::evidence_equivalent(a, b));
         if !evidence.is_empty() {
             return (v, evidence, pending);
@@ -413,6 +436,13 @@ mod tests {
             ("lean and fuzz", vec![("lean", "proved-gather"), ("fuzz", "counterexample")], NOT_EQUIVALENT),
             ("lean alone", vec![("frontend", "refuse:parameter-misaligned"), ("lean", "proved-gather")], EQUIVALENT_GATHER),
             ("lean generated", vec![("lean", "proved-gather-generated")], EQUIVALENT_GATHER_GENERATED),
+            // The same binding: a gather counterexample contradicts a Lean proof, vacuous or not.
+            ("lean and a gather counterexample", vec![("lean", "proved-gather"), ("fuzz", "counterexample-gather")], ALARM),
+            ("lean no-witness and a gather counterexample", vec![("lean", "no-witness"), ("fuzz", "counterexample-gather")], ALARM),
+            ("a gather counterexample", vec![("lean", "unsupported"), ("fuzz", "counterexample-gather")], NOT_EQUIVALENT_GATHER),
+            ("no gather counterexample", vec![("lean", "unsupported"), ("fuzz", "no-counterexample-gather")], UNDECIDED),
+            // Index binding is read first, and a proof under it is not contradicted by the gather rule.
+            ("an index proof and a gather counterexample", vec![("qed", "proved"), ("fuzz", "counterexample-gather")], EQUIVALENT),
             // Possibly vacuous: a claim, not evidence.
             ("lean no-witness", vec![("lean", "no-witness"), ("fuzz", "no-counterexample")], UNDECIDED),
             ("nothing decisive, all done", vec![("qed", "no-proof"), ("fuzz", "no-counterexample")], UNDECIDED),

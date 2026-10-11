@@ -38,8 +38,9 @@
 //!
 //! `--portfolio` asks every backend at once on each case instead, within that case's one deadline,
 //! and reports one combined verdict -- `equivalent`, Lean's weaker `equivalent-gather` and
-//! `equivalent-gather-generated`, `not-equivalent`, `alarm` when a proof meets a counterexample,
-//! `timeout` or `undecided` -- which then decides the exit code; see [`portfolio`].
+//! `equivalent-gather-generated`, `not-equivalent`, sqleq-fuzz's `not-equivalent-gather`, `alarm`
+//! when a proof meets a counterexample under one binding, `timeout` or `undecided` -- which then
+//! decides the exit code; see [`portfolio`].
 //!
 //! `--corpus` runs the rows of a corpus CSV instead of pair files, each through every backend's own
 //! corpus code, with what a long run needs beside it: one JSON line per case as it finishes and

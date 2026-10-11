@@ -45,11 +45,14 @@ in the frontend that feeds them, and every occurrence has been chased to a root 
 listed below.
 
 A proof and a counterexample contradict each other only when both answer the same question, which
-for a parameterized pair means the same parameter binding. A Lean proof holds under the gather rule
-and a `sqleq-fuzz` counterexample under index binding, so that combination is a non-equivalence,
-not an alarm. `sqleq-check --portfolio` runs every asked backend on each case, whether the cases are
-pair files or the rows of a corpus (`--corpus`), and reports the first cell as the verdict `alarm` — which fails the run
-whatever `--expect` says — and the second as `not-equivalent`.
+for a parameterized pair means the same parameter binding. A Lean proof holds under the gather rule,
+and `sqleq-fuzz` tests a pair of that shape under the same rule (`counterexample-gather`), so the
+`proved × refuted` cell is checked there too: a Lean proof beside a gather counterexample is an
+alarm. A Lean proof beside a counterexample under index binding is a non-equivalence, not an alarm.
+`sqleq-check --portfolio` runs every asked backend on each case, whether the cases are pair files or
+the rows of a corpus (`--corpus`), and reports the first cell as the verdict `alarm` — which fails
+the run whatever `--expect` says — and the second as `not-equivalent` (`not-equivalent-gather`
+under the gather rule).
 
 The `not proved × refuted` cell is what keeps the rest honest. It is the disprover demonstrating, on
 this very run, that it is awake and can still refute things. If it ever collapsed toward zero, every
