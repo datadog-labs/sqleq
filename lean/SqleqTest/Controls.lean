@@ -189,4 +189,26 @@ example : ¬ EquivGatherGen dfltCol swapped := not_equivGen_of_rows (by decide)
 example : ¬ EquivGatherGen ⟨1, cols2, .values [[.gen .dflt, .p 1], [.p 2]], tail0⟩ unnest2 :=
   not_equivGen_of_rows (by decide)
 
+/-! ### Element types that widen
+
+`widens` admits an unnest element type that holds every value of its column's type unchanged:
+`int8[]` into an `int4` column, `text[]` into a `varchar` one. Never the other way round. -/
+
+/-- The ids the translator pins, which `widens` is written in. -/
+example : [tyInt2, tyInt4, tyInt8, tyText, tyVarchar] = [0, 1, 2, 3, 4] := rfl
+
+/-- `INSERT INTO t (n, s) VALUES ($1, $2)` with `n int4` and `s varchar`. -/
+def narrow : Insert := ⟨1, cols2, .values [[.p 1, .p 2]], tail0⟩
+
+example : checkGather [tyInt4, tyVarchar] narrow
+    ⟨1, cols2, .unnest [⟨1, tyInt8⟩, ⟨2, tyText⟩], tail0⟩ = true := by decide +kernel
+
+/-- `int4[]` into an `int8` column: an `int8` the `VALUES` side inserts can overflow the array. -/
+example : checkGather [tyInt8, tyText] narrow
+    ⟨1, cols2, .unnest [⟨1, tyInt4⟩, ⟨2, tyText⟩], tail0⟩ = false := by decide +kernel
+
+example : tyOk tyInt2 tyInt4 = false := by decide
+example : tyOk tyText tyInt4 = false := by decide
+example : tyOk tyInt8 tyText = false := by decide
+
 end Sqleq.Controls

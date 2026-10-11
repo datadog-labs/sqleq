@@ -70,17 +70,19 @@ fn examples_get_their_declared_verdicts() {
     assert!(proved >= 3, "the positive examples must actually reach the kernel");
 }
 
-/// A pair whose two sides differ only in the tail must be refused by the *kernel* too, not only by
-/// the Rust comparison. Forge a translation whose tails differ and check Lean rejects it.
-#[test]
-fn the_kernel_rechecks_what_rust_compared() {
-    let text = std::fs::read_to_string(pairs_dir().join("insert_unnest/row_major.sql")).unwrap();
+/// The translation of a pinned pair, to forge.
+fn translated(file: &str) -> sqleq_lean::translate::LeanPair {
+    let text = std::fs::read_to_string(pairs_dir().join(file)).unwrap();
     let case = Case::from_file("forged".into(), &text);
     let (a, b) = case.pair.as_ref().unwrap();
-    let mut p = translate(a, b, &case.schema).unwrap();
-    p.b.tail.push(sqleq_lean::translate::LTok::Word(u32::MAX));
-    let (src, entries) = sqleq_lean::emit::batch(&[&p]);
-    let dir = std::env::temp_dir().join(format!("sqleq-lean-forged-{}", std::process::id()));
+    translate(a, b, &case.schema).unwrap()
+}
+
+/// Emit a forged translation and require the kernel to refuse it. The forged file is still
+/// well-formed, so the audit passes it: refusing it is the kernel's job.
+fn assert_kernel_refuses(p: &sqleq_lean::translate::LeanPair, what: &str) {
+    let (src, entries) = sqleq_lean::emit::batch(&[p]);
+    let dir = std::env::temp_dir().join(format!("sqleq-lean-forged-{what}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("forged.lean");
     std::fs::write(&file, &src).unwrap();
@@ -88,10 +90,30 @@ fn the_kernel_rechecks_what_rust_compared() {
     lean.build().unwrap();
     let out = lean.check(&file).unwrap().expect("no timeout");
     let _ = std::fs::remove_dir_all(&dir);
-    // The forged file is still well-formed, so the audit passes it: refusing it is the kernel's job.
-    sqleq_lean::run::audit(&src).expect("a forged tail is still a well-formed batch");
+    sqleq_lean::run::audit(&src).unwrap_or_else(|e| panic!("a forged {what} is still a well-formed batch: {e}"));
     let o = sqleq_lean::run::outcomes(&src, &out, &[entries[0].proof.clone()]);
-    assert!(matches!(&o[0], sqleq_lean::run::Outcome::Failed(_)), "forged pair was proved: {out}");
+    assert!(matches!(&o[0], sqleq_lean::run::Outcome::Failed(_)), "a forged {what} was proved: {out}");
+}
+
+/// A pair whose two sides differ only in the tail must be refused by the *kernel* too, not only by
+/// the Rust comparison. Forge a translation whose tails differ and check Lean rejects it.
+#[test]
+fn the_kernel_rechecks_what_rust_compared() {
+    let mut p = translated("insert_unnest/row_major.sql");
+    p.b.tail.push(sqleq_lean::translate::LTok::Word(u32::MAX));
+    assert_kernel_refuses(&p, "tail");
+}
+
+/// The kernel checks each unnest element type against its column's type itself: the translation
+/// carries B's own element types, so an element type Rust admitted by mistake is still refused.
+/// Forge one that holds no `int` (`text[]` into the `int` column) and check Lean rejects it.
+#[test]
+fn the_kernel_rechecks_the_element_types() {
+    let mut p = translated("insert_unnest/widened_int8_into_int4.sql");
+    let sqleq_lean::translate::LSource::Unnest(args) = &mut p.b.src else { panic!("not unnest") };
+    assert_eq!(args[0].1, 2, "the element type is int8's id");
+    args[0].1 = 3;
+    assert_kernel_refuses(&p, "element type");
 }
 
 /// The audit accepts what the emitter writes for every example, and refuses each way a batch could

@@ -16,9 +16,10 @@ play the same parts.
 Most of what it checks is the *modelling* preconditions, not the semantics. Values are abstract
 in this model, so a mismatched cast type would not make the Lean statement false; it would make the
 statement *about the wrong thing*. With `$j::T[]` where `T` is not the column's type, Postgres
-applies an assignment coercion the two sides do not share (`varchar(10)[]` truncates where
-`VALUES` raises). Requiring equal types is what makes "the parameter's value is the column's value"
-true on both sides.
+applies an assignment coercion the two sides do not share (`int[]` raises on a value a `bigint`
+column takes, `varchar(10)[]` truncates where `VALUES` raises). Requiring each element type to be
+the column's, or one of the few in `widens` that carry every value of the column's type unchanged,
+is what makes "the parameter's value is the column's value" true on both sides.
 
 `tys` lists the declared *base* type id of each target column, in column-list order, interned by
 the translator with aliases resolved. A modifier on the column (`varchar(10)`) is allowed, because
@@ -28,11 +29,34 @@ modifier, or an array-typed column, never reaches here.
 
 namespace Sqleq
 
+/-! ## Type ids
+
+The translator interns every type name to a number. It pins these five to fixed numbers, so that
+`widens` can name them; every other type gets a number from 5 up. -/
+
+def tyInt2 : Nat := 0
+def tyInt4 : Nat := 1
+def tyInt8 : Nat := 2
+def tyText : Nat := 3
+def tyVarchar : Nat := 4
+
+/-- `(element, column)`: an unnest element type that may differ from its column's type, because
+every value of the column's type is a value of the element type, and assigning it back to the
+column gives the same value. Under the gather binding, B's array holds A's values, which have the
+column's type: `int8[]` holds any `int4`, and `text[]` any `varchar`, exactly. The other direction
+does not hold: `int4[]` cannot hold every `int8`, so B raises where A inserts. -/
+def widens : List (Nat × Nat) :=
+  [(tyInt8, tyInt4), (tyInt8, tyInt2), (tyInt4, tyInt2), (tyText, tyVarchar), (tyVarchar, tyText)]
+
+/-- An unnest element type `e` may fill a column of type `t`. -/
+def tyOk (e t : Nat) : Bool :=
+  e == t || widens.contains (e, t)
+
 /-- The unnest arguments are exactly `$i::tᵢ[], $(i+1)::tᵢ₊₁[], …`, one per column, each element
-type equal to its column's type. -/
+type its column's type or one `widens` admits for it. -/
 def argsOk : Nat → List Nat → List Arg → Bool
   | _, [], [] => true
-  | i, t :: ts, a :: as => a.param == i && a.ty == t && argsOk (i + 1) ts as
+  | i, t :: ts, a :: as => a.param == i && tyOk a.ty t && argsOk (i + 1) ts as
   | _, _, _ => false
 
 /-- `$n` sits in column `j` of `k`, and only there: `(n - 1) mod k = j`.

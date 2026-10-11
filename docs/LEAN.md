@@ -63,8 +63,17 @@ without error.
 The checker enforces the conditions that make "typed rows" the same on both sides, and refuses
 everything else:
 
-- **Types.** Each `unnest` element type is exactly its column's declared base type, with aliases
-  resolved. A `VALUES` cell is `$n`, `$n` cast to its column's base type, or `NULL`.
+- **Types.** Each `unnest` element type is its column's declared base type, with aliases resolved,
+  or one that holds every value of it. A `VALUES` cell is `$n`, `$n` cast to its column's base
+  type, or `NULL`.
+  - The element types that may differ from the column's are a fixed list, `widens` in
+    `lean/Sqleq/Check.lean`: `int8[]` into an `int4` or `int2` column, `int4[]` into `int2`, and
+    `text[]` and `varchar[]` into each other. Under the gather binding, B's array holds A's values,
+    which have the column's type. Each listed element type holds every such value exactly, and
+    assigning it back to the column gives the same value, so the two sides insert the same rows.
+    The direction matters: `int4[]` into an `int8` column is not on the list, because an `int8`
+    the `VALUES` side inserts can overflow the array. The kernel checks the list itself, against
+    B's own element types.
   - A modifier on the *column* (`varchar(10)`, `numeric(10,2)`, `timestamp(3)`) is fine. Both sides
     reach it through the same assignment coercion from the base type: the same length check that
     raises, and the same rounding.
@@ -218,7 +227,9 @@ pair on a real Postgres:
 - the `VALUES` side under the canonical binding, and the `unnest` side under the gather binding
   built from the same values;
 - once on an empty table, and once run twice, so the second run meets existing rows through the
-  conflict clause.
+  conflict clause;
+- for a pair whose element type differs from its column's (`int8[]` into `int4`), once more with
+  the parameters in those columns at the limits of the column's type.
 
 The two sides must agree on outcome, row count, `RETURNING` rows in order, and table contents. The
 witness model must agree with Postgres on whether the `VALUES` side succeeds.
