@@ -14,6 +14,7 @@
 //! `EquivGatherGen` for pairs with generated cells) and in `docs/LEAN.md`.
 
 pub mod emit;
+pub mod idents;
 pub mod recognize;
 pub mod run;
 pub mod schema;

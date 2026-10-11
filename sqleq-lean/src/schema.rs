@@ -69,7 +69,7 @@ pub fn type_key(dt: &DataType) -> TypeKey {
     // A quoted name is exactly its contents (`"json"` is `json`); an unquoted one folds to lower case.
     let lower = match base.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
         Some(inner) if !inner.contains('"') => inner.to_string(),
-        _ => base.to_lowercase(),
+        _ => base.to_ascii_lowercase(),
     };
     let name = match lower.as_str() {
         "int" | "integer" | "int4" | "serial" | "serial4" => "int4",
@@ -93,10 +93,11 @@ pub fn type_key(dt: &DataType) -> TypeKey {
     TypeKey { name, modded, array }
 }
 
-/// An identifier as Postgres resolves it: unquoted names fold to lower case, quoted ones do not.
+/// An identifier as Postgres resolves it: unquoted names fold to lower case, in ASCII only (so `Éx`
+/// stays `Éx`), and quoted ones do not fold.
 pub fn fold(id: &Ident) -> String {
     match id.quote_style {
-        None => id.value.to_lowercase(),
+        None => id.value.to_ascii_lowercase(),
         Some(_) => id.value.clone(),
     }
 }
@@ -605,7 +606,7 @@ fn unread_domain(stmt: &str) -> Option<String> {
     let last = name.rsplit('.').next().unwrap_or(name);
     Some(match last.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
         Some(q) => q.to_string(),
-        None => last.to_lowercase(),
+        None => last.to_ascii_lowercase(),
     })
 }
 
@@ -680,6 +681,17 @@ mod tests {
         assert!(!foo.columns[1].nullable);
         assert!(s.table("foo").is_err(), "a quoted name does not fold");
         assert!(s.table("bar").is_ok());
+    }
+
+    #[test]
+    fn folding_is_ascii_only() {
+        // Postgres folds an unquoted identifier's ASCII letters only: `Éx` stays `Éx`.
+        let s = Schema::from_ddl("CREATE TABLE Ünits (Éx int, ABC int);");
+        let t = s.table("Ünits").unwrap();
+        assert_eq!(t.column("Éx"), Some(0));
+        assert_eq!(t.column("éx"), None);
+        assert_eq!(t.column("abc"), Some(1));
+        assert!(s.table("ünits").is_err());
     }
 
     #[test]

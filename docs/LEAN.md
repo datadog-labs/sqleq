@@ -84,9 +84,15 @@ everything else:
   inference, and the model cannot see that failure. Nor may a parameter number go unused, which
   would leave it with no type at all. With generated cells, which take a column but no number,
   the parameters must instead be `$1, $2, …` in reading order, each once.
-- **The tail.** The two tails are identical and mention no parameter, because a parameter number
-  means different things on the two sides: on one side `$k+1` may be a `VALUES` cell, while on the
-  other the same `$k+1` is the `DO UPDATE` value.
+- **The tail.** The two tails are identical once their identifiers are resolved as Postgres
+  resolves them, and mention no parameter.
+  - Resolving folds an unquoted name to lower case (ASCII only) and takes it to be the quoted name,
+    so `excluded."id"` and `EXCLUDED.id` are one tail. A keyword is not folded into the quoted
+    name where Postgres would not read it as that name: a bare `user` is the current user, not the
+    column `"user"`. A quoted function name is not either, so `"coalesce"(…)` and `coalesce(…)`
+    differ. Nothing else is normalised, so `t.id` and `id` still differ.
+  - No parameter, because a parameter number means different things on the two sides: on one side
+    `$k+1` may be a `VALUES` cell, while on the other the same `$k+1` is the `DO UPDATE` value.
 - **The `unnest` arguments.** They are `$1..$k` in order, one per column, with no `WITH
   ORDINALITY`, `WHERE`, `ORDER BY`, `LIMIT` or `DISTINCT`.
 

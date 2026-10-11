@@ -551,7 +551,8 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     if a.cols != b.cols {
         return Err(unsupported("the two sides' column lists differ"));
     }
-    if a.tail != b.tail {
+    // As Postgres resolves their identifiers: `excluded."id"` and `EXCLUDED.id` are one name.
+    if a.key != b.key {
         return Err(unsupported("the two sides' alias, conflict clause or RETURNING differ"));
     }
     let table = schema.table(&a.target).map_err(|e| unsupported(format!("schema: {e}")))?;
@@ -663,7 +664,7 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     }
     let generated = if has_gen { Some(generated_preconditions(a, rows, table)?) } else { None };
 
-    let tail_a = tokens(&a.tail, &mut interner);
+    let tail_a = tokens(&a.key, &mut interner);
     if tail_a.iter().any(|t| matches!(t, LTok::Param(_))) {
         return Err(unsupported("a parameter in the conflict clause or RETURNING"));
     }
@@ -673,7 +674,7 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     let side = |p: &Parts, i: &mut Interner| {
         let target = i.id(format!("t:{}", p.target_path.join("\u{1f}")));
         let cols: Vec<u32> = p.cols.iter().map(|c| i.id(format!("c:{c}"))).collect();
-        let tail = tokens(&p.tail, i);
+        let tail = tokens(&p.key, i);
         (target, cols, tail)
     };
     let (ta, ca, tla) = side(a, &mut interner);

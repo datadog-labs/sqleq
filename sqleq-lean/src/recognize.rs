@@ -10,7 +10,8 @@
 //! generator such as `now()`), or
 //! `SELECT * FROM unnest($1::T₁[], …, $k::Tₖ[])`. Everything after the source is kept as rendered
 //! text, the *tail*: the checker never interprets it, it only requires the two sides' tails to be
-//! identical and parameter-free.
+//! parameter-free and identical once their identifiers are resolved as Postgres resolves them
+//! ([`crate::idents`]).
 //!
 //! **Exhaustiveness is checked, not assumed.** An `INSERT` field this module fails to read would be
 //! a clause silently deleted from the Lean statement. So after extracting the parts, [`recognize`]
@@ -20,8 +21,8 @@
 //! is refused.
 
 use sqlparser::ast::{
-    CastKind, DataType, Expr, Insert, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, Value,
+    CastKind, DataType, Expr, Insert, ObjectName, OnInsert, Query, SelectItem, SetExpr, Statement,
+    TableAliasWithoutColumns, TableFactor, TableObject, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -119,7 +120,7 @@ pub fn seq_name(text: &str) -> String {
     let last = text.rsplit('.').next().unwrap_or(text).trim();
     match last.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         Some(q) => q.to_string(),
-        None => last.to_lowercase(),
+        None => last.to_ascii_lowercase(),
     }
 }
 
@@ -144,7 +145,7 @@ pub enum Source {
     },
 }
 
-/// Everything after the source, rendered. Compared as a whole across the two sides.
+/// Everything after the source, rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tail {
     pub alias: Option<String>,
@@ -153,6 +154,20 @@ pub struct Tail {
 }
 
 impl Tail {
+    fn of(
+        alias: &Option<TableAliasWithoutColumns>,
+        on: &Option<OnInsert>,
+        returning: &Option<Vec<SelectItem>>,
+    ) -> Tail {
+        Tail {
+            alias: alias.as_ref().map(|a| format!("{}{}", if a.explicit { "AS " } else { "" }, a.alias)),
+            on: on.as_ref().map(|o| o.to_string().trim().to_string()),
+            returning: returning
+                .as_ref()
+                .map(|items| items.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")),
+        }
+    }
+
     /// One string for the whole tail, with a separator no rendering contains unquoted.
     pub fn text(&self) -> String {
         format!(
@@ -179,7 +194,11 @@ pub struct Parts {
     /// Each `VALUES` cell or `unnest` argument as the original spells it, for the re-render.
     /// Spelling only: `(($1))` and `$1` are one cell, and the extraction already read which.
     src_text: Vec<Vec<String>>,
+    /// The tail as written, for the re-render.
     pub tail: Tail,
+    /// The tail with its identifiers resolved ([`crate::idents`]): what the two sides are compared
+    /// on, and what the Lean statement carries.
+    pub key: Tail,
     /// The conflict clause itself, for the witness. The tail already carries it as text.
     pub on: Option<sqlparser::ast::OnInsert>,
 }
@@ -498,17 +517,11 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     }
     let src = source(q)?;
     let src_text = source_text(q);
-    let tail = Tail {
-        alias: i
-            .table_alias
-            .as_ref()
-            .map(|a| format!("{}{}", if a.explicit { "AS " } else { "" }, a.alias)),
-        on: i.on.as_ref().map(|o| o.to_string().trim().to_string()),
-        returning: i.returning.as_ref().map(|items| {
-            items.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
-        }),
-    };
-    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, on: i.on.clone() })
+    let tail = Tail::of(&i.table_alias, &i.on, &i.returning);
+    let (mut alias, mut on, mut returning) = (i.table_alias.clone(), i.on.clone(), i.returning.clone());
+    crate::idents::resolve(&mut alias, &mut on, &mut returning);
+    let key = Tail::of(&alias, &on, &returning);
+    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, key, on: i.on.clone() })
 }
 
 /// The original text of each `VALUES` cell (one inner list per row), or of each `unnest` argument
