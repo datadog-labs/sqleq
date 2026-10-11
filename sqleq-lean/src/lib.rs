@@ -156,6 +156,9 @@ pub fn replay_plan(case: &Case, p: &LeanPair) -> Value {
             "name": n, "type": t, "default": d, "listed": listed,
         })).collect::<Vec<_>>(),
     });
+    if !p.replay.widened.is_empty() {
+        plan["widened"] = json!(p.replay.widened);
+    }
     if let Some(g) = &p.generated {
         plan["values_clause"] = json!(p.replay.values_text);
         plan["generated"] = generated_json(g);

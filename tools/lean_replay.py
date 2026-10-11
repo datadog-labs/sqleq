@@ -31,6 +31,12 @@ recognise as deterministic are left out of the table comparison. After the DDL, 
 `SET CONSTRAINTS ALL IMMEDIATE`: a witness is a run that commits on its own, so a deferred key is
 checked at the statement, as the witness model checks it.
 
+**Element types that widen.** Where the unnest side's element type is not its column's own but one
+that holds every value of it (`bigint[]` into an `integer` column, the plan's `widened`), the
+canonical values say little, being far from any limit. Such a pair runs once more, both sides, with
+each parameter in a widened column at the limit of its column's type (`integer`'s largest and
+smallest values, a string of exactly `varchar(n)`'s length), and the two sides must agree there too.
+
 **Generated cells.** For a `proved-gather-generated` or `no-witness-generated` pair, the unnest side
 needs the values the VALUES side's generated cells evaluate to, which the claim takes as given. A
 probe learns them first (see `probe_script`), and the unnest side is then run under the gather of
@@ -157,6 +163,31 @@ def value_for(raw_type: str, n: int, enums: dict[str, list[str]] | None = None) 
     raise NoValue(f"type {raw_type}")
 
 
+_INT_LIMITS = {"smallint": 32767, "integer": 2147483647, "bigint": 9223372036854775807}
+
+
+def extreme_for(raw_type: str, n: int) -> str | None:
+    """Text of a value of `raw_type` at the limit of what the type holds, distinct for parameter `n`,
+    or `None` for a type with no limit this checks."""
+    t = re.sub(r"^pg_catalog\.", "", raw_type.strip().lower())
+    m = re.match(r'^"?([a-z_0-9 ]+?)"?\s*(\((\d+)\))?$', t)
+    if not m:
+        return None
+    base, length = m.group(1).strip(), m.group(3)
+    base = {"int": "integer", "int4": "integer", "int2": "smallint", "int8": "bigint",
+            "serial": "integer", "serial4": "integer", "bigserial": "bigint", "serial8": "bigint",
+            "smallserial": "smallint", "serial2": "smallint",
+            "character varying": "varchar"}.get(base, base)
+    if base in _INT_LIMITS:
+        top = _INT_LIMITS[base]
+        return str(top - n) if n % 2 else str(-top - 1 + n)
+    if base == "varchar" and length is not None:
+        # `-` is not a base-36 digit, so the padded strings stay distinct.
+        s = _base36(n)
+        return s + "-" * (int(length) - len(s)) if len(s) <= int(length) else None
+    return None
+
+
 def sql_str(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
@@ -183,18 +214,24 @@ def is_param(cell) -> bool:
 GEN_OFFSET = 20000
 
 
+def param_columns(plan: dict) -> dict[int, int]:
+    """The column each parameter sits in, as its position in the insert's column list."""
+    col_of: dict[int, int] = {}
+    for r in plan["rows"]:
+        for j, cell in enumerate(r):
+            if is_param(cell):
+                col_of.setdefault(cell, j)
+    return col_of
+
+
 def bindings(plan: dict) -> list[str]:
     """The VALUES side's canonical binding, as literals."""
     types = {c["name"]: c["type"] for c in plan["columns"]}
     enums = enums_in(plan["ddl"])
     insert = plan["insert"]
     rows = plan["rows"]
-    col_of: dict[int, int] = {}
+    col_of = param_columns(plan)
     gen_cols = {j for r in rows for j, cell in enumerate(r) if isinstance(cell, dict)}
-    for r in rows:
-        for j, cell in enumerate(r):
-            if is_param(cell):
-                col_of.setdefault(cell, j)
     if not col_of:
         return []
     top = max(col_of)
@@ -203,6 +240,19 @@ def bindings(plan: dict) -> list[str]:
         raise NoValue(f"parameter ${missing[0]} is not used, so Postgres cannot type it")
     return [value_for(types[insert[col_of[n]]], n + (GEN_OFFSET if col_of[n] in gen_cols else 0), enums)
             for n in range(1, top + 1)]
+
+
+def extremes(plan: dict, scalars: list[str]) -> list[str] | None:
+    """The canonical binding with each parameter in a widened column at its column type's limit, or
+    `None` when no parameter changes."""
+    types = {c["name"]: c["type"] for c in plan["columns"]}
+    out, changed = list(scalars), False
+    for n, j in param_columns(plan).items():
+        if j in plan.get("widened", []):
+            v = extreme_for(types[plan["insert"][j]], n)
+            if v is not None:
+                out[n - 1], changed = v, True
+    return out if changed else None
 
 
 def gather(plan: dict, scalars: list[str], g: list[list[str | None]] | None = None) -> list[str]:
@@ -607,6 +657,18 @@ def replay(name: str, plan: dict, psql: list[str], timeout: int) -> dict:
             rec["unnest_run"] = runs[("unnest", times)]["runs"]
             if generated and probe_disagrees(plan, cols, runs[("values", times)], g, times):
                 return {**rec, "status": "inconclusive: probe disagrees with the VALUES side"}
+            return {**rec, "status": "ALARM-sides-differ"}
+    ext = extremes(plan, scalars) if plan.get("widened") and not generated else None
+    if ext is not None:
+        try:
+            v_ext = parse(run(psql, script(plan, plan["values_sql"], [ext], cols), timeout), 1)
+            u_ext = parse(run(psql, script(plan, plan["unnest_sql"], [gather(plan, ext)], cols), timeout), 1)
+        except subprocess.TimeoutExpired:
+            return {**rec, "status": "inconclusive: psql timed out"}
+        rec["extremes"] = {"ok": bool(v_ext["runs"]) and v_ext["runs"][0]["ok"]}
+        if outcome(v_ext) != outcome(u_ext):
+            rec["differs_on"] = "values at the limits of a widened column's type"
+            rec["values_run"], rec["unnest_run"] = v_ext["runs"], u_ext["runs"]
             return {**rec, "status": "ALARM-sides-differ"}
     model_ok = plan["verdict"] in CREDITED
     if model_ok != pg_ok:

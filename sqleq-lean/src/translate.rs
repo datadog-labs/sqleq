@@ -156,6 +156,10 @@ pub struct Replay {
     pub values_text: String,
     /// `(name, type, default, listed by the INSERT)` per table column, in table order.
     pub columns: Vec<(String, String, Option<String>, bool)>,
+    /// Positions in the insert's column list whose unnest element type is not the column's own but
+    /// one that holds its every value (`int8[]` into an `int4` column). The replay runs these pairs
+    /// once more with values at the limits of the column's type.
+    pub widened: Vec<usize>,
 }
 
 /// Resolve the conflict clause to what the witness model needs: which unique constraint is the
@@ -260,10 +264,26 @@ fn witness_for(a: &Parts, table: &Table) -> Witness {
     })
 }
 
-#[derive(Default)]
+/// The types `Sqleq.widens` names, in the order of the ids `lean/Sqleq/Check.lean` gives them
+/// (`tyInt2 = 0`, …, `tyVarchar = 4`). [`Interner::new`] pins them to those ids.
+const PINNED_TYPES: [&str; 5] = ["int2", "int4", "int8", "text", "varchar"];
+
+/// `(element, column)` base types for which an unnest element may differ from its column's type: the
+/// element type holds every value of the column's type, and assigning it back gives the same value.
+/// The kernel checks the same list, `Sqleq.widens`, by id.
+const WIDENS: &[(&str, &str)] =
+    &[("int8", "int4"), ("int8", "int2"), ("int4", "int2"), ("text", "varchar"), ("varchar", "text")];
+
 struct Interner(HashMap<String, u32>);
 
 impl Interner {
+    fn new() -> Interner {
+        let mut i = Interner(HashMap::new());
+        for t in PINNED_TYPES {
+            i.id(format!("ty:{t}"));
+        }
+        i
+    }
     fn id(&mut self, key: String) -> u32 {
         let n = self.0.len() as u32;
         *self.0.entry(key).or_insert(n)
@@ -493,7 +513,7 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
         (Source::Values(_), Source::Values(_)) => return Err(unsupported("both sides are VALUES")),
         (Source::Unnest { .. }, Source::Unnest { .. }) => return Err(unsupported("both sides are unnest")),
     };
-    let Lowered { tys, a: la, b: lb, shape, generated } = lower(&a, &b, schema)?;
+    let Lowered { tys, a: la, b: lb, shape, generated, widened } = lower(&a, &b, schema)?;
     let table = schema.table(&a.target).expect("resolved by lower");
     let mut unmodelled = Vec::new();
     if table.has_check {
@@ -523,6 +543,7 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
                 .iter()
                 .map(|c| (c.name.clone(), c.raw_type.clone(), c.default_text.clone(), a.cols.contains(&c.name)))
                 .collect(),
+            widened,
         },
         col_names: table.columns.iter().map(|c| c.name.clone()).collect(),
         unique_names: table
@@ -574,8 +595,9 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
         )));
     }
 
-    let mut interner = Interner::default();
+    let mut interner = Interner::new();
     let mut tys = Vec::with_capacity(k);
+    let mut col_tys = Vec::with_capacity(k);
     let mut col_ids = Vec::with_capacity(k);
     for c in &a.cols {
         let Some(i) = table.column(c) else {
@@ -589,10 +611,12 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
             return Err(unsupported(format!("column {c} has an array type")));
         }
         tys.push(interner.ty(ty));
+        col_tys.push(ty.name.as_str());
         col_ids.push(interner.id(format!("c:{c}")));
     }
 
     let mut lb_args = Vec::with_capacity(k);
+    let mut widened = Vec::new();
     for (j, arg) in args.iter().enumerate() {
         if arg.param as usize != j + 1 {
             return Err(unsupported("unnest arguments are not $1..$k in order"));
@@ -604,13 +628,18 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
                 arg.param, arg.elem
             )));
         }
-        if interner.ty(&elem) != tys[j] || elem.array {
+        let e = interner.ty(&elem);
+        if elem.array || !(e == tys[j] || WIDENS.contains(&(elem.name.as_str(), col_tys[j]))) {
             return Err(unsupported(format!(
-                "unnest argument ${} is {}[], not the type of column {}",
+                "unnest argument ${} is {}[], not the type of column {} or one that holds its every value",
                 arg.param, arg.elem, a.cols[j]
             )));
         }
-        lb_args.push((arg.param, tys[j]));
+        if e != tys[j] {
+            widened.push(j);
+        }
+        // B's own element type, so that the kernel checks it against the column's type itself.
+        lb_args.push((arg.param, e));
     }
 
     // With a generated cell the pair is `checkGatherGen`'s, which numbers parameters by reading
@@ -682,7 +711,7 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     debug_assert_eq!(ca, col_ids);
     let la = LInsert { target: ta, cols: ca, src: LSource::Values(la_rows), tail: tla };
     let lb = LInsert { target: tb, cols: cb, src: LSource::Unnest(lb_args), tail: tlb };
-    Ok(Lowered { tys, a: la, b: lb, shape: shape(rows), generated })
+    Ok(Lowered { tys, a: la, b: lb, shape: shape(rows), generated, widened })
 }
 
 struct Lowered {
@@ -691,6 +720,7 @@ struct Lowered {
     b: LInsert,
     shape: Shape,
     generated: Option<GenSummary>,
+    widened: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -736,8 +766,8 @@ mod tests {
     #[test]
     fn negative_controls() {
         let v = "INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4)";
-        // Cast mismatch on either side.
-        assert!(matches!(refused(v, "INSERT INTO t (a, b) SELECT * FROM unnest($1::bigint[], $2::text[])"), Refusal::Unsupported(_)));
+        // Cast mismatch on either side: `smallint[]` cannot hold every `int` the VALUES side inserts.
+        assert!(matches!(refused(v, "INSERT INTO t (a, b) SELECT * FROM unnest($1::smallint[], $2::text[])"), Refusal::Unsupported(_)));
         assert!(matches!(refused("INSERT INTO t (a, b) VALUES ($1::bigint, $2)", B), Refusal::Unsupported(_)));
         // A parameter in the tail.
         let t = " ON CONFLICT (a) DO UPDATE SET b = $3";
@@ -937,8 +967,56 @@ mod tests {
     }
 
     #[test]
+    fn element_types_that_hold_every_column_value_are_accepted() {
+        // `bigint[]` into the `int` column a, `text[]` into the `varchar(10)` column c.
+        let p = pair("INSERT INTO t (a, c) VALUES ($1, $2)", "INSERT INTO t (a, c) SELECT * FROM unnest($1::bigint[], $2::text[])")
+            .unwrap();
+        let LSource::Unnest(args) = &p.b.src else { panic!("not unnest") };
+        // B carries its own element types, not the columns', so the kernel compares the two.
+        assert_eq!(args.iter().map(|a| a.1).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(p.tys, [1, 4]);
+        assert!(pair("INSERT INTO t (a, b) VALUES ($1, $2)", "INSERT INTO t (a, b) SELECT * FROM unnest($1::int8[], $2::varchar[])").is_ok());
+    }
+
+    #[test]
+    fn element_types_that_do_not_hold_every_column_value_are_refused() {
+        for (cols, b) in [
+            // `int[]` into the `bigint` column d: an `int8` overflows it.
+            ("a, d", "unnest($1::int[], $2::int[])"),
+            // Unrelated types.
+            ("a, b", "unnest($1::text[], $2::text[])"),
+            ("a, b", "unnest($1::int[], $2::int[])"),
+            // `char(1)` pads and truncates; not in the list.
+            ("a, b", "unnest($1::int[], $2::char[])"),
+            // A modifier on the element is refused as before, even where the base type widens.
+            ("a, c", "unnest($1::int[], $2::varchar(20)[])"),
+        ] {
+            let a = format!("INSERT INTO t ({cols}) VALUES ($1, $2)");
+            let r = refused(&a, &format!("INSERT INTO t ({cols}) SELECT * FROM {b}"));
+            assert!(matches!(r, Refusal::Unsupported(_)), "{b}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn the_pinned_type_ids_and_widenings_are_the_kernels() {
+        let mut i = Interner::new();
+        for (n, t) in PINNED_TYPES.iter().enumerate() {
+            assert_eq!(i.id(format!("ty:{t}")), n as u32, "{t}");
+        }
+        let check = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../lean/Sqleq/Check.lean")).unwrap();
+        let lean = |t: &str| format!("ty{}{}", t[..1].to_ascii_uppercase(), &t[1..]);
+        for (n, t) in PINNED_TYPES.iter().enumerate() {
+            let def = format!("def {} : Nat := {n}\n", lean(t));
+            assert!(check.contains(&def), "Check.lean lacks `{}`", def.trim());
+        }
+        let list: Vec<String> = WIDENS.iter().map(|(e, c)| format!("({}, {})", lean(e), lean(c))).collect();
+        let list = format!("[{}]", list.join(", "));
+        assert!(check.contains(&list), "Check.lean's widens is not {list}");
+    }
+
+    #[test]
     fn tail_tokens_see_parameters_anywhere() {
-        let mut i = Interner::default();
+        let mut i = Interner::new();
         let t = Tail { alias: None, on: Some("DO UPDATE SET x=$12,y".into()), returning: None };
         assert!(tokens(&t, &mut i).contains(&LTok::Param(12)));
     }
