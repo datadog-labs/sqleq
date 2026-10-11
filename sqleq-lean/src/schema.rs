@@ -57,9 +57,13 @@ pub fn type_key(dt: &DataType) -> TypeKey {
         s = stripped.trim_end().to_string();
         array = true;
     }
-    // A modifier is anything in parentheses after the name.
+    // A modifier is anything in parentheses. It can sit inside the name: `timestamp(3) with time
+    // zone` is `timestamptz` with a precision, so what follows the parentheses is kept.
     let (mut base, modded) = match s.find('(') {
-        Some(i) => (s[..i].trim().to_string(), true),
+        Some(i) => {
+            let after = s[i..].find(')').map_or("", |j| s[i + j + 1..].trim());
+            (format!("{} {after}", s[..i].trim()).trim().to_string(), true)
+        }
         None => (s, false),
     };
     // `pg_catalog` is where the built-in types live, so `pg_catalog.date` is `date`.
@@ -657,6 +661,12 @@ mod tests {
         assert_eq!(key("bigserial").name, "int8");
         assert_eq!(key("character varying").name, "varchar");
         assert_eq!(key("timestamp with time zone").name, "timestamptz");
+        // A precision sits inside the name, and does not make the type `timestamp` or `time`.
+        let tz = key("timestamp(3) with time zone");
+        assert_eq!((tz.name.as_str(), tz.modded), ("timestamptz", true));
+        assert_eq!(key("time(6) with time zone").name, "timetz");
+        assert_eq!(key("timestamp(0) without time zone").name, "timestamp");
+        assert_eq!(key("timestamptz(3)").name, "timestamptz");
         assert_eq!(key("TIMESTAMP").name, "timestamp");
         assert_eq!(key("pg_catalog.date").name, "date");
         assert_eq!(key("\"json\"").name, "json");

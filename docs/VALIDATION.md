@@ -118,6 +118,17 @@ the names as aligned is a false-proof channel; it is now detected and refused as
 `parameter-misaligned`. The tempting shortcuts here are refuted by real pairs rather than argued
 away — see [SOUNDNESS.md](SOUNDNESS.md), which sets out what the frontend still assumes.
 
+**In the Lean axis's reading of column types.** A column declared `timestamp(3) with time zone` was
+read as `timestamp`: the type was cut at the precision, and what followed it dropped. So an `unnest`
+side passing `timestamp[]` was taken to pass the column's own type, and a pair that is not
+equivalent was proved: the `VALUES` side stores the instant its parameter names, the `unnest` side
+drops the offset and reads the time in the session's zone. It surfaced while `sqleq-fuzz` was being
+taught to test these pairs under the gather rule: its findings showed Lean refusing `timestamptz[]`
+into such a column, which is equivalent, and the same misreading admitted `timestamp[]`. The
+Postgres replay of Lean's proofs had confirmed the pair, because it ran in UTC, where the two
+readings agree on its values; it now runs in another zone. Pinned as
+`tests/pairs/insert_unnest/timestamptz_precision_column.sql`.
+
 **In the disprover, four times.** A disprover's failure mode is the mirror image: a *false
 refutation*, claiming non-equivalence that does not hold. Each of these was caught and closed.
 Comparing a `WITH`-wrapped DML statement against table state compared the wrong observable.
