@@ -964,6 +964,67 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
     }
 }
 
+/// Drop the outer of two casts to one type: `CAST(CAST(e AS T) AS T)`, in any spelling, is
+/// `CAST(e AS T)`.
+///
+/// **Why it is sound.** In Postgres a cast to the type its operand already has is the identity. A
+/// type modifier's coercion (`varchar(10)`, `numeric(10,2)`) leaves a value it has already coerced
+/// as it is. A domain's checks pass again on the value they have just passed. Every other cast from a
+/// type to itself is a no-op. So the outer cast can only return what the inner one did.
+///
+/// **Why it is needed.** The inner cast and the outer one are not lowered alike. Over a parameter,
+/// the inner is dropped as the parameter's own type (`casts`, rule 1), and the outer is then a cast
+/// over a value the frontend reads through `q_exact_<type>` (`equality`). So `$1::uuid::uuid`, which
+/// an ORM writes, and `$1::uuid` lowered to two different plans.
+///
+/// **The guards.**
+/// - **One type.** The two targets must be the same `DataType`, modifiers included. `varchar(10)`
+///   inside `varchar(5)` truncates, so it is no repeat. Two spellings of one type that sqlparser keeps
+///   apart (`int4` and `integer`, a quoted `"uuid"` and `uuid`) are left as they are, which costs only
+///   proofs.
+/// - **Postgres's own casts.** Only `CAST(.. AS ..)` and `::`, with no `FORMAT`. `TRY_CAST` and
+///   `SAFE_CAST` are other functions, with a failure mode of their own.
+/// - **Parentheses.** They are seen through: `($1::uuid)::uuid` is the same repeat.
+///
+/// The inner cast is the one kept, with its spelling. `casts::decide` keys a `qcast` symbol on the
+/// rendered operand, so re-spelling a cast would split symbols that should be one. The visitor is
+/// post-order, so a chain of three collapses from the inside out.
+pub fn collapse_repeated_casts(statements: &mut [Statement]) {
+    let mut c = CollapseRepeatedCast;
+    for st in statements {
+        let _ = st.visit(&mut c);
+    }
+}
+
+struct CollapseRepeatedCast;
+
+impl VisitorMut for CollapseRepeatedCast {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        let postgres_cast = |k: &CastKind| matches!(k, CastKind::Cast | CastKind::DoubleColon);
+        let Expr::Cast { expr, data_type, kind, format: None } = e else {
+            return ControlFlow::Continue(());
+        };
+        if !postgres_cast(kind) {
+            return ControlFlow::Continue(());
+        }
+        let mut inner = &mut **expr;
+        while let Expr::Nested(n) = inner {
+            inner = &mut **n;
+        }
+        let repeat = matches!(
+            inner,
+            Expr::Cast { data_type: t, kind: k, format: None, .. } if t == data_type && postgres_cast(k)
+        );
+        if repeat {
+            let inner = core::mem::replace(inner, placeholder());
+            *e = inner;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Drop every `ORDER BY` that nothing can observe.
 ///
 /// The prover compares relations as bags, in which row order is not part of the value, so an
@@ -2650,6 +2711,46 @@ mod tests {
             "SELECT a | b FROM t",
         ] {
             assert_eq!(demoted_sql(sql), sql, "should not be demoted");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // collapse_repeated_casts
+    // -----------------------------------------------------------------------
+
+    /// Round-trip one statement through the `CAST(CAST(e AS T) AS T)` -> `CAST(e AS T)` rewrite.
+    fn collapsed(sql: &str) -> String {
+        let mut st = Parser::parse_sql(&crate::DIALECT, sql).expect("parses");
+        collapse_repeated_casts(&mut st);
+        st[0].to_string()
+    }
+
+    /// The outer cast goes and the inner stays, in its own spelling, whichever spelling the outer
+    /// had; parentheses between the two are no obstacle, and a chain collapses to one cast.
+    #[test]
+    fn a_cast_to_the_type_its_operand_has_is_dropped() {
+        assert_eq!(collapsed("SELECT $1::uuid::UUID FROM t"), "SELECT $1::UUID FROM t");
+        assert_eq!(collapsed("SELECT ($1::uuid)::uuid FROM t"), "SELECT $1::UUID FROM t");
+        assert_eq!(collapsed("SELECT CAST($1::uuid AS uuid) FROM t"), "SELECT $1::UUID FROM t");
+        assert_eq!(collapsed("SELECT CAST(CAST(a AS TEXT) AS TEXT) FROM t"), "SELECT CAST(a AS TEXT) FROM t");
+        assert_eq!(collapsed("SELECT a::numeric(10,2)::numeric(10,2)::numeric(10,2) FROM t"), "SELECT a::NUMERIC(10,2) FROM t");
+        assert_eq!(collapsed("SELECT a::text[]::text[] FROM t"), "SELECT a::TEXT[] FROM t");
+    }
+
+    /// Two different targets, two spellings of one type that sqlparser keeps apart, and the casts
+    /// that are not Postgres's are left as they are.
+    #[test]
+    fn a_cast_to_another_type_is_kept() {
+        for sql in [
+            "SELECT a::VARCHAR(10)::VARCHAR(5) FROM t",
+            "SELECT a::NUMERIC(10,2)::NUMERIC FROM t",
+            "SELECT a::INT4::INTEGER FROM t",
+            "SELECT a::UUID::\"UUID\" FROM t",
+            "SELECT a::TEXT::VARCHAR FROM t",
+            "SELECT TRY_CAST(TRY_CAST(a AS INT) AS INT) FROM t",
+            "SELECT a::TEXT || b::TEXT FROM t",
+        ] {
+            assert_eq!(collapsed(sql), sql, "should not be rewritten");
         }
     }
 

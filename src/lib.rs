@@ -547,10 +547,11 @@ impl Rewrites {
     pub const DISTRIBUTE_ARRAY_CAST: Rewrites = Rewrites(1 << 8);
     pub const STRIP_IDENTICAL_LOCKS: Rewrites = Rewrites(1 << 9);
     pub const DESUGAR_SPECIAL_FORMS: Rewrites = Rewrites(1 << 10);
-    /// The eleven bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
+    pub const COLLAPSE_REPEATED_CASTS: Rewrites = Rewrites(1 << 11);
+    /// The twelve bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
     /// is a rewrite an attribution pass reports as "no rewrite was necessary" for every row it
     /// closes, so the two are pinned equal by a test and this mask is what makes that pin possible.
-    pub const ALL: Rewrites = Rewrites((1 << 11) - 1);
+    pub const ALL: Rewrites = Rewrites((1 << 12) - 1);
     /// Every rewrite except one — the single-subtraction counterfactual.
     pub const NONE: Rewrites = Rewrites(0);
 
@@ -568,13 +569,14 @@ impl Rewrites {
 
     /// The individual rewrites, in the order [`reflexive_with`] runs them, each with the stable name
     /// an attribution pass reports it under.
-    pub const EACH: [(&'static str, Rewrites); 11] = [
+    pub const EACH: [(&'static str, Rewrites); 12] = [
         ("fix_precedence", Rewrites::FIX_PRECEDENCE),
         ("desugar_special_forms", Rewrites::DESUGAR_SPECIAL_FORMS),
         ("demote_operators", Rewrites::DEMOTE_OPERATORS),
         ("strip_in_exists_distinct", Rewrites::STRIP_IN_EXISTS_DISTINCT),
         ("unnest_in_to_any", Rewrites::UNNEST_IN_TO_ANY),
         ("distribute_array_casts", Rewrites::DISTRIBUTE_ARRAY_CAST),
+        ("collapse_repeated_casts", Rewrites::COLLAPSE_REPEATED_CASTS),
         ("inline_ctes", Rewrites::INLINE_CTES),
         ("strip_identical_locks", Rewrites::STRIP_IDENTICAL_LOCKS),
         ("strip_identical_pagination", Rewrites::STRIP_IDENTICAL_PAGINATION),
@@ -692,6 +694,9 @@ fn normalized_pair(
     }
     if rewrites.has(Rewrites::DISTRIBUTE_ARRAY_CAST) {
         normalize::distribute_array_casts(&mut statements);
+    }
+    if rewrites.has(Rewrites::COLLAPSE_REPEATED_CASTS) {
+        normalize::collapse_repeated_casts(&mut statements);
     }
 
     // The pair, without the `CREATE TABLE`s `catalog::scan_ddl` reads. Anything but exactly two is
@@ -907,6 +912,9 @@ fn parse_input(
     // the rows this reaches are written as `IN (SELECT unnest(..))`. Before `infer`, so the
     // element cast it leaves behind types the placeholder under it.
     normalize::distribute_array_casts(&mut statements);
+    // Before `params::mentioned`, `infer` and the cast rules, which would each read the outer of
+    // `$1::uuid::uuid` differently from the inner.
+    normalize::collapse_repeated_casts(&mut statements);
     let mut queries = catalog::collect_queries(statements)?;
     // The `$N` each query mentions, read here and not later: the pair is decided (the DML is reduced,
     // the two queries separated) and no rewrite below has yet been able to delete a placeholder. Every

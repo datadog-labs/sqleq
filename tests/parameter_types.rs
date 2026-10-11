@@ -149,6 +149,24 @@ fn a_declared_parameter_type_is_the_client_s() {
     }
 }
 
+/// A cast to the type its operand already has is the identity, so `$2::uuid::uuid` and `$2::uuid`
+/// are one plan. The inner cast is the parameter's own type and dropped; the outer one used to be
+/// read through `q_exact_varbinary`, which split the plans.
+#[test]
+fn a_repeated_cast_over_a_parameter_lowers_to_one_plan() {
+    let ddl = r#"create table "t" ("id" UUID PRIMARY KEY, "a" INTEGER);"#;
+    let one = r#"UPDATE "t" SET "a" = $1 WHERE "id" = $2::uuid"#;
+    for other in [
+        r#"UPDATE "t" SET "a" = $1 WHERE "id" = $2::uuid::UUID"#,
+        r#"UPDATE "t" SET "a" = $1 WHERE "id" = ($2::uuid)::uuid"#,
+        r#"UPDATE "t" SET "a" = $1 WHERE "id" = CAST($2::uuid AS uuid)"#,
+    ] {
+        let v: Value = lower_with(&format!("{ddl}\n{other};\n{one};"), CatalogSource::InferredSeeded)
+            .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{other}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{other}");
+    }
+}
+
 #[test]
 fn a_cast_over_a_parameter_to_another_type_is_refused() {
     let q0 = r#"SELECT "id" FROM "t" WHERE "n" = $1 AND $1::int = 0"#;

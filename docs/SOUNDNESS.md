@@ -360,6 +360,12 @@ what it is or refused:
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
   target.
+- **A second cast to the type a cast just gave is no cast.** In Postgres, `CAST(CAST(e AS T) AS T)`
+  is `CAST(e AS T)`: the outer cast is handed a value of its own type, and a typmod's coercion and a
+  domain's checks are idempotent. So it is removed before anything reads the tree
+  (`normalize::collapse_repeated_casts`), and `$1::uuid::uuid` and `$1::uuid` are one plan. The two
+  targets must be spelled the same, modifiers included. Two spellings of one type that the parser
+  keeps apart (`int4` and `integer`) stay as written, which costs only proofs.
 - **A parameter has the type Postgres gives it at its first use.** A client that sends `$N` without a
   type leaves it to Postgres, which types it where it first meets it, in the order it analyses the
   statement: in `n + 0 = $1 AND $1 > 0`, over a `numeric` `n`, `$1` is a `numeric`. Type inference
