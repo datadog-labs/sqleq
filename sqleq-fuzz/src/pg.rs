@@ -40,6 +40,7 @@ use rand::{RngExt, SeedableRng};
 use regex::Regex;
 
 use crate::duck::{table_forms, RowData};
+use crate::gather::{self, Gather};
 use crate::gen::{
     array_element_type, cast_target, clocks, randval, randval_cast, randval_col, randval_need,
     CastTarget, Val,
@@ -553,6 +554,15 @@ impl Db<'_> {
         self.c.simple_query(sql).map_err(|e| msg(&e))
     }
 
+    /// [`Db::simple`], keeping the SQLSTATE of an error the server raised.
+    fn simple_coded(&mut self, sql: &str) -> Result<Vec<SimpleQueryMessage>, SideError> {
+        self.trips += 1;
+        self.c.simple_query(sql).map_err(|e| SideError {
+            code: e.code().map(|c| c.code().to_string()),
+            msg: msg(&e),
+        })
+    }
+
     /// Run `sql` under a savepoint of its own, so a failure leaves the transaction usable.
     fn guarded<T>(
         &mut self,
@@ -939,6 +949,68 @@ fn side_types(
     .ok()
 }
 
+/// Why a side did not run: the SQLSTATE when the server raised the error, and its message.
+#[derive(Clone, Debug)]
+struct SideError {
+    code: Option<String>,
+    msg: String,
+}
+
+/// Whether an error one side raised and the other did not tells the two statements apart, under
+/// the gather rule: an error about the values and the statement themselves -- a datatype mismatch,
+/// a value out of range or too long, a constraint the rows break, a row affected twice (classes 42,
+/// 22, 23, 21). Not an error that says something is missing, which incomplete DDL explains as well
+/// as the statement does (an undefined table, column, function, type or parameter), and not one
+/// about the run itself: a timeout, a lock, a serialization failure, an internal error, a function
+/// raising. Those trials are skipped.
+fn tells_apart(code: Option<&str>) -> bool {
+    const MISSING: [&str; 7] = ["42P01", "42703", "42883", "42704", "42P02", "42P08", "42P18"];
+    match code {
+        Some(c) => ["21", "22", "23", "42"].contains(&&c[..2.min(c.len())]) && !MISSING.contains(&c),
+        None => false,
+    }
+}
+
+/// A type as Postgres names a parameter's type, made safe to cast a value to: `character` and `bit`
+/// with no length are `char(1)` and `bit(1)` written as a type, which a parameter of those types is
+/// not, so they become `bpchar` and `varbit`.
+fn param_type(t: &str) -> String {
+    match t.strip_suffix("[]") {
+        Some(elem) => format!("{}[]", param_type(elem)),
+        None => match t {
+            "character" => "bpchar".to_string(),
+            "bit" => "varbit".to_string(),
+            other => other.to_string(),
+        },
+    }
+}
+
+/// Render a counterexample under the gather rule: the clock and the time zone, where the trial set
+/// them; the `VALUES` side's parameters and the arrays the `unnest` side was given for them; the
+/// rows Postgres accepted; and, when one side raised and the other did not, which.
+fn describe_gather(
+    vals: &HashMap<u32, Val>,
+    arrays: &HashMap<u32, Val>,
+    kept: &RowData,
+    session: &[String],
+    raised: Option<String>,
+) -> String {
+    let params = |binds: &HashMap<u32, Val>| {
+        let mut ps: Vec<(u32, &Val)> = binds.iter().map(|(k, v)| (*k, v)).collect();
+        ps.sort_by_key(|(k, _)| *k);
+        ps.iter().map(|(k, v)| format!("${k}={}", pg_lit(v))).collect::<Vec<_>>().join(", ")
+    };
+    let tables = describe(&HashMap::new(), kept, None);
+    let mut parts: Vec<String> = session.to_vec();
+    parts.push(format!("VALUES side: {}", params(vals)));
+    parts.push(format!("unnest side: {}", params(arrays)));
+    parts.push(tables);
+    if let Some(r) = raised {
+        parts.push(r);
+    }
+    parts.join("  |  ")
+}
+
 /// One observed bag: a label (the returned rows, or a table), its column types when known, and its
 /// rows as Postgres's text.
 #[derive(Clone, Debug, PartialEq)]
@@ -978,7 +1050,7 @@ fn run_side(
     returning: bool,
     reset: &str,
     targets: &[(String, Target)],
-) -> Result<Vec<Bag>, String> {
+) -> Result<Vec<Bag>, SideError> {
     let mut sql = String::from("SAVEPOINT side;\n");
     let mut skip = 1; // statements before the side's own
     if !is_query && !reset.is_empty() {
@@ -1001,7 +1073,7 @@ fn run_side(
         }
     }
     sql.push_str("ROLLBACK TO SAVEPOINT side");
-    let msgs = match db.simple(&sql) {
+    let msgs = match db.simple_coded(&sql) {
         Ok(m) => m,
         Err(e) => {
             // A syntax error rejects the whole batch before its savepoint is taken, so this can
@@ -1026,7 +1098,10 @@ fn run_side(
     let tables = labels.len() - 1;
     let own = segments.len().saturating_sub(skip + tables + 1);
     if own == 0 || (is_query && own != 1) {
-        return Err(format!("side is not one statement ({} completions)", segments.len()));
+        return Err(SideError {
+            code: None,
+            msg: format!("side is not one statement ({} completions)", segments.len()),
+        });
     }
     let mut bags: Vec<Bag> = Vec::new();
     if is_query || returning {
@@ -1266,7 +1341,19 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         (Ok(pa), Ok(pb)) => (pa, pb),
         (Err(e), _) | (_, Err(e)) => return Verdict::Error(e),
     };
-    let misaligned = pat::misalignment(a, b);
+    // A pair of the gather rule's shape is run under that rule: the `unnest` side's arrays are built
+    // from the values drawn for the `VALUES` side, so the value heuristics read that side alone.
+    let gathered: Option<Gather> = match gather::recognize(a, b) {
+        None => None,
+        Some(Err(why)) => return Verdict::NotComparable(format!("gather: {why}")),
+        Some(Ok(g)) => Some(g),
+    };
+    let (pa, pb, ph_draw) = match &gathered {
+        Some(g) if g.values_first => (a, "", &ph_a),
+        Some(_) => (b, "", &ph_b),
+        None => (a, b, &ph_a),
+    };
+    let misaligned = if gathered.is_some() { None } else { pat::misalignment(a, b) };
 
     // --- the parameter analysis, as `test_pair` does it ---
     let mut coltype: HashSet<String> = HashSet::new();
@@ -1284,16 +1371,29 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         .filter(|(_, (_, _, _, array))| !array)
         .map(|(name, (_, _, vt, _))| (name.clone(), *vt))
         .collect();
-    let pneed = typing::param_needs(a, b, &coltypes);
-    let pcol = pat::param_cols(a, b, &coltype);
-    let pcast = pat::param_casts(a, b);
+    let pneed = typing::param_needs(pa, pb, &coltypes);
+    let mut pcol = pat::param_cols(pa, pb, &coltype);
+    let pcast = pat::param_casts(pa, pb);
+    // Under the gather rule each `VALUES` parameter is linked to the column it fills, so it is drawn
+    // from what that column holds.
+    if let Some(g) = &gathered {
+        for p in ph_draw {
+            if let Some(c) = g.column_of_param(p.n) {
+                pcol.entry(p.n).or_insert_with(|| g.cols[c].clone());
+            }
+        }
+    }
     let arraycols: HashSet<String> = colloc
         .iter()
         .filter(|(_, (_, _, _, arr))| *arr)
         .map(|(n, _)| n.clone())
         .collect();
-    let parray = pat::array_params(a, b, &arraycols);
-    let pnums: BTreeSet<u32> = ph_a.iter().chain(&ph_b).map(|p| p.n).collect();
+    let parray = pat::array_params(pa, pb, &arraycols);
+    // The placeholders drawn for: under the gather rule, the `VALUES` side's alone.
+    let pnums: BTreeSet<u32> = match &gathered {
+        Some(_) => ph_draw.iter().map(|p| p.n).collect(),
+        None => ph_a.iter().chain(&ph_b).map(|p| p.n).collect(),
+    };
 
     let cuts: Vec<limits::Cut> = limits::cuts(a, &schema)
         .into_iter()
@@ -1528,6 +1628,17 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     };
     let types_a = infer(db, a, &ph_a);
     let types_b = infer(db, b, &ph_b);
+    // Under the gather rule the two sides number their parameters apart, so neither side's types say
+    // anything about the other's: the steps below that bind `$N` alike are skipped, and the one
+    // check is whether each side prepares as written. Postgres types a gather pair's parameters from
+    // its cells and casts, and a side it cannot prepare can never run, whatever a literal written in
+    // its place makes of it.
+    let prepares = |db: &mut Db, sql: &str, ph: &[pat::Placeholder]| {
+        side_types(db, sql, ph, &BTreeMap::new()).is_some()
+    };
+    let prepared = gathered
+        .as_ref()
+        .map(|_| (prepares(db, a, &ph_a), prepares(db, b, &ph_b)));
     // One `$N` is one value, of one type, in both statements. Where a side leaves a placeholder
     // untyped (`SELECT $2 AS x`, which Postgres cannot prepare without being told), the type the
     // other side gives it is the one the application bound; untyped, it would be read as text.
@@ -1536,7 +1647,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 ph: &[pat::Placeholder],
                 mine: &BTreeMap<u32, String>,
                 other: &BTreeMap<u32, String>| {
-        if ph.iter().all(|p| mine.contains_key(&p.n)) {
+        if gathered.is_some() || ph.iter().all(|p| mine.contains_key(&p.n)) {
             return mine.clone();
         }
         let mut declared = hints.clone();
@@ -1558,7 +1669,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         out
     };
     let (shapes_a, shapes_b) = (shapes(a, &types_a), shapes(b, &types_b));
-    for n in &pnums {
+    for n in pnums.iter().filter(|_| gathered.is_none()) {
         if let (Some(x), Some(y)) = (shapes_a.get(n), shapes_b.get(n)) {
             if x.ends_with(']') != y.ends_with(']') {
                 return Verdict::NotComparable(format!(
@@ -1591,7 +1702,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 _ => (*n, t.clone()),
             })
             .collect();
-        if declared == mine {
+        if gathered.is_some() || declared == mine {
             return mine;
         }
         side_types(db, sql, ph, &declared).unwrap_or(mine)
@@ -1599,7 +1710,16 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     let types_b = prefer(db, b, &ph_b, types_b, &types_a);
     let types_a = prefer(db, a, &ph_a, types_a, &types_b);
     let mut pgtypes: HashMap<u32, (VType, bool)> = HashMap::new();
-    for &n in &pnums {
+    let types_vals = match &gathered {
+        Some(g) if !g.values_first => &types_b,
+        _ => &types_a,
+    };
+    for &n in pnums.iter().filter(|_| gathered.is_some()) {
+        if let Some(x) = types_vals.get(&n).and_then(|t| vtype_of(t)) {
+            pgtypes.insert(n, x);
+        }
+    }
+    for &n in pnums.iter().filter(|_| gathered.is_none()) {
         let va = types_a.get(&n).and_then(|t| vtype_of(t));
         let vb = types_b.get(&n).and_then(|t| vtype_of(t));
         match (va, vb) {
@@ -1615,6 +1735,62 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             _ => {}
         }
     }
+    // Under the gather rule: the values worth trying for each `VALUES` parameter, and why, if at all,
+    // one side raising where the other does not says nothing about the pair here.
+    let plan = match &gathered {
+        Some(g) => {
+            let declared = |col: &str| -> Vec<String> {
+                targets
+                    .iter()
+                    .flat_map(|(k, tg)| {
+                        schema[k].cols.iter().zip(&tg.col_types).filter_map(|(c, t)| {
+                            (c.name.to_lowercase() == col).then(|| t.clone()).flatten()
+                        })
+                    })
+                    .collect()
+            };
+            let mut boundary: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+            let mut zoned = false;
+            for &n in &pnums {
+                let (Some(c), Some(ty)) = (g.column_of_param(n), types_vals.get(&n)) else {
+                    continue;
+                };
+                if ty.ends_with(']') {
+                    continue;
+                }
+                let mut meet = g.types_meeting(c);
+                for col in g.columns_fed(c) {
+                    meet.extend(declared(col));
+                }
+                let (vs, z) = gather::boundary_values(ty, &meet);
+                zoned |= z;
+                if !vs.is_empty() {
+                    boundary.insert(n, vs);
+                }
+            }
+            let regs: Vec<String> = targets.iter().map(|(_, t)| t.reg.clone()).collect();
+            db.trips += 1;
+            let rewritten = match db.c.query(
+                "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal \
+                   AND tgrelid = ANY (ARRAY(SELECT r::regclass::oid FROM unnest($1::text[]) AS r))) \
+                 OR EXISTS (SELECT 1 FROM pg_rewrite WHERE rulename <> '_RETURN' \
+                   AND ev_class = ANY (ARRAY(SELECT r::regclass::oid FROM unnest($1::text[]) AS r)))",
+                &[&regs],
+            ) {
+                Ok(rows) => rows.first().is_none_or(|r| r.get::<_, bool>(0)),
+                Err(e) => return Verdict::Error(msg(&e)),
+            };
+            let unheard = if timing.stand_ins + timing.dropped_defaults > 0 {
+                Some("the DDL was repaired to run")
+            } else if rewritten {
+                Some("a target table has a trigger or a rule")
+            } else {
+                None
+            };
+            Some((boundary, zoned, unheard))
+        }
+        None => None,
+    };
     timing.ddl_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
@@ -1636,6 +1812,22 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 return Verdict::Error(e);
             }
         }
+        // Where a `timestamp` and a `timestamptz` meet under the gather rule, every other trial runs
+        // in a zone with daylight saving, the one setting under which the two read a value apart.
+        let zone = match &plan {
+            Some((_, true, _)) if i % 2 == 1 => Some(gather::DST_ZONE),
+            _ => None,
+        };
+        if let Some(z) = zone {
+            if let Err(e) = db.exec(&format!("SET LOCAL TimeZone = '{z}'")) {
+                return Verdict::Error(e);
+            }
+        }
+        let session: Vec<String> = clock
+            .map(|c| format!("clock: {c}"))
+            .into_iter()
+            .chain(zone.map(|z| format!("TimeZone: {z}")))
+            .collect();
         let small = i % 5 == 4 && i / 5 < small_trials;
         let rng: &mut StdRng = if small {
             &mut small_rng
@@ -1767,6 +1959,68 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             binds.insert(n, v);
         }
 
+        // The gather rule: on every other trial each parameter takes a value of its own, out of the
+        // domains the draws share with the tables (`gather::fresh`), so that the rows meet neither
+        // the table's nor each other on a key. These are the trials that run in another zone too.
+        if gathered.is_some() && i % 2 == 1 {
+            for (n, v) in binds.iter_mut() {
+                *v = gather::fresh(v, *n, types_vals.get(n).map_or("", String::as_str));
+            }
+        }
+        // On some trials a parameter takes a value just past a narrower type its value meets, then
+        // the `unnest` side's array `$p` is `VALUES` column `p`, row by row.
+        let mut arrays: HashMap<u32, Val> = HashMap::new();
+        // Whether a boundary value was given: such a trial's error does not replace an earlier
+        // one, which says more about why the ordinary trials did not run.
+        let mut boundary_trial = false;
+        if let (Some(g), Some((boundary, _, _))) = (&gathered, &plan) {
+            if i % 3 == 2 {
+                for (n, vs) in boundary {
+                    if rng.random_bool(0.5) {
+                        binds.insert(*n, Val::Str(vs.choose(rng).unwrap().clone()));
+                        boundary_trial = true;
+                    }
+                }
+            }
+            for (p, _) in &g.args {
+                let c = Gather::column_of(*p);
+                let column = g
+                    .rows
+                    .iter()
+                    .map(|r| match &r[c] {
+                        gather::Cell::Param(n, _) => binds.get(n).cloned().unwrap_or(Val::Null),
+                        gather::Cell::Null => Val::Null,
+                    })
+                    .collect();
+                arrays.insert(*p, Val::List(column));
+            }
+            // A value its parameter's own type does not hold is no binding of the `VALUES` side.
+            let mut checks: Vec<(u32, String)> = binds
+                .iter()
+                .filter_map(|(n, v)| {
+                    let t = types_vals.get(n)?;
+                    Some((*n, format!("CAST({} AS {})", pg_lit(v), param_type(t))))
+                })
+                .collect();
+            checks.sort();
+            if !checks.is_empty() {
+                let casts: Vec<String> = checks.into_iter().map(|(_, c)| c).collect();
+                let sql = format!("SELECT {}", casts.join(", "));
+                if let Err(e) = db.guarded(|db| db.simple(&sql)) {
+                    if let Err(e2) = finish(db) {
+                        return Verdict::Error(e2);
+                    }
+                    if !boundary_trial || last_err.is_none() {
+                        last_err = Some(format!(
+                            "gather: a value drawn is not of its parameter's type: {e}"
+                        ));
+                    }
+                    timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
+                    continue;
+                }
+            }
+        }
+
         // Load the instance: one statement per table when every row is accepted, else row by row,
         // twice, so a child row whose parent comes later in name order still finds it.
         let mut kept: RowData = RowData::new();
@@ -1814,29 +2068,100 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         }
         timing.rows_kept += kept.values().map(Vec::len).sum::<usize>();
 
-        let sub_a = substitute(a, &ph_a, &binds, &types_a);
-        let sub_b = substitute(b, &ph_b, &binds, &types_b);
+        let (sub_a, sub_b) = match &gathered {
+            // The `VALUES` side's parameters as Postgres types them; the `unnest` side's arrays as
+            // literals, which each argument's own cast types.
+            Some(g) => {
+                let typed: BTreeMap<u32, String> =
+                    types_vals.iter().map(|(n, t)| (*n, param_type(t))).collect();
+                let (vals, ph_vals, unn, ph_unn) =
+                    if g.values_first { (a, &ph_a, b, &ph_b) } else { (b, &ph_b, a, &ph_a) };
+                let sv = substitute(vals, ph_vals, &binds, &typed);
+                let su = substitute(unn, ph_unn, &arrays, &BTreeMap::new());
+                if g.values_first {
+                    (sv, su)
+                } else {
+                    (su, sv)
+                }
+            }
+            None => (substitute(a, &ph_a, &binds, &types_a), substitute(b, &ph_b, &binds, &types_b)),
+        };
         let side_a = run_side(db, &sub_a, is_query_a, ret_a, &reset, &targets);
+        // Under the gather rule a side that raises is an outcome to compare, so the other runs too.
         let side_b = match &side_a {
             Ok(_) => run_side(db, &sub_b, is_query_b, ret_b, &reset, &targets),
-            Err(_) => Err(String::new()),
+            Err(_) if gathered.is_some() => run_side(db, &sub_b, is_query_b, ret_b, &reset, &targets),
+            Err(_) => Err(SideError { code: None, msg: String::new() }),
         };
         let (ra, rb) = match (side_a, side_b) {
             (Ok(ra), Ok(rb)) => (ra, rb),
-            (Err(e), _) | (_, Err(e)) => {
+            (side_a, side_b) => {
                 if let Err(e2) = finish(db) {
                     return Verdict::Error(e2);
                 }
-                if e.contains("statement timeout") {
-                    return Verdict::Error(e);
+                let e = match (&side_a, &side_b) {
+                    (Err(e), _) | (_, Err(e)) => e.clone(),
+                    _ => unreachable!("one side failed"),
+                };
+                if e.msg.contains("statement timeout") {
+                    return Verdict::Error(e.msg);
                 }
-                if !e.is_empty() {
-                    last_err = Some(e);
+                // The gather rule's one outcome beside two result sets: one side raises and the other
+                // does not. It counts only when nothing but the two statements explains it.
+                let one_sided = match (&side_a, &side_b, prepared) {
+                    (Ok(_), Err(e), Some((ran, _))) => Some(("B", "A", e, ran)),
+                    (Err(e), Ok(_), Some((_, ran))) => Some(("A", "B", e, ran)),
+                    _ => None,
+                };
+                // The `VALUES` side must prepare as written whichever side raised: its parameters
+                // need not be cast, so where Postgres cannot type them, a client declaring their
+                // types could make it run, or fail, otherwise than here. The `unnest` side casts
+                // every parameter, so its failing to prepare is the statement's own.
+                let values_prepares = match (&gathered, prepared) {
+                    (Some(g), Some((pa, pb))) => if g.values_first { pa } else { pb },
+                    _ => false,
+                };
+                if let (Some((who, other, e, ran)), Some((_, _, unheard))) = (one_sided, &plan) {
+                    let code = e.code.as_deref().unwrap_or("-");
+                    let why_not = if !tells_apart(e.code.as_deref()) {
+                        Some("an error that does not tell the statements apart")
+                    } else if !ran {
+                        Some("the side that ran does not prepare as written")
+                    } else if !values_prepares {
+                        Some("the VALUES side does not prepare as written")
+                    } else {
+                        *unheard
+                    };
+                    match why_not {
+                        None => {
+                            timing.typed_params = typed.len();
+                            let raised = format!("{who} raises {code} ({}); {other} does not", e.msg);
+                            let w = describe_gather(&binds, &arrays, &kept, &session, Some(raised));
+                            return Verdict::NotEquivalentGather(w);
+                        }
+                        Some(_) if boundary_trial && last_err.is_some() => {}
+                        Some(w) => {
+                            last_err =
+                                Some(format!("{who} alone raised {code}: {} (skipped: {w})", e.msg))
+                        }
+                    }
+                } else if !e.msg.is_empty() && (!boundary_trial || last_err.is_none()) {
+                    last_err = Some(e.msg);
                 }
                 timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
                 continue;
             }
         };
+        // A side that does not prepare as written can never run; a literal in its place running is
+        // no outcome of it.
+        if prepared.is_some_and(|(pa, pb)| !(pa && pb)) {
+            if let Err(e2) = finish(db) {
+                return Verdict::Error(e2);
+            }
+            last_err = Some("gather: a side ran that does not prepare as written".to_string());
+            timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
+            continue;
+        }
         ok_trials += 1;
         if misaligned.is_some() {
             let _ = finish(db);
@@ -1885,7 +2210,10 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             if ra.len() != rb.len() {
                 real = true;
             }
-            if real {
+            if real && gathered.is_some() {
+                let w = describe_gather(&binds, &arrays, &kept, &session, None);
+                verdict = Some(Verdict::NotEquivalentGather(w));
+            } else if real {
                 verdict = Some(Verdict::NotEquivalent(describe(&binds, &kept, clock)));
             } else if unknown {
                 timing.uncomparable += 1;
@@ -1904,6 +2232,12 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     }
     timing.typed_params = typed.len();
 
+    if gathered.is_some() {
+        return match (ok_trials, last_err) {
+            (0, Some(e)) => Verdict::Error(e),
+            (ok, e) => Verdict::NoCounterexampleGather(e.map(|e| (ok, e))),
+        };
+    }
     if let Some(detail) = misaligned {
         return match (ok_trials, last_err) {
             (0, Some(e)) => Verdict::Error(e),
@@ -1933,6 +2267,30 @@ mod tests {
             pg_lit(&Val::List(vec![Val::Str("a\"b".into()), Val::Int(2)])),
             r#"'{"a\"b","2"}'"#
         );
+    }
+
+    #[test]
+    fn only_errors_about_the_statements_tell_them_apart() {
+        for c in ["42804", "42846", "22003", "22001", "22P02", "23505", "23502", "21000", "42P10"] {
+            assert!(tells_apart(Some(c)), "{c}");
+        }
+        // Something missing from the DDL, the run itself, a function raising, or no SQLSTATE.
+        for c in [
+            "42P01", "42703", "42883", "42704", "42P18", "57014", "40001", "55P03", "XX000", "P0001",
+            "0A000",
+        ] {
+            assert!(!tells_apart(Some(c)), "{c}");
+        }
+        assert!(!tells_apart(None));
+    }
+
+    #[test]
+    fn a_parameter_type_with_a_default_length_is_cast_to_without_one() {
+        assert_eq!(param_type("character"), "bpchar");
+        assert_eq!(param_type("character[]"), "bpchar[]");
+        assert_eq!(param_type("bit"), "varbit");
+        assert_eq!(param_type("character varying"), "character varying");
+        assert_eq!(param_type("integer[]"), "integer[]");
     }
 
     #[test]

@@ -83,7 +83,8 @@ everything else:
     as an array type, as `T[]` does, and an `unnest` argument spelled `$j::T ARRAY` is refused, as
     the frontend refuses that spelling.
   - With a mismatched type the two sides apply different coercions. `text[]` into a `uuid` column
-    always errors, and `int4[]` into `bigint` differs on overflow.
+    always errors, and `int4[]` into `bigint` differs on overflow. `sqleq-fuzz` refutes such pairs
+    under the gather rule ([its README](../sqleq-fuzz/README.md#the-gather-rule)).
   - A generated cell is `DEFAULT`, `nextval('s')`, or one of a short list of generators called with
     no argument: the clocks (`now()`, `current_timestamp`, `localtimestamp`, `clock_timestamp()`,
     …) and the uuid generators. A generator with a parameter, a cast over one, and any other

@@ -260,11 +260,12 @@ fn an_array_on_one_side_and_a_scalar_on_the_other_is_not_compared() {
 #[test]
 fn an_array_on_a_side_postgres_cannot_prepare_is_still_not_compared_with_a_scalar() {
     // The `unnest` side assigns text to a uuid column, so Postgres types none of its placeholders;
-    // its own casts still say they are arrays.
+    // its own casts still say they are arrays. Its `WHERE` makes it no pair of the gather rule's
+    // shape, which would be run under that rule instead (below).
     let ddl = r#"create table "s" ("id" UUID PRIMARY KEY, "name" TEXT)"#;
     assert_kind!(
         r#"INSERT INTO "s" ("id", "name") VALUES (CAST($1 AS UUID), $2)"#,
-        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::text[], $2::pg_catalog.text[])"#,
+        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::text[], $2::pg_catalog.text[]) WHERE true"#,
         ddl,
         "NOT-COMPARABLE"
     );
@@ -429,6 +430,133 @@ create trigger "e_stamp" before update on "e" for each row execute function "sta
     assert_kind!(
         r#"UPDATE "e" SET "at" = now() WHERE "id" = $1"#,
         r#"UPDATE "e" SET "id" = "id" WHERE "id" = $1"#,
+        ddl,
+        "NOT-COMPARABLE"
+    );
+}
+
+// -- The gather rule: `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)` ----------------
+//
+// Each class of mismatch is refuted, beside a control the same but for the mismatch.
+
+const VALUES2: &str = r#"INSERT INTO "s" ("id", "name") VALUES ($1, $2), ($3, $4)"#;
+
+/// `VALUES2` against `unnest` of these two arrays.
+fn unnest2(id: &str, name: &str) -> String {
+    format!(r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::{id}[], $2::{name}[])"#)
+}
+
+/// The counterexample, or `None` when no Postgres is there to ask.
+fn witness(a: &str, b: &str, ddl: &str) -> Option<String> {
+    match outcome(a, b, ddl)?.verdict {
+        Verdict::NotEquivalentGather(w) => Some(w),
+        v => panic!("not a gather counterexample: {}\n  A: {a}\n  B: {b}", v.label()),
+    }
+}
+
+#[test]
+fn text_elements_into_a_uuid_column_are_refuted() {
+    let ddl = r#"create table "s" ("id" UUID PRIMARY KEY, "name" TEXT)"#;
+    assert_kind!(VALUES2, &unnest2("text", "text"), ddl, "NOT-EQUIVALENT-GATHER");
+    assert_kind!(VALUES2, &unnest2("uuid", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+    // Which side comes first does not matter.
+    assert_kind!(&unnest2("text", "text"), VALUES2, ddl, "NOT-EQUIVALENT-GATHER");
+    if let Some(w) = witness(VALUES2, &unnest2("text", "text"), ddl) {
+        assert!(w.contains("unnest side: $1='{"), "{w}");
+        assert!(w.contains("B raises 42804"), "{w}");
+    }
+}
+
+#[test]
+fn elements_narrower_than_the_column_are_refuted_past_their_range() {
+    let ddl = r#"create table "s" ("id" BIGINT, "name" TEXT)"#;
+    assert_kind!(VALUES2, &unnest2("int", "text"), ddl, "NOT-EQUIVALENT-GATHER");
+    assert_kind!(VALUES2, &unnest2("bigint", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+}
+
+#[test]
+fn an_element_cast_that_truncates_is_refuted() {
+    // A bare `char` is `char(1)`: the explicit cast keeps one character, the column all of them.
+    let ddl = r#"create table "s" ("id" INTEGER, "name" TEXT)"#;
+    assert_kind!(VALUES2, &unnest2("int", "char"), ddl, "NOT-EQUIVALENT-GATHER");
+    assert_kind!(VALUES2, &unnest2("int", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+    // Into a `varchar(8)` column the `VALUES` side raises on a long value, where the cast to
+    // `varchar(8)` truncates it; with `text` elements both sides raise.
+    let ddl = r#"create table "s" ("id" INTEGER, "name" VARCHAR(8))"#;
+    assert_kind!(VALUES2, &unnest2("int", "varchar(8)"), ddl, "NOT-EQUIVALENT-GATHER");
+    assert_kind!(VALUES2, &unnest2("int", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+}
+
+#[test]
+fn an_element_cast_that_rounds_is_refuted() {
+    let ddl = r#"create table "s" ("id" NUMERIC(10, 2), "name" TEXT)"#;
+    assert_kind!(VALUES2, &unnest2("numeric(10, 1)", "text"), ddl, "NOT-EQUIVALENT-GATHER");
+    // The same modifier rounds as the assignment does, and none leaves it to the assignment.
+    assert_kind!(VALUES2, &unnest2("numeric(10, 2)", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+    assert_kind!(VALUES2, &unnest2("numeric", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+}
+
+#[test]
+fn timestamptz_elements_into_a_timestamp_column_are_refuted_where_the_clocks_change() {
+    // A local time that does not exist in New York comes back an hour later from `timestamptz`.
+    let ddl = r#"create table "s" ("id" TIMESTAMP, "name" TEXT)"#;
+    assert_kind!(VALUES2, &unnest2("timestamp", "text"), ddl, "NO-COUNTEREXAMPLE-GATHER");
+    if let Some(w) = witness(VALUES2, &unnest2("timestamptz", "text"), ddl) {
+        assert!(w.contains("TimeZone: America/New_York"), "{w}");
+    }
+}
+
+#[test]
+fn an_array_column_is_refuted() {
+    // `unnest` flattens, so a `text[]` element is a `text`, and the column wants a `text[]`.
+    let ddl = r#"create table "s" ("id" INTEGER, "name" TEXT[])"#;
+    assert_kind!(VALUES2, &unnest2("int", "text"), ddl, "NOT-EQUIVALENT-GATHER");
+}
+
+#[test]
+fn the_arrays_follow_the_values_sides_columns() {
+    let ddl = r#"create table "s" ("id" INTEGER PRIMARY KEY, "name" TEXT)"#;
+    // Listed the other way round on both sides, the same pair.
+    let tail = r#"ON CONFLICT ("id") DO NOTHING RETURNING "id""#;
+    assert_kind!(
+        &format!(r#"INSERT INTO "s" ("name", "id") VALUES ($1, $2), ($3, $4) {tail}"#),
+        &format!(r#"INSERT INTO "s" ("name", "id") SELECT * FROM unnest($1::text[], $2::int[]) {tail}"#),
+        ddl,
+        "NO-COUNTEREXAMPLE-GATHER"
+    );
+    // The arrays the other way round: `$1` is the `id` column, whatever argument it is.
+    let ddl = r#"create table "s" ("id" TEXT, "name" TEXT)"#;
+    let swapped = r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($2::text[], $1::text[])"#;
+    assert_kind!(VALUES2, swapped, ddl, "NOT-EQUIVALENT-GATHER");
+}
+
+#[test]
+fn a_one_sided_error_counts_only_when_the_statements_alone_explain_it() {
+    // The same text-into-uuid pair, but a trigger could raise on either side's rows, and an
+    // undeclared type is a text domain here: no trial is a counterexample.
+    let trigger = r#"create table "s" ("id" UUID PRIMARY KEY, "name" TEXT);
+create function "f"() returns trigger language plpgsql as $$ begin return new; end $$;
+create trigger "s_f" before insert on "s" for each row execute function "f"()"#;
+    assert_kind!(VALUES2, &unnest2("text", "text"), trigger, "ERROR");
+    let repaired = r#"create table "s" ("id" UUID PRIMARY KEY, "name" "status")"#;
+    assert_kind!(VALUES2, &unnest2("text", "status"), repaired, "ERROR");
+    // A `VALUES` side Postgres cannot prepare as written: how a client typed its parameters could
+    // change whether it runs, so its raising is not counted either, though here it always would.
+    let ddl = r#"create table "s" ("id" INTEGER, "name" TEXT)"#;
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES ($1::text, $2), ($3::text, $4)"#,
+        &unnest2("int", "text"),
+        ddl,
+        "ERROR"
+    );
+}
+
+#[test]
+fn a_gather_pair_the_rule_cannot_bind_is_not_compared() {
+    let ddl = r#"create table "s" ("id" SERIAL PRIMARY KEY, "name" TEXT)"#;
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES (DEFAULT, $1), (DEFAULT, $2)"#,
+        &unnest2("int", "text"),
         ddl,
         "NOT-COMPARABLE"
     );

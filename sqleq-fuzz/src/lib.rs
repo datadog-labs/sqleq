@@ -25,11 +25,18 @@
 //! difference is not a counterexample and an agreement is not evidence. Those pairs report
 //! `PARAM-MISALIGNED` ([`patterns::misalignment`], [`test_pair`]).
 //!
+//! One shape of pair is bound another way. An `INSERT … VALUES` against an `INSERT … SELECT * FROM
+//! unnest(…)` has a value at `$1` on one side and an array on the other, so the Postgres engine runs
+//! it under the gather rule the Lean axis proves under: the `unnest` side's arrays are built from the
+//! values drawn for the `VALUES` side ([`gather`]). It answers `NOT-EQUIVALENT-GATHER` or
+//! `NO-COUNTEREXAMPLE-GATHER`, never a claim about index binding.
+//!
 //! Every soundness rule a verdict rests on is enforced here rather than assumed of the caller:
 //! uniqueness enforcement, time freezing, LIMIT/OFFSET handling, array canonicalization, the
 //! cardinality-only rule, and value-from-data param biasing. `README.md` states each one.
 
 pub mod duck;
+pub mod gather;
 pub mod gen;
 pub mod lex;
 pub mod limits;
