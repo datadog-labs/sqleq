@@ -74,7 +74,7 @@ reads looks exactly like one that holds.
 | `binding:` | a person | `index` (the default), `gather` or `gather-generated`: how the truth binds `$N` across the two sides ([below](#the-gather-rule)) |
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
-| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample`, which counts only under `binding: index`. |
+| `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` under `binding: index`, or `expect fuzz: counterexample-gather` under `binding: gather`. |
 | `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, the frontend's is `emit-reflexive` or `reflexive`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
 
 ## What each axis may say
@@ -85,7 +85,7 @@ nothing and changing what is refused moves a pin.
 | axis | words |
 |---|---|
 | `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `reflexive` (refused, but the two sides normalize to the same tree: settled without a plan), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
-| `fuzz` | `counterexample`, `no-counterexample`, `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
+| `fuzz` | `counterexample`, `no-counterexample`, `counterexample-gather`, `no-counterexample-gather` (the same two, for a pair it ran under the gather rule), `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
 | `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
 | `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `proved-gather-generated`, `no-witness-generated` (the same, under the weaker claim for generated cells), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
@@ -107,9 +107,9 @@ length, a date at infinity or a second session is pinned `no-counterexample` and
 
 | what the run sees | result |
 |---|---|
-| an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend finds its two sides one query (`emit-reflexive` or `reflexive`), or `sqleq-fuzz` refutes an equivalent one | **fails; `--bless` will not pin it** |
+| an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend finds its two sides one query (`emit-reflexive` or `reflexive`), or `sqleq-fuzz` refutes an equivalent one (`counterexample` under `binding: index`, `counterexample-gather` under `binding: gather`) | **fails; `--bless` will not pin it** |
 | the same, on a line marked `!known-unsound` | passes while the bug reproduces |
-| a proof (or the frontend's `emit-reflexive` or `reflexive`) and a `sqleq-fuzz` counterexample on one pair, an [alarm](../../sqleq-check/README.md#alarms) — whether or not either contradicts `truth`, as under a gather binding neither does | fails, unless one of the two is a `!known-unsound` line that still reproduces |
+| a proof (or the frontend's `emit-reflexive` or `reflexive`) and a `sqleq-fuzz` counterexample under the same binding on one pair, an [alarm](../../sqleq-check/README.md#alarms) — whether or not either contradicts `truth`, as an index-binding proof and counterexample on a gather pair do not | fails, unless one of the two is a `!known-unsound` line that still reproduces |
 | a `!known-unsound` line whose answer no longer contradicts `truth` | fails; `--bless` drops the marker |
 | a pinned answer that moved, either way | fails; `--bless` takes the new answer |
 | an axis that ran with no `expect` line | fails; `--bless` adds one |
@@ -128,8 +128,10 @@ pin is caught in every CI run, not only where that axis is installed.
 Every axis but Lean binds `$N` by number: `$1` on one side is `$1` on the other. The Lean axis
 proves `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)` under the gather rule instead:
 the `unnest` side's array `$j` is column `j` of the `VALUES` rows ([LEAN.md](../../docs/LEAN.md)).
-A pair headed `-- binding: gather` states its truth under that rule, and its `witness:` or
-`argument:` binds the parameters the same way.
+`sqleq-fuzz` tests a pair of that shape under the same rule, building the `unnest` side's arrays
+from the values it draws for the `VALUES` side, and says `counterexample-gather` or
+`no-counterexample-gather`. A pair headed `-- binding: gather` states its truth under that rule,
+and its `witness:` or `argument:` binds the parameters the same way.
 
 A pair whose `VALUES` side has generated cells (`DEFAULT`, `nextval('s')`, `now()`) is headed
 `-- binding: gather-generated` instead. Its `unnest` side's arrays also carry what those cells
@@ -138,11 +140,12 @@ claims: the `unnest` side reproduces the `VALUES` side when given the generated 
 `witness:` for such a pair gives the `unnest` side the values the `VALUES` side generated.
 
 Only an axis answering under a pair's binding can contradict its truth or stand as evidence for it.
-Under either gather binding that is Lean alone; the other axes refuse to compare a scalar with an
-array at the same `$N`, and their pins record exactly that. Under `gather` a generated answer
+Under `gather` that is Lean, and `sqleq-fuzz`'s `-gather` answers; under `gather-generated` it is
+Lean alone, since `sqleq-fuzz` refuses a generated cell. The provers refuse to compare a scalar with
+an array at the same `$N`, and their pins record exactly that. Under `gather` a generated answer
 claims less than the truth, so it is neither evidence nor a contradiction there; under
 `gather-generated` a plain gather proof claims more, so it is both. Under the default binding,
-Lean's answers are ordinary pins.
+Lean's answers and `sqleq-fuzz`'s `-gather` ones are ordinary pins.
 
 ## `!known-unsound`
 

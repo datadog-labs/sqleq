@@ -233,6 +233,9 @@ fn fuzz_labels_map_to_their_kind() {
     let rows = [
         ("echo NOT-EQUIVALENT; echo 'counterexample: t=[(0)]'", ("counterexample", "t=[(0)]")),
         ("echo NO-COUNTEREXAMPLE", ("no-counterexample", "")),
+        ("echo NOT-EQUIVALENT-GATHER; echo 'counterexample: $1=0'", ("counterexample-gather", "$1=0")),
+        ("echo NO-COUNTEREXAMPLE-GATHER", ("no-counterexample-gather", "")),
+        ("echo 'NOT-COMPARABLE:gather: generated cells'", ("not-comparable", "gather: generated cells")),
         ("echo 'PARAM-MISALIGNED:$1 vs $2'", ("param-misaligned", "$1 vs $2")),
         ("echo 'ERROR:Binder Error'", ("error", "Binder Error")),
         ("echo boom >&2; exit 1", ("error", "boom")),

@@ -105,7 +105,7 @@ pub fn fmt_verdict(c: Color, v: &str) -> String {
         "{} {v}",
         match v {
             portfolio::ALARM => "‼",
-            portfolio::NOT_EQUIVALENT => "✗",
+            portfolio::NOT_EQUIVALENT | portfolio::NOT_EQUIVALENT_GATHER => "✗",
             portfolio::TIMEOUT => "⏱",
             portfolio::UNDECIDED => "·",
             _ => "✓",
@@ -113,7 +113,7 @@ pub fn fmt_verdict(c: Color, v: &str) -> String {
     );
     match v {
         portfolio::ALARM => c.red(&c.bold(&s)),
-        portfolio::NOT_EQUIVALENT | portfolio::TIMEOUT => c.yellow(&s),
+        portfolio::NOT_EQUIVALENT | portfolio::NOT_EQUIVALENT_GATHER | portfolio::TIMEOUT => c.yellow(&s),
         portfolio::UNDECIDED => c.dim(&s),
         _ => c.green(&s),
     }
@@ -132,7 +132,9 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
     }
     if o.verdict == portfolio::ALARM {
         tail += &format!("  {}", c.red(&format!("— {}", alarm_words(case, &o.by))));
-    } else if o.verdict == portfolio::NOT_EQUIVALENT && !case.f_note.is_empty() {
+    } else if [portfolio::NOT_EQUIVALENT, portfolio::NOT_EQUIVALENT_GATHER].contains(&o.verdict.as_str())
+        && !case.f_note.is_empty()
+    {
         tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
     } else if !portfolio::decisive(&o.verdict) {
         let last = suite::splitlines(&case.message).into_iter().map(str::trim).rfind(|l| !l.is_empty());
@@ -530,8 +532,10 @@ pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
         println!("  {v:<22} {n:>5}");
     }
     println!("{}", rule(c));
-    for x in scored.iter().filter(|x| x.f_verdict.as_deref() == Some("counterexample")) {
-        println!("{}", c.dim(&format!("  {:<22}       {}", "counterexample", x.name)));
+    for word in ["counterexample", "counterexample-gather"] {
+        for x in scored.iter().filter(|x| x.f_verdict.as_deref() == Some(word)) {
+            println!("{}", c.dim(&format!("  {word:<22}       {}", x.name)));
+        }
     }
     if let Some(w) = stats.wall_s {
         println!("{}", c.dim(&format!("  {:<22} {w:.2}s", "wall time")));
@@ -691,6 +695,8 @@ pub struct VerdictCounts {
     #[serde(rename = "not-equivalent")]
     pub not_equivalent: usize,
     pub equivalent: usize,
+    #[serde(rename = "not-equivalent-gather")]
+    pub not_equivalent_gather: usize,
     #[serde(rename = "equivalent-gather")]
     pub equivalent_gather: usize,
     #[serde(rename = "equivalent-gather-generated")]
@@ -721,6 +727,7 @@ impl PortfolioMeta {
                 }
                 portfolio::NOT_EQUIVALENT => counts.not_equivalent += 1,
                 portfolio::EQUIVALENT => counts.equivalent += 1,
+                portfolio::NOT_EQUIVALENT_GATHER => counts.not_equivalent_gather += 1,
                 portfolio::EQUIVALENT_GATHER => counts.equivalent_gather += 1,
                 portfolio::EQUIVALENT_GATHER_GENERATED => counts.equivalent_gather_generated += 1,
                 portfolio::TIMEOUT => counts.timeout += 1,

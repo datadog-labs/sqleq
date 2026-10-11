@@ -190,8 +190,10 @@ plain gather proof claims more. A proof the binding counts is a claim of equival
 a witness was found, so a `no-witness` pinned against a not-equivalent truth fails the run as a
 false proof would. Under `--portfolio` a Lean proof gives a verdict of its own rather than plain
 `equivalent`: `proved-gather` makes a case `equivalent-gather`, and `proved-gather-generated` makes
-it `equivalent-gather-generated`. A Lean proof and a `sqleq-fuzz` counterexample answer under
-different bindings, so together they make a case `not-equivalent`, not an alarm.
+it `equivalent-gather-generated`. A Lean proof and a `sqleq-fuzz` `counterexample-gather`, which
+`sqleq-fuzz` finds by running the pair under the gather rule, answer under one binding, so together
+they make the case an alarm. A Lean proof and a plain `counterexample` answer under different
+bindings, so together they make a case `not-equivalent`, not an alarm.
 
 A proof counts only if both of these checks pass:
 

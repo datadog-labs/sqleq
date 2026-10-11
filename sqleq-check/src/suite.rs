@@ -29,9 +29,9 @@
 //! `truth` is stated under a parameter binding. The default, `index`, is the one every axis but
 //! Lean answers under: `$N` on one side is `$N` on the other. A pair headed `-- binding: gather`
 //! states its truth under the gather rule instead (the `unnest` side's array `$j` is column `j` of
-//! the `VALUES` rows; docs/LEAN.md), which only the Lean axis answers under. An answer can
-//! contradict a truth only when the axis and the pair use the same binding; under the other one it
-//! is an ordinary pin.
+//! the `VALUES` rows; docs/LEAN.md), which the Lean axis proves under and sqleq-fuzz tests under,
+//! with its own words for what it finds there. An answer can contradict a truth only when the axis
+//! and the pair use the same binding; under the other one it is an ordinary pin.
 //!
 //! This is the logic only; the harness runs the axes and calls it.
 
@@ -64,15 +64,17 @@ pub const GATHER_GENERATED: &str = "gather-generated";
 pub const BINDINGS: [&str; 3] = [INDEX, GATHER, GATHER_GENERATED];
 pub const GATHERS: [&str; 2] = [GATHER, GATHER_GENERATED];
 
-/// The bindings an axis answers under. Only Lean reads a scalar and an array at the same `$N` as
-/// the gather rule relates them; every other axis refuses such a pair.
+/// The bindings an axis answers under. Lean reads a scalar and an array at the same `$N` only as
+/// the gather rule relates them. sqleq-fuzz answers under `index`, and under `gather` for a pair of
+/// the gather rule's shape, which it runs with the `unnest` side's arrays built from the `VALUES`
+/// side's values; it refuses a generated cell, so it never answers under `gather-generated`. Every
+/// other axis refuses such a pair.
 pub fn axis_bindings(axis: &str) -> &'static [&'static str] {
-    if axis == "lean" {
-        &GATHERS
-    } else if AXES.contains(&axis) {
-        &[INDEX]
-    } else {
-        &[]
+    match axis {
+        "lean" => &GATHERS,
+        "fuzz" => &[INDEX, GATHER],
+        a if AXES.contains(&a) => &[INDEX],
+        _ => &[],
     }
 }
 
@@ -96,9 +98,12 @@ pub fn words(axis: &str) -> &'static [&'static str] {
             "refuse:schema",
             "refuse:parameter-misaligned",
         ],
+        // The `-gather` pair is what it found under the gather binding.
         "fuzz" => &[
             "counterexample",
             "no-counterexample",
+            "counterexample-gather",
+            "no-counterexample-gather",
             "param-misaligned",
             "not-comparable",
             "nondet-skip",
@@ -160,10 +165,13 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
     }
 }
 
-/// The one answer that claims the opposite of equivalence.
-pub fn refutes(axis: &str) -> &'static [&'static str] {
-    match axis {
-        "fuzz" => &["counterexample"],
+/// The one answer that claims the opposite of equivalence under `binding`: a counterexample found
+/// with `$N` bound alike on both sides, or one found with the `unnest` side's arrays gathered from
+/// the `VALUES` side's values.
+pub fn refutes(axis: &str, binding: &str) -> &'static [&'static str] {
+    match (axis, binding) {
+        ("fuzz", INDEX) => &["counterexample"],
+        ("fuzz", GATHER) => &["counterexample-gather"],
         _ => &[],
     }
 }
@@ -368,7 +376,7 @@ pub fn contradicts(truth: Option<&str>, axis: &str, word: &str, binding: &str) -
     }
     match truth {
         Some(NOT_EQUIVALENT) => claims_equivalent(axis, binding).contains(&word),
-        Some(EQUIVALENT) => refutes(axis).contains(&word),
+        Some(EQUIVALENT) => refutes(axis, binding).contains(&word),
         _ => false,
     }
 }
@@ -421,11 +429,10 @@ pub fn lint(h: &Header) -> Vec<String> {
     };
     let gather = GATHERS.contains(&h.binding.as_str());
     let has = |k: &str| h.text.get(k).is_some_and(|v| !v.is_empty());
-    if truth == Some(NOT_EQUIVALENT) && !says(&refutes) && !has("witness") {
-        errs.push(if gather {
-            "a non-equivalent pair needs a `witness:`".to_string()
-        } else {
-            "a non-equivalent pair needs `expect fuzz: counterexample` or a `witness:`".to_string()
+    if truth == Some(NOT_EQUIVALENT) && !says(&|a| refutes(a, &h.binding)) && !has("witness") {
+        errs.push(match refutes("fuzz", &h.binding) {
+            [word] => format!("a non-equivalent pair needs `expect fuzz: {word}` or a `witness:`"),
+            _ => "a non-equivalent pair needs a `witness:`".to_string(),
         });
     }
     if truth == Some(EQUIVALENT) && !says(&|a| evidence_equivalent(a, &h.binding)) && !has("argument") {
@@ -726,10 +733,20 @@ mod tests {
                 "contradicts `truth: not-equivalent`",
                 with(&NEQ_OK, &["-- binding: gather", "-- expect lean: no-witness"]),
             ),
-            // Under the gather rule only Lean's answers are evidence, and `no-witness` is not.
+            // Under the gather rule a counterexample found with `$N` bound alike is no evidence...
+            (
+                "a non-equivalent pair needs `expect fuzz: counterexample-gather` or a `witness:`",
+                vec!["-- truth: not-equivalent", "-- binding: gather", "-- origin: x", "-- expect fuzz: counterexample"],
+            ),
+            // ...under its generated form sqleq-fuzz answers nothing, so only a written witness is...
             (
                 "a non-equivalent pair needs a `witness:`",
-                vec!["-- truth: not-equivalent", "-- binding: gather", "-- origin: x", "-- expect fuzz: counterexample"],
+                vec!["-- truth: not-equivalent", "-- binding: gather-generated", "-- origin: x"],
+            ),
+            // ...and a gather counterexample contradicts a gather truth, as `counterexample` does an index one.
+            (
+                "contradicts `truth: equivalent`",
+                with(&EQ_OK, &["-- binding: gather", "-- expect fuzz: counterexample-gather"]),
             ),
             (
                 "needs `expect lean: proved-gather` or an `argument:`",
@@ -784,6 +801,10 @@ mod tests {
             none
         );
         assert_eq!(
+            errors(&["-- truth: not-equivalent", "-- binding: gather", "-- origin: x", "-- expect fuzz: counterexample-gather"]),
+            none
+        );
+        assert_eq!(
             errors(&[
                 "-- truth: equivalent",
                 "-- binding: gather-generated",
@@ -796,7 +817,8 @@ mod tests {
 
     #[test]
     fn an_axis_under_the_other_binding_contradicts_nothing() {
-        // The other axes refuse a gather pair, and Lean has nothing to say about an index one.
+        // The provers refuse a gather pair, Lean has nothing to say about an index one, and each of
+        // sqleq-fuzz's counterexamples is about its own binding only.
         let none = Vec::<String>::new();
         assert_eq!(
             errors(&[
@@ -809,6 +831,7 @@ mod tests {
             none
         );
         assert_eq!(errors(&with(&NEQ_OK, &["-- expect lean: proved-gather"])), none);
+        assert_eq!(errors(&with(&EQ_OK, &["-- expect fuzz: counterexample-gather"])), none);
     }
 
     #[test]
@@ -897,7 +920,17 @@ mod tests {
             ("lean vacuous false proof", with(&NEQ_OK, &["-- binding: gather"]), ("lean", "no-witness"), INVARIANT),
             ("lean on an index pair", NEQ_OK.to_vec(), ("lean", "proved-gather"), UNPINNED),
             ("prover on a gather pair", with(&NEQ_OK, &["-- binding: gather"]), ("qed", "proved"), UNPINNED),
+            // sqleq-fuzz's two kinds of counterexample, each against the truth of its own binding only.
             ("fuzz on a gather pair", with(&EQ_OK, &["-- binding: gather"]), ("fuzz", "counterexample"), UNPINNED),
+            ("false gather refutation", with(&EQ_OK, &["-- binding: gather"]), ("fuzz", "counterexample-gather"), INVARIANT),
+            ("gather refutation of an index pair", EQ_OK.to_vec(), ("fuzz", "counterexample-gather"), UNPINNED),
+            (
+                "gather refutation of a gather-generated pair",
+                with(&EQ_OK, &["-- binding: gather-generated"]),
+                ("fuzz", "counterexample-gather"),
+                UNPINNED,
+            ),
+            ("gather refutation", with(&NEQ_OK, &["-- binding: gather"]), ("fuzz", "counterexample-gather"), UNPINNED),
             (
                 "lean generated false proof",
                 with(&NEQ_OK, &["-- binding: gather-generated"]),

@@ -35,6 +35,9 @@ fn word_of(kind: &str) -> &'static str {
     match kind {
         "NOT-EQUIVALENT" => "counterexample",
         "NO-COUNTEREXAMPLE" => "no-counterexample",
+        // The same two answers about a pair it ran under the gather rule (docs/LEAN.md).
+        "NOT-EQUIVALENT-GATHER" => "counterexample-gather",
+        "NO-COUNTEREXAMPLE-GATHER" => "no-counterexample-gather",
         "PARAM-MISALIGNED" => "param-misaligned",
         "NOT-COMPARABLE" => "not-comparable",
         "NONDET-SKIP" => "nondet-skip",

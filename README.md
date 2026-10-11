@@ -124,15 +124,16 @@ axis, and under `--portfolio` one verdict per pair.
 | `proved-literal`, `emit-reflexive`, `reflexive` | a prover, the frontend | the two sides are one query once normalized, so equivalent without a proof search | — |
 | `proved-gather` | Lean | equivalent under the gather rule for parameters, a different binding from the others' ([`docs/LEAN.md`](docs/LEAN.md)) | equivalent under index binding |
 | `counterexample` | `sqleq-fuzz` | not equivalent, and here is the instance that shows it | — |
-| `no-counterexample` | `sqleq-fuzz` | no divergence on the instances it tried | **not** a proof |
+| `counterexample-gather` | `sqleq-fuzz` | not equivalent under the gather rule, the binding Lean proves under, and here is the instance | not equivalent under index binding |
+| `no-counterexample`, `no-counterexample-gather` | `sqleq-fuzz` | no divergence on the instances it tried | **not** a proof |
 | `unprovable`, `no-proof` | the QED prover, any prover | this prover did not get there | **not** "not equivalent" |
 | `timeout` | any axis | it ran out of time | **not** a claim about the pair |
 | `refused`, `no-plan`, `unsupported` | the frontend, a prover | it declined to lower the pair rather than guess | **not** a claim about the pair |
 
 Under `--portfolio` each pair gets one verdict: `alarm` (a proof *and* a counterexample under the
 same parameter binding — one backend is wrong), `not-equivalent`, `equivalent`,
-`equivalent-gather` or `equivalent-gather-generated` (the Lean axis's claims), `timeout` (nothing
-decisive, and a backend was cut off) or `undecided`.
+`not-equivalent-gather`, `equivalent-gather` or `equivalent-gather-generated` (the claims under the
+gather rule), `timeout` (nothing decisive, and a backend was cut off) or `undecided`.
 
 Two consequences worth internalizing before you read any output:
 
