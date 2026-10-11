@@ -71,8 +71,9 @@ How the Postgres engine differs from the DuckDB one:
   hint where Postgres cannot infer one — and one type across the pair: a side that leaves `$N`
   untyped, or that Postgres merely reads as `text` (`SELECT $1 AS x`), takes the other side's type;
   a side that casts it keeps its cast. A `$N` that is an array on one side and a scalar on the
-  other is `NOT-COMPARABLE`. Values are still written into the statement, cast to that type, rather
-  than bound as parameters: captured SQL writes a `$N` where no parameter may stand
+  other is `NOT-COMPARABLE`, unless the pair is one the gather rule binds
+  ([below](#the-gather-rule)). Values are still written into the statement, cast to that type,
+  rather than bound as parameters: captured SQL writes a `$N` where no parameter may stand
   (`interval $1`).
 - **Rows are compared under Postgres `=`.** Bags whose text is the same are the same; two bags of
   one size whose text differs are compared again in Postgres, so `1.0` and `1.00` are one value
@@ -194,6 +195,56 @@ diagonal. `WHERE a = $1` against `WHERE a = $2` shares no index, and drawing `1`
 landed (pinned by `disjoint_parameter_sets_are_misaligned_too`). So the condition here is *any* index
 in one query and not the other. It exists for the argument, not for any measured yield.
 
+### The gather rule
+
+One shape of pair is bound another way: an `INSERT … VALUES` against an
+`INSERT … SELECT * FROM unnest(…)` on the same table and column list, each source that and nothing
+else, the `VALUES` cells parameters (cast or not) or `NULL`, the `unnest` arguments parameters cast
+to arrays.
+
+```sql
+INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4);
+INSERT INTO t (a, b) SELECT * FROM unnest($1::int[], $2::text[]);
+```
+
+The `VALUES` side's `$1` is a value and the `unnest` side's an array, so index binding has nothing to
+compare. The Postgres engine runs such a pair under the gather rule instead, the binding the Lean
+axis proves under ([`../docs/LEAN.md`](../docs/LEAN.md)): the `unnest` side's array `$j` is column `j`
+of the `VALUES` rows, in row order, whatever position its argument has. Each trial draws values for
+the `VALUES` side's parameters, typed as Postgres types them, and builds the arrays from them, so
+here `$1 = [$1, $3]` and `$2 = [$2, $4]`. What the two sides show is then compared as for any other
+pair, and the labels say which binding was used: `NOT-EQUIVALENT-GATHER` and
+`NO-COUNTEREXAMPLE-GATHER`.
+
+Four things differ from index binding, all in this mode only:
+
+- **Fresh values.** The draws repeat a handful of values, shared with the generated tables, so the
+  rows an `INSERT` writes mostly meet a row already there, or each other, on a key, and both sides
+  raise. On every other trial each parameter instead takes a value of its own that the tables do not
+  hold (an integer, a number, a string or a uuid moved out of those domains), so that the two sides
+  have rows to compare. Those are the trials that run in `America/New_York`, below.
+- **Values past a narrower type.** Some trials give a parameter a value just past the narrowest type
+  its value meets on either side: one past an integer type's range, a string one character longer
+  than a `char` or `varchar(n)`, one more decimal place than a `numeric(p, s)`, an integer a `real`
+  does not hold. Where a `timestamp` and a `timestamptz` meet, every other trial runs in
+  `America/New_York`, where a local time inside the spring gap does not survive the round trip, and
+  a value with an explicit offset is read apart by the two types.
+- **One side raising is an outcome.** Both sides run on every trial, and one raising while the other
+  does not is a counterexample, when nothing but the two statements explains it: the error is about
+  the values or the statement (SQLSTATE class 21, 22, 23 or 42, but not a missing table, column,
+  function, type or parameter, which incomplete DDL explains as well), the side that ran and the
+  `VALUES` side both prepare as written (the `unnest` side casts every parameter, so its failing to
+  prepare is its own), the DDL ran without a repair, and no target table has a trigger or a rule.
+  Otherwise the trial is skipped, as every failed trial is under index binding.
+- **What cannot be bound is said.** A pair of the shape with a cell the rule has no parameter for (a
+  generated cell such as `DEFAULT` or `now()`, or a literal), an `unnest` argument `$p` with no
+  column `p`, or a parameter outside the cells and the arguments is
+  `NOT-COMPARABLE:gather: …`.
+
+A value drawn that its own parameter's type does not hold is no binding at all, so such a trial is
+skipped before it runs. The DuckDB engine does not bind this way: such a pair stays
+`NOT-COMPARABLE` there.
+
 ### What the withdrawn claims actually were
 
 Refusing costs verdicts, so a withdrawn claim is classified by what evidence the pair carries about
@@ -267,11 +318,13 @@ to `out.json` (default: beside the corpus, its extension replaced by `.fuzz.json
 is one, `caveat`. A name whose digits number no row gets `NO-ROW`. A
 panic while testing one row is that row's `ERROR:panic: …`, and the run goes on to the next one.
 
-Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `ERROR:...`, `PARAM-MISALIGNED:...`,
-`NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that carry a message after
-a `:` still bucket correctly for a consumer that splits on the first one. `NOT-COMPARABLE` is a
-withheld verdict: the two sides share no observable, a `$N` is an array on one side and a scalar on
-the other, a pair needs an ICU collation, or the generated instances cannot stand for the DDL.
+Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `NOT-EQUIVALENT-GATHER`,
+`NO-COUNTEREXAMPLE-GATHER` (the same two, under [the gather rule](#the-gather-rule)), `ERROR:...`,
+`PARAM-MISALIGNED:...`, `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that
+carry a message after a `:` still bucket correctly for a consumer that splits on the first one.
+`NOT-COMPARABLE` is a withheld verdict: the two sides share no observable, a `$N` is an array on one
+side and a scalar on the other, a pair of the gather rule's shape cannot be bound by it, a pair needs
+an ICU collation, or the generated instances cannot stand for the DDL.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file without exactly two

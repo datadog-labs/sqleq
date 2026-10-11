@@ -101,6 +101,13 @@ pub enum Verdict {
     /// Labelled `NO-COUNTEREXAMPLE` (that *is* the finding); the count is reported alongside so thin
     /// coverage stays visible instead of masquerading as a full run.
     NoCounterexamplePartial { ok: usize, last_err: String },
+    /// A counterexample under the gather rule, the binding the Lean axis proves under: the `unnest`
+    /// side's arrays built from the `VALUES` side's values ([`crate::gather`]). Not a claim about
+    /// the pair under index binding. Only the Postgres engine finds one.
+    NotEquivalentGather(String),
+    /// No counterexample under the gather rule, within the budget; `Some` with how many trials
+    /// compared both sides and the last error, when not all of them did.
+    NoCounterexampleGather(Option<(usize, String)>),
     /// *No* trial ever ran both sides — genuinely untestable (carries the last error message).
     Error(String),
 }
@@ -120,6 +127,8 @@ impl Verdict {
             Verdict::NoCounterexample | Verdict::NoCounterexamplePartial { .. } => {
                 "NO-COUNTEREXAMPLE".to_string()
             }
+            Verdict::NotEquivalentGather(_) => "NOT-EQUIVALENT-GATHER".to_string(),
+            Verdict::NoCounterexampleGather(_) => "NO-COUNTEREXAMPLE-GATHER".to_string(),
             Verdict::Error(e) => format!("ERROR:{e}"),
         }
     }
@@ -128,6 +137,7 @@ impl Verdict {
     pub fn partial(&self) -> Option<(usize, &str)> {
         match self {
             Verdict::NoCounterexamplePartial { ok, last_err } => Some((*ok, last_err.as_str())),
+            Verdict::NoCounterexampleGather(Some((ok, last_err))) => Some((*ok, last_err.as_str())),
             _ => None,
         }
     }

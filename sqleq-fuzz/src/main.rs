@@ -466,7 +466,7 @@ fn test_one(a: &str, b: &str, ddl: &str, cfg: Config, engine: &str) -> Result<()
 
 fn report(v: &Verdict, engine: &str, caveat: Option<&str>) {
     println!("{}", v.label());
-    if let Verdict::NotEquivalent(ce) = v {
+    if let Verdict::NotEquivalent(ce) | Verdict::NotEquivalentGather(ce) = v {
         println!("counterexample: {ce}");
     }
     // The same fact `csv` mode records as `ok_trials` / `trial_error`: the label is the finding,
