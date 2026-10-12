@@ -378,6 +378,16 @@ what it is or refused:
   (`normalize::collapse_repeated_casts`), and `$1::uuid::uuid` and `$1::uuid` are one plan. The two
   targets must be spelled the same, modifiers included. Two spellings of one type that the parser
   keeps apart (`int4` and `integer`) stay as written, which costs only proofs.
+- **`NOT` over a comparison is the comparison's negator.** Postgres declares `<>` the negator of
+  `=`, `>=` that of `<` and `>` that of `<=`, and each agrees with `NOT` over the other under
+  three-valued logic: on a NULL operand both are NULL. So `NOT (a = 1)` is lowered as `a <> 1` and
+  `NOT (a < 1)` as `a >= 1` (`types::not_bool`), and the two spellings are one plan. Only over
+  operands of a type whose order and `=` the IR reads as its own: the integers, `numeric`, text,
+  `boolean`, `date`, `time`, `timestamp`, `timestamptz` and `interval`. Every other negated
+  predicate stays a `NOT`: a comparison of values the IR keeps opaque, a float's included, since
+  some of the types it stands for declare no negator (`path`'s `=` has none, and `point` has a `<>`
+  and no `=`); an order comparison of strings under a collation other than `C` or `POSIX`
+  (`q_str_lt`); `IS DISTINCT FROM`, `LIKE`, an `IN` subquery, and `= ANY` over an array value.
 - **A parameter has the type Postgres gives it at its first use.** A client that sends `$N` without a
   type leaves it to Postgres, which types it where it first meets it, in the order it analyses the
   statement: in `n + 0 = $1 AND $1 > 0`, over a `numeric` `n`, `$1` is a `numeric`. Type inference
