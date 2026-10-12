@@ -20,7 +20,8 @@
 //! What is this module's own is the parse (one statement at a time, with a retry, below) and the
 //! type mapping: [`crate::pgddl::map_pg_type`] defers to `map_type_name`, which matches the *base*
 //! name against fixed sets and treats anything array/struct/map-shaped, or simply unrecognised, as
-//! unmappable, where a pair file keeps an unrecognised type's own name (issue #93).
+//! unmappable. The catalog maps a pair file's columns through it too, so a column's type is read one
+//! way whichever input declared it (issue #93).
 //!
 //! Opaque means `VARBINARY`, which the prover treats as an uninterpreted `Custom` sort supporting `=`
 //! only. That is the conservative answer: equality, `IN` and projection keep working, while any
@@ -421,7 +422,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             Parsed::Rejected(r) => Ddl::Rejected(&r.statement),
         })
         .collect();
-    let catalog = crate::catalog::build(&ddl, crate::catalog::TypeMap::Raw);
+    let catalog = crate::catalog::build(&ddl);
     let errors = parsed
         .into_iter()
         .filter_map(|p| match p {
@@ -494,8 +495,8 @@ mod tests {
                 ("id".into(), "INTEGER".into()),
                 ("total".into(), "REAL".into()),
                 ("note".into(), "VARCHAR".into()),
-                // An array of text: opaque, and its `=` is identity.
-                ("tags".into(), crate::types::IDENTITY_OPAQUE.into()),
+                // An array of text: opaque, its `=` is identity, and it carries its declared type.
+                ("tags".into(), format!("{}@text[]", crate::types::IDENTITY_OPAQUE)),
                 ("created_at".into(), "TIMESTAMP".into()),
             ]
         );
@@ -542,7 +543,7 @@ mod tests {
         // `"char"` is a real Postgres type, a parser that keeps the quotes must not lose the table
         // over them, and it is neither `char(n)` nor text: one byte, which reads `'ab'` as `'a'`.
         let cat = parse_provided_schema(r#"CREATE TABLE t (a "char" NOT NULL);"#);
-        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARBINARY".into())]);
+        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARBINARY@\"char\"".into())]);
     }
 
     #[test]

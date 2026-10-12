@@ -32,9 +32,13 @@ fn schema_of(column_type: &str, raw: bool) -> (Vec<String>, Option<Vec<bool>>) {
 
 #[test]
 fn an_opaque_column_whose_equality_is_identity_is_listed() {
-    let declared = ["BYTEA", "INTEGER[]", "BIGINT[]", "TEXT[]", "VARCHAR(8)[]", "BOOLEAN[]", "DATE[]", "TIMESTAMP[]", "BYTEA[]", "INT ARRAY"];
-    let raw_only = ["uuid", "money", "name", "int4range", "int8range", "daterange", "uuid[]", "timestamptz[]", "int4range[]"];
-    for (ty, raw) in declared.iter().map(|t| (*t, false)).chain(declared.iter().chain(&raw_only).map(|t| (*t, true))) {
+    // A pair file and raw DDL read a column's type one way (issue #93).
+    let names = [
+        "BYTEA", "INTEGER[]", "BIGINT[]", "TEXT[]", "VARCHAR(8)[]", "BOOLEAN[]", "DATE[]", "TIMESTAMP[]", "BYTEA[]",
+        "INT ARRAY", "uuid", "money", "name", "int4range", "int8range", "daterange", "uuid[]", "timestamptz[]",
+        "int4range[]",
+    ];
+    for (ty, raw) in names.iter().flat_map(|t| [(*t, false), (*t, true)]) {
         let (types, flags) = schema_of(ty, raw);
         assert_eq!(types, ["INTEGER", "VARBINARY"], "{ty} (raw DDL: {raw})");
         assert_eq!(flags, Some(vec![false, true]), "{ty} (raw DDL: {raw})");
@@ -44,9 +48,11 @@ fn an_opaque_column_whose_equality_is_identity_is_listed() {
 #[test]
 fn an_opaque_column_whose_equality_is_not_identity_is_not() {
     // Each has two values `=` calls equal that print differently, or no `=` worth the name.
-    let both = ["DOUBLE PRECISION", "REAL", "NUMERIC[]", "DOUBLE PRECISION[]", "INTERVAL[]", "JSONB[]", "TIME WITH TIME ZONE"];
-    let raw_only = ["jsonb", "numrange", "tsrange", "box", "point", "json", "inet", "mood", "public.uuid"];
-    for (ty, raw) in both.iter().map(|t| (*t, false)).chain(both.iter().chain(&raw_only).map(|t| (*t, true))) {
+    let names = [
+        "DOUBLE PRECISION", "REAL", "NUMERIC[]", "DOUBLE PRECISION[]", "INTERVAL[]", "JSONB[]", "TIME WITH TIME ZONE",
+        "jsonb", "numrange", "tsrange", "box", "point", "json", "inet", "mood", "public.uuid",
+    ];
+    for (ty, raw) in names.iter().flat_map(|t| [(*t, false), (*t, true)]) {
         let (types, flags) = schema_of(ty, raw);
         assert_eq!(types, ["INTEGER", "VARBINARY"], "{ty} (raw DDL: {raw})");
         assert_eq!(flags, None, "{ty} (raw DDL: {raw})");
@@ -55,9 +61,8 @@ fn an_opaque_column_whose_equality_is_not_identity_is_not() {
 
 #[test]
 fn a_column_that_is_not_opaque_is_not_listed() {
-    // INTEGER's `=` is identity too, but its IR type already says so; `uuid` in a declared `CREATE
-    // TABLE` keeps its own name.
-    for (ty, raw) in [("INTEGER", false), ("TEXT", true), ("NUMERIC", true), ("uuid", false)] {
+    // INTEGER's `=` is identity too, but its IR type already says so.
+    for (ty, raw) in [("INTEGER", false), ("TEXT", true), ("NUMERIC", true)] {
         assert_eq!(schema_of(ty, raw).1, None, "{ty} (raw DDL: {raw})");
     }
 }

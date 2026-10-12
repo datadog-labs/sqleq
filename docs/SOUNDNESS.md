@@ -191,8 +191,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   which Postgres computes as an integer division. `count`, `min` and `max` are integers, so they keep
   their operand's type.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
-  The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
-  inference, read every name from one table, so `uuid` and `money` are opaque in both.
+  A column's type is read one way, whether a pair file or raw DDL declares it, and a cast's target
+  from the same table of names, so `uuid` and `money` are opaque in both.
 - **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
   where two values `=` calls equal are the same value, and for `double precision`, `jsonb` and
   `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the
@@ -215,6 +215,18 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   the same, in comparisons, in `CASE` branches and in arithmetic, rather than comparing `a::text`
   with `'01'` as strings. Text it cannot read the way Postgres does stays an uninterpreted cast of
   the literal.
+- **A value coerced into an opaque type is read at that type.** Every opaque type is one sort to
+  the provers, so a coercion named after VARBINARY would be one function for all of them.
+  - **The hazard.** `u = 'x' AND n = 'x'` over a `uuid` `u` and a `name` `n` would make `u` and `n`
+    one value, though `'x'::uuid` and `'x'::name` print differently and have no `=` between them.
+  - **Into an opaque column.** A literal or other value coerced into one becomes a cast named after
+    the column's declared type. That holds in a comparison, an `IN`, a `CASE` branch, arithmetic, an
+    array, and an argument of `coalesce`, `nullif`, `greatest` or `least`.
+  - **Into any other opaque value.** It becomes a cast named after that value, with each column in it
+    replaced by its type, which together decide the value's type.
+  - **What it costs.** Two columns of one declared type share the cast, so a proof resting on
+    `a = 'x' AND b = 'x'` over two `uuid` columns stays. A type spelled two ways (`float8` and
+    `double precision`) costs such a proof and never makes one.
 
 ### Strings are ordered by a collation no input states
 

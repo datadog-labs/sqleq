@@ -94,3 +94,17 @@ fn a_domain_column_is_assigned_as_its_base_type_in_both_inputs() {
         "INTERVAL DAY",
     );
 }
+
+#[test]
+fn a_column_type_is_read_one_way_in_both_inputs() {
+    // A pair file used to keep the name of a type nothing classifies (`UUID`, `JSONB`), which reached
+    // the provers as a sort of its own, where raw DDL read it as opaque: `sqleq-solver` refused the
+    // one and translated the other (issue #93).
+    let ddl = r#"create table "t" ("id" INTEGER PRIMARY KEY, "u" uuid, "j" jsonb, "i" inet, "r" int4range,
+        "p" point, "m" money, "n" name, "b" bytea, "f" float8, "a" text[], "d" numeric[], "e" mood);"#;
+    let q = r#"SELECT "u", "j", "i", "r", "p", "m", "n", "b", "f", "a", "d", "e" FROM "t" WHERE "id" = 1"#;
+    let [file, raw] = lowered(ddl, q, q);
+    assert_eq!(file, raw, "a pair file and raw DDL lower one table differently");
+    let types = file["schemas"][0]["types"].as_array().unwrap();
+    assert!(types[1..].iter().all(|t| t == "VARBINARY"), "every column but the key is opaque: {types:?}");
+}
