@@ -4,13 +4,14 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: refuse:unsupported
+-- expect frontend: emit
 -- expect fuzz: counterexample
--- expect qed: no-plan
--- expect sqleq-solver: no-plan
+-- expect qed: no-proof
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
--- origin: a TIMESTAMP IN a subquery over a DATE column is refused, not lowered (docs/SOUNDNESS.md);
---   a pin for each documented refusal (#68)
+-- origin: a pin for a documented refusal (#68), lifted by issue #92 item 4: a TIMESTAMP IN a subquery
+--   over a DATE column now converts the column, as Postgres does (ts = d::timestamp), and this pair
+--   guards the direction: B, which converts ts to a date instead, is another query
 -- witness: t = {(1, '2024-01-01', '2024-01-01 12:00:00')}: A compares ts with midnight and returns
 --   no rows, B compares dates and returns 1
 create table "t" ("id" INTEGER, "d" DATE, "ts" TIMESTAMP);

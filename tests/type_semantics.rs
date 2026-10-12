@@ -495,9 +495,25 @@ fn an_in_subquery_operand_takes_the_columns_type() {
 }
 
 #[test]
+fn an_in_subquery_column_is_converted_to_the_operands_type() {
+    // A numeric against an integer column: Postgres converts the column (`n = a::numeric`), and so
+    // does the lowering, inside the subquery (issue #92, item 4).
+    let in_sub = |x: &str| format!(r#"SELECT "id" FROM "t" WHERE {x} IN (SELECT "a" FROM "t")"#);
+    let v = lower_with(&format!("{T}\n{};\n{};", in_sub(r#""n""#), r#"SELECT "id" FROM "t""#), CatalogSource::Declared)
+        .unwrap_or_else(|e| panic!("expected Ok, got {e}"));
+    let q = &v["queries"][0].to_string();
+    assert!(q.contains(r#""operator":"CAST","type":"REAL""#), "{q}");
+    // An opaque operand (an undeclared function's result): the column is cast to its type, as in
+    // `x = c`.
+    let v = lower_with(&format!("{T}\n{};\n{};", in_sub(r#"abs("a")"#), r#"SELECT "id" FROM "t""#), CatalogSource::Declared)
+        .unwrap_or_else(|e| panic!("expected Ok, got {e}"));
+    assert!(v["queries"][0].to_string().contains("q_cast_"), "{}", v["queries"][0]);
+}
+
+#[test]
 fn an_in_subquery_operand_that_cannot_take_the_columns_type_is_refused() {
-    // A numeric against an integer column: Postgres converts the column, which the lowering cannot
-    // reach from the operand's side.
-    refused(T, r#"SELECT "id" FROM "t" WHERE "n" IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
-    refused(T, r#"SELECT "id" FROM "t" WHERE abs("a") IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
+    // A text operand against an integer column: Postgres rejects it, and no conversion a comparison
+    // makes applies.
+    let ddl = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" TEXT);"#;
+    refused(ddl, r#"SELECT "id" FROM "t" WHERE "s" IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
 }
