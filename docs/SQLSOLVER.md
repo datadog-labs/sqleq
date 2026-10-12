@@ -166,8 +166,8 @@ Each difference is there for soundness:
 
 * **Three-valued logic is explicit.** A predicate translates to separate TRUE and FALSE terms, so
   `NOT` of an UNKNOWN comparison stays UNKNOWN and `NOT IN` gets its `NULL` rule. A single 0/1 term
-  per predicate would make `NOT (a = 1)` hold on a `NULL` `a`, and a projected boolean FALSE where
-  Postgres returns NULL.
+  per predicate would make `NOT (s LIKE 'a%')` hold on a `NULL` `s`, and a projected boolean FALSE
+  where Postgres returns NULL.
 * **No cast is erased.** Every cast in the IR is an uninterpreted function of its operand. The
   fork erases casts, which equates `CAST(a AS REAL) / b` with `a / b`; and a cast between equal IR
   types is not treated as an identity either, since the frontend drops the ones that are.
