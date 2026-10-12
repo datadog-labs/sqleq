@@ -196,7 +196,14 @@ fn an_update_converts_to_the_column_type_as_postgres_does() {
 #[test]
 fn relation_shapes_that_would_mix_units_are_refused() {
     refused(r#"SELECT "d" FROM "t" UNION SELECT "ts" FROM "t""#, r#"SELECT "d" FROM "t""#, "set operation over columns of type DATE and TIMESTAMP");
-    refused(r#"SELECT "id" FROM "t" WHERE "ts" IN (SELECT "d" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
+    // A TIMESTAMP operand against a DATE column: Postgres promotes the subquery's column, and so does
+    // the lowering (issue #92, item 4).
+    let ops = ops_of(
+        r#"SELECT "id" FROM "t" WHERE "ts" IN (SELECT "d" FROM "t")"#,
+        r#"SELECT "id" FROM "t""#,
+        CatalogSource::InferredSeeded,
+    );
+    assert!(ops.contains(&"q_conv_date_timestamp".to_string()), "{ops:?}");
     // A temporal column against an untyped parameter or a NULL is not two units; it lowers as the
     // INTEGER it replaces always did.
     let q = r#"SELECT "tz" FROM "t" UNION ALL SELECT $1 FROM "t" UNION ALL SELECT NULL FROM "t""#;
