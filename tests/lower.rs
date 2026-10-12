@@ -361,12 +361,15 @@ fn refuses_order_by_using() {
 }
 
 /// Nothing above a `Group` can address the FROM scope, so those keep the refusal rather than
-/// appending a key at an index that means something else.
+/// appending a key at an index that means something else. That includes a grouped key that is not
+/// selected: it is a value of every group, but no output column holds it.
 #[test]
 fn refuses_to_widen_past_a_group() {
     for q in [
         r#"SELECT "a" FROM "t" GROUP BY "a" ORDER BY MAX("b") LIMIT 5"#,
         r#"SELECT DISTINCT "a" FROM "t" ORDER BY "b" LIMIT 5"#,
+        r#"SELECT COUNT(*) FROM "t" GROUP BY "a" ORDER BY "t"."a" LIMIT 5"#,
+        r#"SELECT COUNT(*) FROM "t" GROUP BY "a" ORDER BY "a" LIMIT 5"#,
     ] {
         refused(&pair(q, r#"SELECT "a" FROM "t""#), "ORDER BY key is not an output column");
     }
