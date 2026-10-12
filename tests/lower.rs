@@ -111,11 +111,13 @@ fn count_lowers_to_group() {
 
 #[test]
 fn comparison_inserts_cast_for_mismatched_types() {
-    // c is VARBINARY (opaque); comparing to an INTEGER literal must insert a CAST to a common type.
+    // c is VARBINARY (opaque); comparing to an INTEGER literal must convert the literal to c's type,
+    // through the cast to c's declared type: every opaque type is one sort to the provers, so a bare
+    // CAST would be one function for all of them.
     let sql = format!("{T}\nSELECT \"a\" FROM \"t\" WHERE \"c\" = 1;\nSELECT \"a\" FROM \"t\" WHERE \"c\" = 1;");
     let v = ok(&sql);
     let s = v.to_string();
-    assert!(s.contains("CAST"), "expected a CAST for the VARBINARY vs INTEGER comparison");
+    assert!(s.contains("q_cast_varbinary"), "expected the cast to VARBINARY for the VARBINARY vs INTEGER comparison: {s}");
 }
 
 #[test]

@@ -2757,6 +2757,8 @@ impl AggCtx<'_> {
                 let operand =
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
+                let operand =
+                    if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -2834,7 +2836,7 @@ fn key_determines(cat: &Catalog, scope: &Scope, grouped: &[usize], level: usize)
     let Some(t) = b.table else { return false };
     let tbl = &cat.tables[t];
     let pk = &tbl.primary_key;
-    !pk.is_empty() && pk.iter().all(|&ci| !tbl.nullable[ci] && grouped.contains(&(b.offset + ci)))
+    !pk.is_empty() && pk.iter().all(|&ci| tbl.nullable.get(ci) == Some(&false) && grouped.contains(&(b.offset + ci)))
 }
 
 /// Every column level a lowered expression references.
@@ -3250,6 +3252,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .map(|e| lower_expr(cat, scope, fns, e))
                 .collect::<Result<Vec<_>>>()?;
             let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
+            let operand =
+                if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
             Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
@@ -3617,7 +3621,11 @@ fn lower_in_subquery(
     let lhs: Vec<Value> = lhs
         .into_iter()
         .zip(&sub_cols)
-        .map(|(x, (_, t))| coerce_in_operand(x, t).map_err(|m| unsupported(format!("IN subquery: {m}"))))
+        .enumerate()
+        .map(|(i, (x, (_, t)))| {
+            coerce_in_operand(x, t, &json!({ "subquery": &sub, "output": i }))
+                .map_err(|m| unsupported(format!("IN subquery: {m}")))
+        })
         .collect::<Result<_>>()?;
     let v = json!({ "operator": "IN", "operand": lhs, "query": sub, "type": "BOOLEAN" });
     Ok(if negated { not_bool(v) } else { v })
@@ -3797,7 +3805,16 @@ fn array_shape(arr: &sqlparser::ast::Array) -> Result<()> {
 /// `numeric`. An array of values whose `=` is identity is [`IDENTITY_OPAQUE`].
 fn array_call(elems: Vec<Value>) -> Value {
     let ty = elems.iter().map(ty_of).reduce(|a, b| common_type(&a, &b)).unwrap_or_else(|| "VARBINARY".into());
-    let operand: Vec<Value> = elems.into_iter().map(|v| cast_to(v, &ty)).collect();
+    // An element coerced into an opaque type is converted as the element that gave it that type
+    // would be compared (`types::cast_into`).
+    let like = elems.iter().find(|v| is_opaque(&ty_of(v))).or(elems.first()).cloned();
+    let operand: Vec<Value> = elems
+        .into_iter()
+        .map(|v| match &like {
+            Some(l) => cast_into(v, &ty, l),
+            None => cast_to(v, &ty),
+        })
+        .collect();
     let array = coarse_class(&ty).map_or_else(|| IDENTITY_OPAQUE.to_string(), |c| format!("{COARSE_OPAQUE}{c}[]"));
     json!({ "operator": format!("q_array_{}", name_part(&ty).to_lowercase()), "operand": operand, "type": array })
 }
