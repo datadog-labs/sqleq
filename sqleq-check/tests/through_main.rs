@@ -277,3 +277,44 @@ printf '{%s}' "$body" > "$out"
     assert_eq!(cases[1].l_verdict.as_deref(), Some("missing"));
     assert_eq!(cases[2].l_verdict, None, "a pre-parsed .json plan has no pair file to read");
 }
+
+/// Issue #93: a pair the frontend refuses is `x` against `x` or not by its text, cut into statements
+/// where Postgres cuts it. Cut at the `;` inside each dollar-quoted literal, two different queries
+/// left equal halves once the halves that start with `set ` were dropped as declarations.
+#[test]
+fn a_refused_pairs_text_is_cut_where_postgres_ends_its_statements() {
+    let f = Fakes::new();
+    let side = |v: &str| format!("SELECT \"id\", row_number() OVER () FROM \"t\" WHERE \"s\" = $${v}$$;");
+    for (b, trivial) in [("x; set z", false), ("x; set y", true)] {
+        let sql = format!(
+            "{LICENCE}\n-- truth: not-equivalent\n-- origin: a test\n-- witness: t = {{(1, 'x; set y')}}\n\n\
+             create table \"t\" (\"id\" INTEGER PRIMARY KEY, \"s\" TEXT);\n{}\n{}\n",
+            side("x; set y"),
+            side(b)
+        );
+        std::fs::write(&f.case, sql).unwrap();
+        let out = f.path().join("out.json");
+        let argv: Vec<String> = [
+            "--expect",
+            "report-only",
+            "--axes",
+            "frontend",
+            "-j",
+            "1",
+            "--frontend",
+            &f.frontend.to_string_lossy(),
+            "--json",
+            &out.to_string_lossy(),
+            &f.case.to_string_lossy(),
+        ]
+        .iter()
+        .map(|x| s(x))
+        .collect();
+        let log = f.argv_log.to_string_lossy().into_owned();
+        let ran = run(f.path(), &argv, &[("FAKE_ARGV", &log), ("FAKE_FE_STATUS", "unsupported")]);
+        assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+        let v: serde_json::Value = serde_json::from_str(&read(&out)).unwrap();
+        let c = &v["cases"][0];
+        assert_eq!((c["trivial"].as_bool(), c["trivial_basis"].as_str()), (Some(trivial), Some("text")), "{b}: {c}");
+    }
+}

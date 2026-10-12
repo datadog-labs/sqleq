@@ -163,8 +163,9 @@ CSV, and `meta.triviality` in the JSON holds the totals.
 Triviality is decided on the **lowered IR** — `queries[0] == queries[1]` in the plan handed to the
 prover (`trivial_basis: "ir"`). That is the exact thing the prover sees, so it also catches pairs
 differing only in aliasing, quoting or whitespace. A refused case has no IR, so it falls back to
-comparing the two statements in the source text after whitespace normalization
-(`trivial_basis: "text"`), which is weaker; `trivial` is `null` when neither test applies.
+comparing the two statements in the source text, cut where Postgres would cut them and with
+comments and whitespace aside (`trivial_basis: "text"`), which is weaker; `trivial` is `null` when
+neither test applies, or the text does not lex.
 
 ## Second opinion: sqleq-solver
 

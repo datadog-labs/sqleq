@@ -86,62 +86,31 @@ pub fn read_names(path: &Path) -> Result<HashSet<String>, String> {
     Ok(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
-/// Split on top-level `;`, dropping declarations. Quote- and comment-aware, because a `;` inside a
-/// string literal or a `--` comment does not end a statement and mis-splitting would silently
-/// mis-classify the case.
-pub fn statements(sql: &str) -> Vec<String> {
-    let s: Vec<char> = sql.chars().collect();
-    let starts = |i: usize, pat: &str| pat.chars().enumerate().all(|(k, c)| s.get(i + k) == Some(&c));
-    let find = |from: usize, pat: &str| (from..s.len()).find(|&j| starts(j, pat));
-    let (mut out, mut buf, mut quote, mut i) = (Vec::new(), String::new(), None::<char>, 0);
-    while i < s.len() {
-        let ch = s[i];
-        if let Some(q) = quote {
-            buf.push(ch);
-            if ch == q {
-                // A doubled quote is an escaped quote, not a terminator.
-                if s.get(i + 1) == Some(&q) {
-                    buf.push(q);
-                    i += 2;
-                    continue;
-                }
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-            buf.push(ch);
-        } else if starts(i, "--") {
-            i = find(i, "\n").unwrap_or(s.len());
-            continue;
-        } else if starts(i, "/*") {
-            i = find(i + 2, "*/").map_or(s.len(), |e| e + 2);
-            continue;
-        } else if ch == ';' {
-            out.push(std::mem::take(&mut buf));
-        } else {
-            buf.push(ch);
-        }
-        i += 1;
-    }
-    out.push(buf);
-
-    out.into_iter()
-        .map(|st| st.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|st| {
-            let head = st.to_lowercase();
-            !st.is_empty() && !["create ", "declare ", "drop ", "set ", "insert "].iter().any(|p| head.starts_with(p))
-        })
-        .collect()
+/// The statements of a pair file as compact text ([`sqleq_frontend::split::compact`]: each run of
+/// whitespace and comments one space, literals as written), declarations dropped. `None` if the
+/// text does not lex.
+///
+/// Cut by the frontend's own splitter, at the `;`s Postgres would end a statement at: a `;` inside a
+/// literal, a quoted name, a dollar-quoted body or a comment ends none, and cut there instead, the
+/// pieces of two different queries can compare equal, and the case is reported `x` against `x`.
+pub fn statements(sql: &str) -> Option<Vec<String>> {
+    let st = sqleq_frontend::split::statements(sql).ok()?;
+    let st: Vec<String> = st.into_iter().map(sqleq_frontend::split::compact).collect::<Result<_, _>>().ok()?;
+    Some(
+        st.into_iter()
+            .filter(|st| {
+                let head = st.to_lowercase();
+                !["create ", "declare ", "drop ", "set ", "insert "].iter().any(|p| head.starts_with(p))
+            })
+            .collect(),
+    )
 }
 
-/// True when the two queries are textually identical after whitespace normalization. Weaker than
-/// the IR test -- it misses alias-only and quoting differences -- and used only when there is no IR
-/// to look at.
+/// True when the two queries are the same text as [`statements`] gives it: the same tokens, in the
+/// same order. Weaker than the IR test -- it misses alias-only and quoting differences -- and used
+/// only when there is no IR to look at.
 pub fn triviality_from_text(sql: &str) -> Option<bool> {
-    let qs = statements(sql);
+    let qs = statements(sql)?;
     (qs.len() == 2).then(|| qs[0] == qs[1])
 }
 
@@ -247,45 +216,84 @@ mod tests {
         let sql = "create table \"t\" (\"a\" INTEGER);\n\
                    declare scalar function f(INTEGER) returns INTEGER;\n\
                    select \"a\" from \"t\";\nselect \"a\" from \"t\";";
-        assert_eq!(statements(sql), ["select \"a\" from \"t\"", "select \"a\" from \"t\""]);
+        assert_eq!(statements(sql).unwrap(), ["select \"a\" from \"t\"", "select \"a\" from \"t\""]);
     }
 
     #[test]
     fn whitespace_is_normalized() {
-        assert_eq!(statements("select   1\n  +\t2; select 1 + 2;"), ["select 1 + 2", "select 1 + 2"]);
+        assert_eq!(statements("select   1\n  +\t2; select 1 + 2;").unwrap(), ["select 1 + 2", "select 1 + 2"]);
     }
 
     #[test]
     fn semicolon_inside_a_string_literal_does_not_split() {
-        assert_eq!(statements("select ';' ; select ';';"), ["select ';'", "select ';'"]);
+        assert_eq!(statements("select ';' ; select ';';").unwrap(), ["select ';'", "select ';'"]);
     }
 
     #[test]
     fn semicolon_inside_a_quoted_identifier_does_not_split() {
-        assert_eq!(statements("select \"a;b\" from \"t\"; select 1;"), ["select \"a;b\" from \"t\"", "select 1"]);
+        assert_eq!(statements("select \"a;b\" from \"t\"; select 1;").unwrap(), ["select \"a;b\" from \"t\"", "select 1"]);
     }
 
     #[test]
     fn doubled_quote_is_an_escape_not_a_terminator() {
         // If the doubled quote ended the literal, the `;` after it would split.
-        assert_eq!(statements("select 'it''s; fine'; select 2;"), ["select 'it''s; fine'", "select 2"]);
+        assert_eq!(statements("select 'it''s; fine'; select 2;").unwrap(), ["select 'it''s; fine'", "select 2"]);
     }
 
     #[test]
     fn line_comment_hides_a_semicolon() {
-        assert_eq!(statements("select 1 -- ; not a split\n; select 1;"), ["select 1", "select 1"]);
+        assert_eq!(statements("select 1 -- ; not a split\n; select 1;").unwrap(), ["select 1", "select 1"]);
     }
 
     #[test]
     fn block_comment_hides_a_semicolon() {
-        assert_eq!(statements("select /* ; */ 1; select 1;"), ["select 1", "select 1"]);
+        assert_eq!(statements("select /* ; */ 1; select 1;").unwrap(), ["select 1", "select 1"]);
     }
 
     #[test]
-    fn unterminated_comment_swallows_the_rest() {
-        // Degenerate input; the point is that it terminates and yields a count other than two, so
-        // the case is reported undetermined rather than guessed at.
+    fn text_that_does_not_lex_is_undetermined() {
+        // Where its statements end is not known, so the case is reported undetermined rather than
+        // guessed at.
         assert_eq!(triviality_from_text("select 1; /* unterminated"), None);
+        assert_eq!(triviality_from_text("select 'a; select 'a"), None);
+        assert_eq!(triviality_from_text("select $$a; select $$a"), None);
+    }
+
+    /// Issue #93: each query was cut at the `;` inside its dollar-quoted literal, the halves that
+    /// start with `set ` were dropped as declarations, and the two halves left were equal, so two
+    /// different queries were reported `x` against `x`.
+    #[test]
+    fn a_semicolon_in_a_dollar_quoted_literal_does_not_make_two_queries_one() {
+        let sql = "create table \"t\" (\"id\" INTEGER PRIMARY KEY, \"s\" TEXT);\n\
+                   SELECT \"id\" FROM \"t\" WHERE \"s\" = $$x; set y$$;\n\
+                   SELECT \"id\" FROM \"t\" WHERE \"s\" = $$x; set z$$;";
+        assert_eq!(statements(sql).unwrap().len(), 2);
+        assert_eq!(triviality_from_text(sql), Some(false));
+        let same = sql.replace("set z", "set y");
+        assert_eq!(triviality_from_text(&same), Some(true));
+    }
+
+    #[test]
+    fn a_function_body_before_the_pair_is_one_statement() {
+        let sql = "create function \"inc\"(\"x\" INTEGER) returns INTEGER language sql immutable \
+                   as $$ SELECT \"x\" + 1; $$;\nSELECT 1;\nSELECT 1;";
+        assert_eq!(triviality_from_text(sql), Some(true));
+    }
+
+    #[test]
+    fn e_strings_and_nested_comments_are_read_as_postgres_reads_them() {
+        assert_eq!(statements(r"select E'a\';b'; select 1;").unwrap(), [r"select E'a\';b'", "select 1"]);
+        assert_eq!(
+            statements("select /* outer /* inner */ still a comment; */ 1; select 1;").unwrap(),
+            ["select 1", "select 1"]
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_a_literal_is_its_value() {
+        // Normalizing it would make two different queries one.
+        assert_eq!(triviality_from_text("select 'a  b'; select 'a b';"), Some(false));
+        assert_eq!(triviality_from_text("select 'a  b'; select  'a  b' ;"), Some(true));
     }
 
     #[test]

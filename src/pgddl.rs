@@ -32,9 +32,11 @@
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 use crate::catalog::{Catalog, Ddl};
 use crate::infer::{map_type_name, Ty};
+use crate::split::Tok;
 
 /// The opaque type: an uninterpreted sort that supports `=` and nothing else.
 pub const OPAQUE: &str = "VARBINARY";
@@ -85,172 +87,76 @@ fn unescape(raw: &str) -> String {
 
 /// Raw Postgres DDL as the statements this module reads it as, each as the original text, before
 /// any parse. For a caller that must hand the DDL to a real database rather than to our parser.
+///
+/// DDL the tokenizer rejects is one statement, the whole text, as [`parse_reporting`] reads it: where
+/// it could be cut is not known (`crate::split`).
 pub fn split_ddl(raw: &str) -> Vec<String> {
     let sql = unescape(raw);
-    split_statements(&sql)
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    match crate::split::statements(&sql) {
+        Ok(st) => st.into_iter().map(str::to_string).collect(),
+        // Never blank: blank text lexes.
+        Err(_) => vec![sql.trim().to_string()],
+    }
 }
 
-/// Split SQL text into top-level statements on `;`, ignoring separators inside string literals,
-/// quoted identifiers, dollar-quoted bodies and comments.
-///
-/// Needed because a DDL dump is parsed one statement at a time — see [`parse_provided_schema`] — and
-/// a naive split would cut a `DEFAULT 'a;b'` in half.
-fn split_statements(sql: &str) -> Vec<&str> {
-    let b = sql.as_bytes();
-    let (mut out, mut start, mut i) = (Vec::new(), 0usize, 0usize);
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        // A doubled quote is an escaped quote, not the end of the literal.
-                        if b.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'$' => {
-                // `$tag$ ... $tag$` — the tag is empty or an identifier.
-                let tag_end = b[i + 1..]
-                    .iter()
-                    .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                    .map(|p| i + 1 + p);
-                match tag_end {
-                    Some(e) if b[e] == b'$' => {
-                        let tag = &sql[i..=e];
-                        match sql[e + 1..].find(tag) {
-                            Some(p) => i = e + 1 + p + tag.len() - 1,
-                            None => i = b.len(),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            b';' => {
-                out.push(&sql[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if !sql[start..].trim().is_empty() {
-        out.push(&sql[start..]);
-    }
-    out
-}
-
-/// Span of the outermost parenthesised region — a `CREATE TABLE`'s column list.
-fn body_span(stmt: &str) -> Option<(usize, usize)> {
-    let b = stmt.as_bytes();
-    let (mut i, mut depth, mut open) = (0usize, 0i32, None);
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += 1;
-                }
-            }
-            b'(' => {
+/// Span of the outermost parenthesised region — a `CREATE TABLE`'s column list — in the statement
+/// `toks` lexes: from just after its `(` to its `)`.
+fn body_span(toks: &[Tok]) -> Option<(usize, usize)> {
+    let (mut depth, mut open) = (0usize, None);
+    for t in toks {
+        match t.token {
+            Token::LParen => {
                 if depth == 0 {
-                    open = Some(i);
+                    open = Some(t.end);
                 }
                 depth += 1;
             }
-            b')' => {
+            Token::RParen if depth > 0 => {
                 depth -= 1;
                 if depth == 0 {
-                    return open.map(|o| (o + 1, i));
+                    return open.map(|o| (o, t.start));
                 }
             }
             _ => {}
         }
-        i += 1;
     }
     None
 }
 
-/// Split a column list at its top-level commas, so `numeric(10,2)` stays in one piece.
-fn split_items(body: &str) -> Vec<&str> {
-    let b = body.as_bytes();
-    let (mut out, mut start, mut depth, mut i) = (Vec::new(), 0usize, 0i32, 0usize);
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += 1;
-                }
-            }
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => {
-                out.push(&body[start..i]);
-                start = i + 1;
+/// The byte ranges of the items of the column list `from..to` spans in the statement `toks` lexes,
+/// cut at its top-level commas, so `numeric(10,2)` and a `DEFAULT $$a,b$$` stay in one piece.
+fn split_items(toks: &[Tok], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let (mut out, mut start, mut depth) = (Vec::new(), from, 0usize);
+    for t in toks.iter().filter(|t| t.start >= from && t.end <= to) {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                out.push((start, t.start));
+                start = t.end;
             }
             _ => {}
         }
-        i += 1;
     }
-    if !body[start..].trim().is_empty() {
-        out.push(&body[start..]);
+    // A last item with no token in it is none: `(a int, )` is read as `(a int)`.
+    if toks.iter().any(|t| t.start >= start && t.end <= to && !matches!(t.token, Token::Whitespace(_))) {
+        out.push((start, to));
     }
     out
 }
 
-/// Spans of the bare words in `s`, with the paren depth each sits at. Text inside quotes is skipped,
-/// so a word here is always an identifier or a keyword, never part of a literal.
+/// Spans of the bare words in `s`, with the paren depth each sits at: its unquoted identifiers and
+/// keywords, as the tokenizer reads them, so a word here is never part of a literal, a quoted name
+/// or a comment. Empty if `s` does not lex.
 fn word_spans(s: &str) -> Vec<(usize, usize, i32)> {
-    let b = s.as_bytes();
-    let (mut out, mut i, mut depth) = (Vec::new(), 0usize, 0i32);
-    while i < b.len() {
-        match b[i] {
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth -= 1;
-                i += 1;
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let st = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                out.push((st, i, depth));
-            }
-            _ => i += 1,
+    let Ok(toks) = crate::split::lex(s) else { return Vec::new() };
+    let (mut out, mut depth) = (Vec::new(), 0i32);
+    for t in toks {
+        match &t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Word(w) if w.quote_style.is_none() => out.push((t.start, t.end, depth)),
+            _ => {}
         }
     }
     out
@@ -324,8 +230,9 @@ fn simplify_for_retry(stmt: &str) -> Option<String> {
     if !up.starts_with("CREATE") || !head.contains("TABLE") {
         return None;
     }
-    let (bs, be) = body_span(stmt)?;
-    let items: Vec<String> = split_items(&stmt[bs..be]).iter().map(|i| simplify_item(i)).collect();
+    let toks = crate::split::lex(stmt).ok()?;
+    let (bs, be) = body_span(&toks)?;
+    let items: Vec<String> = split_items(&toks, bs, be).into_iter().map(|(s, e)| simplify_item(&stmt[s..e])).collect();
     Some(format!("{}{}{}", &stmt[..bs], items.join(","), &stmt[be..]))
 }
 
@@ -345,6 +252,9 @@ fn simplify_for_retry(stmt: &str) -> Option<String> {
 /// statement that would not parse is not lost: it is read off its first words, as a loss of the facts
 /// about what it names. A `CREATE UNIQUE INDEX` the parser rejects (`ON ONLY`, a `TABLESPACE`) gives
 /// no key: that is a completeness gap, not a soundness one, since a missed key only costs proofs.
+///
+/// The statements are cut where Postgres cuts them (`crate::split`). DDL the tokenizer rejects has
+/// no such cut, so it is one rejected statement, and gives no table at all.
 pub fn parse_provided_schema(raw: &str) -> Catalog {
     parse_reporting(raw).0
 }
@@ -378,8 +288,20 @@ enum Parsed {
 /// the catalog needs: a statement after a `CREATE TABLE` can undo what an earlier one said.
 fn parse_in_order(raw: &str) -> Vec<Parsed> {
     let sql = unescape(raw);
+    // Cut where Postgres cuts. DDL the tokenizer rejects is one rejected statement: cut by a cruder
+    // rule, the statements after the one it rejects could be read where Postgres would not run them,
+    // or lost where it would, a `DROP CONSTRAINT` among them, so nothing of it is read.
+    let stmts = match crate::split::statements(&sql) {
+        Ok(st) => st,
+        Err(e) => {
+            return vec![Parsed::Rejected(Rejected {
+                message: format!("cannot cut into statements: {e}"),
+                statement: sql.trim().to_string(),
+            })]
+        }
+    };
     let mut out = Vec::new();
-    for s in split_statements(&sql) {
+    for s in stmts {
         match Parser::parse_sql(&PostgreSqlDialect {}, s) {
             Ok(st) => out.extend(st.into_iter().map(|st| Parsed::Statement(Box::new(st), false))),
             Err(e) => {
@@ -536,6 +458,58 @@ mod tests {
         let cat = parse_provided_schema("CREATE TABLE t (a text DEFAULT 'x;y', b integer);");
         assert_eq!(cat.tables.len(), 1);
         assert_eq!(cat.tables[0].cols.len(), 2);
+    }
+
+    /// Issue #93: the `;` after an escaped quote in an `E'…'` string, and one inside a nested
+    /// comment, end no statement, as Postgres reads them. The hand-written splitter took `\'` for
+    /// the end of the literal and the first `*/` for the end of the comment, and cut at both, and
+    /// the tables either side of each cut were lost. The comment's `ALTER TABLE` is never run.
+    #[test]
+    fn e_strings_and_nested_comments_are_cut_where_postgres_cuts() {
+        let cat = parse_provided_schema(
+            r"CREATE TABLE t (a text DEFAULT E'x\';y', b integer);
+              CREATE TABLE u (c integer PRIMARY KEY, d text);
+              /* outer /* inner */ ALTER TABLE u DROP CONSTRAINT u_pkey; */
+              CREATE TABLE v (e integer);",
+        );
+        let names: Vec<&str> = cat.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["t", "u", "v"]);
+        assert_eq!(cat.tables[0].cols.len(), 2);
+        assert_eq!(cat.tables[1].keys, vec![vec![0]], "the ALTER inside the comment was read");
+        assert_eq!(
+            split_ddl("CREATE TABLE t (a text DEFAULT E'x\\';y'); /* a; /* b; */ c; */ CREATE TABLE u (c int)"),
+            ["CREATE TABLE t (a text DEFAULT E'x\\';y')", "CREATE TABLE u (c int)"]
+        );
+    }
+
+    /// DDL the tokenizer rejects is not cut by a cruder rule: where its statements end is not
+    /// known, so none of it is read, and the one rejection says why.
+    #[test]
+    fn ddl_that_does_not_lex_is_one_rejected_statement() {
+        let ddl = "CREATE TABLE t (a integer); CREATE TABLE u (b text DEFAULT 'unterminated);";
+        let (cat, rejected) = parse_reporting(ddl);
+        assert!(cat.tables.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].message.starts_with("cannot cut into statements"), "{}", rejected[0].message);
+        assert_eq!(rejected[0].statement, ddl);
+        assert_eq!(split_ddl(ddl), [ddl]);
+    }
+
+    /// The retry cuts a column list at its top-level commas as the tokenizer reads it. A comma in a
+    /// dollar-quoted default cut the column in two, and the second half, `b text$$`, came back as
+    /// a column `b` of a type `text$$` that the table does not have.
+    #[test]
+    fn the_retry_keeps_a_dollar_quoted_default_in_its_column() {
+        let cat = parse_provided_schema(
+            "CREATE TABLE t (\
+               a uuid DEFAULT md5_concat(g, VARIADIC ARRAY[x, (y)::text]),\
+               s text DEFAULT $$a, b text$$ NOT NULL,\
+               n integer /* x, y */ UNIQUE);",
+        );
+        let t = &cat.tables[0];
+        assert_eq!(t.cols.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["a", "s", "n"]);
+        assert_eq!(t.nullable, vec![true, false, true]);
+        assert_eq!(t.keys, vec![vec![2]]);
     }
 
     #[test]
