@@ -494,8 +494,8 @@ mod tests {
                 ("id".into(), "INTEGER".into()),
                 ("total".into(), "REAL".into()),
                 ("note".into(), "VARCHAR".into()),
-                // An array of text: opaque, and its `=` is identity.
-                ("tags".into(), crate::types::IDENTITY_OPAQUE.into()),
+                // An array of text: opaque, its `=` is identity, and it carries its declared type.
+                ("tags".into(), format!("{}@text[]", crate::types::IDENTITY_OPAQUE)),
                 ("created_at".into(), "TIMESTAMP".into()),
             ]
         );
@@ -542,7 +542,7 @@ mod tests {
         // `"char"` is a real Postgres type, a parser that keeps the quotes must not lose the table
         // over them, and it is neither `char(n)` nor text: one byte, which reads `'ab'` as `'a'`.
         let cat = parse_provided_schema(r#"CREATE TABLE t (a "char" NOT NULL);"#);
-        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARBINARY".into())]);
+        assert_eq!(cat.tables[0].cols, vec![("a".into(), "VARBINARY@\"char\"".into())]);
     }
 
     #[test]

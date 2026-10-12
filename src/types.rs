@@ -135,6 +135,7 @@ fn no_equality(name: &str) -> bool {
 /// [`IDENTITY_OPAQUE`] value, or a type that keeps its own name and is on the [`opaque_identity`]
 /// list (`uuid` in a declared `CREATE TABLE`) or has no `=` ([`NO_EQUALITY`]).
 pub fn is_identity(t: &str) -> bool {
+    let t = untag(t);
     IDENTITY_TYPES.contains(&t) || t == IDENTITY_OPAQUE || (!is_opaque(t) && (opaque_identity(t) || no_equality(t)))
 }
 
@@ -148,6 +149,7 @@ pub fn is_identity(t: &str) -> bool {
 /// costs proofs. Also `None` for an [`UNFAITHFUL`] type, whose `=` is not identity either, but which
 /// is refused wherever it reaches a plan ([`refuse_unfaithful`], which runs first).
 pub fn coarse_class(t: &str) -> Option<&str> {
+    let t = untag(t);
     match t {
         "REAL" => Some("numeric"),
         "INTERVAL" => Some("interval"),
@@ -168,6 +170,7 @@ pub fn known_class(class: &str) -> bool {
 /// Whether `t` is VARBINARY to the provers: VARBINARY itself, [`IDENTITY_OPAQUE`] or a
 /// [`COARSE_OPAQUE`] name.
 pub fn is_opaque(t: &str) -> bool {
+    let t = untag(t);
     t == "VARBINARY" || t == IDENTITY_OPAQUE || t.starts_with(COARSE_OPAQUE)
 }
 
@@ -175,6 +178,7 @@ pub fn is_opaque(t: &str) -> bool {
 /// [`COARSE_OPAQUE`] name is VARBINARY there as everywhere the provers look, so it names the same
 /// function it always did.
 pub fn name_part(t: &str) -> &str {
+    let t = untag(t);
     if is_opaque(t) {
         "VARBINARY"
     } else {
@@ -239,6 +243,7 @@ pub fn opaque_name(name: &str) -> &'static str {
 /// IR: every crossing between them is a conversion named `q_conv_timestamp_timestamptz` or the
 /// reverse, so the time zone that separates them lives in that name, not in the type annotation.
 pub fn emitted_type_name(t: &str) -> &str {
+    let t = untag(t);
     if t == "TIMESTAMPTZ" {
         "TIMESTAMP"
     } else if is_opaque(t) {
@@ -626,9 +631,163 @@ pub fn opaque_identity(name: &str) -> bool {
             || matches!(temporal_class(elem), Some(Some("DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ"))))
 }
 
-/// The `type` annotation of a lowered expression Value (defaults to INTEGER if absent).
+/// The `type` annotation of a lowered expression Value (defaults to INTEGER if absent), without the
+/// declared type an opaque column's annotation carries ([`untag`]).
 pub fn ty_of(v: &Value) -> String {
-    v.get("type").and_then(|t| t.as_str()).unwrap_or("INTEGER").to_string()
+    untag(raw_ty_of(v)).to_string()
+}
+
+/// The `type` annotation of a lowered expression Value as written, with its declared-type tag.
+fn raw_ty_of(v: &Value) -> &str {
+    v.get("type").and_then(|t| t.as_str()).unwrap_or("INTEGER")
+}
+
+/// The separator between an opaque type and the declared type a column of it has.
+///
+/// `VARBINARY=@uuid` is VARBINARY to the provers, [`IDENTITY_OPAQUE`] to the frontend's reading of
+/// it, and a value of a `uuid` column to a coercion into it ([`cast_into`]). Every opaque name is
+/// one sort to the provers, so the declared type is the only thing that keeps a literal read as a
+/// `uuid` apart from the same literal read as a `name`.
+const DECLARED: char = '@';
+
+/// `t` without the declared type an opaque column's type carries ([`DECLARED`]).
+pub fn untag(t: &str) -> &str {
+    t.split_once(DECLARED).map_or(t, |(base, _)| base)
+}
+
+/// The type of a column declared as `declared` and mapped to `ty`: an opaque `ty` carries the
+/// declared type, so that a coercion into it is named after it ([`cast_into`]). Any other type is
+/// returned as it is.
+///
+/// Spelled as Postgres folds it: lower case outside double quotes, a quoted name as written, runs of
+/// white space as one space. `DOUBLE PRECISION` and `double precision` are one type, and `"MyType"`
+/// and `mytype` are two. Two spellings of one type that fold apart (`float8` and `double precision`)
+/// only keep their coercions apart, which costs a proof and never makes one.
+pub fn with_declared(ty: String, declared: &str) -> String {
+    if !is_opaque(&ty) {
+        return ty;
+    }
+    let mut canon = String::new();
+    let (mut quoted, mut space) = (false, false);
+    for c in declared.trim().chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space {
+            canon.push(' ');
+            space = false;
+        }
+        if quoted || c == '"' {
+            canon.push(c);
+        } else {
+            canon.extend(c.to_lowercase());
+        }
+    }
+    with_tag(ty, &canon)
+}
+
+/// `ty` carrying `tag`, as it is: the declared type it stands for where a coercion into it is named
+/// ([`opaque_cast_name`]). Not folded, so two tags are one only when they are written alike.
+pub fn with_tag(ty: String, tag: &str) -> String {
+    if is_opaque(&ty) {
+        format!("{ty}{DECLARED}{tag}")
+    } else {
+        ty
+    }
+}
+
+/// The function a coercion into `like`'s opaque type is, named after what decides the value it
+/// computes beside the value coerced: the declared type of a column, spelled as an explicit cast to
+/// that type is named ([`cast_name`]); or, for any other value, the value itself with every column
+/// in it replaced by its type.
+///
+/// Every opaque type is VARBINARY to the provers, so a coercion named after the IR type alone would
+/// be one function for a `uuid` and a `name` target, and `u = 'x' AND n = 'x'` would make `u` and
+/// `n` one value, though `'x'::uuid` and `'x'::name` print differently and have no `=` between them.
+/// A column's tag names its type; any other value's type is decided by its operators and the types
+/// of what they apply to, which the shape keeps. Two values with one key are of one type, so the
+/// coercion is one function exactly where Postgres's is.
+fn opaque_cast_name(like: &Value) -> String {
+    // `cast_name` writes every character but a letter or a digit as `_`, which is one-to-one over
+    // the spellings of a type without `_` or a quote (`double precision`, `text[]`, `int4range`),
+    // and keeps the name the explicit cast has. Over any other tag it is not: `"MyType"` and
+    // `mytype`, or a type named `double_precision`, would share one, so such a tag is written out.
+    if like.get("column").is_some() {
+        if let Some((_, declared)) = raw_ty_of(like).split_once(DECLARED) {
+            if !declared.contains(['_', '"']) {
+                return cast_name(declared);
+            }
+            return escaped_cast_name(&Value::String(declared.to_string()));
+        }
+    }
+    fn columns_to_types(v: &mut Value) {
+        match v {
+            Value::Object(m) if m.contains_key("column") => {
+                *v = Value::String(raw_ty_of(v).to_string());
+            }
+            Value::Object(m) => m.values_mut().for_each(columns_to_types),
+            Value::Array(a) => a.iter_mut().for_each(columns_to_types),
+            _ => {}
+        }
+    }
+    let mut shape = like.clone();
+    columns_to_types(&mut shape);
+    escaped_cast_name(&shape)
+}
+
+/// A cast function named after `key` exactly: `q_cast__` and `key`'s JSON, every character but a
+/// letter or a digit written as `_<hex>_`. One name per key, and none of the frontend's type names
+/// spelled out in the IR. An explicit cast's name never has two underscores in a row
+/// ([`cast_name`]), so `q_cast__` is never one of theirs.
+fn escaped_cast_name(key: &Value) -> String {
+    let mut name = String::from("q_cast__");
+    for c in key.to_string().chars() {
+        if c.is_ascii_alphanumeric() {
+            name.push(c);
+        } else {
+            name.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
+    name
+}
+
+/// The arguments of a call that returns one of its arguments (`COALESCE`, `NULLIF`, `GREATEST`,
+/// `LEAST`), its literals read at its type `ret` when that is opaque, as Postgres reads them
+/// ([`cast_into`], beside the first argument of an opaque type).
+///
+/// The lowering does not coerce a call's arguments, and a literal left as written would be the
+/// same text in `coalesce(u, 'x')` over a `uuid` and in `coalesce(n, 'x')` over a `name`, though
+/// Postgres returns `'x'::uuid` from one and `'x'::name` from the other. Only literals: an argument
+/// of another type than the opaque one is an error in Postgres, and with no opaque argument the
+/// call keeps the IR it had.
+pub fn coerce_literal_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
+    let Some(like) = operand.iter().find(|v| is_opaque(&ty_of(v))).cloned() else {
+        return operand;
+    };
+    if !is_opaque(ret) {
+        return operand;
+    }
+    let literal = |v: &Value| {
+        !is_null_lit(v)
+            && v.get("operand").and_then(Value::as_array).is_some_and(|a| a.is_empty())
+            && v.get("operator").is_some_and(Value::is_string)
+    };
+    operand.into_iter().map(|v| if literal(&v) { cast_into(v, ret, &like) } else { v }).collect()
+}
+
+/// [`cast_to`] `ct`, where `ct` is the type `like` gave the comparison or the expression `v` is
+/// coerced for. A coercion of a value that is not opaque into an opaque `ct` is the cast function
+/// [`opaque_cast_name`]`(like)`, not a `CAST`: the provers read every opaque type as one sort, and a
+/// `CAST` into it would be one function for every opaque type.
+pub fn cast_into(v: Value, ct: &str, like: &Value) -> Value {
+    let from = ty_of(&v);
+    if !is_opaque(ct) || is_opaque(&from) || is_null_lit(&v) || is_temporal(&from) {
+        return cast_to(v, ct);
+    }
+    json!({ "operator": opaque_cast_name(like), "operand": [v], "type": ct })
 }
 
 pub fn is_num(t: &str) -> bool {
@@ -889,11 +1048,16 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
 /// * an opaque one. VARBINARY carries every array type and the binary ones, so `ys::int[]` over a
 ///   `text[]` would read as `ys`, while it parses each element.
 fn named_cast(dt: &DataType, target: &str) -> Option<String> {
-    let spelled = format!("{dt}").to_lowercase().replace("[]", " array");
-    (spelled.contains('(') || is_opaque(target)).then(|| {
-        let safe: String = spelled.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        format!("q_cast_{}", safe.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"))
-    })
+    let spelled = format!("{dt}");
+    (spelled.contains('(') || is_opaque(target)).then(|| cast_name(&spelled))
+}
+
+/// The name of the cast function to the type spelled `spelled`: `q_cast_` and the spelling, lower
+/// case, with `[]` as `array` and every other character that is not a letter or a digit as `_`.
+fn cast_name(spelled: &str) -> String {
+    let spelled = spelled.to_lowercase().replace("[]", " array");
+    let safe: String = spelled.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!("q_cast_{}", safe.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"))
 }
 
 /// Whether two column types are two *different temporal types*. Where a relation-shaped construct
@@ -937,19 +1101,23 @@ pub fn hides_coarse(first: &str, other: &str) -> bool {
 /// Every pair of types, not only temporal ones: the QED prover equates the operand with the
 /// subquery's column and asserts that the two have one sort, so any mismatch left here panics it. A
 /// `NULL` is relabelled and a string literal read at the column's type, as in a comparison.
-pub fn coerce_in_operand(x: Value, col_ty: &str) -> std::result::Result<Value, String> {
+///
+/// `column` stands for the subquery's column in naming a conversion into an opaque type
+/// ([`cast_into`]): the subquery itself and the column's position in it, since its type is decided
+/// by them and the IR type does not say which opaque type it is.
+pub fn coerce_in_operand(x: Value, col_ty: &str, column: &Value) -> std::result::Result<Value, String> {
     let xt = ty_of(&x);
     if xt == col_ty || (is_opaque(&xt) && is_opaque(col_ty)) {
         return Ok(x);
     }
     if is_null_lit(&x) || is_string_literal(&x) {
-        return Ok(cast_to(x, col_ty));
+        return Ok(cast_into(x, col_ty, column));
     }
     // Compared as the provers read the two types: a `numeric` operand against an opaque column
     // meets it at VARBINARY, under the name that says what it was ([`common_type`]).
     let ct = common_type(&xt, col_ty);
     if name_part(&ct) == name_part(col_ty) {
-        Ok(cast_to(x, &ct))
+        Ok(cast_into(x, &ct, column))
     } else {
         Err(format!("{xt} compared with a subquery column of type {col_ty}"))
     }
@@ -1003,7 +1171,8 @@ pub fn coerce_cmp(l: Value, r: Value) -> (Value, Value) {
         return (l, r);
     }
     let ct = common_type_of(&l, &r);
-    (cast_to(l, &ct), cast_to(r, &ct))
+    let lc = cast_into(l.clone(), &ct, &r);
+    (lc, cast_into(r, &ct, &l))
 }
 
 /// Build a comparison/equality operator (BOOLEAN result) with operand type coercion.
@@ -1079,7 +1248,8 @@ pub fn make_arith(opstr: &str, l: Value, r: Value, num_ty: &str) -> Value {
     }
     let ct = common_type(&a, &b);
     let ty = if is_builtin(&ct) { num_ty } else { &ct };
-    integer_arith(opstr, cast_to(l.clone(), &ct), cast_to(r, &ct), ty)
+    let lc = cast_into(l.clone(), &ct, &r);
+    integer_arith(opstr, lc, cast_into(r, &ct, &l), ty)
 }
 
 /// `l op r` of result type `ty`: the native operator, except an INTEGER `/` or `%`.
@@ -1197,8 +1367,15 @@ pub fn make_case(mut ops: Vec<Value>) -> Value {
         .map(|&i| ty_of(&ops[i]))
         .reduce(|a, b| common_type(&a, &b))
         .unwrap_or_else(|| "INTEGER".to_string());
+    // A branch coerced into an opaque type is converted as the branch that gave it that type would
+    // be compared ([`cast_into`]).
+    let like = voters.iter().find(|&&i| is_opaque(&ty_of(&ops[i]))).or(voters.first()).map(|&i| ops[i].clone());
     for &i in &res {
-        ops[i] = cast_to(ops[i].take(), &ct);
+        let v = ops[i].take();
+        ops[i] = match &like {
+            Some(l) => cast_into(v, &ct, l),
+            None => cast_to(v, &ct),
+        };
     }
     // Conditions are predicates and must be boolean-sorted.
     for i in (0..n.saturating_sub(1)).step_by(2) {

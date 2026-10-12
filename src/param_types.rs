@@ -65,7 +65,9 @@ fn walk(v: &Value, inferred: &BTreeSet<String>) -> Result<()> {
                             return Err(refusal(&p, class));
                         }
                     }
-                } else if op == "CAST" {
+                } else if op == "CAST" || op.starts_with("q_cast_") {
+                    // A coercion into an opaque type is a named cast (`types::cast_into`), and so is a
+                    // cast to a qualified or opaque target: each is a `CAST` the IR spells by name.
                     if let Some(p) = operand.first().and_then(|o| narrow_param(o, inferred)) {
                         if let Some(class) = wide_class(v) {
                             return Err(refusal(&p, class));

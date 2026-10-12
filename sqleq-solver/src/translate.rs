@@ -301,6 +301,10 @@ fn is_null_exactly_on_null_input(op: &str) -> bool {
         // date/time operators are all strict.
         || op.starts_with("q_conv_")
         || op.starts_with("q_arith_")
+        // The frontend's named casts: a cast to a qualified or opaque target (`q_cast_float8`), and
+        // a value coerced into an opaque type, named after the type it is read at. A cast of a
+        // non-NULL value is never NULL, as for `CAST` itself.
+        || op.starts_with("q_cast_")
 }
 
 /// The operators with a three-valued meaning of their own (see [`Translator::truth_call`]), at the

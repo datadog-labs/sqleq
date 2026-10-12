@@ -71,8 +71,11 @@ fn ir(msg: impl std::fmt::Display) -> crate::error::FrontendError {
     schema(format!("internal: ill-formed IR: {msg}"))
 }
 
+/// An expression's type, without the declared type an opaque column's carries
+/// ([`crate::types::untag`]): a row's types are the frontend's own, and a column's tag says only what
+/// a coercion into it is named after.
 fn ty_of(e: &Value) -> Result<&str> {
-    e["type"].as_str().ok_or_else(|| ir("expression without a type"))
+    e["type"].as_str().map(crate::types::untag).ok_or_else(|| ir("expression without a type"))
 }
 
 /// The prover's `AggCall` accepts either spelling for both of its list fields.
@@ -98,7 +101,7 @@ impl Verifier<'_> {
             val.as_array()
                 .ok_or_else(|| ir("expected a type list"))?
                 .iter()
-                .map(|t| t.as_str().map(str::to_string).ok_or_else(|| ir("non-string type")))
+                .map(|t| t.as_str().map(|t| crate::types::untag(t).to_string()).ok_or_else(|| ir("non-string type")))
                 .collect()
         };
         Ok(match tag {

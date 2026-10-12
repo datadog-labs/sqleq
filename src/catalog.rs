@@ -465,16 +465,17 @@ pub enum TypeMap {
 }
 
 impl TypeMap {
+    /// The IR type of a column declared as `dt`. An opaque one carries `dt`
+    /// ([`crate::types::with_declared`]), so that a value coerced into it is converted as a `dt`.
     fn column_type(self, dt: &DataType) -> String {
-        match self {
+        let rendered = dt.to_string();
+        let ty = match self {
             TypeMap::Declared => map_type(dt),
-            TypeMap::Raw => {
-                let rendered = dt.to_string();
-                crate::pgddl::map_pg_type(&rendered)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::types::opaque_name(&rendered).to_string())
-            }
-        }
+            TypeMap::Raw => crate::pgddl::map_pg_type(&rendered)
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::types::opaque_name(&rendered).to_string()),
+        };
+        crate::types::with_declared(ty, &rendered)
     }
 }
 
@@ -763,7 +764,7 @@ impl Builder {
             // coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE` either. The list
             // `sqleq-solver` reads is `opaque_identity`'s alone: `IDENTITY_OPAQUE` also names a type
             // with no `=`.
-            b.table.opaque_identity.push(cty == IDENTITY_OPAQUE && opaque_identity(&rendered));
+            b.table.opaque_identity.push(crate::types::untag(&cty) == IDENTITY_OPAQUE && opaque_identity(&rendered));
             b.table.cols.push((cname, cty));
             b.table.declared_types.push(rendered);
             b.table.collations.push(collation);
