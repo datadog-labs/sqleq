@@ -1393,9 +1393,74 @@ fn is_structural(op: &str) -> bool {
     matches!(op, "CASE" | "CAST" | "+" | "-" | "*" | "/" | "%" | "||")
 }
 
-/// Logical negation.
+/// Logical negation. Over one of the six native comparisons it is that comparison's negator over the
+/// same operands instead: `NOT (a = b)` is `a <> b`, `NOT (a < b)` is `a >= b`, `NOT (a <= b)` is
+/// `a > b`, and each of the other three the other way round.
+///
+/// Each is the negator Postgres declares for the comparison (`pg_operator.oprnegate`), and the two
+/// agree under three-valued logic: on two non-NULL operands one is true exactly where the other is
+/// false, and on a NULL operand both are NULL. So they agree in a select list as well as in a
+/// `WHERE`. A prover that reads the six as one order and its equality loses nothing by it, and one
+/// that gives each its own predicate, as `sqleq-solver` gives `<>` one that it never relates to
+/// `=`, can then prove `NOT (a = 1)` equal to `a <> 1`, since the two are one term.
+///
+/// Only where the comparison is its operands' type's own ([`negator_holds`]). Everything else stays
+/// a `NOT`, and that includes every predicate that is not one of the six: `q_str_lt` and `q_str_le`
+/// (an order of strings under a collation the frontend does not know, [`crate::collation`]),
+/// `IS DISTINCT FROM`, which is never NULL, `LIKE`, `IN`, and the quantified `= ANY` and `<> ALL`.
 pub fn not_bool(v: Value) -> Value {
-    json!({ "operator": "NOT", "operand": [v], "type": "BOOLEAN" })
+    match negated_comparison(&v) {
+        Some(c) => c,
+        None => json!({ "operator": "NOT", "operand": [v], "type": "BOOLEAN" }),
+    }
+}
+
+/// `v`'s negator, as [`not_bool`] puts it for `NOT v`: `None` unless `v` is one of the six native
+/// comparisons, over two operands whose types [`negator_holds`] admits.
+fn negated_comparison(v: &Value) -> Option<Value> {
+    let negator = match v.get("operator")?.as_str()? {
+        "=" => "<>",
+        "<>" => "=",
+        "<" => ">=",
+        ">=" => "<",
+        "<=" => ">",
+        ">" => "<=",
+        _ => return None,
+    };
+    let [l, r] = v.get("operand")?.as_array()?.as_slice() else { return None };
+    // The type an operand is annotated with, not [`ty_of`]'s INTEGER for one that has none.
+    let (a, b) = (l.get("type")?.as_str()?, r.get("type")?.as_str()?);
+    negator_holds(a, b).then(|| json!({ "operator": negator, "operand": [l, r], "type": "BOOLEAN" }))
+}
+
+/// Whether a native comparison between operands of the types `a` and `b`, as [`make_cmp`] leaves
+/// them, is an operator of one total order and its equality, so that [`not_bool`] may put its
+/// negator for `NOT` over it: an order of the type's values, or of the classes its `=` makes, under
+/// which `<>` is the negation of `=`, `>=` of `<` and `>` of `<=`. An allowlist, each entry checked
+/// on Postgres 17 over `NULL` and the values at the ends of its order:
+///
+/// * INTEGER and REAL, in any mix: the integer types and `numeric`. An integer is compared with a
+///   `numeric` as a `numeric`. `numeric` orders `NaN` and the infinities with the numbers (`NaN`
+///   above `Infinity`, and equal to itself), and its `=` is the order's equality, though not
+///   identity: `2.0 = 2.00`.
+/// * VARCHAR against VARCHAR: text. Its `=` and `<>` are negators under every collation. An order
+///   comparison of two strings is native only under `C` or `POSIX` ([`crate::collation::compare`]),
+///   whose order is that of the bytes, and is `q_str_lt` or `q_str_le` under any other.
+/// * BOOLEAN against BOOLEAN, ordered `false < true`.
+/// * DATE, TIME, TIMESTAMP, TIMESTAMPTZ and INTERVAL, each against itself: the bounded total orders
+///   the module docs describe, `-infinity` and `infinity` included, and for INTERVAL an order of
+///   classes (`'1 day' = '24 hours'`). Two different temporal types meet in a comparison only
+///   through a [`convert`] call on one side, so they are never its two operands.
+///
+/// Not an operand of a type the IR does not model: an opaque one (VARBINARY, whatever the frontend
+/// calls it), or one that keeps its own name, such as `uuid`, an enum or a range. Their operators are
+/// declarations the frontend does not read, and some are not one another's negators: `point` has no
+/// `=`, and its `<>` negates `~=`; `path` has `=`, `<`, `<=`, `>` and `>=`, no `<>`, and names no
+/// negator for any of them. A float is opaque too, though its order would do: Postgres orders `NaN`
+/// above every other float, and calls it equal to itself. Nor an [`UNFAITHFUL`] type.
+fn negator_holds(a: &str, b: &str) -> bool {
+    (is_num(a) && is_num(b))
+        || (a == b && matches!(a, "VARCHAR" | "BOOLEAN" | "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL"))
 }
 
 /// In a predicate position the prover requires a BOOLEAN-typed expression (it panics otherwise).
@@ -1631,5 +1696,63 @@ mod tests {
         assert_eq!(common_type("TIMESTAMPTZ", "DATE"), "TIMESTAMPTZ");
         assert_eq!(common_type("TIME", "DATE"), "VARBINARY");
         assert_eq!(common_type("VARCHAR", "DATE"), "DATE");
+    }
+
+    fn not(v: Value) -> Value {
+        json!({ "operator": "NOT", "operand": [v], "type": "BOOLEAN" })
+    }
+
+    #[test]
+    fn not_over_a_comparison_is_its_negator() {
+        let pairs = [("=", "<>"), ("<>", "="), ("<", ">="), (">=", "<"), ("<=", ">"), (">", "<=")];
+        for (op, negator) in pairs {
+            let (l, r) = (col(0, "INTEGER"), col(1, "INTEGER"));
+            assert_eq!(not_bool(plain(op, l.clone(), r.clone())), plain(negator, l.clone(), r.clone()));
+            // Twice is the comparison itself.
+            assert_eq!(not_bool(not_bool(plain(op, l.clone(), r.clone()))), plain(op, l, r));
+        }
+        // A NULL operand is relabelled to the other's type, and stays an operand.
+        let null = json!({ "operator": "NULL", "operand": [], "type": "INTEGER" });
+        assert_eq!(not_bool(plain("=", col(0, "INTEGER"), null.clone())), plain("<>", col(0, "INTEGER"), null));
+    }
+
+    #[test]
+    fn the_negator_is_put_over_each_type_whose_order_is_its_own() {
+        let one = json!({ "operator": "1", "operand": [], "type": "INTEGER" });
+        // An integer against a `numeric`, which `make_cmp` leaves to the provers' promotion.
+        assert_eq!(not_bool(plain("<", col(0, "REAL"), one.clone())), plain(">=", col(0, "REAL"), one));
+        for ty in ["REAL", "VARCHAR", "BOOLEAN", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL"] {
+            for (op, negator) in [("=", "<>"), ("<=", ">")] {
+                let (l, r) = (col(0, ty), col(1, ty));
+                assert_eq!(not_bool(plain(op, l.clone(), r.clone())), plain(negator, l, r), "{ty}");
+            }
+        }
+    }
+
+    #[test]
+    fn not_over_anything_else_stays_a_not() {
+        let kept = |v: Value| assert_eq!(not_bool(v.clone()), not(v));
+        let s = |i| col(i, "VARCHAR");
+        // An order of strings under a collation the frontend does not know.
+        kept(json!({ "operator": "q_str_lt", "operand": [s(0), s(1)], "type": "BOOLEAN" }));
+        kept(json!({ "operator": "q_str_le", "operand": [s(0), s(1), string_literal("en_US.utf8")], "type": "BOOLEAN" }));
+        // Opaque operands, a float's among them, and types that keep their own names.
+        for ty in ["VARBINARY", "VARBINARY:float", "VARBINARY:jsonb", IDENTITY_OPAQUE, "UUID", "NUMRANGE", "CITEXT", "BPCHAR"] {
+            kept(plain("=", col(0, ty), col(1, ty)));
+            kept(plain("<", col(0, ty), col(1, ty)));
+        }
+        // Two different types, and an operand with no type annotation.
+        kept(plain("=", col(0, "DATE"), col(1, "TIMESTAMP")));
+        kept(plain("=", col(0, "VARCHAR"), col(1, "INTEGER")));
+        kept(plain("<", json!({ "column": 0 }), col(1, "INTEGER")));
+        // Predicates that are not one of the six comparisons.
+        let (a, b) = (col(0, "INTEGER"), col(1, "INTEGER"));
+        kept(plain("IS DISTINCT FROM", a.clone(), b.clone()));
+        kept(plain("IS NOT DISTINCT FROM", a.clone(), b.clone()));
+        kept(plain("LIKE", s(0), s(1)));
+        kept(plain("= ANY", a.clone(), col(1, "VARBINARY")));
+        kept(json!({ "operator": "IN", "operand": [a.clone()], "query": { "scan": 0 }, "type": "BOOLEAN" }));
+        kept(json!({ "operator": "IS NULL", "operand": [a.clone()], "type": "BOOLEAN" }));
+        kept(json!({ "operator": "AND", "operand": [plain("=", a.clone(), b.clone()), plain("<", a, b)], "type": "BOOLEAN" }));
     }
 }
