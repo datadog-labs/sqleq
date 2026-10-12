@@ -3059,7 +3059,8 @@ fn result_group_func_count(v: &Value) -> usize {
     g.and_then(|g| g.get("function")).and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)
 }
 
-/// Apply a unary operator to an already-lowered operand.
+/// Apply a unary operator to an already-lowered operand. `NOT` is [`not_bool`]'s, as in a
+/// predicate, so `NOT (a = 1)` is `a <> 1` in a select list too.
 fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
     match op {
         UnaryOperator::Plus => Ok(inner),
@@ -3067,7 +3068,7 @@ fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
             let ty = ty_of(&inner);
             Ok(json!({ "operator": "-", "operand": [inner], "type": ty }))
         }
-        UnaryOperator::Not => Ok(json!({ "operator": "NOT", "operand": [inner], "type": "BOOLEAN" })),
+        UnaryOperator::Not => Ok(not_bool(inner)),
         other => Err(unsupported(format!("unary op {other:?}"))),
     }
 }
