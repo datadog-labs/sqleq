@@ -99,9 +99,11 @@ const UNKNOWN: &str = "= is not known to be identity";
 #[test]
 fn a_type_no_reader_names_is_not_read_as_one_whose_equality_is_identity() {
     // '[1.0,2.0)' = '[1.00,2.00)' as numranges, and their text differs.
+    // A pair file reads such a column as raw DDL does, as a value of a type the frontend does not
+    // know (issue #93).
     for ty in ["numrange", "nummultirange", "path", "tsquery", "mood"] {
         let ddl = format!(r#"create table "t" ("id" INTEGER, "a" {ty}, "b" {ty});"#);
-        refused(&ddl, CAST_A, CAST_B, &format!("a value of type {ty}"));
+        refused(&ddl, CAST_A, CAST_B, UNKNOWN);
         refused_raw(&ddl, CAST_A, CAST_B, UNKNOWN);
     }
     // A `DISTINCT` puts equal values in one class without a written `=`.
@@ -109,7 +111,7 @@ fn a_type_no_reader_names_is_not_read_as_one_whose_equality_is_identity() {
         r#"create table "t" ("id" INTEGER, "a" numrange);"#,
         r#"SELECT DISTINCT CAST("a" AS TEXT) FROM (SELECT DISTINCT "a" FROM "t") AS "s""#,
         r#"SELECT DISTINCT CAST("a" AS TEXT) FROM "t""#,
-        "a value of type numrange",
+        UNKNOWN,
     );
     // An array of one compares its elements with their `=`.
     refused(r#"create table "t" ("id" INTEGER, "a" numrange[], "b" numrange[]);"#, CAST_A, CAST_B, UNKNOWN);
