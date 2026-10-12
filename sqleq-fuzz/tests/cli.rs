@@ -4,8 +4,8 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! The executable's own behaviour: `csv` mode keeps every row and writes beside its input
-//! (issues #63, #67), `file` mode reads an `ALTER TABLE` as DDL (issue #64), and the engine is
-//! Postgres unless it is told otherwise. Each test runs on both engines, Postgres only where a
+//! (issues #63, #67), `file` mode reads an `ALTER TABLE` as DDL (issue #64) and cuts statements
+//! where Postgres does (issue #93), and the engine is Postgres unless it is told otherwise. Each test runs on both engines, Postgres only where a
 //! PostgreSQL 17 is there to run on (always, when `$SQLEQ_PG_REQUIRED` says one must be).
 
 use std::path::{Path, PathBuf};
@@ -139,6 +139,54 @@ fn alter_pair(dir: &Path) -> PathBuf {
     )
     .unwrap();
     pair
+}
+
+/// File mode cuts a pair file where Postgres cuts it (issue #93): a `;` inside a function's
+/// dollar-quoted body, an `E'…'` string with an escaped quote, or a nested comment ends no
+/// statement. Cut at those, the file had too many queries, or two pieces of queries that ran as a
+/// pair. Text that does not lex is an error, not cut on every `;`.
+#[test]
+fn file_mode_cuts_where_postgres_cuts() {
+    for engine in engines() {
+        let dir = scratch(&format!("cuts-{engine}"));
+        let pair = dir.join("pair.sql");
+        std::fs::write(
+            &pair,
+            "create table \"t\" (\"id\" INTEGER PRIMARY KEY, \"s\" TEXT);\n\
+             create function \"inc\"(\"x\" INTEGER) returns INTEGER language sql immutable \
+             as $$ SELECT \"x\" + 1; $$;\n\
+             SELECT \"id\" FROM \"t\" WHERE \"s\" <> E'a\\';b' /* outer /* inner */ still a comment; */;\n\
+             SELECT \"id\" FROM \"t\" WHERE E'a\\';b' <> \"s\";\n",
+        )
+        .unwrap();
+        let st = Command::new(BIN)
+            .arg("file")
+            .arg(&pair)
+            .args(["--engine", engine, "--trials", "20"])
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{engine}: {st:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&st.stdout).lines().next(),
+            Some("NO-COUNTEREXAMPLE"),
+            "{engine}"
+        );
+
+        std::fs::write(
+            &pair,
+            "create table t (id INTEGER);\nSELECT id FROM t;\nSELECT id FROM t /* unterminated;\n",
+        )
+        .unwrap();
+        let st = Command::new(BIN)
+            .arg("file")
+            .arg(&pair)
+            .args(["--engine", engine])
+            .output()
+            .unwrap();
+        assert!(!st.status.success(), "{engine}: {st:?}");
+        let err = String::from_utf8_lossy(&st.stderr);
+        assert!(err.contains("cannot cut"), "{engine}: {err}");
+    }
 }
 
 /// With no `--engine` the pair runs on Postgres; `$SQLEQ_FUZZ_ENGINE` picks DuckDB. Each says which.

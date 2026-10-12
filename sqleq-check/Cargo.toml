@@ -24,7 +24,8 @@ path = "src/main.rs"
 # built to build this. A hard per-case deadline needs a process to kill anyway: a Z3 call cannot be
 # interrupted from outside, and sqleq-fuzz has no timeout of its own.
 [dependencies]
-# Only its corpus reader, so a corpus row is named and split exactly as every other tool reads it.
+# Only its corpus reader and statement splitter, so a corpus row is named and split, and a pair file
+# cut into statements, exactly as the frontend reads them.
 sqleq-frontend = { path = ".." }
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 csv = { workspace = true }

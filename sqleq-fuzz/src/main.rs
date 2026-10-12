@@ -356,12 +356,14 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
         .join("\n");
     let mut ddl_parts: Vec<String> = Vec::new();
     let mut queries: Vec<String> = Vec::new();
-    for s in split_statements(&cleaned) {
+    let stmts = split_statements(&cleaned)
+        .map_err(|e| format!("cannot cut {path} into statements: {e}"))?;
+    for s in stmts {
         let upper = s.to_uppercase();
         if upper.starts_with("CREATE") || upper.starts_with("ALTER") || upper.starts_with("DROP") {
-            ddl_parts.push(s);
+            ddl_parts.push(s.to_string());
         } else {
-            queries.push(s);
+            queries.push(s.to_string());
         }
     }
     if queries.len() != 2 {
@@ -401,7 +403,7 @@ fn report(v: &Verdict, engine: &str, caveat: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_out, guarded, split_statements};
+    use super::{default_out, guarded};
     use sqleq_fuzz::Verdict;
 
     /// A panic inside one pair's test is that pair's `ERROR` verdict. It used to unwind through the
@@ -423,56 +425,5 @@ mod tests {
     fn the_default_output_sits_beside_the_corpus() {
         assert_eq!(default_out("runs/corpus.csv"), "runs/corpus.fuzz.json");
         assert_eq!(default_out("corpus"), "corpus.fuzz.json");
-    }
-
-    /// The shape of `examples/*.sql`: a comment above the DDL used to hide `CREATE` from the
-    /// classifier, so the schema was counted as a third query and the file was rejected.
-    #[test]
-    fn leading_comment_does_not_hide_the_keyword() {
-        let src = "-- Schema for the pair.\ncreate table \"t\" (\"id\" INTEGER);\n\
-                   -- A: one way\nSELECT 1;\n-- B: the other\nSELECT 1;\n";
-        let stmts = split_statements(src);
-        assert_eq!(stmts.len(), 3);
-        assert!(stmts[0].to_uppercase().starts_with("CREATE"));
-        assert_eq!(stmts[1], "SELECT 1");
-        assert_eq!(stmts[2], "SELECT 1");
-    }
-
-    #[test]
-    fn semicolons_inside_quotes_and_comments_do_not_split() {
-        let stmts = split_statements(
-            "SELECT 'a;b' AS \"c;d\"; -- trailing ; note\nSELECT 2; /* block ; */\n",
-        );
-        assert_eq!(stmts, vec!["SELECT 'a;b' AS \"c;d\"", "SELECT 2"]);
-    }
-
-    #[test]
-    fn doubled_quote_is_escaped_not_a_terminator() {
-        assert_eq!(
-            split_statements("SELECT 'it''s; fine';"),
-            vec!["SELECT 'it''s; fine'"]
-        );
-    }
-
-    /// A trigger's function, as a pair pinning a trigger declares it: the body's `;`s used to split
-    /// it into three statements, and the file was rejected for having four queries.
-    #[test]
-    fn semicolons_inside_a_dollar_quoted_body_do_not_split() {
-        let f = "create function f() returns trigger language plpgsql as $$ begin NEW.a := 1; return NEW; end $$";
-        assert_eq!(split_statements(&format!("{f};\nSELECT 1;")), vec![f, "SELECT 1"]);
-        let g = "create function g() returns int language sql as $body$ select 1; $body$";
-        assert_eq!(split_statements(&format!("{g}; SELECT 2;")), vec![g, "SELECT 2"]);
-        // A parameter is no tag.
-        assert_eq!(split_statements("SELECT $1; SELECT $2;"), vec!["SELECT $1", "SELECT $2"]);
-    }
-
-    #[test]
-    fn comment_only_text_yields_no_statement() {
-        assert!(split_statements("-- nothing here\n/* nor here */\n").is_empty());
-    }
-
-    #[test]
-    fn block_comment_before_a_statement_is_dropped() {
-        assert_eq!(split_statements("/* why */ SELECT 1;"), vec!["SELECT 1"]);
     }
 }

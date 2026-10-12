@@ -20,6 +20,7 @@ See [DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
 | `src/{catalog,scope,types,casts,lower,error}.rs` | catalog, de-Bruijn scope, type mapping/coercion, cast rules, lowering, errors |
 | `src/{normalize,dml}.rs` | equivalence-preserving rewrites; `DELETE`, `UPDATE` and `INSERT` pairs reduced to queries computing their effect |
 | `src/{infer,pgddl}.rs` | type inference (the `--infer`/`--infer-seeded` modes) and the raw-Postgres-DDL reader |
+| `src/split.rs` | SQL text cut into statements where Postgres cuts it, on sqlparser's tokens; raw DDL is read through it, and `sqleq-check` decides a refused pair's triviality with it |
 | `src/params.rs` | `$N` handling and the misalignment check ([SOUNDNESS.md](SOUNDNESS.md)) |
 | `src/verify.rs` | re-derives the de-Bruijn invariants on every lowering — a second net under the soundness argument |
 | `src/corpus.rs` | the corpus CSV reader and `--csv` batch driver: row *n* is case `pair{n:04}`, lowered against its own DDL; `sqleq-check --corpus` reads rows through it |

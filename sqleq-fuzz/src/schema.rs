@@ -44,6 +44,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 /// A column's value domain, mapped to how it is generated and rendered for DuckDB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,42 +383,27 @@ fn vtype_word(base: &str) -> VType {
     }
 }
 
-/// Split on commas that are outside any parentheses and outside any quoted run.
-fn split_top(body: &str) -> Vec<String> {
+/// Split on commas outside any parentheses, as the tokenizer reads the text: a comma inside a
+/// literal (a dollar-quoted one, `DEFAULT $$a,b$$`, too), a quoted name or a comment splits nothing.
+/// `None` if the text does not lex, which costs the caller its table: all or nothing.
+fn split_top(body: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for ch in body.chars() {
-        match quote {
-            Some(q) => {
-                cur.push(ch);
-                if ch == q {
-                    quote = None;
-                }
+    let (mut start, mut depth) = (0usize, 0usize);
+    for t in crate::lex::lex_as_postgres(body).ok()? {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                out.push(body[start..t.start].to_string());
+                start = t.end;
             }
-            None => match ch {
-                '\'' | '"' => {
-                    quote = Some(ch);
-                    cur.push(ch);
-                }
-                '(' => {
-                    depth += 1;
-                    cur.push(ch);
-                }
-                ')' => {
-                    depth -= 1;
-                    cur.push(ch);
-                }
-                ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
-                _ => cur.push(ch),
-            },
+            _ => {}
         }
     }
-    if !cur.trim().is_empty() {
-        out.push(cur);
+    if !body[start..].trim().is_empty() {
+        out.push(body[start..].to_string());
     }
-    out
+    Some(out)
 }
 
 /// Byte index of the `)` matching the `(` at `open`.
@@ -566,7 +552,7 @@ fn plain_key(s: &str) -> Option<Vec<String>> {
     let open = s.find('(')?;
     let close = matching(s, open)?;
     let mut cols = Vec::new();
-    for part in split_top(&s[open + 1..close]) {
+    for part in split_top(&s[open + 1..close])? {
         let (name, rest) = take_ident(&part)?;
         if !rest.trim().is_empty() {
             return None;
@@ -724,7 +710,7 @@ fn like_item(item: &str) -> Option<(Target, bool)> {
 /// its name.
 fn recover_body(body: &str) -> Option<Body> {
     let mut b = Body::default();
-    for raw in split_top(body) {
+    for raw in split_top(body)? {
         let mut item = raw.trim();
         if item.is_empty() {
             continue;
@@ -2001,6 +1987,9 @@ pub fn parse_schema_stats(ddl: &str) -> (Schema, usize) {
     // Prefer one whole-DDL parse; if a single odd statement trips the strict parser, parse each
     // statement independently -- split as Postgres's lexer splits them, so a `;` in a string or a
     // dollar-quoted body ends none -- so the good ones still land. Either way they apply in order.
+    // DDL the tokenizer rejects is no schema at all: where its statements end is not known, and a
+    // table read without a statement after it that adds a key would be filled with rows no
+    // database holds.
     match Parser::parse_sql(&dialect, &cleaned) {
         Ok(stmts) => {
             for st in &stmts {
@@ -2008,14 +1997,17 @@ pub fn parse_schema_stats(ddl: &str) -> (Schema, usize) {
             }
         }
         Err(_) => {
-            for chunk in crate::lex::split_statements(&cleaned) {
-                match Parser::parse_sql(&dialect, &chunk) {
+            let Ok(chunks) = crate::lex::split_statements(&cleaned) else {
+                return (Schema::new(), 0);
+            };
+            for chunk in chunks {
+                match Parser::parse_sql(&dialect, chunk) {
                     Ok(stmts) => {
                         for st in &stmts {
                             r.statement(st);
                         }
                     }
-                    Err(_) => r.unparsed(&chunk),
+                    Err(_) => r.unparsed(chunk),
                 }
             }
         }

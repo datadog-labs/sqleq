@@ -1084,6 +1084,47 @@ fn a_function_body_is_not_split_into_statements() {
     assert!(s["t"].cols[1].notnull);
 }
 
+/// The same per-statement fallback, cut where Postgres cuts (issue #93). Block comments nest: the
+/// hand-written splitter ended this one at its first `*/`, so the `ALTER TABLE` inside it, which
+/// nothing runs, was read as the DDL's and made `id` nullable. The unparseable `CREATE INDEX … ON
+/// ONLY` is what sends the DDL to the fallback.
+#[test]
+fn the_fallback_reads_a_nested_comment_as_postgres_does() {
+    let s = parse_schema(
+        "create table t (id integer not null, s text default 'it''s; fine');\n\
+         create index i on only t using btree (id);\n\
+         /* outer /* inner */ alter table t alter column id drop not null; */\n\
+         alter table t add column w integer;",
+    );
+    let names: Vec<&str> = s["t"].cols.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "s", "w"]);
+    assert!(s["t"].cols[0].notnull, "the ALTER in the comment ran");
+}
+
+/// DDL that does not lex has no statements to fall back on: where they end is not known, and a
+/// table read without a later statement's key would be filled with rows no database holds.
+#[test]
+fn ddl_that_does_not_lex_is_no_schema() {
+    let s = parse_schema(
+        "create table t (id integer);\n\
+         create index i on only t using btree (id);\n\
+         alter table t add constraint k unique (id) /* unterminated;",
+    );
+    assert!(s.is_empty(), "{s:?}");
+}
+
+/// The regex fallback's column list is cut at its top-level commas by the tokenizer: a comma in a
+/// dollar-quoted default used to cut the column in two and cost the table.
+#[test]
+fn a_comma_in_a_dollar_quoted_default_stays_in_its_column() {
+    let s = parse_schema(
+        "create table q (id integer primary key, primary boolean, s text default $$a,b$$ not null);",
+    );
+    let names: Vec<&str> = s["q"].cols.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "primary", "s"]);
+    assert!(s["q"].cols[2].notnull && s["q"].unreadable.is_none());
+}
+
 #[test]
 fn recovery_never_overrides_a_parsed_table() {
     let s = parse_schema("CREATE TABLE t (a INTEGER UNIQUE, b INTEGER)");
@@ -1362,3 +1403,4 @@ fn array_column_pairs_actually_run() {
     assert_eq!(v.label(), "NO-COUNTEREXAMPLE");
     assert!(v.partial().is_none(), "{:?}", v.partial());
 }
+

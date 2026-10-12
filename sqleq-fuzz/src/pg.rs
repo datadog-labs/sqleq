@@ -972,22 +972,10 @@ fn compatible(p: VType, l: VType) -> bool {
 
 static PREPARED: AtomicUsize = AtomicUsize::new(0);
 
-/// How many statements `sql` holds, by its top-level semicolons; 0 if it does not lex.
+/// How many statements `sql` holds, cut where Postgres cuts them ([`crate::lex::split_statements`]);
+/// 0 if it does not lex.
 fn statements(sql: &str) -> usize {
-    match crate::lex::significant(sql) {
-        Some(toks) => {
-            let semis = toks
-                .iter()
-                .filter(|t| matches!(t.token, sqlparser::tokenizer::Token::SemiColon))
-                .count();
-            let trailing = matches!(
-                toks.last().map(|t| &t.token),
-                Some(sqlparser::tokenizer::Token::SemiColon)
-            );
-            semis + 1 - usize::from(trailing)
-        }
-        None => 0,
-    }
+    crate::lex::split_statements(sql).map_or(0, |s| s.len())
 }
 
 /// The type each of `sql`'s placeholders has once Postgres prepares it with `declared` (unknown where

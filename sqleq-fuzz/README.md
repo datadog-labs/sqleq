@@ -175,6 +175,11 @@ deterministic, on either engine. The rules:
 - **Read placeholders off the tokens.** `$N` is found by the tokenizer, never inside a string literal
   or a comment, and substituted at those positions only. A placeholder Postgres would reject (`$0`,
   a number past `u32`) makes the pair `ERROR`.
+- **Cut statements where Postgres does.** A pair file, and DDL the parser cannot read whole, are cut
+  at the `;`s the tokenizer reads as Postgres's lexer does: not inside a literal (`E'…'` with its
+  backslash escapes too), a quoted name, a dollar-quoted body or a nested comment, nor inside
+  parentheses or a routine's `BEGIN ATOMIC` body, as psql does. Text it cannot lex is never cut on
+  every `;`: `file` mode stops with an error, and DDL is `NO-SCHEMA`.
 - **Don't invent a parameter correspondence.** See the next section.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
@@ -341,9 +346,9 @@ side and a scalar on the other, a pair of the gather rule's shape cannot be boun
 an ICU collation, or the generated instances cannot stand for the DDL.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
-read or an argument is missing (a missing file, a row out of range, a file without exactly two
-statements besides its DDL, `row` without an index), or when a `csv` worker died and left rows
-without a verdict; `2` when the mode is missing or unknown, after printing the usage.
+read or an argument is missing (a missing file, a row out of range, a file that does not lex or
+has other than two statements besides its DDL, `row` without an index), or when a `csv` worker died
+and left rows without a verdict; `2` when the mode is missing or unknown, after printing the usage.
 
 ### The generated value domain (why a literal can make a pair look equivalent)
 

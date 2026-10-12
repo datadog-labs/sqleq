@@ -57,6 +57,10 @@ mod param_types;
 pub mod pgddl;
 mod rejected_ddl;
 mod scope;
+/// Public because `sqleq-check` cuts a pair file into statements with it, to decide from the text
+/// whether its two queries are one: a second splitter there would cut some file differently from
+/// this crate's.
+pub mod split;
 /// Public because it is an entry point: the `--sqlsolver --ir` mode of the CLI turns a lowered plan
 /// into a job for a SQLSolver driver — `sqleq-solver`, or the JVM fork's.
 pub mod sqlsolver;
