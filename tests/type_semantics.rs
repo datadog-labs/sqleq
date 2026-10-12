@@ -125,6 +125,25 @@ fn json_extract_path_is_neither_operator() {
 }
 
 #[test]
+fn a_literal_path_operator_is_the_extraction_function() {
+    // `#>` is `jsonb_extract_path` and `#>>` is `jsonb_extract_path_text` (`pg_operator.oprcode`),
+    // and the literal `'{a,b}'` is the array `{a, b}`. One plan on both sides, so the `#>>` pair, which
+    // reads a `jsonb` as text, lowers rather than being refused.
+    assert!(identical(r#"SELECT "j" #> '{a,b}' FROM "t""#, r#"SELECT jsonb_extract_path("j", 'a', 'b') FROM "t""#));
+    assert!(identical(
+        r#"SELECT "j" #>> '{a,b}' FROM "t""#,
+        r#"SELECT jsonb_extract_path_text("j", 'a', 'b') FROM "t""#,
+    ));
+    assert!(identical(r#"SELECT "j" #> '{"a,b"}' FROM "t""#, r#"SELECT jsonb_extract_path("j", 'a,b') FROM "t""#));
+    // Over `{"a": {"b": 1, "NULL": 2}}`, `j #> '{a,NULL}'` is NULL (the element is NULL), and
+    // `jsonb_extract_path(j, 'a', 'NULL')` is 2.
+    assert!(!identical(
+        r#"SELECT "j" #> '{a,NULL}' FROM "t""#,
+        r#"SELECT jsonb_extract_path("j", 'a', 'NULL') FROM "t""#,
+    ));
+}
+
+#[test]
 fn another_dialects_json_extract_is_an_ordinary_call() {
     // `json_extract` reads a JSONPath in the dialects that have it, and Postgres has none: it is not
     // `->`.
