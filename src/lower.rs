@@ -3499,7 +3499,9 @@ fn lower_in_subquery(
         )));
     }
     // The prover compares each left operand with the subquery's column as it stands, with no
-    // coercion of its own, so a DATE against a TIMESTAMP column would compare two units.
+    // coercion of its own, so a DATE against a TIMESTAMP column would compare two units. Where the
+    // conversion belongs on the subquery's side, its column is converted instead.
+    let (sub, sub_cols) = widen_in_subquery(&lhs, sub, sub_cols, Scope::outer_width(&scope.binds));
     let lhs: Vec<Value> = lhs
         .into_iter()
         .zip(&sub_cols)
@@ -3511,6 +3513,53 @@ fn lower_in_subquery(
         .collect::<Result<_>>()?;
     let v = json!({ "operator": "IN", "operand": lhs, "query": sub, "type": "BOOLEAN" });
     Ok(if negated { not_bool(v) } else { v })
+}
+
+/// The subquery of `lhs IN (sub)`, each of its columns converted to its left operand's type where
+/// that is the type the two are compared at, as Postgres converts it: `r IN (SELECT id ..)` over a
+/// `numeric` `r` and an `integer` `id` compares `r = id::numeric`. `base` is the width of the context
+/// the subquery reads, where its own row starts in the level numbering ([`Scope::base`]).
+///
+/// [`coerce_in_operand`] converts the left operand when the subquery's column has the type they meet
+/// at, and refuses the other way round, because the conversion is not its to make. Only the
+/// conversions a comparison `x = c` makes in that place ([`make_cmp`]) are made here, so `x IN
+/// (SELECT c ..)` and `EXISTS (.. WHERE x = c)` keep one encoding: an `integer` column against a
+/// `numeric` operand, a temporal column against an operand of the temporal type they meet at, and a
+/// column against an opaque operand ([`cast_into`], named as `x = c` names it). Any other pair keeps
+/// the refusal: a `text` operand against an `integer` column, say, which Postgres rejects. A row
+/// value's arity is checked before this runs.
+fn widen_in_subquery(lhs: &[Value], sub: Value, sub_cols: OutCols, base: usize) -> (Value, OutCols) {
+    let widened: Vec<Option<String>> = lhs
+        .iter()
+        .zip(&sub_cols)
+        .map(|(x, (_, t))| {
+            let xt = ty_of(x);
+            let ct = common_type(&xt, t);
+            let to_operand = ct == xt && ct != *t;
+            let allowed = (xt == "REAL" && t == "INTEGER")
+                || (is_temporal(&xt) && is_temporal(t))
+                || (is_opaque(&xt) && !is_opaque(t));
+            (to_operand && allowed && !is_null_lit(x)).then_some(ct)
+        })
+        .collect();
+    if widened.iter().all(Option::is_none) {
+        return (sub, sub_cols);
+    }
+    let target: Vec<Value> = sub_cols
+        .iter()
+        .zip(&widened)
+        .zip(lhs)
+        .enumerate()
+        .map(|(j, (((_, t), w), x))| {
+            let col = json!({ "column": base + j, "type": t });
+            match w {
+                Some(ct) => cast_into(col, ct, x),
+                None => col,
+            }
+        })
+        .collect();
+    let cols = sub_cols.into_iter().zip(widened).map(|((n, t), w)| (n, w.unwrap_or(t))).collect();
+    (json!({ "project": { "target": target, "source": sub } }), cols)
 }
 
 /// `x = ANY(rhs)` and `x <> ALL(rhs)`, in each of the operand shapes Postgres allows on the right.
