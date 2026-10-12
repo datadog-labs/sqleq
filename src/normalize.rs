@@ -276,15 +276,25 @@ fn placeholder() -> Expr {
 /// **The two sides of the pair have to get the same symbol for the same operator.** They do — the
 /// mapping is a constant table keyed on the operator, not on anything about the query. Were it
 /// query-dependent, two spellings of the same operator would become two unrelated symbols and the
-/// abstraction would stop being conservative in the safe direction.
+/// abstraction would stop being conservative in the safe direction. The one input the mapping reads
+/// besides the operator is a literal path under `#>` and `#>>` (below), and what it reads there is
+/// the value Postgres reads, so one path gets one term whichever side spells it.
 ///
-/// # Two places where the mapping says more than the minimum
+/// # Three places where the mapping says more than the minimum
 ///
 /// **`<@` is `@>` with its arguments swapped.** They are the same containment relation read in the two
 /// directions, so giving them one symbol lets the prover see `a @> b` and `b <@ a` as the same thing
 /// rather than as two opaque calls. Likewise `!~` becomes a negated `~` instead of a symbol of its
 /// own: in Postgres `x !~ p` *is* `NOT (x ~ p)`, nulls included, since both sides are `NULL` when
 /// either operand is and `NOT NULL` is `NULL`.
+///
+/// **`#>` over a literal path is the extraction function, written as an operator.** Postgres
+/// implements `j #> p` as `jsonb_extract_path(j, VARIADIC p)`, and `#>>` as
+/// `jsonb_extract_path_text` (on `json`, as the `json_` forms, which share their symbols). So where
+/// the path is a literal whose elements [`path_elements`] can read, the operator becomes the call
+/// the function's spelling becomes: `j #> '{a,b}'` and `jsonb_extract_path(j, 'a', 'b')` are one
+/// term, `q_op_jsonpath_elems(j, 'a', 'b')`. Every other path keeps `#>`'s own symbol, which costs
+/// the proof and nothing else.
 ///
 /// **`|`, `#`, `<<` and the rest of the bitwise family are left refused.** `|` is bitwise-or on
 /// integers, union on `tsquery`, and something else again on `inet`; a single symbol for it would be
@@ -305,7 +315,8 @@ fn demoted(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
         // the opaque sort it is; `->>` and `#>>` yield text. `->` looks up one key (or one array
         // index) and `#>` follows a path, so they are two operations with two symbols: over
         // `{"a": "x"}`, `j ->> '{a}'` looks for the key `{a}` and finds nothing, while `j #>> '{a}'`
-        // follows the path `[a]` to `x`.
+        // follows the path `[a]` to `x`. A `#>` or `#>>` whose path [`literal_path`] reads is
+        // rewritten before this table is asked, so these two are the symbols of every other path.
         Arrow => ("q_op_jsonx", false, false),
         LongArrow => ("q_str_jsonx", false, false),
         HashArrow => ("q_op_jsonpath", false, false),
@@ -365,8 +376,9 @@ const CLOCKS: [(&str, &str); 7] = [
 /// * not `#>`'s, though they are one operation, because their arguments are spelled differently:
 ///   `#>` takes the path as one array, the function as one text argument per element. With one
 ///   symbol, `j #> '{a}'` and `jsonb_extract_path(j, '{a}')` would be one term, and the first follows
-///   `[a]` while the second follows `["{a}"]`. A pair that rewrites between the two spellings goes
-///   unproved.
+///   `[a]` while the second follows `["{a}"]`. The two spellings meet only where `#>`'s path is a
+///   literal [`literal_path`] reads: it is then passed as its elements, one argument each, and
+///   `j #> '{a}'` becomes the term `jsonb_extract_path(j, 'a')` becomes.
 ///
 /// The return type follows Postgres, so the split is the same one the operators make: the `_text`
 /// forms yield `text` and take `q_str_`, the rest yield `json`/`jsonb` and take `q_op_`.
@@ -405,6 +417,99 @@ fn json_fn_symbol(f: &Function) -> Option<&'static str> {
         return None;
     }
     JSON_FNS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
+/// The symbol `#>` or `#>>` becomes over a literal path: the one [`JSON_FNS`] gives the function
+/// Postgres implements the operator with (`pg_operator.oprcode`), `jsonb_extract_path` for `#>` and
+/// `jsonb_extract_path_text` for `#>>`. On `json` the operators are the `json_` functions, which
+/// share those symbols. `None` for every other operator, `->` and `->>` included: they look up one
+/// key or one array index, not a path.
+fn path_operator_symbol(op: &BinaryOperator) -> Option<&'static str> {
+    let name = match op {
+        BinaryOperator::HashArrow => "JSONB_EXTRACT_PATH",
+        BinaryOperator::HashLongArrow => "JSONB_EXTRACT_PATH_TEXT",
+        _ => return None,
+    };
+    JSON_FNS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
+/// The elements of a path operand, as the string literals the function's spelling passes them as, if
+/// the operand is a plain string literal [`path_elements`] reads. Parentheses are looked through,
+/// since they change nothing. Every other path keeps the operator's own symbol: a parameter or a
+/// column, whose value is not known here; a cast or an `ARRAY[..]`, which are paths too but are not
+/// read here; and a string spelled other than `'..'` (`E'..'`, `U&'..'`, `$$..$$`), which sqlparser
+/// keeps apart and which is not read here either.
+fn literal_path(e: &Expr) -> Option<Vec<Expr>> {
+    let mut e = e;
+    while let Expr::Nested(inner) = e {
+        e = inner;
+    }
+    let Expr::Value(v) = e else { return None };
+    let Value::SingleQuotedString(s) = &v.value else { return None };
+    let elements = path_elements(s)?;
+    Some(elements.into_iter().map(|x| Expr::Value(Value::SingleQuotedString(x).into())).collect())
+}
+
+/// The elements of a `text[]` literal, as Postgres's `array_in` reads them, if the literal is in the
+/// one grammar read here; `None` otherwise.
+///
+/// ```text
+/// path     = '{' element (',' element)* '}'
+/// element  = [A-Za-z0-9_-]+        unquoted, and not NULL in any case
+///          | '"' [^"\]* '"'        quoted, with no backslash
+/// ```
+///
+/// Within it, `array_in` reads each element as exactly its characters: an unquoted element has
+/// nothing in it to trim, unescape or read as NULL, and a quoted one is the characters between its
+/// quotes, a `,`, a brace or a space included (`'{"a,b"}'` is the one element `a,b`). So the elements
+/// returned are the array's, in order, and `j #> '{a,"b c"}'` is `jsonb_extract_path(j, 'a', 'b c')`
+/// on every document, a NULL one included: the operator calls that function with that array.
+///
+/// Everything outside the grammar is left alone, which costs the proof between the two spellings and
+/// nothing else. Reading these right would take more of `array_in` than the grammar models, and
+/// reading them as their characters would be wrong:
+///
+/// * an unquoted `NULL`, in any case, is the SQL NULL element, not the string: `'{a,NULL}'` makes
+///   the result NULL, where `jsonb_extract_path(j, 'a', 'NULL')` looks up the key `NULL`. A quoted
+///   `"NULL"` is the string, and is read;
+/// * a backslash escapes the character after it, inside quotes and out (`'{a\,b}'` is the one element
+///   `a,b`). It is also what the string lexer would read first under
+///   `standard_conforming_strings = off`, so a literal without one means the same under either;
+/// * `'{}'` is the empty path, which yields the document itself and has no spelling as a call
+///   (`jsonb_extract_path(j)` does not resolve);
+/// * a nested `{` makes an array of more than one dimension, which the function reads flattened, a
+///   leading `[1:2]=` gives it bounds, and the whitespace around an element is trimmed. Postgres reads
+///   each as the elements one would guess, and none of them is needed to meet the call;
+/// * an empty element, a stray quote or brace, or an unquoted character outside the class, which
+///   Postgres rejects or reads by rules the grammar does not model.
+fn path_elements(literal: &str) -> Option<Vec<String>> {
+    let unquoted = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut rest = literal.strip_prefix('{')?.strip_suffix('}')?;
+    let mut elements = Vec::new();
+    loop {
+        let (element, after) = match rest.strip_prefix('"') {
+            Some(quoted) => {
+                let end = quoted.find(['"', '\\'])?;
+                if !quoted[end..].starts_with('"') {
+                    return None;
+                }
+                (&quoted[..end], &quoted[end + 1..])
+            }
+            None => {
+                let end = rest.find(|c: char| !unquoted(c)).unwrap_or(rest.len());
+                let word = &rest[..end];
+                if word.is_empty() || word.eq_ignore_ascii_case("null") {
+                    return None;
+                }
+                (word, &rest[end..])
+            }
+        };
+        elements.push(element.to_string());
+        if after.is_empty() {
+            return Some(elements);
+        }
+        rest = after.strip_prefix(',')?;
+    }
 }
 
 /// Move the positional arguments out of a call, leaving placeholders behind.
@@ -469,8 +574,8 @@ impl VisitorMut for Demote {
                 *e = call1(sym, Expr::Value(number_zero()));
                 return ControlFlow::Continue(());
             }
-            // The call spelling of an extraction operator, onto the same symbol the operator gets.
-            // Arity is carried through: the path argument is variadic.
+            // The call spelling of an extraction operator, onto the symbol the operator gets over a
+            // literal path. Arity is carried through: the path argument is variadic.
             if let Some(sym) = json_fn_symbol(f) {
                 let args = take_positional_args(f);
                 *e = calln(sym, args);
@@ -480,6 +585,13 @@ impl VisitorMut for Demote {
         let Expr::BinaryOp { left, op, right } = e else {
             return ControlFlow::Continue(());
         };
+        // The operator spelling of an extraction over a literal path, as the call it is: the document,
+        // then one text argument per element, as the function's spelling passes them.
+        if let (Some(sym), Some(elements)) = (path_operator_symbol(op), literal_path(right)) {
+            let doc = core::mem::replace(&mut **left, placeholder());
+            *e = calln(sym, std::iter::once(doc).chain(elements).collect());
+            return ControlFlow::Continue(());
+        }
         let Some((name, swap, negate)) = demoted(op) else {
             return ControlFlow::Continue(());
         };
@@ -2488,13 +2600,166 @@ mod tests {
             "SELECT q_str_jsonx(payload, 'a') FROM t"
         );
         assert_eq!(
+            demoted_sql("SELECT payload #> path FROM t"),
+            "SELECT q_op_jsonpath(payload, path) FROM t"
+        );
+        assert_eq!(
+            demoted_sql("SELECT payload #>> path FROM t"),
+            "SELECT q_str_jsonpath(payload, path) FROM t"
+        );
+        // Over a literal path, the same split, in the symbols of the function spellings.
+        assert_eq!(
             demoted_sql("SELECT payload #> '{a,b}' FROM t"),
-            "SELECT q_op_jsonpath(payload, '{a,b}') FROM t"
+            "SELECT q_op_jsonpath_elems(payload, 'a', 'b') FROM t"
         );
         assert_eq!(
             demoted_sql("SELECT payload #>> '{a,b}' FROM t"),
-            "SELECT q_str_jsonpath(payload, '{a,b}') FROM t"
+            "SELECT q_str_jsonpath_elems(payload, 'a', 'b') FROM t"
         );
+    }
+
+    /// `#>` over a literal path is `jsonb_extract_path` with the path's elements as its arguments,
+    /// and `#>>` is `jsonb_extract_path_text` (`pg_operator.oprcode`), so the two spellings are one
+    /// term. Each case was checked on Postgres 17 against the call, over objects, arrays, scalars and a
+    /// NULL document, for `jsonb` and for `json`.
+    #[test]
+    fn a_literal_path_operator_is_the_extraction_call() {
+        for (path, elements) in [
+            ("'{a,b}'", "'a', 'b'"),
+            ("'{a}'", "'a'"),
+            ("'{a,b,c}'", "'a', 'b', 'c'"),
+            // Array indexes are path elements like any other, a negative one included.
+            ("'{0,1}'", "'0', '1'"),
+            ("'{-1,0}'", "'-1', '0'"),
+            ("'{a-b_c9,Z}'", "'a-b_c9', 'Z'"),
+            // A quoted element is its characters between the quotes, whatever they are.
+            ("'{\"a\",\"b\"}'", "'a', 'b'"),
+            ("'{\"a\",b}'", "'a', 'b'"),
+            ("'{\"a,b\"}'", "'a,b'"),
+            ("'{\"a b\",x}'", "'a b', 'x'"),
+            ("'{\"{x}\"}'", "'{x}'"),
+            ("'{\"}\"}'", "'}'"),
+            ("'{\",\",\"\"}'", "',', ''"),
+            ("'{\"\"}'", "''"),
+            ("'{\"é\"}'", "'é'"),
+            // The quote in the SQL string is one character of the element.
+            ("'{\"''\"}'", "''''"),
+            // Quoted, NULL is the string.
+            ("'{\"NULL\"}'", "'NULL'"),
+            ("'{\"null\"}'", "'null'"),
+            // Only the whole word is NULL.
+            ("'{nullx}'", "'nullx'"),
+        ] {
+            assert_eq!(
+                demoted_sql(&format!("SELECT j #> {path} FROM t")),
+                demoted_sql(&format!("SELECT jsonb_extract_path(j, {elements}) FROM t")),
+                "{path}"
+            );
+            assert_eq!(
+                demoted_sql(&format!("SELECT j #>> {path} FROM t")),
+                demoted_sql(&format!("SELECT jsonb_extract_path_text(j, {elements}) FROM t")),
+                "{path}"
+            );
+        }
+        // Parentheses change nothing.
+        assert_eq!(
+            demoted_sql("SELECT j #> ('{a,b}') FROM t"),
+            "SELECT q_op_jsonpath_elems(j, 'a', 'b') FROM t"
+        );
+    }
+
+    /// Every path outside the grammar keeps the operator's own symbol, over the literal as written.
+    /// The first group would be read wrong as its characters; the rest Postgres reads as one would
+    /// guess, or rejects, and the grammar does not model them.
+    #[test]
+    fn a_path_outside_the_grammar_keeps_the_operator_symbol() {
+        for path in [
+            // An unquoted NULL, in any case, is the SQL NULL element, not the string.
+            "'{NULL}'",
+            "'{a,NULL}'",
+            "'{null}'",
+            "'{NuLl}'",
+            // A backslash escapes the next character: the one element `a,b`, then `a"b`, then `a\b`.
+            r"'{a\,b}'",
+            r#"'{"a\"b"}'"#,
+            r#"'{"a\\b"}'"#,
+            // The empty path is the whole document, and no call spells it.
+            "'{}'",
+            // More than one dimension, explicit bounds, padding.
+            "'{{a,b}}'",
+            "'[1:2]={a,b}'",
+            "'{ a , b }'",
+            "' {a,b}'",
+            "'{a,b} '",
+            "'{\"a\" ,b}'",
+            // Not an array literal Postgres accepts.
+            "'{a,,b}'",
+            "'{a,}'",
+            "'{,a}'",
+            "'{\"a\"b}'",
+            "'{a\"b\"}'",
+            "'{\"a\"\"b\"}'",
+            "'{\"a}'",
+            "'{a}}'",
+            "'{a'",
+            "'a,b'",
+            "''",
+            // Unquoted, a character outside the class.
+            "'{é}'",
+            "'{a.b}'",
+            "'{$1}'",
+        ] {
+            let out = demoted_sql(&format!("SELECT j #> {path} FROM t"));
+            assert!(out.starts_with("SELECT q_op_jsonpath(j, "), "{path} -> {out}");
+            let out = demoted_sql(&format!("SELECT j #>> {path} FROM t"));
+            assert!(out.starts_with("SELECT q_str_jsonpath(j, "), "{path} -> {out}");
+        }
+        // A path that is not a plain string literal is not read at all.
+        for path in [
+            "$1",
+            "p",
+            "'{a,b}'::TEXT[]",
+            "ARRAY['a', 'b']",
+            r"E'{a,b}'",
+            "$${a,b}$$",
+            "U&'{a,b}'",
+            "NULL",
+        ] {
+            let out = demoted_sql(&format!("SELECT j #> {path} FROM t"));
+            assert!(out.starts_with("SELECT q_op_jsonpath(j, "), "{path} -> {out}");
+        }
+    }
+
+    /// A backslash is a character of a plain string literal, as it is to Postgres with
+    /// `standard_conforming_strings` on, so the path reader sees it and refuses. Were sqlparser to
+    /// unescape it, `'{a\,b}'` (the one element `a,b`) would reach the reader as `{a,b}`, two elements.
+    #[test]
+    fn a_backslash_reaches_the_path_reader() {
+        let st = Parser::parse_sql(&crate::DIALECT, r"SELECT '{a\,b}'").expect("parses");
+        assert!(st[0].to_string().contains(r"'{a\,b}'"), "{}", st[0]);
+        assert_eq!(path_elements(r"{a\,b}"), None);
+    }
+
+    /// `->` and `->>` look up one key, never a path, so a path-shaped key is left as the key.
+    #[test]
+    fn a_key_lookup_is_never_read_as_a_path() {
+        assert_eq!(demoted_sql("SELECT j -> '{a,b}' FROM t"), "SELECT q_op_jsonx(j, '{a,b}') FROM t");
+        assert_eq!(demoted_sql("SELECT j ->> '{a}' FROM t"), "SELECT q_str_jsonx(j, '{a}') FROM t");
+    }
+
+    /// The two pairs a careless reading would make one term, and are not: `'{a}'` follows `[a]`
+    /// while the function's `'{a}'` is the key `{a}`, and `'{"a,b"}'` is one element.
+    #[test]
+    fn a_literal_path_meets_only_its_own_elements() {
+        assert_ne!(
+            demoted_sql("SELECT j #> '{a}' FROM t"),
+            demoted_sql("SELECT jsonb_extract_path(j, '{a}') FROM t")
+        );
+        assert_ne!(
+            demoted_sql("SELECT j #> '{\"a,b\"}' FROM t"),
+            demoted_sql("SELECT jsonb_extract_path(j, 'a', 'b') FROM t")
+        );
+        assert_eq!(path_elements("{\"a,b\"}"), Some(vec!["a,b".to_string()]));
     }
 
     /// The call spellings get symbols of their own, split the same way by return type.
@@ -2584,7 +2849,7 @@ mod tests {
         // entries in the table.
         assert_eq!(
             demoted_sql("SELECT 1 FROM t WHERE payload #>> '{a,b}' <> 'v'"),
-            "SELECT 1 FROM t WHERE q_str_jsonpath(payload, '{a,b}') <> 'v'"
+            "SELECT 1 FROM t WHERE q_str_jsonpath_elems(payload, 'a', 'b') <> 'v'"
         );
         // The jsonb-returning arrows sit above `=` too, and above `IS NULL`.
         assert_eq!(
