@@ -191,8 +191,8 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   which Postgres computes as an integer division. `count`, `min` and `max` are integers, so they keep
   their operand's type.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
-  The two readers of type names, one for a declared `CREATE TABLE` and one for raw DDL and
-  inference, read every name from one table, so `uuid` and `money` are opaque in both.
+  A column's type is read one way, whether a pair file or raw DDL declares it, and a cast's target
+  from the same table of names, so `uuid` and `money` are opaque in both.
 - **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
   where two values `=` calls equal are the same value, and for `double precision`, `jsonb` and
   `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the

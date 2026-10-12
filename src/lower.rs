@@ -2718,7 +2718,7 @@ fn key_determines(cat: &Catalog, scope: &Scope, grouped: &[usize], level: usize)
     let Some(t) = b.table else { return false };
     let tbl = &cat.tables[t];
     let pk = &tbl.primary_key;
-    !pk.is_empty() && pk.iter().all(|&ci| !tbl.nullable[ci] && grouped.contains(&(b.offset + ci)))
+    !pk.is_empty() && pk.iter().all(|&ci| tbl.nullable.get(ci) == Some(&false) && grouped.contains(&(b.offset + ci)))
 }
 
 /// Every column level a lowered expression references.

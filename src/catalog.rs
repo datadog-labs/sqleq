@@ -17,7 +17,7 @@ use crate::collation::Collation;
 use crate::error::{schema, unsupported, Result};
 use crate::infer::Ty;
 use crate::rejected_ddl::Rejection;
-use crate::types::{map_type, opaque_identity, IDENTITY_OPAQUE};
+use crate::types::{opaque_identity, IDENTITY_OPAQUE};
 
 /// Columns Postgres puts on every table and no DDL ever declares.
 ///
@@ -450,33 +450,24 @@ impl Domains {
 /// catalog has to exist while the tree still holds `DELETE`/`UPDATE` statements rather than the two
 /// queries they reduce to.
 pub fn scan_ddl(statements: &[Statement]) -> Catalog {
-    build(&statements.iter().map(Ddl::Parsed).collect::<Vec<_>>(), TypeMap::Declared)
+    build(&statements.iter().map(Ddl::Parsed).collect::<Vec<_>>())
 }
 
-/// Which column-type mapper a catalog's input takes. The two readers still map a type nothing
-/// classifies differently: a pair file keeps its name, raw DDL makes it an opaque `VARBINARY` (see
-/// `pgddl::map_pg_type`). Everything else about a table is read one way, by [`build`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TypeMap {
-    /// A pair file's `CREATE TABLE`s: [`map_type`].
-    Declared,
-    /// Raw Postgres DDL: `pgddl::map_pg_type`, else [`crate::types::opaque_name`].
-    Raw,
-}
-
-impl TypeMap {
-    /// The IR type of a column declared as `dt`. An opaque one carries `dt`
-    /// ([`crate::types::with_declared`]), so that a value coerced into it is converted as a `dt`.
-    fn column_type(self, dt: &DataType) -> String {
-        let rendered = dt.to_string();
-        let ty = match self {
-            TypeMap::Declared => map_type(dt),
-            TypeMap::Raw => crate::pgddl::map_pg_type(&rendered)
-                .map(str::to_string)
-                .unwrap_or_else(|| crate::types::opaque_name(&rendered).to_string()),
-        };
-        crate::types::with_declared(ty, &rendered)
-    }
+/// The IR type of a column declared as `dt`, whatever the input: a pair file's `CREATE TABLE` and raw
+/// DDL read a type one way (issue #93), through `pgddl::map_pg_type`, and a type nothing classifies
+/// is opaque ([`crate::types::opaque_name`]), with its `=` read as identity only where
+/// [`opaque_identity`] lists it. An opaque one carries `dt` ([`crate::types::with_declared`]), so
+/// that a value coerced into it is converted as a `dt`.
+///
+/// A pair file used to keep the name of a type nothing classifies (`UUID`, `JSONB`), which reached
+/// the provers as a sort of its own: `sqleq-solver` refused it as an unknown type, where the same
+/// table in raw DDL was translated.
+fn column_type(dt: &DataType) -> String {
+    let rendered = dt.to_string();
+    let ty = crate::pgddl::map_pg_type(&rendered)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::types::opaque_name(&rendered).to_string());
+    crate::types::with_declared(ty, &rendered)
 }
 
 /// One statement of a DDL, in the order the input gives them: parsed, or the text of one the parser
@@ -521,7 +512,7 @@ pub enum Ddl<'a> {
 ///
 /// The DDL is taken as what the database ran, every statement in it having succeeded. A statement
 /// Postgres would refuse, such as a second `PRIMARY KEY`, is read as if it had taken effect.
-pub fn build(ddl: &[Ddl], map: TypeMap) -> Catalog {
+pub fn build(ddl: &[Ddl]) -> Catalog {
     let parsed: Vec<&Statement> = ddl
         .iter()
         .filter_map(|d| match d {
@@ -547,7 +538,7 @@ pub fn build(ddl: &[Ddl], map: TypeMap) -> Catalog {
         }
     }
     let created = crate::collation::created(parsed.iter().copied());
-    let mut b = Builder { rels: Vec::new(), map, created, domains };
+    let mut b = Builder { rels: Vec::new(), created, domains };
     for (d, losses) in ddl.iter().zip(rejected) {
         match d {
             Ddl::Parsed(st) => b.statement(st),
@@ -616,7 +607,6 @@ struct Key {
 
 struct Builder {
     rels: Vec<Rel>,
-    map: TypeMap,
     created: crate::collation::Created,
     domains: Domains,
 }
@@ -758,7 +748,7 @@ impl Builder {
             let cname = crate::dml::fold_ident(&c.name);
             let data_type = self.domains.resolve(&c.data_type);
             let rendered = data_type.to_string();
-            let (cty, collation) = crate::collation::column(&c.options, self.map.column_type(data_type), &self.created);
+            let (cty, collation) = crate::collation::column(&c.options, column_type(data_type), &self.created);
             let idx = b.table.cols.len();
             // A collated column is `COLLATED`, never identity, and an opaque name that records a
             // coarse `=` (`types::COARSE_OPAQUE`) is not `IDENTITY_OPAQUE` either. The list

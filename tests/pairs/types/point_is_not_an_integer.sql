@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #58: point was mapped to INTEGER, because its name contains INT
 -- witness: t = {('(0.1,0)', '(0.2,0)')}: A yields (0.10000000000000003,0), B yields (0.1,0)
