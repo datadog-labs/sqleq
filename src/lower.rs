@@ -1157,7 +1157,7 @@ struct SortScope {
     outputs: SortOutputs,
 }
 
-/// What a select's result offers an input-expression `ORDER BY` key, by what sits between its
+/// What a select's result gives an input-expression `ORDER BY` key, by what sits between its
 /// output columns and the FROM relation.
 enum SortOutputs {
     /// A plain select, whose projection sits directly on the FROM relation and is widened with the
