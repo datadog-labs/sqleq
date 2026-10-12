@@ -20,7 +20,8 @@
 //! What is this module's own is the parse (one statement at a time, with a retry, below) and the
 //! type mapping: [`crate::pgddl::map_pg_type`] defers to `map_type_name`, which matches the *base*
 //! name against fixed sets and treats anything array/struct/map-shaped, or simply unrecognised, as
-//! unmappable, where a pair file keeps an unrecognised type's own name (issue #93).
+//! unmappable. The catalog maps a pair file's columns through it too, so a column's type is read one
+//! way whichever input declared it (issue #93).
 //!
 //! Opaque means `VARBINARY`, which the prover treats as an uninterpreted `Custom` sort supporting `=`
 //! only. That is the conservative answer: equality, `IN` and projection keep working, while any
@@ -421,7 +422,7 @@ pub fn parse_reporting(raw: &str) -> (Catalog, Vec<Rejected>) {
             Parsed::Rejected(r) => Ddl::Rejected(&r.statement),
         })
         .collect();
-    let catalog = crate::catalog::build(&ddl, crate::catalog::TypeMap::Raw);
+    let catalog = crate::catalog::build(&ddl);
     let errors = parsed
         .into_iter()
         .filter_map(|p| match p {

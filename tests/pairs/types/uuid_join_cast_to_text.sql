@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: proved
 -- expect lean: unsupported
 -- origin: issue #108: identity became the case to establish, and uuid, whose = is identity, has to keep the proofs it had
 -- argument: uuid's = compares the 128 bits, and its text is their canonical spelling, so a = b makes the

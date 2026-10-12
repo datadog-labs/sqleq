@@ -347,8 +347,9 @@ pub enum Scalar {
 /// Classify a type's name by exact spelling: upper-cased, unquoted, without its typmod. `None` is a
 /// name this crate gives no meaning to, which every caller reads as opaque.
 ///
-/// One table for both type readers, [`map_type`] for declared columns and casts and
-/// `infer::map_type_name` for inference and raw DDL, so the two cannot disagree about a name. It is
+/// One table for both type readers, [`map_type`] for casts and `infer::map_type_name` for columns
+/// (`catalog`, for a pair file and raw DDL alike) and inference, so the two cannot disagree about a
+/// name. It is
 /// an allowlist rather than substring tests: `INT4RANGE` and `POINT` contain `INT` and are not
 /// integers, and `CITEXT` contains `TEXT` and does not compare like text.
 pub fn scalar_class(name: &str) -> Option<Scalar> {
@@ -511,8 +512,10 @@ pub fn unfaithful_refusal(name: &str) -> crate::error::FrontendError {
     unsupported(format!("a value of type {}: {why}, which no prover's equality does", name.to_lowercase()))
 }
 
-/// Map a sqlparser `DataType` to the prover's type string. Classifies on the rendered type name so
-/// it stays robust across sqlparser versions, by exact name ([`scalar_class`]). Temporal types keep
+/// Map a sqlparser `DataType` to the prover's type string: a cast's target. A column's type is read
+/// by the catalog instead, as raw DDL reads it, which makes a type it does not classify opaque.
+/// Classifies on the rendered type name so it stays robust across sqlparser versions, by exact name
+/// ([`scalar_class`]). Temporal types keep
 /// their own names (see the module docs); BINARY/BLOB/BYTEA and arrays become opaque: an array of
 /// values whose `=` is identity and a binary type [`IDENTITY_OPAQUE`], floats and arrays whose
 /// elements' `=` is not identity a [`COARSE_OPAQUE`] name, any other array VARBINARY
