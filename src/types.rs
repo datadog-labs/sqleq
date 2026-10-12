@@ -1131,7 +1131,7 @@ pub fn coerce_in_operand(x: Value, col_ty: &str, column: &Value) -> std::result:
 /// The name alone decides it, and that is sound only because nothing else is ever a nullary node
 /// named `NULL`: [`string_literal`] does not emit the string `'NULL'` as one. The type cannot decide
 /// it, since a NULL is relabelled to whatever type it is coerced to.
-fn is_null_lit(v: &Value) -> bool {
+pub(crate) fn is_null_lit(v: &Value) -> bool {
     v.get("operator").and_then(|o| o.as_str()) == Some("NULL")
         && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
 }

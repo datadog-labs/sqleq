@@ -412,10 +412,17 @@ what it is or refused:
   are two uninterpreted functions, and `jsonb_extract_path(j, 'k')`, which takes the path one
   element per argument, is a third: over `[5]`, `jsonb_extract_path(j, '0')` is `5` and `j -> '0'`
   is NULL.
-- **An `IN` subquery compares values of one type.** Its operand is converted to the type of the
-  subquery's column (`i IN (SELECT a / 2.0 ..)` compares `i::numeric`), and where only the column
-  could be converted (`n IN (SELECT i ..)` over a numeric `n`), the pair is refused, since the QED
-  prover asserts that the two have one sort.
+- **An `IN` subquery compares values of one type,** since the QED prover asserts that the two have
+  one sort.
+  - **The operand converted.** Its operand is converted to the type of the subquery's column
+    (`i IN (SELECT a / 2.0 ..)` compares `i::numeric`).
+  - **The column converted.** Where the type they meet at is the operand's, the subquery's column is
+    converted instead, as Postgres converts it (`n IN (SELECT i ..)` over a numeric `n` compares
+    `n = i::numeric`). This is done only for the conversions a comparison `x = c` makes there: an
+    integer column against a numeric operand, a temporal column against the temporal type they meet
+    at, and a column against an opaque operand.
+  - **Anything else is refused,** a text operand against an integer column among them, which
+    Postgres rejects.
 - **A row against a parameter is a record comparison.** In `(a, b) IN ($1, ..)` each parameter
   stands for a composite value, and Postgres compares a row with one under record semantics, where
   two NULL fields are equal. Each such item is one opaque predicate, never per-field comparisons.
