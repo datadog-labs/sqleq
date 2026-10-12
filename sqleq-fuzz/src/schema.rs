@@ -20,13 +20,26 @@
 //! materialized as a DuckDB unique index ([`Table::expr_keys`]), and `NULLS NOT DISTINCT` is kept
 //! ([`Table::nnd_keys`]). A uniqueness statement that cannot be read at all does not silently drop out:
 //! it marks its table [`Table::unreadable`], and a pair over that table gets no verdict.
+//!
+//! Statements apply in the order they are written, as Postgres runs them (`Reader`): `DROP NOT
+//! NULL`, `DROP CONSTRAINT`, `DROP INDEX`, `DROP COLUMN`, `DROP TABLE` and the renames change the
+//! tables as they stand where they are written, and a `CREATE TABLE … (LIKE t)` copies `t` as it
+//! stands there -- its columns and their NOT NULLs, and its keys with `INCLUDING INDEXES`. A table
+//! that `INHERITS` another has the other's columns first; whether a table takes part in inheritance
+//! is kept ([`Table::inheritance`]). A drop whose target cannot be told for sure drops nothing,
+//! which only narrows the instance space.
+//!
+//! This is the DuckDB engine's whole picture of the tables. The Postgres engine runs the DDL itself
+//! and generates rows for the tables its catalog then holds (`crate::pg`); it reads this model only
+//! to find the tables the queries name and to analyse them before the DDL has run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, DataType, ExactNumberInfo,
-    Expr, GeneratedAs, IndexColumn, NullsDistinctOption, ObjectName, ObjectNamePart, Statement,
+    AlterColumnOperation, AlterIndexOperation, AlterTableOperation, ColumnDef, ColumnOption,
+    CreateTableLikeKind, DataType, ExactNumberInfo, Expr, GeneratedAs, Ident, IndexColumn,
+    NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Statement,
     TableConstraint,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -139,6 +152,10 @@ pub struct Table {
     /// the parser rejected and no fallback could read. Generating rows for it would ignore a
     /// constraint, so no pair over the table gets a verdict.
     pub unreadable: Option<String>,
+    /// How the table takes part in inheritance, if it does: `inherits from p`, or `is inherited by
+    /// c`. A scan of an inherited table reads its children's rows too, and DuckDB has no
+    /// inheritance to build that with, so the DuckDB engine withholds a pair over such a table.
+    pub inheritance: Option<String>,
 }
 
 impl Table {
@@ -601,8 +618,7 @@ fn table_constraint(item: &str) -> Option<Kind> {
         "foreign" if next == "key" => Some(Kind::Ignore),
         "check" if rest.starts_with('(') => Some(Kind::Ignore),
         "exclude" if rest.starts_with('(') || next == "using" => Some(Kind::Ignore),
-        // `LIKE other` inherits columns we cannot see, so the table is not recoverable.
-        "like" => Some(Kind::Abort),
+        "like" => Some(Kind::Like),
         _ => None,
     }
 }
@@ -612,18 +628,102 @@ enum Kind {
     Key,
     /// `FOREIGN KEY` / `CHECK` / `EXCLUDE` — ignored, exactly as the AST path ignores them.
     Ignore,
-    Abort,
+    /// `LIKE other [options]`: the columns of another table, copied where the item stands.
+    Like,
 }
 
-/// Read one `CREATE TABLE` body into a table, or `None` if any part of it is unreadable.
+/// A `CREATE TABLE` body as written: its columns and `LIKE` items in order, and the keys it states.
+#[derive(Default)]
+struct Body {
+    items: Vec<Item>,
+    keys: Vec<KeyDecl>,
+    /// The names of the body's other constraints (`CHECK`, `FOREIGN KEY`, `EXCLUDE`).
+    others: Vec<String>,
+    unreadable: Option<String>,
+}
+
+/// One column-list item of a `CREATE TABLE`.
+enum Item {
+    Col(Column),
+    /// `LIKE source`, and whether it copies the source's indexes (`INCLUDING INDEXES`, or `ALL`).
+    /// Postgres always copies the columns, their types and their `NOT NULL`s.
+    Like(Target, bool),
+}
+
+/// A leading identifier as Postgres folds it: as written when double-quoted, else lower-cased. What
+/// names a constraint or an index, where `"Ix"` and `ix` are two names.
+fn take_name(s: &str) -> Option<(String, &str)> {
+    let t = s.trim_start();
+    match t.strip_prefix('"') {
+        Some(rest) => {
+            let end = rest.find('"')?;
+            let name = &rest[..end];
+            (!name.is_empty()).then(|| (name.to_string(), &rest[end + 1..]))
+        }
+        None => take_ident(t),
+    }
+}
+
+/// A raw (possibly quoted, possibly qualified) name as a [`Target`]: its last two parts,
+/// lower-cased.
+fn target_of_raw(raw: &str) -> Target {
+    let parts: Vec<String> = raw
+        .split('.')
+        .map(|p| p.trim().trim_matches('"').to_lowercase())
+        .collect();
+    let name = parts.last().cloned().unwrap_or_default();
+    let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
+    (schema, name)
+}
+
+/// A `LIKE source [{INCLUDING | EXCLUDING} option ...]` body item: the source, and whether its
+/// indexes are copied. Options apply left to right, as Postgres applies them (`INCLUDING ALL
+/// EXCLUDING INDEXES` copies none). `None` for an option this does not know, which would leave
+/// whether a key is copied a guess.
+fn like_item(item: &str) -> Option<(Target, bool)> {
+    let (_, rest) = take_ident(item)?; // `like`
+    let (first, mut rest) = take_ident(rest)?;
+    let mut parts = vec![first];
+    while let Some(after) = rest.trim_start().strip_prefix('.') {
+        let (p, r) = take_ident(after)?;
+        parts.push(p);
+        rest = r;
+    }
+    let mut indexes = false;
+    loop {
+        let r = rest.trim_start();
+        if r.is_empty() {
+            break;
+        }
+        let (word, after) = take_ident(r)?;
+        let on = match word.as_str() {
+            "including" => true,
+            "excluding" => false,
+            _ => return None,
+        };
+        let (what, after) = take_ident(after)?;
+        match what.as_str() {
+            "indexes" | "all" => indexes = on,
+            "comments" | "compression" | "constraints" | "defaults" | "generated" | "identity"
+            | "statistics" | "storage" => {}
+            _ => return None,
+        }
+        rest = after;
+    }
+    let name = parts.pop()?;
+    Some(((parts.pop(), name), indexes))
+}
+
+/// Read one `CREATE TABLE` body, or `None` if any column or key of it is unreadable.
 ///
 /// All-or-nothing on purpose. A table recovered with the wrong columns is worse than one that is
 /// missing, and — the soundness point — a table recovered *without* one of its uniqueness or NOT
 /// NULL constraints would let us generate an instance no valid database admits, which is exactly
-/// how a bogus counterexample gets manufactured (see the module docs).
-fn recover_body(body: &str) -> Option<Table> {
-    let mut t = Table::default();
-    let mut pk_cols: Vec<String> = Vec::new();
+/// how a bogus counterexample gets manufactured (see the module docs). A `LIKE` whose options
+/// cannot be read keeps the table, marked unreadable, so that it still shadows any other table of
+/// its name.
+fn recover_body(body: &str) -> Option<Body> {
+    let mut b = Body::default();
     for raw in split_top(body) {
         let mut item = raw.trim();
         if item.is_empty() {
@@ -631,30 +731,35 @@ fn recover_body(body: &str) -> Option<Table> {
         }
         // `CONSTRAINT <name> <constraint>` — drop the label, but only when what follows really is a
         // constraint; otherwise this is a column that happens to be named `constraint`.
-        if let Some(after) = take_ident(item)
+        let mut label: Option<String> = None;
+        if let Some((name, after)) = take_ident(item)
             .filter(|(w, _)| w == "constraint")
-            .and_then(|(_, r)| take_ident(r))
-            .map(|(_, after)| after.trim())
-            .filter(|after| table_constraint(after).is_some())
+            .and_then(|(_, r)| take_name(r))
+            .map(|(name, after)| (name, after.trim()))
+            .filter(|(_, after)| table_constraint(after).is_some())
         {
+            label = Some(name);
             item = after;
         }
         match table_constraint(item) {
             Some(Kind::Key) => {
                 let key = plain_key(item)?;
                 // A table-level PRIMARY KEY makes its columns NOT NULL, exactly as the column-level
-                // one does; those columns may be declared after the constraint, so this is applied
-                // once the whole body is read.
-                if take_ident(item).is_some_and(|(w, _)| w == "primary") {
-                    pk_cols.extend(key.iter().cloned());
-                }
-                if opts_text(item).contains(" nulls not distinct ") {
-                    t.nnd_keys.push(key.clone());
-                }
-                t.keys.push(key);
+                // one does; those columns may be declared after the constraint, so that is applied
+                // once the whole table is built ([`Reader::add_key`]).
+                let primary = take_ident(item).is_some_and(|(w, _)| w == "primary");
+                let nnd = opts_text(item).contains(" nulls not distinct ");
+                b.keys
+                    .push(KeyDecl::new(Key::Cols(key, nnd), primary, false, label));
             }
-            Some(Kind::Ignore) => {}
-            Some(Kind::Abort) => return None,
+            Some(Kind::Ignore) => b.others.extend(label),
+            Some(Kind::Like) => match like_item(item) {
+                Some((src, indexes)) => b.items.push(Item::Like(src, indexes)),
+                None => {
+                    b.unreadable
+                        .get_or_insert("a LIKE whose options cannot be read".to_string());
+                }
+            },
             None => {
                 let (name, rest) = take_ident(item)?;
                 // Read from the raw post-name text, before `opts_text` strips the quotes and
@@ -666,36 +771,34 @@ fn recover_body(body: &str) -> Option<Table> {
                 // An identity column is NOT NULL, and so is a serial one (`ColType::serial`).
                 let sequenced = ct.serial || opts.contains(" as identity ");
                 let mut notnull = opts.contains(" not null ") || sequenced;
+                // A named column constraint keeps its name, which is not read here: such a key is
+                // never dropped by name.
+                let anon = !opts.contains(" constraint ");
+                let key = |nnd: bool, primary: bool| KeyDecl {
+                    anon,
+                    ..KeyDecl::new(Key::Cols(vec![name.clone()], nnd), primary, false, None)
+                };
                 if opts.contains(" primary key ") {
                     notnull = true;
-                    t.keys.push(vec![name.clone()]);
+                    b.keys.push(key(false, true));
                 } else if opts.contains(" unique ") {
-                    t.keys.push(vec![name.clone()]);
-                    if opts.contains(" unique nulls not distinct ") {
-                        t.nnd_keys.push(vec![name.clone()]);
-                    }
+                    b.keys
+                        .push(key(opts.contains(" unique nulls not distinct "), false));
                 }
                 if let Some(why) = ct.problem {
-                    t.unreadable.get_or_insert(format!("column {name}: {why}"));
+                    b.unreadable.get_or_insert(format!("column {name}: {why}"));
                 }
-                // Same lower-case collision rule as the AST path: keep the first, take the stronger
-                // NOT NULL.
-                if let Some(prev) = t.cols.iter_mut().find(|c| c.name == name) {
-                    prev.notnull |= notnull;
-                } else {
-                    t.cols.push(Column {
-                        name,
-                        vt: ct.vt,
-                        notnull,
-                        array,
-                        sequenced,
-                    });
-                }
+                b.items.push(Item::Col(Column {
+                    name,
+                    vt: ct.vt,
+                    notnull,
+                    array,
+                    sequenced,
+                }));
             }
         }
     }
-    set_not_null(&mut t, &pk_cols);
-    (!t.cols.is_empty()).then_some(t)
+    (!b.items.is_empty() || b.unreadable.is_some()).then_some(b)
 }
 
 /// Mark `cols` NOT NULL, as a PRIMARY KEY or `SET NOT NULL` does.
@@ -704,6 +807,24 @@ fn set_not_null(t: &mut Table, cols: &[String]) {
         if cols.contains(&c.name) {
             c.notnull = true;
         }
+    }
+}
+
+/// Add a column to a column list, or -- when one of its name is there already -- keep that one and
+/// take the *stronger* NOT NULL of the two.
+///
+/// Postgres folds an unquoted identifier to lower case, so `modelID` and `modelId` are one column
+/// and a DDL declaring both is one Postgres rejects outright (`column "modelid" specified more than
+/// once`). The table the queries were actually written against therefore had a single `modelid`.
+/// DuckDB folds the same way and refuses to create the table at all if both are emitted, so the row
+/// loses its verdict to a spelling. Treating a NOT NULL column as nullable would widen the instance
+/// space, and that is the unsound direction (see the module docs). An `INHERITS` table merges a
+/// column of its own into the parent's of that name the same way.
+fn merge_col(cols: &mut Vec<Column>, col: Column) {
+    if let Some(prev) = cols.iter_mut().find(|c| c.name == col.name) {
+        prev.notnull |= col.notnull;
+    } else {
+        cols.push(col);
     }
 }
 
@@ -719,6 +840,7 @@ fn index_col_name(ic: &IndexColumn) -> Option<String> {
 /// A uniqueness key as Postgres states it: plain columns when every part is one, else the index
 /// expressions rendered for DuckDB (a plain column among them rendered as itself), plus whether
 /// NULLs are not distinct.
+#[derive(Clone)]
 enum Key {
     Cols(Vec<String>, bool),
     Exprs(Vec<String>, bool),
@@ -736,6 +858,84 @@ fn key_of(cols: &[IndexColumn], nulls_not_distinct: bool) -> Option<Key> {
     // about which rows collide.
     let exprs = cols.iter().map(|ic| format!("({})", ic.column.expr)).collect();
     Some(Key::Exprs(exprs, nulls_not_distinct))
+}
+
+/// A key as declared: what it binds, and the name a later `DROP CONSTRAINT` or `DROP INDEX` drops
+/// it by.
+#[derive(Clone)]
+struct KeyDecl {
+    key: Key,
+    primary: bool,
+    /// A unique index (`CREATE UNIQUE INDEX`), which `DROP INDEX` drops, rather than a constraint,
+    /// which `ALTER TABLE … DROP CONSTRAINT` drops.
+    index: bool,
+    /// Its name, as the DDL gives it or as Postgres generated it; `None` when neither is known for
+    /// sure, and then nothing drops it.
+    name: Option<String>,
+    /// Unnamed in the DDL, so Postgres generates its name ([`generated_name`]).
+    anon: bool,
+    /// `name` is the generated one. Postgres keeps a generated name unique by appending a number,
+    /// so it is the key's only while no other object has it.
+    generated: bool,
+}
+
+impl KeyDecl {
+    fn new(key: Key, primary: bool, index: bool, name: Option<String>) -> KeyDecl {
+        KeyDecl {
+            key,
+            primary,
+            index,
+            anon: name.is_none(),
+            name,
+            generated: false,
+        }
+    }
+
+    fn cols(&self) -> Option<&[String]> {
+        match &self.key {
+            Key::Cols(c, _) => Some(c),
+            Key::Exprs(..) => None,
+        }
+    }
+
+    /// Whether an expression of the key may read `col`: a textual test, so it says yes too often.
+    fn may_read(&self, col: &str) -> bool {
+        match &self.key {
+            Key::Exprs(e, _) => e.iter().any(|x| x.to_lowercase().contains(col)),
+            Key::Cols(..) => false,
+        }
+    }
+}
+
+/// The name Postgres generates for an unnamed key of table `table`: `t_pkey` for a primary key,
+/// `t_a_b_key` for a unique constraint, `t_a_b_idx` for a unique index. `None` for an index over an
+/// expression, and for a name past Postgres's 63 bytes, which it truncates.
+fn generated_name(table: &str, kd: &KeyDecl) -> Option<String> {
+    let name = if kd.primary && !kd.index {
+        format!("{table}_pkey")
+    } else {
+        let suffix = if kd.index { "idx" } else { "key" };
+        format!("{table}_{}_{suffix}", kd.cols()?.join("_"))
+    };
+    (name.len() <= 63).then_some(name)
+}
+
+/// An identifier as Postgres folds it: as written when double-quoted, else lower-cased.
+fn fold(id: &Ident) -> String {
+    match id.quote_style {
+        Some(_) => id.value.clone(),
+        None => id.value.to_lowercase(),
+    }
+}
+
+/// The parts of an object name, each folded as Postgres folds it.
+fn folded_parts(n: &ObjectName) -> Vec<String> {
+    n.0.iter()
+        .filter_map(|p| match p {
+            ObjectNamePart::Identifier(id) => Some(fold(id)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Last component of a (possibly qualified) object name, lower-cased.
@@ -759,27 +959,51 @@ fn schema_of(n: &ObjectName) -> Option<String> {
     (parts.len() >= 2).then(|| parts[parts.len() - 2].clone())
 }
 
-/// A table as declared: the schema its `CREATE TABLE` names (if any), its name, and what was read.
+fn target_of(n: &ObjectName) -> Option<Target> {
+    Some((schema_of(n), last_name(n)?))
+}
+
+/// A table as declared so far: the schema its `CREATE TABLE` names (if any), its name, its columns,
+/// and the keys it has now.
 struct Decl {
     schema: Option<String>,
     name: String,
+    /// The columns, and why the table cannot be read, if so; the keys are `keys`, until
+    /// [`Reader::finish`].
     table: Table,
+    keys: Vec<KeyDecl>,
 }
 
 /// A table a later statement refers to, by (schema, name).
 type Target = (Option<String>, String);
 
-/// What a statement other than `CREATE TABLE` adds to a table, applied once every table is known
-/// (statement order is free).
+/// A statement that only adds to a table, held when no table of the name it gives is declared yet
+/// -- captured DDL is not always in the order it ran in -- and applied once every statement is
+/// read, as a narrower instance space only costs counterexamples.
 enum Pending {
-    Key(Target, Key, bool),
+    Key(Target, KeyDecl),
     NotNull(Target, Vec<String>),
     AddColumn(Target, Column, Option<String>),
     Unreadable(Target, String),
 }
 
-/// One column definition, as the AST states it.
-fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<String>) {
+impl Pending {
+    fn target(&self) -> &Target {
+        match self {
+            Pending::Key(t, _)
+            | Pending::NotNull(t, _)
+            | Pending::AddColumn(t, ..)
+            | Pending::Unreadable(t, _) => t,
+        }
+    }
+}
+
+/// One column definition, as the AST states it; its keys go to `keys`.
+fn column_of(
+    c: &ColumnDef,
+    keys: &mut Vec<KeyDecl>,
+    others: &mut Vec<String>,
+) -> (Column, Option<String>) {
     let name = c.name.value.to_lowercase();
     let ct = map_vtype(&c.data_type);
     // A serial or identity column is NOT NULL in Postgres whatever else the definition says (an
@@ -787,6 +1011,7 @@ fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<Stri
     let mut sequenced = ct.serial;
     let mut notnull = ct.serial;
     for opt in &c.options {
+        let label = opt.name.as_ref().map(fold);
         match &opt.option {
             ColumnOption::NotNull => notnull = true,
             // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`; a generated column with an expression
@@ -801,16 +1026,18 @@ fn column_of(c: &ColumnDef, keys: &mut Vec<(Key, bool)>) -> (Column, Option<Stri
             }
             ColumnOption::PrimaryKey(_) => {
                 notnull = true; // PRIMARY KEY implies NOT NULL
-                keys.push((Key::Cols(vec![name.clone()], false), true));
+                keys.push(KeyDecl::new(Key::Cols(vec![name.clone()], false), true, false, label));
             }
-            ColumnOption::Unique(u) => keys.push((
+            ColumnOption::Unique(u) => keys.push(KeyDecl::new(
                 Key::Cols(
                     vec![name.clone()],
                     u.nulls_distinct == NullsDistinctOption::NotDistinct,
                 ),
                 false,
+                false,
+                label,
             )),
-            _ => {}
+            _ => others.extend(label),
         }
     }
     let problem = ct.problem.map(|why| format!("column {name}: {why}"));
@@ -863,155 +1090,875 @@ fn constraint_key(con: &TableConstraint) -> Option<(Key, bool)> {
     }
 }
 
-/// Fold one parsed statement in: a `CREATE TABLE` becomes a declaration; `CREATE UNIQUE INDEX` and
-/// `ALTER TABLE` become pending changes to one.
-fn absorb(st: &Statement, decls: &mut Vec<Decl>, pending: &mut Vec<Pending>) {
-    match st {
-        Statement::CreateTable(ct) => {
-            let Some(name) = last_name(&ct.name) else {
-                return;
-            };
-            let mut table = Table::default();
-            let mut keys: Vec<(Key, bool)> = Vec::new();
-            for c in &ct.columns {
-                let (col, problem) = column_of(c, &mut keys);
-                if let Some(why) = problem {
-                    table.unreadable.get_or_insert(why);
-                }
-                // Postgres folds an unquoted identifier to lower case, so `modelID` and `modelId` are
-                // one column and a DDL declaring both is one Postgres rejects outright (`column
-                // "modelid" specified more than once`). The table the queries were actually written
-                // against therefore had a single `modelid`. DuckDB folds the same way and refuses to
-                // create the table at all if both are emitted, so the row loses its verdict to a
-                // spelling. Keep the first declaration, but take the *stronger* NOT NULL of the two:
-                // treating a NOT NULL column as nullable would widen the instance space, and that is
-                // the unsound direction (see the module docs).
-                if let Some(prev) = table.cols.iter_mut().find(|c| c.name == col.name) {
-                    prev.notnull |= col.notnull;
-                } else {
-                    table.cols.push(col);
-                }
-            }
-            keys.extend(ct.constraints.iter().filter_map(constraint_key));
-            for (key, primary) in keys {
-                add_key(&mut table, key, primary);
-            }
-            decls.push(Decl {
-                schema: schema_of(&ct.name),
-                name,
-                table,
-            });
+/// The name a table constraint is given, folded.
+fn constraint_name(con: &TableConstraint) -> Option<String> {
+    let id = match con {
+        TableConstraint::Unique(c) => c.name.as_ref(),
+        TableConstraint::PrimaryKey(c) => c.name.as_ref(),
+        TableConstraint::Check(c) => c.name.as_ref(),
+        TableConstraint::ForeignKey(c) => c.name.as_ref(),
+        TableConstraint::Exclude(c) => c.name.as_ref(),
+        TableConstraint::PrimaryKeyUsingIndex(c) | TableConstraint::UniqueUsingIndex(c) => {
+            c.name.as_ref()
         }
-        Statement::CreateIndex(ci) if ci.unique => {
-            if let (Some(name), Some(key)) = (
-                last_name(&ci.table_name),
-                key_of(&ci.columns, ci.nulls_distinct == Some(false)),
-            ) {
-                pending.push(Pending::Key((schema_of(&ci.table_name), name), key, false));
-            }
-        }
-        Statement::AlterTable(at) => {
-            let Some(name) = last_name(&at.name) else {
-                return;
-            };
-            let target: Target = (schema_of(&at.name), name);
-            for op in &at.operations {
-                match op {
-                    AlterTableOperation::AddConstraint { constraint, .. } => {
-                        if let Some((key, primary)) = constraint_key(constraint) {
-                            pending.push(Pending::Key(target.clone(), key, primary));
-                        }
-                    }
-                    AlterTableOperation::AlterColumn {
-                        column_name,
-                        op: AlterColumnOperation::SetNotNull,
-                    } => pending.push(Pending::NotNull(
-                        target.clone(),
-                        vec![column_name.value.to_lowercase()],
-                    )),
-                    AlterTableOperation::AddColumn { column_def, .. } => {
-                        let mut keys = Vec::new();
-                        let (col, problem) = column_of(column_def, &mut keys);
-                        pending.push(Pending::AddColumn(target.clone(), col, problem));
-                        for (key, primary) in keys {
-                            pending.push(Pending::Key(target.clone(), key, primary));
-                        }
-                    }
-                    // Dropping a constraint or a NOT NULL is ignored, which keeps the instance space
-                    // *narrower* than Postgres's: a lost counterexample at worst, never a false one.
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
+        _ => None,
+    };
+    id.map(fold)
+}
+
+/// A table constraint of a `CREATE TABLE` or an `ALTER TABLE … ADD`: its key to `keys`, or, when it
+/// states none, its name to `others`.
+fn table_constraint_of(con: &TableConstraint, keys: &mut Vec<KeyDecl>, others: &mut Vec<String>) {
+    match constraint_key(con) {
+        Some((key, primary)) => keys.push(KeyDecl::new(key, primary, false, constraint_name(con))),
+        None => others.extend(constraint_name(con)),
     }
 }
 
-/// A statement the parser rejected, read for what it would have added to a table: an `ALTER TABLE`
-/// or `CREATE UNIQUE INDEX` stating a constraint the fallbacks cannot read marks its table unreadable,
-/// since generating rows for the table without it would be unsound. A plain-column unique index is
-/// recovered by `IDX_RE` instead, and an `ALTER TABLE` adding a plain-column key or a NOT NULL by
-/// the patterns here.
-fn absorb_unparsed(chunk: &str, pending: &mut Vec<Pending>) {
-    static ALTER: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r#"(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)(.*)$"#).unwrap()
-    });
-    static ADD_KEY: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r#"(?is)^\s*add\s+(?:constraint\s+(?:"[^"]*"|[A-Za-z_][\w$]*)\s+)?(primary\s+key|unique(?:\s+nulls\s+(?:not\s+)?distinct)?)\s*(\([^()]*\))\s*;?\s*$"#).unwrap()
-    });
-    static SET_NN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r#"(?is)^\s*alter\s+(?:column\s+)?("[^"]*"|[A-Za-z_][\w$]*)\s+set\s+not\s+null\s*;?\s*$"#).unwrap()
-    });
-    static UIDX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r#"(?is)^\s*create\s+unique\s+index\b.*?\bon\s+(?:only\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)"#).unwrap()
-    });
-    let target_of = |raw: &str| -> Target {
-        let parts: Vec<String> = raw
-            .split('.')
-            .map(|p| p.trim().trim_matches('"').to_lowercase())
-            .collect();
-        let name = parts.last().cloned().unwrap_or_default();
-        let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
-        (schema, name)
-    };
-    if let Some(caps) = ALTER.captures(chunk) {
-        let target = target_of(&caps[1]);
-        let rest = &caps[2];
-        let states = Regex::new(r"(?i)\b(primary\s+key|unique|not\s+null|exclude)\b")
-            .unwrap()
-            .is_match(rest);
-        if !states {
-            return; // renames, defaults, ownership: nothing that bounds the rows
+/// The declarations a later statement's target refers to: the one table of that name, or -- when
+/// several schemas declare it -- the one in the schema it names (a bare name meaning `public`).
+/// Where that settles nothing every candidate is returned, so a constraint lands on too many tables
+/// rather than on none: a narrower instance space only costs counterexamples.
+fn targets(decls: &[Decl], target: &Target) -> Vec<usize> {
+    let named: Vec<usize> = (0..decls.len())
+        .filter(|&i| decls[i].name == target.1)
+        .collect();
+    if named.len() <= 1 {
+        return named;
+    }
+    let want = target.0.as_deref().unwrap_or("public");
+    let exact: Vec<usize> = named
+        .iter()
+        .copied()
+        .filter(|&i| decls[i].schema.as_deref().unwrap_or("public") == want)
+        .collect();
+    if exact.is_empty() {
+        named
+    } else {
+        exact
+    }
+}
+
+/// The DDL read statement by statement, in the order it is written, as Postgres runs it: each
+/// `ALTER TABLE`, `DROP` and `RENAME` changes the tables as they stand at that point, and a `LIKE`
+/// copies its source as it stands there.
+///
+/// A statement that only *adds* to a table -- a key, a NOT NULL, a column -- and names a table not
+/// yet declared is held until every statement is read ([`Pending`]): captured DDL is not always in
+/// the order it ran in, and a constraint applied late only narrows the instance space. A statement
+/// that *removes* or *renames* something is never guessed at: when no table of its name is declared
+/// it does nothing (Postgres would refuse it, or `IF EXISTS` skip it), and when its name could be
+/// either of two tables, both are withheld.
+#[derive(Default)]
+struct Reader {
+    decls: Vec<Decl>,
+    pending: Vec<Pending>,
+    /// Every (schema, name) a statement created, dropped or renamed away: the regex pass over the
+    /// raw text recovers none of these again.
+    seen: BTreeSet<Target>,
+    /// (table, columns) of every plain-column unique index a statement was read for, so the regex
+    /// pass over the raw text does not add it again -- after a `DROP INDEX`, say.
+    indexed: BTreeSet<(String, Vec<String>)>,
+    /// The names of constraints and indexes that are not keys: a generated name that one of these
+    /// has already is not the key's.
+    others: BTreeSet<String>,
+}
+
+impl Reader {
+    fn find(&self, t: &Target) -> Vec<usize> {
+        targets(&self.decls, t)
+    }
+
+    /// Apply a statement that only adds to a table to every table it may name, or hold it.
+    fn add(&mut self, p: Pending) {
+        let found = self.find(p.target());
+        if found.is_empty() {
+            self.pending.push(p);
+            return;
         }
-        if let Some(k) = ADD_KEY.captures(rest) {
-            if let Some(cols) = plain_key(&k[2]) {
-                let primary = k[1].to_lowercase().starts_with("primary");
-                let nnd = k[1].to_lowercase().contains("not distinct");
-                pending.push(Pending::Key(target, Key::Cols(cols, nnd), primary));
+        for i in found {
+            self.apply(i, &p);
+        }
+    }
+
+    fn apply(&mut self, i: usize, p: &Pending) {
+        match p {
+            Pending::Key(_, kd) => self.add_key(i, kd.clone()),
+            Pending::NotNull(_, cols) => set_not_null(&mut self.decls[i].table, cols),
+            Pending::AddColumn(_, col, problem) => {
+                let t = &mut self.decls[i].table;
+                if let Some(why) = problem {
+                    t.unreadable.get_or_insert(why.clone());
+                }
+                if !t.cols.iter().any(|c| c.name == col.name) {
+                    t.cols.push(col.clone());
+                }
+            }
+            Pending::Unreadable(_, why) => {
+                self.decls[i].table.unreadable.get_or_insert(why.clone());
+            }
+        }
+    }
+
+    /// The one table a statement that removes or renames something names: none when no table of the
+    /// name is declared, and none -- each candidate withheld -- when the name could be either of
+    /// two.
+    fn one(&mut self, t: &Target, what: &str) -> Option<usize> {
+        let found = self.find(t);
+        match found.len() {
+            0 => None,
+            1 => Some(found[0]),
+            _ => {
+                for i in found {
+                    self.decls[i].table.unreadable.get_or_insert(format!(
+                        "{what} of a table the DDL declares in several schemas"
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// How many objects have `name`: keys of every table, and the other constraints and indexes.
+    fn holders(&self, name: &str) -> usize {
+        self.decls
+            .iter()
+            .flat_map(|d| &d.keys)
+            .filter(|k| k.name.as_deref() == Some(name))
+            .count()
+            + usize::from(self.others.contains(name))
+    }
+
+    /// Add a key to table `i`, under the name Postgres generates for it when the DDL gives none --
+    /// if no other object has that name, which would make Postgres choose another.
+    fn add_key(&mut self, i: usize, mut kd: KeyDecl) {
+        if kd.name.is_none() && kd.anon {
+            if let Some(n) = generated_name(&self.decls[i].name, &kd) {
+                if self.holders(&n) == 0 {
+                    kd.name = Some(n);
+                    kd.generated = true;
+                }
+            }
+        }
+        let d = &mut self.decls[i];
+        if kd.primary {
+            if let Key::Cols(cols, _) = &kd.key {
+                set_not_null(&mut d.table, cols);
+            }
+        }
+        d.keys.push(kd);
+    }
+
+    /// Declare a table. An `INHERITS` table has its parents' columns first, then its own; a `LIKE`
+    /// item copies its source's columns where it stands, and its keys with `INCLUDING INDEXES`.
+    fn create(&mut self, schema: Option<String>, name: String, body: Body, parents: Vec<Target>) {
+        // A second declaration of one table is one Postgres refuses (or `IF NOT EXISTS` skips).
+        if self.decls.iter().any(|d| d.name == name && d.schema == schema) {
+            return;
+        }
+        self.seen.insert((schema.clone(), name.clone()));
+        self.others.extend(body.others);
+        let mut table = Table {
+            unreadable: body.unreadable,
+            ..Table::default()
+        };
+        let mut copied: Vec<KeyDecl> = Vec::new();
+        for p in &parents {
+            match self.find(p).as_slice() {
+                [j] => {
+                    let parent = &mut self.decls[*j].table;
+                    for c in parent.cols.clone() {
+                        merge_col(&mut table.cols, c);
+                    }
+                    if let Some(why) = &parent.unreadable {
+                        table
+                            .unreadable
+                            .get_or_insert(format!("inherits from {}: {why}", p.1));
+                    }
+                    parent
+                        .inheritance
+                        .get_or_insert(format!("is inherited by {name}"));
+                    table
+                        .inheritance
+                        .get_or_insert(format!("inherits from {}", p.1));
+                }
+                _ => {
+                    table.unreadable.get_or_insert(format!(
+                        "inherits from {}, which the DDL does not declare once",
+                        p.1
+                    ));
+                    table
+                        .inheritance
+                        .get_or_insert(format!("inherits from {}", p.1));
+                }
+            }
+        }
+        for item in body.items {
+            match item {
+                Item::Col(c) => merge_col(&mut table.cols, c),
+                Item::Like(src, indexes) => match self.find(&src).as_slice() {
+                    [j] => {
+                        let s = &self.decls[*j];
+                        for c in s.table.cols.clone() {
+                            merge_col(&mut table.cols, c);
+                        }
+                        if let Some(why) = &s.table.unreadable {
+                            table
+                                .unreadable
+                                .get_or_insert(format!("LIKE {}: {why}", src.1));
+                        }
+                        if indexes {
+                            // Each copy is named after the new table, as Postgres names it.
+                            copied.extend(s.keys.iter().map(|k| KeyDecl {
+                                name: None,
+                                anon: true,
+                                generated: false,
+                                ..k.clone()
+                            }));
+                        }
+                    }
+                    _ => {
+                        table.unreadable.get_or_insert(format!(
+                            "LIKE {}, which the DDL does not declare once",
+                            src.1
+                        ));
+                    }
+                },
+            }
+        }
+        self.decls.push(Decl {
+            schema,
+            name,
+            table,
+            keys: Vec::new(),
+        });
+        let i = self.decls.len() - 1;
+        for kd in copied.into_iter().chain(body.keys) {
+            self.add_key(i, kd);
+        }
+    }
+
+    fn drop_table(&mut self, t: &Target) {
+        if let Some(i) = self.one(t, "DROP TABLE") {
+            let d = self.decls.remove(i);
+            self.seen.insert((d.schema, d.name));
+        }
+    }
+
+    fn rename_table(&mut self, t: &Target, new: String) {
+        if let Some(i) = self.one(t, "RENAME") {
+            let d = &mut self.decls[i];
+            self.seen.insert((d.schema.clone(), d.name.clone()));
+            d.name = new;
+            self.seen.insert((d.schema.clone(), d.name.clone()));
+        }
+    }
+
+    /// `DROP NOT NULL`, which Postgres refuses on a primary key's column.
+    fn drop_not_null(&mut self, t: &Target, col: &str) {
+        let Some(i) = self.one(t, "DROP NOT NULL") else {
+            return;
+        };
+        let d = &mut self.decls[i];
+        let in_primary = d
+            .keys
+            .iter()
+            .any(|k| k.primary && k.cols().is_some_and(|c| c.iter().any(|x| x == col)));
+        if !in_primary {
+            if let Some(c) = d.table.cols.iter_mut().find(|c| c.name == col) {
+                c.notnull = false;
+            }
+        }
+    }
+
+    /// `DROP COLUMN`, which drops every key over the column with it.
+    fn drop_columns(&mut self, t: &Target, cols: &[String]) {
+        let Some(i) = self.one(t, "DROP COLUMN") else {
+            return;
+        };
+        let d = &mut self.decls[i];
+        for col in cols {
+            d.table.cols.retain(|c| &c.name != col);
+            d.keys
+                .retain(|k| k.cols().is_none_or(|c| !c.contains(col)));
+            if d.keys.iter().any(|k| k.may_read(col)) {
+                d.table.unreadable.get_or_insert(format!(
+                    "a unique index on an expression over dropped column {col}"
+                ));
+            }
+        }
+    }
+
+    fn rename_column(&mut self, t: &Target, old: &str, new: &str) {
+        let Some(i) = self.one(t, "RENAME COLUMN") else {
+            return;
+        };
+        let d = &mut self.decls[i];
+        let Some(c) = d.table.cols.iter().position(|c| c.name == old) else {
+            d.table
+                .unreadable
+                .get_or_insert(format!("RENAME COLUMN of {old}, which the DDL does not declare"));
+            return;
+        };
+        d.table.cols[c].name = new.to_string();
+        if d.keys.iter().any(|k| k.may_read(old)) {
+            d.table.unreadable.get_or_insert(format!(
+                "a unique index on an expression over renamed column {old}"
+            ));
+        }
+        for k in d.keys.iter_mut() {
+            if let Key::Cols(cs, _) = &mut k.key {
+                for x in cs.iter_mut().filter(|x| *x == old) {
+                    *x = new.to_string();
+                }
+            }
+        }
+    }
+
+    fn retype_column(&mut self, t: &Target, col: &str, dt: &DataType) {
+        let Some(i) = self.one(t, "ALTER COLUMN TYPE") else {
+            return;
+        };
+        let ct = map_vtype(dt);
+        let d = &mut self.decls[i];
+        if let Some(c) = d.table.cols.iter_mut().find(|c| c.name == col) {
+            c.vt = ct.vt;
+            c.array = ct.array;
+        }
+        if let Some(why) = ct.problem {
+            d.table.unreadable.get_or_insert(format!("column {col}: {why}"));
+        }
+    }
+
+    /// The keys of table `i` a constraint name names, and whether dropping or renaming them is
+    /// sure: a name the DDL gave is, and a generated one is when no other object has it.
+    fn named_constraints(&self, i: usize, name: &str) -> (Vec<usize>, bool) {
+        let found: Vec<usize> = (0..self.decls[i].keys.len())
+            .filter(|&k| {
+                let kd = &self.decls[i].keys[k];
+                !kd.index && kd.name.as_deref() == Some(name)
+            })
+            .collect();
+        let generated = found.iter().any(|&k| self.decls[i].keys[k].generated);
+        let sure = !generated || self.holders(name) == 1;
+        (found, sure)
+    }
+
+    /// `DROP CONSTRAINT`. A name read as no key's -- a `CHECK`, a foreign key, a key named some way
+    /// this does not work out -- drops nothing here, which only narrows the instance space.
+    fn drop_constraint(&mut self, t: &Target, name: &str) {
+        let Some(i) = self.one(t, "DROP CONSTRAINT") else {
+            return;
+        };
+        let (found, sure) = self.named_constraints(i, name);
+        if sure {
+            for k in found.into_iter().rev() {
+                self.decls[i].keys.remove(k);
+            }
+        }
+    }
+
+    fn rename_constraint(&mut self, t: &Target, old: &str, new: &str) {
+        self.others.insert(new.to_string());
+        let Some(i) = self.one(t, "RENAME CONSTRAINT") else {
+            return;
+        };
+        let (found, sure) = self.named_constraints(i, old);
+        for k in found {
+            let kd = &mut self.decls[i].keys[k];
+            kd.name = sure.then(|| new.to_string());
+            kd.generated = false;
+        }
+    }
+
+    /// The unique indexes an index name may name: of a table in the schema it gives, or of any
+    /// table when it gives none -- its schema is then whichever the search path finds first.
+    fn indexes_named(&self, parts: &[String]) -> Vec<(usize, usize)> {
+        let Some(name) = parts.last() else {
+            return Vec::new();
+        };
+        let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].to_lowercase());
+        let mut out = Vec::new();
+        for (i, d) in self.decls.iter().enumerate() {
+            if schema
+                .as_deref()
+                .is_some_and(|s| d.schema.as_deref().unwrap_or("public") != s)
+            {
+                continue;
+            }
+            for (k, kd) in d.keys.iter().enumerate() {
+                if kd.index && kd.name.as_deref() == Some(name.as_str()) {
+                    out.push((i, k));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `parts` names exactly one unique index for sure: one candidate, and no other index
+    /// (a non-unique one) of that name anywhere.
+    fn sure_index(&self, parts: &[String], found: &[(usize, usize)]) -> bool {
+        found.len() == 1 && parts.last().is_some_and(|n| !self.others.contains(n))
+    }
+
+    /// `DROP INDEX`: drops a key only when exactly one unique index may have the name.
+    fn drop_index(&mut self, parts: &[String]) {
+        let found = self.indexes_named(parts);
+        if self.sure_index(parts, &found) {
+            let (i, k) = found[0];
+            self.decls[i].keys.remove(k);
+        }
+    }
+
+    /// `ALTER INDEX … RENAME TO`: renames the one unique index the name names. Of several, it leaves
+    /// none with a name a later `DROP INDEX` could match; of none, the index renamed is one that is
+    /// no key, and its new name is another's.
+    fn rename_index(&mut self, parts: &[String], new: String) {
+        let found = self.indexes_named(parts);
+        let sure = self.sure_index(parts, &found);
+        if !sure {
+            self.others.insert(new.clone());
+        }
+        for (i, k) in found {
+            let kd = &mut self.decls[i].keys[k];
+            kd.name = sure.then(|| new.clone());
+            kd.generated = false;
+        }
+    }
+
+    /// `ADD [CONSTRAINT c] {PRIMARY KEY | UNIQUE} USING INDEX i`: the index becomes the constraint,
+    /// and a primary key's columns become NOT NULL. An index this cannot find leaves a primary
+    /// key's NOT NULLs unread, so the table is withheld.
+    fn promote(&mut self, t: &Target, index: &str, name: Option<String>, primary: bool) {
+        let found = self.find(t);
+        if found.len() != 1 {
+            if primary {
+                for i in found {
+                    self.decls[i].table.unreadable.get_or_insert(
+                        "a PRIMARY KEY USING INDEX on a table declared in several schemas"
+                            .to_string(),
+                    );
+                }
+            }
+            return;
+        }
+        let i = found[0];
+        let hits: Vec<usize> = (0..self.decls[i].keys.len())
+            .filter(|&k| {
+                let kd = &self.decls[i].keys[k];
+                kd.index && kd.name.as_deref() == Some(index)
+            })
+            .collect();
+        let sure = hits.len() == 1
+            && (!self.decls[i].keys[hits[0]].generated || self.holders(index) == 1);
+        if !sure {
+            if primary {
+                self.decls[i].table.unreadable.get_or_insert(format!(
+                    "PRIMARY KEY USING INDEX {index}, an index the DDL does not declare once"
+                ));
+            }
+            return;
+        }
+        let d = &mut self.decls[i];
+        let kd = &mut d.keys[hits[0]];
+        kd.index = false;
+        kd.primary |= primary;
+        kd.name = Some(name.unwrap_or_else(|| index.to_string()));
+        kd.generated = false;
+        if primary {
+            if let Key::Cols(cols, _) = kd.key.clone() {
+                set_not_null(&mut d.table, &cols);
+            }
+        }
+    }
+
+    /// Fold one parsed statement in.
+    fn statement(&mut self, st: &Statement) {
+        match st {
+            Statement::CreateTable(ct) => {
+                let Some(name) = last_name(&ct.name) else {
+                    return;
+                };
+                let mut body = Body::default();
+                for c in &ct.columns {
+                    // An unquoted `like` is a keyword Postgres reserves, so `(a int, LIKE o)` is a
+                    // `LIKE` item, which the parser reads as a column `like` of type `o`.
+                    if c.name.quote_style.is_none() && c.name.value.eq_ignore_ascii_case("like") {
+                        match (&c.data_type, c.options.is_empty()) {
+                            (DataType::Custom(src, mods), true) if mods.is_empty() => {
+                                if let Some(src) = target_of(src) {
+                                    body.items.push(Item::Like(src, false));
+                                }
+                            }
+                            _ => {
+                                let why = "a LIKE whose options cannot be read";
+                                body.unreadable.get_or_insert(why.to_string());
+                            }
+                        }
+                        continue;
+                    }
+                    let (col, problem) = column_of(c, &mut body.keys, &mut body.others);
+                    if let Some(why) = problem {
+                        body.unreadable.get_or_insert(why);
+                    }
+                    body.items.push(Item::Col(col));
+                }
+                // The parser reads `(LIKE t)` with no option but `{INCLUDING | EXCLUDING}
+                // DEFAULTS`, so no index is copied; any other option sends the statement to
+                // `unparsed`.
+                if let Some(CreateTableLikeKind::Parenthesized(l) | CreateTableLikeKind::Plain(l)) =
+                    &ct.like
+                {
+                    if let Some(src) = target_of(&l.name) {
+                        body.items.push(Item::Like(src, false));
+                    }
+                }
+                for con in &ct.constraints {
+                    table_constraint_of(con, &mut body.keys, &mut body.others);
+                }
+                let parents = ct.inherits.iter().flatten().filter_map(target_of).collect();
+                self.create(schema_of(&ct.name), name, body, parents);
+            }
+            Statement::CreateIndex(ci) => {
+                let name = ci
+                    .name
+                    .as_ref()
+                    .and_then(|n| folded_parts(n).last().cloned());
+                if !ci.unique {
+                    self.others.extend(name);
+                    return;
+                }
+                if let (Some(table), Some(key)) = (
+                    last_name(&ci.table_name),
+                    key_of(&ci.columns, ci.nulls_distinct == Some(false)),
+                ) {
+                    if let Key::Cols(cols, _) = &key {
+                        self.indexed.insert((table.clone(), cols.clone()));
+                    }
+                    self.add(Pending::Key(
+                        (schema_of(&ci.table_name), table),
+                        KeyDecl::new(key, false, true, name),
+                    ));
+                }
+            }
+            Statement::AlterTable(at) => {
+                let Some(target) = target_of(&at.name) else {
+                    return;
+                };
+                for op in &at.operations {
+                    self.alter(&target, op);
+                }
+            }
+            Statement::AlterIndex {
+                name,
+                operation: AlterIndexOperation::RenameIndex { index_name },
+            } => {
+                if let Some(new) = folded_parts(index_name).last().cloned() {
+                    self.rename_index(&folded_parts(name), new);
+                }
+            }
+            Statement::Drop {
+                object_type, names, ..
+            } => match object_type {
+                ObjectType::Table => {
+                    for t in names.iter().filter_map(target_of) {
+                        self.drop_table(&t);
+                    }
+                }
+                ObjectType::Index => {
+                    for n in names {
+                        self.drop_index(&folded_parts(n));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// One `ALTER TABLE` operation.
+    fn alter(&mut self, target: &Target, op: &AlterTableOperation) {
+        match op {
+            AlterTableOperation::AddConstraint { constraint, .. } => match constraint {
+                TableConstraint::PrimaryKeyUsingIndex(u) | TableConstraint::UniqueUsingIndex(u) => {
+                    let primary = matches!(constraint, TableConstraint::PrimaryKeyUsingIndex(_));
+                    self.promote(target, &fold(&u.index_name), u.name.as_ref().map(fold), primary);
+                }
+                con => {
+                    let (mut keys, mut others) = (Vec::new(), Vec::new());
+                    table_constraint_of(con, &mut keys, &mut others);
+                    self.others.extend(others);
+                    for kd in keys {
+                        self.add(Pending::Key(target.clone(), kd));
+                    }
+                }
+            },
+            AlterTableOperation::AlterColumn { column_name, op } => {
+                let col = column_name.value.to_lowercase();
+                match op {
+                    AlterColumnOperation::SetNotNull => {
+                        self.add(Pending::NotNull(target.clone(), vec![col]))
+                    }
+                    AlterColumnOperation::DropNotNull => self.drop_not_null(target, &col),
+                    AlterColumnOperation::SetDataType { data_type, .. } => {
+                        self.retype_column(target, &col, data_type)
+                    }
+                    // A default bounds no row a statement may write; `ADD GENERATED … AS IDENTITY`
+                    // needs a column that is NOT NULL already.
+                    _ => {}
+                }
+            }
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                let (mut keys, mut others) = (Vec::new(), Vec::new());
+                let (col, problem) = column_of(column_def, &mut keys, &mut others);
+                self.others.extend(others);
+                self.add(Pending::AddColumn(target.clone(), col, problem));
+                for kd in keys {
+                    self.add(Pending::Key(target.clone(), kd));
+                }
+            }
+            AlterTableOperation::DropColumn { column_names, .. } => {
+                let cols: Vec<String> =
+                    column_names.iter().map(|c| c.value.to_lowercase()).collect();
+                self.drop_columns(target, &cols);
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => self.rename_column(
+                target,
+                &old_column_name.value.to_lowercase(),
+                &new_column_name.value.to_lowercase(),
+            ),
+            AlterTableOperation::RenameTable {
+                table_name: RenameTableNameKind::To(n) | RenameTableNameKind::As(n),
+            } => {
+                if let Some(new) = last_name(n) {
+                    self.rename_table(target, new);
+                }
+            }
+            AlterTableOperation::DropConstraint { name, .. } => {
+                self.drop_constraint(target, &fold(name))
+            }
+            AlterTableOperation::RenameConstraint { old_name, new_name } => {
+                self.rename_constraint(target, &fold(old_name), &fold(new_name))
+            }
+            // Ownership, storage, triggers, row security: nothing that bounds the rows.
+            _ => {}
+        }
+    }
+
+    /// A statement the parser rejected, read for what it does to a table, in its place. A `CREATE
+    /// TABLE` is recovered by [`recover_body`]; an `ALTER TABLE` that renames, adds a plain-column
+    /// key or sets or drops a NOT NULL by the patterns here; a plain-column unique index by
+    /// `IDX_RE`. Any other `ALTER TABLE` or `CREATE UNIQUE INDEX` stating a constraint marks its
+    /// table unreadable, since generating rows for the table without it would be unsound.
+    fn unparsed(&mut self, chunk: &str) {
+        static ALTER: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)(.*)$"#).unwrap()
+        });
+        static ADD_KEY: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*add\s+(?:constraint\s+("[^"]*"|[A-Za-z_][\w$]*)\s+)?(primary\s+key|unique(?:\s+nulls\s+(?:not\s+)?distinct)?)\s*(\([^()]*\))\s*;?\s*$"#).unwrap()
+        });
+        static SET_NN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*alter\s+(?:column\s+)?("[^"]*"|[A-Za-z_][\w$]*)\s+(set|drop)\s+not\s+null\s*;?\s*$"#).unwrap()
+        });
+        static RENAME: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*rename\s+(?:(column\s+)?("[^"]*"|[A-Za-z_][\w$]*)\s+)?to\s+("[^"]*"|[A-Za-z_][\w$]*)\s*;?\s*$"#).unwrap()
+        });
+        static UIDX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*create\s+unique\s+index\b.*?\bon\s+(?:only\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)"#).unwrap()
+        });
+        let ident = |raw: &str| raw.trim_matches('"').to_lowercase();
+        if let Some(caps) = TBL_RE.captures(chunk) {
+            if chunk[..caps.get(0).unwrap().start()].trim().is_empty() {
+                self.recover(chunk, &caps);
                 return;
             }
         }
-        if let Some(n) = SET_NN.captures(rest) {
-            let col = n[1].trim_matches('"').to_lowercase();
-            pending.push(Pending::NotNull(target, vec![col]));
-            return;
-        }
-        pending.push(Pending::Unreadable(
-            target,
-            "an ALTER TABLE constraint the parser rejected".to_string(),
-        ));
-    } else if let Some(caps) = UIDX.captures(chunk) {
-        // The plain-column form is `IDX_RE`'s; anything else is a key nothing here can read.
-        let readable = IDX_RE.captures(chunk).is_some_and(|c| plain_index_cols(&c[2]).is_some())
-            && !Regex::new(r"(?i)\bnulls\s+not\s+distinct\b").unwrap().is_match(chunk);
-        if !readable {
-            pending.push(Pending::Unreadable(
-                target_of(&caps[1]),
-                "a unique index the parser rejected".to_string(),
+        if let Some(caps) = ALTER.captures(chunk) {
+            let target = target_of_raw(&caps[1]);
+            let rest = &caps[2];
+            if let Some(r) = RENAME.captures(rest) {
+                // `RENAME [COLUMN] a TO b` or `RENAME TO t`; `RENAME CONSTRAINT` matches neither,
+                // and a constraint renamed unread is only one a later DROP CONSTRAINT does not find.
+                match r.get(2) {
+                    Some(old)
+                        if r.get(1).is_some()
+                            || !old.as_str().eq_ignore_ascii_case("constraint") =>
+                    {
+                        self.rename_column(&target, &ident(old.as_str()), &ident(&r[3]))
+                    }
+                    Some(_) => {}
+                    None => self.rename_table(&target, ident(&r[3])),
+                }
+                return;
+            }
+            if Regex::new(r"(?is)^\s*rename\b").unwrap().is_match(rest) {
+                let constraint = Regex::new(r"(?is)^\s*rename\s+constraint\b").unwrap();
+                if !constraint.is_match(rest) {
+                    if let Some(i) = self.one(&target, "RENAME") {
+                        self.decls[i]
+                            .table
+                            .unreadable
+                            .get_or_insert("a RENAME the parser rejected".to_string());
+                    }
+                }
+                return;
+            }
+            if let Some(n) = SET_NN.captures(rest) {
+                let col = ident(&n[1]);
+                if n[2].eq_ignore_ascii_case("set") {
+                    self.add(Pending::NotNull(target, vec![col]));
+                } else {
+                    self.drop_not_null(&target, &col);
+                }
+                return;
+            }
+            let states = Regex::new(r"(?i)\b(primary\s+key|unique|not\s+null|exclude)\b")
+                .unwrap()
+                .is_match(rest);
+            if !states {
+                // Defaults, ownership, a dropped constraint: nothing that widens the rows unread.
+                return;
+            }
+            if let Some(k) = ADD_KEY.captures(rest) {
+                if let Some(cols) = plain_key(&k[3]) {
+                    let kind = k[2].to_lowercase();
+                    let name = k.get(1).map(|m| {
+                        let raw = m.as_str();
+                        match raw.strip_prefix('"') {
+                            Some(q) => q.trim_end_matches('"').to_string(),
+                            None => raw.to_lowercase(),
+                        }
+                    });
+                    let key = Key::Cols(cols, kind.contains("not distinct"));
+                    let kd = KeyDecl::new(key, kind.starts_with("primary"), false, name);
+                    self.add(Pending::Key(target, kd));
+                    return;
+                }
+            }
+            self.add(Pending::Unreadable(
+                target,
+                "an ALTER TABLE constraint the parser rejected".to_string(),
             ));
+        } else if let Some(caps) = UIDX.captures(chunk) {
+            let plain = IDX_RE
+                .captures(chunk)
+                .and_then(|c| plain_index_cols(&c[2]).map(|cols| (target_of_raw(&c[1]), cols)));
+            let nnd = Regex::new(r"(?i)\bnulls\s+not\s+distinct\b").unwrap().is_match(chunk);
+            match plain {
+                Some((target, cols)) if !nnd => {
+                    self.indexed.insert((target.1.clone(), cols.clone()));
+                    // Its name, if it has one, is not read here: such a key is never dropped by
+                    // name.
+                    let kd = KeyDecl {
+                        anon: false,
+                        ..KeyDecl::new(Key::Cols(cols, false), false, true, None)
+                    };
+                    self.add(Pending::Key(target, kd));
+                }
+                _ => self.add(Pending::Unreadable(
+                    target_of_raw(&caps[1]),
+                    "a unique index the parser rejected".to_string(),
+                )),
+            }
         }
     }
+
+    /// Recover the `CREATE TABLE` `caps` matched in `text`, unless a statement already declared,
+    /// dropped or renamed a table of that name.
+    fn recover(&mut self, text: &str, caps: &regex::Captures) {
+        static INHERITS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?is)^\s*inherits\s*\(([^()]*)\)"#).unwrap()
+        });
+        let (schema, name) = target_of_raw(&caps[1]);
+        if name.is_empty() || self.seen.contains(&(schema.clone(), name.clone())) {
+            return;
+        }
+        let open = caps.get(0).unwrap().end() - 1;
+        let Some(close) = matching(text, open) else {
+            return;
+        };
+        let Some(body) = recover_body(&text[open + 1..close]) else {
+            return;
+        };
+        let parents: Vec<Target> = INHERITS
+            .captures(&text[close + 1..])
+            .map(|c| c[1].split(',').map(target_of_raw).filter(|t| !t.1.is_empty()).collect())
+            .unwrap_or_default();
+        self.create(schema, name, body, parents);
+    }
+
+    /// The tables as read: each declaration's keys folded into its [`Table`], keyed as [`Schema`]
+    /// says, with the keys over columns it does not have dropped.
+    fn finish(self) -> (Schema, usize) {
+        let decls = self.decls;
+        // Key the tables: by name, unless the DDL declares that name in more than one schema.
+        let mut out = Schema::new();
+        for d in &decls {
+            let shared = decls
+                .iter()
+                .filter(|o| o.name == d.name)
+                .any(|o| {
+                    o.schema.as_deref().unwrap_or("public") != d.schema.as_deref().unwrap_or("public")
+                });
+            let key = if shared {
+                format!("{}.{}", d.schema.as_deref().unwrap_or("public"), d.name)
+            } else {
+                d.name.clone()
+            };
+            let mut t = d.table.clone();
+            // A primary key made its columns NOT NULL when it was added, which dropping it later
+            // does not undo; nothing is set here.
+            for kd in &d.keys {
+                add_key(&mut t, kd.key.clone(), false);
+            }
+            out.entry(key).or_insert(t);
+        }
+
+        // A key may name a column the table does not declare -- corpus DDL routinely carries
+        // `CREATE UNIQUE INDEX ... ON t (c)` for a `c` that the (truncated) `CREATE TABLE t` never
+        // lists. Emitting `UNIQUE ("c")` then fails the CREATE TABLE outright and every later
+        // reference to the table reports it missing, which costs us the whole pair.
+        //
+        // Dropping a uniqueness constraint is unsound *in general* -- see the module docs: it lets
+        // us fabricate an instance no valid database admits. It is safe here, and only here,
+        // because the key names a column we do not model. Take any instance we generate: whether
+        // the real column is missing from the DDL or merely missing from our parse, its values are
+        // free, so some assignment of distinct values to it satisfies the key. Every instance we
+        // can build is therefore the projection of a real one, which is exactly the property a
+        // counterexample needs -- unlike dropping a key over columns we *do* generate, which would
+        // let two rows collide in a way no real table permits. So the test is exactly "column
+        // absent from `cols`": a key whose columns all exist is never touched, however
+        // inconvenient it is.
+        //
+        // The same key can arrive twice (two statements may state it). `ddl_for` already collapses
+        // repeated column-sets, so this only removes noise — but it keeps the dropped-key count
+        // below meaningful.
+        for t in out.values_mut() {
+            let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+            t.keys.retain(|k| seen.insert(k.clone()));
+            let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+            t.nnd_keys.retain(|k| seen.insert(k.clone()));
+        }
+
+        let mut dropped = 0usize;
+        for t in out.values_mut() {
+            let have: BTreeSet<String> = t.cols.iter().map(|c| c.name.clone()).collect();
+            let before = t.keys.len();
+            t.keys.retain(|k| k.iter().all(|c| have.contains(c)));
+            t.nnd_keys.retain(|k| k.iter().all(|c| have.contains(c)));
+            dropped += before - t.keys.len();
+        }
+        (out, dropped)
+    }
 }
+
+/// `CREATE TABLE name (`, for the statements the parser rejected.
+static TBL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#"(?is)create\s+(?:global\s+|local\s+|temp\w*\s+|unlogged\s+)*table\s+(?:if\s+not\s+exists\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)\s*\("#).unwrap()
+});
 
 /// `CREATE UNIQUE INDEX ... ON t (cols)`, for the statements the parser may have dropped.
 static IDX_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -1038,30 +1985,6 @@ fn plain_index_cols(raw: &str) -> Option<Vec<String>> {
     (cols.len() == parts.len() && !cols.is_empty()).then_some(cols)
 }
 
-/// The declarations a later statement's target refers to: the one table of that name, or -- when
-/// several schemas declare it -- the one in the schema it names (a bare name meaning `public`). Where
-/// that settles nothing every candidate is returned, so a constraint lands on too many tables rather
-/// than on none: a narrower instance space only costs counterexamples.
-fn targets(decls: &[Decl], target: &Target) -> Vec<usize> {
-    let named: Vec<usize> = (0..decls.len())
-        .filter(|&i| decls[i].name == target.1)
-        .collect();
-    if named.len() <= 1 {
-        return named;
-    }
-    let want = target.0.as_deref().unwrap_or("public");
-    let exact: Vec<usize> = named
-        .iter()
-        .copied()
-        .filter(|&i| decls[i].schema.as_deref().unwrap_or("public") == want)
-        .collect();
-    if exact.is_empty() {
-        named
-    } else {
-        exact
-    }
-}
-
 /// Parse the DDL for a pair into a schema. Returns an empty map (→ NO-SCHEMA) if nothing usable
 /// is found. See the module docs on why uniqueness recovery is soundness-critical.
 pub fn parse_schema(ddl: &str) -> Schema {
@@ -1073,162 +1996,59 @@ pub fn parse_schema(ddl: &str) -> Schema {
 pub fn parse_schema_stats(ddl: &str) -> (Schema, usize) {
     let cleaned = clean_ddl(ddl);
     let dialect = PostgreSqlDialect {};
-    let mut decls: Vec<Decl> = Vec::new();
-    let mut pending: Vec<Pending> = Vec::new();
+    let mut r = Reader::default();
 
-    // Prefer one whole-DDL parse; if a single odd statement trips the strict parser, fall back to
-    // parsing each `;`-separated statement independently so the good CREATE TABLEs still land.
+    // Prefer one whole-DDL parse; if a single odd statement trips the strict parser, parse each
+    // statement independently -- split as Postgres's lexer splits them, so a `;` in a string or a
+    // dollar-quoted body ends none -- so the good ones still land. Either way they apply in order.
     match Parser::parse_sql(&dialect, &cleaned) {
         Ok(stmts) => {
             for st in &stmts {
-                absorb(st, &mut decls, &mut pending);
+                r.statement(st);
             }
         }
         Err(_) => {
-            for chunk in cleaned.split(';') {
-                if chunk.trim().is_empty() {
-                    continue;
-                }
-                match Parser::parse_sql(&dialect, chunk) {
+            for chunk in crate::lex::split_statements(&cleaned) {
+                match Parser::parse_sql(&dialect, &chunk) {
                     Ok(stmts) => {
                         for st in &stmts {
-                            absorb(st, &mut decls, &mut pending);
+                            r.statement(st);
                         }
                     }
-                    Err(_) => absorb_unparsed(chunk, &mut pending),
+                    Err(_) => r.unparsed(&chunk),
                 }
             }
         }
     }
 
-    // Regex fallback: recover a `CREATE TABLE` the strict parser rejected (an unquoted reserved
-    // word for a column name is the corpus's usual reason). Runs before the index passes so a
-    // recovered table still collects its uniqueness keys.
-    static TBL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r#"(?is)create\s+(?:global\s+|local\s+|temp\w*\s+|unlogged\s+)*table\s+(?:if\s+not\s+exists\s+)?((?:"[^"]*"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$]*))*)\s*\("#).unwrap()
-    });
+    // Regex fallback over the raw text, for what no statement above declared: a `CREATE TABLE` (an
+    // unquoted reserved word for a column name is the corpus's usual reason the parser rejects one)
+    // and a plain-column `CREATE UNIQUE INDEX`, wherever the text holds one -- a function body's
+    // included. Only ever adds tables and keys, after every statement has applied.
     for caps in TBL_RE.captures_iter(&cleaned) {
-        let parts: Vec<String> = caps[1]
-            .split('.')
-            .map(|p| p.trim().trim_matches('"').to_lowercase())
-            .collect();
-        let name = parts.last().cloned().unwrap_or_default();
-        let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
-        if name.is_empty()
-            || decls
-                .iter()
-                .any(|d| d.name == name && d.schema == schema)
-        {
-            continue;
-        }
-        let open = caps.get(0).unwrap().end() - 1;
-        let Some(close) = matching(&cleaned, open) else {
-            continue;
-        };
-        if let Some(table) = recover_body(&cleaned[open + 1..close]) {
-            decls.push(Decl {
-                schema,
-                name,
-                table,
-            });
-        }
+        r.recover(&cleaned, &caps);
     }
-
-    // Regex fallback: recover `CREATE UNIQUE INDEX ... ON t (cols)` the parser may have dropped.
-    // Only plain-column lists are added here; `absorb_unparsed` withholds a table whose unique index
-    // it cannot read, and a parsed expression index is kept by `absorb`.
     for caps in IDX_RE.captures_iter(&cleaned) {
         let parts: Vec<String> = caps[1].split('.').map(|p| p.to_lowercase()).collect();
         let name = parts.last().cloned().unwrap_or_default();
         let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
         if let Some(cols) = plain_index_cols(&caps[2]) {
-            pending.push(Pending::Key((schema, name), Key::Cols(cols, false), false));
+            if r.indexed.contains(&(name.clone(), cols.clone())) {
+                continue;
+            }
+            let kd = KeyDecl {
+                anon: false,
+                ..KeyDecl::new(Key::Cols(cols, false), false, true, None)
+            };
+            r.pending.push(Pending::Key((schema, name), kd));
         }
     }
 
-    // Apply the constraints other statements state (any statement order).
-    for p in pending {
-        match p {
-            Pending::Key(target, key, primary) => {
-                for i in targets(&decls, &target) {
-                    let key = match &key {
-                        Key::Cols(c, n) => Key::Cols(c.clone(), *n),
-                        Key::Exprs(e, n) => Key::Exprs(e.clone(), *n),
-                    };
-                    add_key(&mut decls[i].table, key, primary);
-                }
-            }
-            Pending::NotNull(target, cols) => {
-                for i in targets(&decls, &target) {
-                    set_not_null(&mut decls[i].table, &cols);
-                }
-            }
-            Pending::AddColumn(target, col, problem) => {
-                for i in targets(&decls, &target) {
-                    let t = &mut decls[i].table;
-                    if let Some(why) = &problem {
-                        t.unreadable.get_or_insert(why.clone());
-                    }
-                    if !t.cols.iter().any(|c| c.name == col.name) {
-                        t.cols.push(col.clone());
-                    }
-                }
-            }
-            Pending::Unreadable(target, why) => {
-                for i in targets(&decls, &target) {
-                    decls[i].table.unreadable.get_or_insert(why.clone());
-                }
-            }
+    // The additions held for a table not declared at their statement.
+    for p in std::mem::take(&mut r.pending) {
+        for i in r.find(p.target()) {
+            r.apply(i, &p);
         }
     }
-
-    // Key the tables: by name, unless the DDL declares that name in more than one schema.
-    let mut out = Schema::new();
-    for d in &decls {
-        let shared = decls
-            .iter()
-            .filter(|o| o.name == d.name)
-            .any(|o| o.schema.as_deref().unwrap_or("public") != d.schema.as_deref().unwrap_or("public"));
-        let key = if shared {
-            format!("{}.{}", d.schema.as_deref().unwrap_or("public"), d.name)
-        } else {
-            d.name.clone()
-        };
-        // A repeated declaration of one table keeps the first, as Postgres would refuse the second.
-        out.entry(key).or_insert_with(|| d.table.clone());
-    }
-
-    // A key may name a column the table does not declare -- corpus DDL routinely carries
-    // `CREATE UNIQUE INDEX ... ON t (c)` for a `c` that the (truncated) `CREATE TABLE t` never
-    // lists. Emitting `UNIQUE ("c")` then fails the CREATE TABLE outright and every later
-    // reference to the table reports it missing, which costs us the whole pair.
-    //
-    // Dropping a uniqueness constraint is unsound *in general* -- see the module docs: it lets us
-    // fabricate an instance no valid database admits. It is safe here, and only here, because the
-    // key names a column we do not model. Take any instance we generate: whether the real column
-    // is missing from the DDL or merely missing from our parse, its values are free, so some
-    // assignment of distinct values to it satisfies the key. Every instance we can build is
-    // therefore the projection of a real one, which is exactly the property a counterexample needs
-    // -- unlike dropping a key over columns we *do* generate, which would let two rows collide in
-    // a way no real table permits. So the test is exactly "column absent from `cols`": a key whose
-    // columns all exist is never touched, however inconvenient it is.
-    // A `CREATE UNIQUE INDEX` the parser recognised is also matched by `IDX_RE`, so the same key
-    // arrives twice. `ddl_for` already collapses repeated column-sets, so this only removes noise —
-    // but it keeps the dropped-key count below meaningful.
-    for t in out.values_mut() {
-        let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
-        t.keys.retain(|k| seen.insert(k.clone()));
-        let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
-        t.nnd_keys.retain(|k| seen.insert(k.clone()));
-    }
-
-    let mut dropped = 0usize;
-    for t in out.values_mut() {
-        let have: BTreeSet<String> = t.cols.iter().map(|c| c.name.clone()).collect();
-        let before = t.keys.len();
-        t.keys.retain(|k| k.iter().all(|c| have.contains(c)));
-        t.nnd_keys.retain(|k| k.iter().all(|c| have.contains(c)));
-        dropped += before - t.keys.len();
-    }
-    (out, dropped)
+    r.finish()
 }

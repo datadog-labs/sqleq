@@ -19,6 +19,10 @@
 //!   of that name in that schema itself), a table the queries name by one schema is moved there, a
 //!   type nothing declares is a `text` domain, and a column default that calls a function nothing
 //!   declares is dropped ([`Timing::caveat`] reports the last two).
+//! * The rows are generated for the tables as the catalog holds them once the DDL has run
+//!   (`relation`): their own columns, each NOT NULL exactly where Postgres says, and every table
+//!   that inherits from one the queries read (`descendants`). The cut and choice rules run again on
+//!   what a scan of each table then reads (`scan_view`).
 //! * Each trial loads its rows under a savepoint and runs each side under a nested one, so nothing is
 //!   re-created per side, and a sequence is reset before each side that can write.
 //! * Each placeholder is written in as a cast to the type Postgres infers for it, one type per `$N`
@@ -48,7 +52,7 @@ use crate::gen::{
 use crate::limits::{self, Count};
 use crate::pair::{is_query, small_size, Config, Verdict, SMALL_STREAM};
 use crate::patterns as pat;
-use crate::schema::{parse_schema, VType};
+use crate::schema::{parse_schema, Column, Schema, Table, VType};
 use crate::typing;
 
 /// Contrib extensions captured schemas commonly use, installed into the template every worker
@@ -741,9 +745,11 @@ fn place_tables(ddl: &str, refs: &str) -> String {
         .into_owned()
 }
 
-/// Where one schema table's rows go: its relation, and for each of the generator's columns the
-/// column it fills (none for a column Postgres computes itself or does not have).
+/// Where one table's rows go: its relation, and for each of the generator's columns -- the
+/// relation's own, in its order -- the column it fills (none for a column Postgres computes
+/// itself).
 struct Target {
+    oid: i64,
     reg: String,
     nsp: String,
     cols: Vec<Option<String>>,
@@ -754,7 +760,9 @@ struct Target {
     col_types: Vec<Option<String>>,
 }
 
-fn target(db: &mut Db, key: &str, gen_cols: &[String]) -> Result<Target, String> {
+/// The relation the table keyed `key` is in Postgres, found by its name as the queries find it: in
+/// the schema the key names, if it names one, and the one the search path finds first.
+fn find_relation(db: &mut Db, key: &str) -> Result<i64, String> {
     let (nsp, name) = match key.rsplit_once('.') {
         Some((s, n)) => (Some(s.to_string()), n.to_string()),
         None => (None, key.to_string()),
@@ -763,54 +771,141 @@ fn target(db: &mut Db, key: &str, gen_cols: &[String]) -> Result<Target, String>
     let rows = db
         .c
         .query(
-            "SELECT c.oid::regclass::text, a.attname::text, a.attgenerated::text, \
-                    a.attidentity::text, format_type(a.atttypid, a.atttypmod), c.oid::int8, \
-                    n.nspname::text \
-             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+            "SELECT c.oid::int8 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE lower(c.relname) = $1 AND c.relkind IN ('r', 'p') \
                AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
                AND ($2::text IS NULL OR lower(n.nspname) = $2) \
-             ORDER BY pg_table_is_visible(c.oid) DESC, c.oid, a.attnum",
+             ORDER BY pg_table_is_visible(c.oid) DESC, c.oid LIMIT 1",
             &[&name, &nsp],
         )
         .map_err(|e| msg(&e))?;
-    let first = rows.first().ok_or(format!("no relation for table {key}"))?;
-    let oid: i64 = first.get(5);
-    let reg: String = first.get(0);
-    let nsp: String = first.get(6);
-    let mut by_name: HashMap<String, (String, bool, String)> = HashMap::new();
-    let mut overriding = false;
-    let mut types = Vec::new();
-    for r in rows.iter().filter(|r| r.get::<_, i64>(5) == oid) {
-        let att: String = r.get(1);
-        let generated = !r.get::<_, String>(2).is_empty();
-        if r.get::<_, String>(3) == "a" {
-            overriding = true;
+    rows.first()
+        .map(|r| r.get(0))
+        .ok_or(format!("no relation for table {key}"))
+}
+
+/// The table at `oid` as Postgres holds it once the DDL has run, and where its rows go.
+///
+/// The generator's columns are the relation's own, as Postgres names them, and each is NOT NULL
+/// exactly where Postgres says it is (`attnotnull`): whatever the DDL did on the way -- a `DROP NOT
+/// NULL`, a `RENAME COLUMN`, an `INHERITS`, a `LIKE` -- is what the catalog holds, so the rows are
+/// rows of the real table, with a NULL wherever it admits one and every column filled. A column
+/// keeps the domain `model` (the DDL as read) gives a column of its name where that is the domain
+/// its type names too (a `numeric(p, s)` keeps its precision), and otherwise takes the one its type
+/// names. The keys are the unique indexes Postgres enforces on every statement: over plain columns,
+/// not partial, not deferred.
+fn relation(db: &mut Db, oid: i64, model: Option<&Table>) -> Result<(Target, Table), String> {
+    db.trips += 1;
+    let rows = db
+        .c
+        .query(
+            "SELECT c.oid::regclass::text, n.nspname::text, a.attname::text, a.attgenerated::text, \
+                    a.attidentity::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+                    coalesce(pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%', false) \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_attribute a \
+                    ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum \
+             WHERE c.oid = $1::int8::oid \
+             ORDER BY a.attnum",
+            &[&oid],
+        )
+        .map_err(|e| msg(&e))?;
+    let first = rows.first().ok_or(format!("no relation {oid}"))?;
+    let mut tg = Target {
+        oid,
+        reg: first.get(0),
+        nsp: first.get(1),
+        cols: Vec::new(),
+        overriding: false,
+        types: Vec::new(),
+        col_types: Vec::new(),
+    };
+    let mut table = Table::default();
+    for r in &rows {
+        // A relation with no columns at all is one row of NULLs.
+        let Some(att) = r.get::<_, Option<String>>(2) else {
+            continue;
+        };
+        let generated = !r.get::<_, String>(3).is_empty();
+        let identity: String = r.get(4);
+        if identity == "a" {
+            tg.overriding = true;
         }
-        let ty: String = r.get(4);
-        types.push(ty.clone());
-        by_name.insert(att.to_lowercase(), (att, generated, ty));
+        let ty: String = r.get(5);
+        let name = att.to_lowercase();
+        let declared = model.and_then(|m| m.cols.iter().find(|c| c.name == name));
+        let (vt, array) = match (declared, vtype_of(&ty)) {
+            (Some(c), Some((v, arr))) if c.vt.same_domain(v) && c.array == arr => (c.vt, c.array),
+            (_, Some(named)) => named,
+            (Some(c), None) => (c.vt, c.array),
+            (None, None) => (VType::Varchar, ty.ends_with("[]")),
+        };
+        table.cols.push(Column {
+            name,
+            vt,
+            notnull: r.get(6),
+            array,
+            sequenced: declared.is_some_and(|c| c.sequenced)
+                || !identity.is_empty()
+                || r.get::<_, bool>(7),
+        });
+        tg.cols.push((!generated).then(|| qi(&att)));
+        tg.types.push(ty.clone());
+        tg.col_types.push(Some(ty));
     }
-    let cols = gen_cols
-        .iter()
-        .map(|c| match by_name.get(&c.to_lowercase()) {
-            Some((att, false, _)) => Some(qi(att)),
-            _ => None,
-        })
-        .collect();
-    let col_types = gen_cols
-        .iter()
-        .map(|c| by_name.get(&c.to_lowercase()).map(|(_, _, t)| t.clone()))
-        .collect();
-    Ok(Target {
-        reg,
-        nsp,
-        cols,
-        overriding,
-        types,
-        col_types,
-    })
+    db.trips += 1;
+    let keys = db
+        .c
+        .query(
+            "SELECT array_agg(lower(a.attname::text) ORDER BY k.ord)::text[], \
+                    i.indnullsnotdistinct \
+             FROM pg_index i \
+             CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+             WHERE i.indrelid = $1::int8::oid AND i.indisunique AND i.indpred IS NULL \
+               AND i.indexprs IS NULL AND k.ord <= i.indnkeyatts \
+               AND NOT EXISTS (SELECT 1 FROM pg_constraint x WHERE x.conindid = i.indexrelid \
+                                 AND x.conrelid = i.indrelid AND x.condeferred) \
+             GROUP BY i.indexrelid, i.indnullsnotdistinct \
+             ORDER BY i.indexrelid",
+            &[&oid],
+        )
+        .map_err(|e| msg(&e))?;
+    for r in &keys {
+        let cols: Vec<String> = r.get(0);
+        if r.get::<_, bool>(1) {
+            table.nnd_keys.push(cols.clone());
+        }
+        table.keys.push(cols);
+    }
+    Ok((tg, table))
+}
+
+/// Every table that inherits, directly or not, from one of `roots`: (root, descendant) by oid, in
+/// creation order. A scan of a table reads the rows of each. A partitioned table's partitions are
+/// not among them: a row inserted into it reaches them through it.
+fn descendants(db: &mut Db, roots: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    db.trips += 1;
+    let rows = db
+        .c
+        .query(
+            "WITH RECURSIVE d(root, child) AS ( \
+                SELECT i.inhparent, i.inhrelid FROM pg_inherits i \
+                 WHERE i.inhparent = ANY (ARRAY(SELECT r::oid FROM unnest($1::int8[]) AS r)) \
+                UNION \
+                SELECT d.root, i.inhrelid FROM d JOIN pg_inherits i ON i.inhparent = d.child) \
+             SELECT d.root::int8, d.child::int8 FROM d \
+             JOIN pg_class r ON r.oid = d.root JOIN pg_class c ON c.oid = d.child \
+             WHERE r.relkind = 'r' AND c.relkind = 'r' \
+             ORDER BY d.child, d.root",
+            &[&roots],
+        )
+        .map_err(|e| msg(&e))?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
 fn insert_sql(t: &Target, rows: &[&Vec<Val>]) -> Option<String> {
@@ -1289,6 +1384,160 @@ fn describe(binds: &HashMap<u32, Val>, kept: &RowData, clock: Option<&str>) -> S
     parts.join("  |  ")
 }
 
+/// What a scan of a table reads, as the analyses see it: its own rows and those of every table that
+/// inherits from it, `kids`. A key binds only the table it is declared on, so with any descendant
+/// there is none, and a column is NOT NULL only where it is NOT NULL in every one of them (Postgres
+/// lets a child drop a NOT NULL its parent has).
+///
+/// The analyses find a column by its lower-cased name, so two columns whose names differ only in
+/// case (`"Id"` and `id`) are one name to them: such a column is NOT NULL in no key and in none of
+/// them, and nothing that names it is a key.
+fn scan_view(own: &Table, kids: &[&Table]) -> Table {
+    let mut view = own.clone();
+    let twins: BTreeSet<String> = own
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| own.cols[..*i].iter().any(|d| d.name == c.name))
+        .map(|(_, c)| c.name.clone())
+        .collect();
+    if !twins.is_empty() {
+        view.keys.retain(|k| !k.iter().any(|c| twins.contains(c)));
+        view.nnd_keys.retain(|k| !k.iter().any(|c| twins.contains(c)));
+        for c in view.cols.iter_mut().filter(|c| twins.contains(&c.name)) {
+            c.notnull = false;
+        }
+    }
+    if !kids.is_empty() {
+        view.keys.clear();
+        view.nnd_keys.clear();
+        for c in view.cols.iter_mut() {
+            c.notnull &= kids
+                .iter()
+                .all(|kt| kt.cols.iter().any(|x| x.name == c.name && x.notnull));
+        }
+    }
+    view
+}
+
+/// What the parameter, cut and choice analyses read off a pair, against one reading of its tables.
+struct Analysis {
+    /// Column name -> (table, index, element domain, is array), for drawing parameter values.
+    colloc: HashMap<String, (String, usize, VType, bool)>,
+    pneed: HashMap<u32, typing::Need>,
+    pcol: HashMap<u32, String>,
+    parray: BTreeSet<u32>,
+    cuts: Vec<limits::Cut>,
+    counted: BTreeMap<u32, BTreeSet<Count>>,
+    neutral: HashMap<u32, Val>,
+    /// A choice among tied rows that nothing about the result survives: no verdict at all.
+    skip: bool,
+    /// A choice among tied rows that leaves only the cardinality determined.
+    nondet: bool,
+}
+
+/// The analyses `test_pair` makes, against the tables `schema` describes: which column each
+/// placeholder is drawn from, which row cuts and tie-breaking choices the pair makes, and whether
+/// they leave the rows, only their number, or nothing determined. `sides` are what the value
+/// heuristics read (under the gather rule, the `VALUES` side alone), `pair` both statements.
+///
+/// Whether an order is total rests on the tables' keys and NOT NULLs, so it is only as sound as the
+/// reading of them is true of the rows the trials load: run on the DDL as read it decides early
+/// what cannot be compared at all, and run again on the tables as Postgres holds them it decides
+/// what is.
+fn analyze(
+    sides: (&str, &str),
+    pair: (&str, &str),
+    finals: &[String],
+    schema: &Schema,
+    gathered: Option<&Gather>,
+    ph_draw: &[pat::Placeholder],
+) -> Analysis {
+    let ((pa, pb), (a, b)) = (sides, pair);
+    let mut coltype: HashSet<String> = HashSet::new();
+    let mut colloc: HashMap<String, (String, usize, VType, bool)> = HashMap::new();
+    for t in finals {
+        for (j, c) in schema[t].cols.iter().enumerate() {
+            coltype.insert(c.name.clone());
+            colloc
+                .entry(c.name.clone())
+                .or_insert((t.clone(), j, c.vt, c.array));
+        }
+    }
+    let coltypes: HashMap<String, VType> = colloc
+        .iter()
+        .filter(|(_, (_, _, _, array))| !array)
+        .map(|(name, (_, _, vt, _))| (name.clone(), *vt))
+        .collect();
+    let pneed = typing::param_needs(pa, pb, &coltypes);
+    let mut pcol = pat::param_cols(pa, pb, &coltype);
+    // Under the gather rule each `VALUES` parameter is linked to the column it fills, so it is
+    // drawn from what that column holds.
+    if let Some(g) = gathered {
+        for p in ph_draw {
+            if let Some(c) = g.column_of_param(p.n) {
+                pcol.entry(p.n).or_insert_with(|| g.cols[c].clone());
+            }
+        }
+    }
+    let arraycols: HashSet<String> = colloc
+        .iter()
+        .filter(|(_, (_, _, _, arr))| *arr)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let parray = pat::array_params(pa, pb, &arraycols);
+
+    let cuts: Vec<limits::Cut> = limits::cuts(a, schema)
+        .into_iter()
+        .chain(limits::cuts(b, schema))
+        .collect();
+    let mut counted: BTreeMap<u32, BTreeSet<Count>> = BTreeMap::new();
+    for c in &cuts {
+        for (n, kind) in &c.params {
+            counted.entry(*n).or_default().insert(*kind);
+        }
+    }
+    let neutral: HashMap<u32, Val> = counted
+        .iter()
+        .filter(|(n, kinds)| !pcol.contains_key(n) && kinds.len() == 1)
+        .map(|(n, kinds)| {
+            let v = match kinds.first() {
+                Some(Count::Offset) => Val::Int(0),
+                _ => Val::Int(1_000_000_000),
+            };
+            (*n, v)
+        })
+        .collect();
+    let open = |c: &limits::Cut| {
+        !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
+    };
+    let cut_nondet = cuts.iter().any(open);
+    let choice = limits::choices(a, schema).max(limits::choices(b, schema));
+    // A cut under a level that can tell its tied rows apart leaves the cardinality open too, as a
+    // `DISTINCT ON` there does ([`limits::Cut::counted`]).
+    let skip = choice == limits::Choice::Unbounded || cuts.iter().any(|c| !c.counted && open(c));
+    // `array_agg` with no order: DuckDB's path sorts list cells; text cannot be sorted faithfully
+    // here, so such a pair compares only cardinality.
+    let unordered_agg = [a, b]
+        .iter()
+        .any(|s| s.to_lowercase().contains("array_agg"));
+    let nondet = cut_nondet
+        || choice == limits::Choice::Cardinality
+        || pat::has_nondet_agg(a, b)
+        || unordered_agg;
+    Analysis {
+        colloc,
+        pneed,
+        pcol,
+        parray,
+        cuts,
+        counted,
+        neutral,
+        skip,
+        nondet,
+    }
+}
+
 /// Test one pair on Postgres. The connection must not be inside a transaction.
 pub fn test_pair_pg(client: &mut Client, a: &str, b: &str, ddl: &str, cfg: Config) -> Outcome {
     let mut db = Db { c: client, trips: 0 };
@@ -1355,86 +1604,18 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     };
     let misaligned = if gathered.is_some() { None } else { pat::misalignment(a, b) };
 
-    // --- the parameter analysis, as `test_pair` does it ---
-    let mut coltype: HashSet<String> = HashSet::new();
-    let mut colloc: HashMap<String, (String, usize, VType, bool)> = HashMap::new();
-    for t in &finals {
-        for (j, c) in schema[t].cols.iter().enumerate() {
-            coltype.insert(c.name.clone());
-            colloc
-                .entry(c.name.clone())
-                .or_insert((t.clone(), j, c.vt, c.array));
-        }
-    }
-    let coltypes: HashMap<String, VType> = colloc
-        .iter()
-        .filter(|(_, (_, _, _, array))| !array)
-        .map(|(name, (_, _, vt, _))| (name.clone(), *vt))
-        .collect();
-    let pneed = typing::param_needs(pa, pb, &coltypes);
-    let mut pcol = pat::param_cols(pa, pb, &coltype);
+    // --- the parameter, cut and choice analyses, as `test_pair` does them, on the DDL as read;
+    // they run again on the tables as Postgres holds them once the DDL has run (below) ---
     let pcast = pat::param_casts(pa, pb);
-    // Under the gather rule each `VALUES` parameter is linked to the column it fills, so it is drawn
-    // from what that column holds.
-    if let Some(g) = &gathered {
-        for p in ph_draw {
-            if let Some(c) = g.column_of_param(p.n) {
-                pcol.entry(p.n).or_insert_with(|| g.cols[c].clone());
-            }
-        }
-    }
-    let arraycols: HashSet<String> = colloc
-        .iter()
-        .filter(|(_, (_, _, _, arr))| *arr)
-        .map(|(n, _)| n.clone())
-        .collect();
-    let parray = pat::array_params(pa, pb, &arraycols);
     // The placeholders drawn for: under the gather rule, the `VALUES` side's alone.
     let pnums: BTreeSet<u32> = match &gathered {
         Some(_) => ph_draw.iter().map(|p| p.n).collect(),
         None => ph_a.iter().chain(&ph_b).map(|p| p.n).collect(),
     };
-
-    let cuts: Vec<limits::Cut> = limits::cuts(a, &schema)
-        .into_iter()
-        .chain(limits::cuts(b, &schema))
-        .collect();
-    let mut counted: BTreeMap<u32, BTreeSet<Count>> = BTreeMap::new();
-    for c in &cuts {
-        for (n, kind) in &c.params {
-            counted.entry(*n).or_default().insert(*kind);
-        }
-    }
-    let neutral: HashMap<u32, Val> = counted
-        .iter()
-        .filter(|(n, kinds)| !pcol.contains_key(n) && kinds.len() == 1)
-        .map(|(n, kinds)| {
-            let v = match kinds.first() {
-                Some(Count::Offset) => Val::Int(0),
-                _ => Val::Int(1_000_000_000),
-            };
-            (*n, v)
-        })
-        .collect();
-    let open = |c: &limits::Cut| {
-        !c.total && (c.fixed || c.params.iter().any(|(n, _)| !neutral.contains_key(n)))
-    };
-    let cut_nondet = cuts.iter().any(open);
-    let choice = limits::choices(a, &schema).max(limits::choices(b, &schema));
-    // A cut under a level that can tell its tied rows apart leaves the cardinality open too, as a
-    // `DISTINCT ON` there does ([`limits::Cut::counted`]).
-    if choice == limits::Choice::Unbounded || cuts.iter().any(|c| !c.counted && open(c)) {
+    let read = analyze((pa, pb), (a, b), &finals, &schema, gathered.as_ref(), ph_draw);
+    if read.skip {
         return Verdict::NondetSkip;
     }
-    // `array_agg` with no order: DuckDB's path sorts list cells; text cannot be sorted faithfully
-    // here, so such a pair compares only cardinality.
-    let unordered_agg = [a, b]
-        .iter()
-        .any(|s| s.to_lowercase().contains("array_agg"));
-    let nondet = cut_nondet
-        || choice == limits::Choice::Cardinality
-        || pat::has_nondet_agg(a, b)
-        || unordered_agg;
 
     let is_query_a = is_query(a);
     let is_query_b = is_query(b);
@@ -1524,8 +1705,10 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     // A table the queries name by one schema, created in another, moves there: it is one table under
     // the spelling the queries use. Named by two schemas, it is two tables to the queries.
     let mut targets: Vec<(String, Target)> = Vec::new();
+    // The tables the rows are generated for, as Postgres holds them now: whatever the DDL did to
+    // them on the way is what its catalog says.
+    let mut tables: BTreeMap<String, Table> = BTreeMap::new();
     for t in &finals {
-        let names: Vec<String> = schema[t].cols.iter().map(|c| c.name.clone()).collect();
         let quals: BTreeSet<&String> = forms[t]
             .iter()
             .filter(|p| p.len() >= 2)
@@ -1534,8 +1717,9 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         if quals.len() > 1 {
             return Verdict::NotComparable(format!("table {t} named in several schemas"));
         }
-        let mut tg = match target(db, t, &names) {
-            Ok(tg) => tg,
+        let found = find_relation(db, t).and_then(|oid| relation(db, oid, Some(&schema[t])));
+        let (mut tg, mut table) = match found {
+            Ok(found) => found,
             Err(e) => return Verdict::Error(e),
         };
         if let Some(s) = quals.first() {
@@ -1543,15 +1727,69 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 if let Err(e) = db.exec(&format!("ALTER TABLE {} SET SCHEMA {}", tg.reg, qi(s))) {
                     return Verdict::Error(format!("ddl: {e}"));
                 }
-                let key = format!("{s}.{}", t.rsplit('.').next().unwrap_or(t));
-                tg = match target(db, &key, &names) {
-                    Ok(tg) => tg,
+                (tg, table) = match relation(db, tg.oid, Some(&schema[t])) {
+                    Ok(found) => found,
                     Err(e) => return Verdict::Error(e),
                 };
             }
         }
         targets.push((t.clone(), tg));
+        tables.insert(t.clone(), table);
     }
+    // A scan of a table reads the rows of every table that inherits from it, so each of those gets
+    // rows too: the queries' tables first, in the order they were drawn before, then these.
+    let roots: Vec<i64> = targets.iter().map(|(_, tg)| tg.oid).collect();
+    let below = match descendants(db, &roots) {
+        Ok(d) => d,
+        Err(e) => return Verdict::Error(e),
+    };
+    let mut keyed: HashMap<i64, String> =
+        targets.iter().map(|(k, tg)| (tg.oid, k.clone())).collect();
+    let mut loaded: Vec<String> = finals.clone();
+    for &(_, child) in &below {
+        if keyed.contains_key(&child) {
+            continue;
+        }
+        let (tg, table) = match relation(db, child, None) {
+            Ok(found) => found,
+            Err(e) => return Verdict::Error(e),
+        };
+        let mut key = tg.reg.clone();
+        if tables.contains_key(&key) {
+            key = format!("{key}#{child}");
+        }
+        keyed.insert(child, key.clone());
+        loaded.push(key.clone());
+        tables.insert(key.clone(), table);
+        targets.push((key, tg));
+    }
+    // The analyses run again on what a scan of each of the queries' tables reads, since an order
+    // they found total on the DDL as read need not be total on the rows loaded.
+    let mut scan: Schema = schema.clone();
+    for (k, tg) in targets.iter().filter(|(k, _)| finals.contains(k)) {
+        let kids: Vec<&Table> = below
+            .iter()
+            .filter(|(root, _)| *root == tg.oid)
+            .filter_map(|(_, c)| keyed.get(c))
+            .map(|ck| &tables[ck])
+            .collect();
+        scan.insert(k.clone(), scan_view(&tables[k], &kids));
+    }
+    let held = analyze((pa, pb), (a, b), &finals, &scan, gathered.as_ref(), ph_draw);
+    if held.skip {
+        return Verdict::NondetSkip;
+    }
+    let nondet = read.nondet || held.nondet;
+    let Analysis {
+        colloc,
+        pneed,
+        pcol,
+        parray,
+        cuts,
+        counted,
+        neutral,
+        ..
+    } = held;
     let mutates = !is_query_a || !is_query_b;
     let reset = if mutates {
         db.trips += 1;
@@ -1743,7 +1981,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 targets
                     .iter()
                     .flat_map(|(k, tg)| {
-                        schema[k].cols.iter().zip(&tg.col_types).filter_map(|(c, t)| {
+                        tables[k].cols.iter().zip(&tg.col_types).filter_map(|(c, t)| {
                             (c.name.to_lowercase() == col).then(|| t.clone()).flatten()
                         })
                     })
@@ -1835,8 +2073,8 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
             &mut full_rng
         };
         let mut rowdata: RowData = RowData::new();
-        for t in &finals {
-            let table = &schema[t];
+        for t in &loaded {
+            let table = &tables[t];
             let size = if small {
                 small_size(rng, cfg.nrows)
             } else {
@@ -2063,7 +2301,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                 pending = failed;
             }
         }
-        for t in &finals {
+        for t in &loaded {
             kept.entry(t.clone()).or_default();
         }
         timing.rows_kept += kept.values().map(Vec::len).sum::<usize>();
@@ -2257,6 +2495,30 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scan of a table that another inherits from reads the other's rows too, which its key does
+    /// not bind: an order by that key is no total order there, and a NOT NULL the child dropped is
+    /// none there either.
+    #[test]
+    fn a_scan_of_an_inherited_table_has_no_key() {
+        let schema = parse_schema(r#"create table "p" ("id" INTEGER PRIMARY KEY, "v" INTEGER)"#);
+        let child = parse_schema(r#"create table "c" ("id" INTEGER, "v" INTEGER, "x" INTEGER)"#);
+        let view = scan_view(&schema["p"], &[&child["c"]]);
+        assert!(view.keys.is_empty(), "{:?}", view.keys);
+        assert!(!view.cols[0].notnull);
+        assert_eq!(scan_view(&schema["p"], &[]).keys, schema["p"].keys);
+        // Columns that differ only in case are one name to the analyses.
+        let mut twins = schema["p"].clone();
+        twins.cols.push(Column { notnull: true, ..twins.cols[0].clone() });
+        let view = scan_view(&twins, &[]);
+        assert!(view.keys.is_empty() && !view.cols[0].notnull && !view.cols[2].notnull);
+        let sql = r#"SELECT "v" FROM "p" ORDER BY "id" LIMIT 1"#;
+        let total = |s: &Schema| limits::cuts(sql, s)[0].total;
+        assert!(total(&schema));
+        let mut scan = schema.clone();
+        scan.insert("p".to_string(), view);
+        assert!(!total(&scan));
+    }
 
     #[test]
     fn untyped_literals_quote_every_value() {

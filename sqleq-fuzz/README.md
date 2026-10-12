@@ -45,8 +45,9 @@ counterexample shows the two statements differ under DuckDB, not that they diffe
 (DuckDB binds `->>` looser than `AND`, reads a bare `float` as a 4-byte `REAL`, divides integers as
 floats, and has no name for many Postgres functions). It also builds its tables from its own reading
 of the DDL, which enforces `NOT NULL`, primary keys and unique constraints but not `CHECK` or
-`FOREIGN KEY` constraints. Its output always says `engine: duckdb`, and `sqleq-check` runs the
-Postgres engine only.
+`FOREIGN KEY` constraints, and has no table inheritance: a pair over a table that `INHERITS`
+another, or that another inherits from, is `NOT-COMPARABLE` there. Its output always says
+`engine: duckdb`, and `sqleq-check` runs the Postgres engine only.
 The Postgres engine starts a private PostgreSQL 17 cluster for the run — from `$SQLEQ_PG_BIN`, else
 the PostgreSQL the build fetched (a digest-pinned prebuilt PostgreSQL 17 for Linux and macOS on
 x86_64 and arm64, unless `SQLEQ_PG_DOWNLOAD=0`) if it runs there, else the `postgres` on `PATH`; any
@@ -66,6 +67,14 @@ How the Postgres engine differs from the DuckDB one:
   `public.t`), a table the queries name by one other schema is moved there, a type nothing declares
   is read as `text`, and a column default that calls a function nothing declares is dropped. The
   last two are reported as a `caveat`, since a verdict then rests on more than the DDL says.
+- **The rows are rows of the tables the DDL leaves.** Once the DDL has run, each table's rows are
+  generated from Postgres's catalog: its own columns under their own names, every one filled, and
+  `NULL` in some rows exactly where Postgres admits a `NULL`. Whatever the DDL did on the way —
+  a `DROP NOT NULL`, a `RENAME COLUMN`, a `CREATE TABLE … (LIKE …)`, a `DO` block — is what the
+  catalog holds. Every table that `INHERITS` from one the queries read gets rows too, since a scan
+  of a table reads its children's. The cut and tie rules below read the keys Postgres enforces on
+  every statement (not partial, not deferred), and a table that others inherit from has none for
+  them, since its key does not bind its children's rows.
 - **Each `$N` is typed as Postgres types it.** Both statements are prepared, and each placeholder
   gets the type Postgres infers for it — with the column the heuristics link it to declared as a
   hint where Postgres cannot infer one — and one type across the pair: a side that leaves `$N`
@@ -93,9 +102,14 @@ A reported counterexample is only valid if the instance is valid *and* both quer
 deterministic, on either engine. The rules:
 
 - **Enforce every uniqueness constraint.** Missing one lets us fabricate an instance no valid
-  database admits. Constraints are read inline, as table constraints (a table-level `PRIMARY KEY`
-  makes its columns `NOT NULL` too), from `CREATE UNIQUE INDEX`, and from `ALTER TABLE … ADD
-  PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET NOT NULL`. A `serial` column (`smallserial`,
+  database admits. On Postgres the DDL itself enforces them. The DuckDB engine reads them inline,
+  as table constraints (a table-level `PRIMARY KEY` makes its columns `NOT NULL` too), from
+  `CREATE UNIQUE INDEX`, and from `ALTER TABLE … ADD PRIMARY KEY | UNIQUE` and `ALTER COLUMN … SET
+  NOT NULL`, and applies the DDL in the order it is written: a `DROP NOT NULL`, `DROP CONSTRAINT`,
+  `DROP INDEX`, `DROP COLUMN` or rename changes the table as it stands there, and a `LIKE` copies
+  the named table as it stands there (its columns and their `NOT NULL`s, and its keys with
+  `INCLUDING INDEXES`). A drop whose key cannot be told for sure — a name Postgres generated may be
+  another's — drops nothing, which only shrinks the valid space. A `serial` column (`smallserial`,
   `bigserial`, `serial2/4/8`) and an identity column (`GENERATED … AS IDENTITY`) are `NOT NULL`,
   and draw distinct values, as a fresh sequence does (that is not a key: Postgres lets an explicit
   value repeat one). A unique index over an expression is
@@ -298,7 +312,7 @@ the defaults below cannot move its answers. On its own:
 ```
 sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   # batch (rows are a,b,ddl); names are pairNNNN
 sqleq-fuzz row  <corpus.csv> <index>                  # one corpus row (counting from 0)
-sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER) + exactly two statements
+sqleq-fuzz file <pair.sql>                            # DDL (CREATE, ALTER, DROP) + exactly two statements
 
 options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows N (default 5)
          --seed N (default 0)  --engine postgres|duckdb (default $SQLEQ_FUZZ_ENGINE, else postgres)

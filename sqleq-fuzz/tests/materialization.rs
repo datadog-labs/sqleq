@@ -205,3 +205,186 @@ fn a_record_compares_by_its_values_not_its_field_types() {
         "NOT-EQUIVALENT"
     );
 }
+
+// -- The DDL applies in the order it is written (issue #143) -------------------------------------
+
+/// The column names of table `t`, each with `!` when NOT NULL.
+fn cols(ddl: &str, t: &str) -> Vec<String> {
+    parse_schema(ddl)[t]
+        .cols
+        .iter()
+        .map(|c| format!("{}{}", c.name, if c.notnull { "!" } else { "" }))
+        .collect()
+}
+
+fn keys(ddl: &str, t: &str) -> Vec<Vec<String>> {
+    parse_schema(ddl)[t].keys.clone()
+}
+
+#[test]
+fn a_dropped_not_null_is_dropped_where_it_is_written() {
+    let create = r#"create table "t" ("id" INTEGER NOT NULL, "a" INTEGER)"#;
+    let drop = r#"alter table "t" alter column "id" drop not null"#;
+    let set = r#"alter table "t" alter column "id" set not null"#;
+    assert_eq!(cols(&format!("{create}; {drop}"), "t"), ["id", "a"]);
+    assert_eq!(cols(&format!("{create}; {drop}; {set}"), "t"), ["id!", "a"]);
+    assert_eq!(cols(&format!("{create}; {set}; {drop}"), "t"), ["id", "a"]);
+    // Postgres refuses to drop a primary key's NOT NULL, and dropping the key leaves it.
+    let pk = r#"create table "t" ("id" INTEGER PRIMARY KEY, "a" INTEGER)"#;
+    assert_eq!(cols(&format!("{pk}; {drop}"), "t"), ["id!", "a"]);
+    assert_eq!(
+        cols(&format!(r#"{pk}; alter table "t" drop constraint "t_pkey""#), "t"),
+        ["id!", "a"]
+    );
+    assert_eq!(
+        label(
+            r#"SELECT "a" FROM "t" WHERE "id" IS NOT NULL"#,
+            r#"SELECT "a" FROM "t""#,
+            &format!("{create}; {drop}")
+        ),
+        "NOT-EQUIVALENT"
+    );
+}
+
+#[test]
+fn a_renamed_column_keeps_its_not_null_and_its_keys() {
+    // Three renames swap `a` and `b`: the NOT NULL, and the key, go with the column.
+    let ddl = r#"create table "t" ("a" INTEGER NOT NULL UNIQUE, "b" INTEGER);
+                 alter table "t" rename column "a" to "c";
+                 alter table "t" rename column "b" to "a";
+                 alter table "t" rename column "c" to "b""#;
+    assert_eq!(cols(ddl, "t"), ["b!", "a"]);
+    assert_eq!(keys(ddl, "t"), [["b"]]);
+    // Read as declared, `b` drew NULLs and this equivalent pair was refuted.
+    assert_eq!(
+        label(
+            r#"SELECT "b" FROM "t" WHERE "b" IS NOT NULL"#,
+            r#"SELECT "b" FROM "t""#,
+            ddl
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+    // A renamed table is found by its new name.
+    let s = parse_schema(r#"create table "t" ("a" INTEGER); alter table "t" rename to "u""#);
+    assert!(s.contains_key("u") && !s.contains_key("t"), "{:?}", s.keys());
+    // A column the DDL never declared cannot be renamed into the table's picture of itself.
+    let s = parse_schema(r#"create table "t" ("a" INTEGER); alter table "t" rename column "z" to "y""#);
+    assert!(s["t"].unreadable.is_some());
+}
+
+#[test]
+fn a_dropped_key_is_dropped_only_when_its_name_is_sure() {
+    let t = r#"create table "t" ("id" INTEGER NOT NULL, "a" INTEGER)"#;
+    for (ddl, kept) in [
+        // Named by the DDL, or by Postgres (`t_pkey`, `t_a_key`, `t_id_idx`).
+        (r#"alter table "t" add constraint "k" unique ("id"); alter table "t" drop constraint "k""#, 0),
+        (r#"alter table "t" add primary key ("id"); alter table "t" drop constraint "t_pkey""#, 0),
+        (r#"alter table "t" add unique ("a"); alter table "t" drop constraint "t_a_key""#, 0),
+        (r#"create unique index on "t" ("id"); drop index "t_id_idx""#, 0),
+        (r#"create unique index "i" on "t" ("id"); drop index "i""#, 0),
+        (r#"create unique index "i" on "t" ("id"); alter index "i" rename to "j"; drop index "j""#, 0),
+        (r#"create unique index "i" on "t" ("id"); alter index "i" rename to "j"; drop index "i""#, 1),
+        // A column dropped takes its keys along.
+        (r#"alter table "t" add unique ("a"); alter table "t" drop column "a""#, 0),
+        // A CHECK named `t_a_key` first makes Postgres name the key `t_a_key1`.
+        (
+            r#"alter table "t" add constraint "t_a_key" check ("a" > 0); alter table "t" add unique ("a"); alter table "t" drop constraint "t_a_key""#,
+            1,
+        ),
+        // `"I"` and `i` are two names.
+        (r#"create unique index "I" on "t" ("id"); drop index "i""#, 1),
+        // A name this cannot tell drops nothing.
+        (r#"alter table "t" add unique ("a"); alter table "t" drop constraint "other""#, 1),
+    ] {
+        assert_eq!(keys(&format!("{t}; {ddl}"), "t").len(), kept, "{ddl}");
+    }
+    // An index name qualified by its schema names that schema's index alone.
+    let ddl = r#"create table "s1"."t" ("a" INTEGER); create table "s2"."t" ("a" INTEGER);
+                 create unique index "i" on "s1"."t" ("a"); create unique index "i" on "s2"."t" ("a")"#;
+    let s = parse_schema(&format!(r#"{ddl}; drop index "s2"."i""#));
+    assert_eq!((s["s1.t"].keys.len(), s["s2.t"].keys.len()), (1, 0));
+    // Unqualified, it could be either, and both stay.
+    let s = parse_schema(&format!(r#"{ddl}; drop index "i""#));
+    assert_eq!((s["s1.t"].keys.len(), s["s2.t"].keys.len()), (1, 1));
+}
+
+#[test]
+fn a_statement_before_its_table_is_read_as_before() {
+    // A key or NOT NULL for a table declared later still lands on it; a drop does nothing.
+    let ddl = r#"alter table "t" add primary key ("id");
+                 alter table "t" alter column "a" drop not null;
+                 create table "t" ("id" INTEGER, "a" INTEGER NOT NULL)"#;
+    assert_eq!(cols(ddl, "t"), ["id!", "a!"]);
+    assert_eq!(keys(ddl, "t"), [["id"]]);
+    // A table dropped and declared again is the second one.
+    let ddl = r#"create table "t" ("a" INTEGER); drop table "t"; create table "t" ("b" INTEGER NOT NULL)"#;
+    assert_eq!(cols(ddl, "t"), ["b!"]);
+}
+
+#[test]
+fn a_table_created_like_another_copies_it_as_it_stands() {
+    let o = r#"create table "o" ("id" INTEGER PRIMARY KEY, "n" INTEGER NOT NULL, "x" INTEGER)"#;
+    // The columns and their NOT NULLs always, the keys only with the indexes.
+    let ddl = format!(r#"{o}; create table "t" (like "o")"#);
+    assert_eq!(cols(&ddl, "t"), ["id!", "n!", "x"]);
+    assert!(keys(&ddl, "t").is_empty());
+    for like in [
+        r#"like "o" including indexes"#,
+        r#"like "o" including all"#,
+        "like o including defaults including indexes",
+    ] {
+        assert_eq!(keys(&format!(r#"{o}; create table "t" ({like})"#), "t"), [["id"]], "{like}");
+    }
+    let ddl = format!(r#"{o}; create table "t" (like "o" including all excluding indexes)"#);
+    assert!(keys(&ddl, "t").is_empty());
+    // Where the item stands among the table's own columns.
+    assert_eq!(
+        cols(&format!(r#"{o}; create table "t" ("z" INTEGER, like "o", "w" INTEGER NOT NULL)"#), "t"),
+        ["z", "id!", "n!", "x", "w!"]
+    );
+    // As the source stands at that point.
+    let ddl = format!(r#"{o}; create table "t" (like "o"); alter table "o" add column "y" INTEGER"#);
+    assert_eq!(cols(&ddl, "t"), ["id!", "n!", "x"]);
+    // A source the DDL does not declare, or an option this does not know, withholds the table.
+    for ddl in [
+        r#"create table "t" (like "elsewhere")"#.to_string(),
+        format!(r#"{o}; create table "t" (like "o" including everything)"#),
+    ] {
+        assert!(parse_schema(&ddl)["t"].unreadable.is_some(), "{ddl}");
+    }
+    assert_eq!(
+        label(
+            r#"SELECT DISTINCT "id" FROM "t""#,
+            r#"SELECT "id" FROM "t""#,
+            &format!(r#"{o}; create table "t" (like "o")"#)
+        ),
+        "NOT-EQUIVALENT"
+    );
+    assert_eq!(
+        label(
+            r#"SELECT DISTINCT "id" FROM "t""#,
+            r#"SELECT "id" FROM "t""#,
+            &format!(r#"{o}; create table "t" (like "o" including indexes)"#)
+        ),
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
+fn inheritance_is_withheld_on_duckdb() {
+    let ddl = r#"create table "p" ("id" INTEGER PRIMARY KEY);
+                 create table "c" ("id" INTEGER NOT NULL, "x" INTEGER) inherits ("p")"#;
+    // The child has its parent's columns first, its own NOT NULL merged in, and no key of the
+    // parent.
+    assert_eq!(cols(ddl, "c"), ["id!", "x"]);
+    assert!(keys(ddl, "c").is_empty());
+    // DuckDB has no inheritance: a scan of the parent would miss the child's rows.
+    for t in ["p", "c"] {
+        let v = label(
+            &format!(r#"SELECT DISTINCT "id" FROM "{t}""#),
+            &format!(r#"SELECT "id" FROM "{t}""#),
+            ddl,
+        );
+        assert!(v.starts_with("NOT-COMPARABLE:") && v.contains("inheritance"), "{v}");
+    }
+}

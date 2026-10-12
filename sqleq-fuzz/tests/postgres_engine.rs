@@ -562,6 +562,112 @@ fn a_gather_pair_the_rule_cannot_bind_is_not_compared() {
     );
 }
 
+// -- Rows for the tables the DDL leaves (issue #143) ---------------------------------------------
+//
+// The rows are generated for each table as Postgres's catalog holds it once the DDL has run: its
+// own columns, each NOT NULL exactly where Postgres says, and every table inheriting from one the
+// queries read.
+
+#[test]
+fn a_dropped_not_null_admits_a_null() {
+    let a = r#"SELECT "a" FROM "t" WHERE "id" IS NOT NULL"#;
+    let b = r#"SELECT "a" FROM "t""#;
+    let ddl = r#"create table "t" ("id" INTEGER NOT NULL, "a" INTEGER);
+                 alter table "t" alter column "id" drop not null"#;
+    assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    // Wherever the DDL drops it: the catalog is read, not the DDL's text.
+    let ddl = r#"create table "t" ("id" INTEGER NOT NULL, "a" INTEGER);
+                 do $$ begin alter table "t" alter column "id" drop not null; end $$"#;
+    assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    // A column still NOT NULL gets no NULL.
+    let ddl = r#"create table "t" ("id" INTEGER NOT NULL, "a" INTEGER NOT NULL);
+                 alter table "t" alter column "a" drop not null"#;
+    assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+}
+
+#[test]
+fn a_renamed_column_is_filled_under_its_new_name() {
+    // Two renames move the NOT NULL from the name `a` to the name `c`.
+    let ddl = r#"create table "t" ("a" INTEGER NOT NULL, "b" INTEGER);
+                 alter table "t" rename column "a" to "c";
+                 alter table "t" rename column "b" to "a""#;
+    assert_kind!(
+        r#"SELECT "a" FROM "t" WHERE "a" IS NOT NULL"#,
+        r#"SELECT "a" FROM "t""#,
+        ddl,
+        "NOT-EQUIVALENT"
+    );
+    // Three swap the two, and `b` is the NOT NULL one.
+    let ddl = r#"create table "t" ("a" INTEGER NOT NULL, "b" INTEGER);
+                 alter table "t" rename column "a" to "c";
+                 alter table "t" rename column "b" to "a";
+                 alter table "t" rename column "c" to "b""#;
+    assert_kind!(
+        r#"SELECT "b" FROM "t" WHERE "b" IS NOT NULL"#,
+        r#"SELECT "b" FROM "t""#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+}
+
+#[test]
+fn a_table_inheriting_from_one_the_queries_read_has_rows() {
+    let ddl = r#"create table "p" ("id" INTEGER PRIMARY KEY);
+                 create table "c" ("x" INTEGER) inherits ("p")"#;
+    assert_kind!(
+        r#"SELECT DISTINCT "id" FROM "p""#,
+        r#"SELECT "id" FROM "p""#,
+        ddl,
+        "NOT-EQUIVALENT"
+    );
+    // `ONLY` reads the parent alone, which its key binds.
+    assert_kind!(
+        r#"SELECT DISTINCT "id" FROM ONLY "p""#,
+        r#"SELECT "id" FROM ONLY "p""#,
+        ddl,
+        "NO-COUNTEREXAMPLE"
+    );
+    // The rows reach every generation, and the counterexample shows them.
+    let ddl = r#"create table "p" ("id" INTEGER PRIMARY KEY);
+                 create table "c" () inherits ("p");
+                 create table "g" ("y" INTEGER) inherits ("c")"#;
+    if let Some(o) = outcome(r#"SELECT DISTINCT "id" FROM "p""#, r#"SELECT "id" FROM "p""#, ddl) {
+        match o.verdict {
+            Verdict::NotEquivalent(w) => assert!(w.contains("g=["), "{w}"),
+            v => panic!("{}", v.label()),
+        }
+    }
+}
+
+#[test]
+fn a_table_created_like_another_has_its_columns() {
+    let a = r#"SELECT DISTINCT "id" FROM "t""#;
+    let b = r#"SELECT "id" FROM "t""#;
+    let ddl = r#"create table "o" ("id" INTEGER PRIMARY KEY);
+                 create table "t" (like "o")"#;
+    assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    // With its indexes, it has the key too.
+    let ddl = r#"create table "o" ("id" INTEGER PRIMARY KEY);
+                 create table "t" (like "o" including indexes)"#;
+    assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+}
+
+#[test]
+fn the_gather_rule_loads_rows_into_a_renamed_column() {
+    // Only a row already in the table, with the `id` the `VALUES` row brings, tells `DO UPDATE`
+    // from
+    // `DO NOTHING`; under its old name `id` was left out of the rows loaded, and every one of them
+    // was refused.
+    let ddl = r#"create table "s" ("k" INTEGER PRIMARY KEY, "name" TEXT);
+                 alter table "s" rename column "k" to "id""#;
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = excluded."name""#,
+        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::int[], $2::text[]) ON CONFLICT ("id") DO NOTHING"#,
+        ddl,
+        "NOT-EQUIVALENT-GATHER"
+    );
+}
+
 // -- Plain refutations still found --------------------------------------------------------------
 
 #[test]
