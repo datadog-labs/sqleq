@@ -1049,12 +1049,39 @@ fn recovery_is_all_or_nothing() {
         !s.contains_key("q"),
         "recovered a table with an unreadable column"
     );
-    // And `LIKE`, which inherits columns we cannot see.
+    // A `LIKE` of a table the DDL does not declare copies columns we cannot see: the table is kept,
+    // so that it still shadows any other table of its name, but withheld.
     let s = parse_schema("CREATE TABLE q (LIKE other INCLUDING ALL, primary boolean)");
     assert!(
-        !s.contains_key("q"),
-        "recovered a table with inherited columns"
+        s["q"].unreadable.is_some(),
+        "recovered a table with columns we cannot see: {:?}",
+        s["q"]
     );
+    // Of one it does declare, the columns are copied where the item stands, and the keys with it.
+    let s = parse_schema(
+        "CREATE TABLE other (id integer PRIMARY KEY); \
+         CREATE TABLE q (LIKE other INCLUDING ALL, primary boolean)",
+    );
+    let names: Vec<&str> = s["q"].cols.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "primary"]);
+    assert!(s["q"].cols[0].notnull && s["q"].unreadable.is_none());
+    assert_eq!(s["q"].keys, [["id"]]);
+}
+
+/// When the whole DDL does not parse, each statement is parsed on its own -- split where Postgres
+/// would split it. A `;` inside a function's dollar-quoted body ends no statement: split there, the
+/// body's own `ALTER TABLE`s, which nothing runs, were read as the DDL's.
+#[test]
+fn a_function_body_is_not_split_into_statements() {
+    let s = parse_schema(
+        "create table t (primary boolean, id integer not null);\n\
+         create function f() returns void language plpgsql as $$ begin perform 1; \
+         alter table t add column z integer; alter table t alter column id drop not null; end $$;\n\
+         alter table t add column w integer;",
+    );
+    let names: Vec<&str> = s["t"].cols.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["primary", "id", "w"]);
+    assert!(s["t"].cols[1].notnull);
 }
 
 #[test]

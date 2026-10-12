@@ -644,6 +644,9 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
 ///
 /// * A table whose constraints could not all be read ([`crate::schema::Table::unreadable`]): the rows
 ///   generated for it may be rows the schema forbids.
+/// * A table that takes part in inheritance ([`crate::schema::Table::inheritance`]). DuckDB has
+///   none: a scan of a parent would miss its children's rows, and an `ALTER TABLE` of a parent,
+///   which Postgres applies to its children too, would leave a child as first declared.
 /// * A table spelled two ways in a mutation pair, `s.t` beside `t`. Each spelling is a table of its
 ///   own here, loaded from the same rows, and a mutation through one leaves the other as it was;
 ///   both are one table only if they resolve to it, which the DDL does not say. (`public.t` and `t`
@@ -652,6 +655,9 @@ fn unfaithful(finals: &[String], forms: &Forms, schema: &Schema, queries: bool) 
     for t in finals {
         if let Some(why) = &schema[t].unreadable {
             return Some(format!("table {t}: {why}"));
+        }
+        if let Some(how) = &schema[t].inheritance {
+            return Some(format!("table {t} {how}, and DuckDB has no table inheritance"));
         }
     }
     if !queries {

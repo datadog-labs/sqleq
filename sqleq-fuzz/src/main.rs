@@ -26,6 +26,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sqleq_fuzz::lex::split_statements;
 use sqleq_fuzz::{pg, test_pair, Config, Verdict};
 
 const USAGE: &str = "\
@@ -371,89 +372,6 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
     }
     let ddl = ddl_parts.join(";\n");
     test_one(&queries[0], &queries[1], &ddl, cfg, engine)
-}
-
-/// Split a file into statements on top-level `;`, skipping semicolons inside string literals,
-/// quoted identifiers, dollar-quoted bodies (a function's) and comments. Each statement comes back with its leading comments removed, so
-/// the caller's `CREATE` test sees the keyword rather than the `--` line above it; text that is only
-/// a comment yields no statement at all.
-fn split_statements(src: &str) -> Vec<String> {
-    let b = src.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let (mut start, mut i) = (0usize, 0usize);
-    while i < b.len() {
-        match b[i] {
-            // A doubled quote inside a quoted run is an escaped quote, not the terminator.
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if b.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-            }
-            // `$tag$ ... $tag$`, the tag empty or an identifier: a function body, whose statements
-            // end in `;`. A `$1` is no tag, since a tag is followed by `$`.
-            b'$' => {
-                let tag_end = b[i + 1..]
-                    .iter()
-                    .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                    .map(|p| i + 1 + p);
-                match tag_end {
-                    Some(e) if b[e] == b'$' => {
-                        let tag = &src[i..=e];
-                        i = src[e + 1..].find(tag).map_or(b.len(), |p| e + 1 + p + tag.len());
-                    }
-                    _ => i += 1,
-                }
-            }
-            b';' => {
-                push_statement(&mut out, &src[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    push_statement(&mut out, &src[start..]);
-    out
-}
-
-/// Trim a statement and drop its leading comments; push it unless nothing is left.
-fn push_statement(out: &mut Vec<String>, raw: &str) {
-    let mut s = raw;
-    loop {
-        s = s.trim_start();
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest.split_once('\n').map_or("", |(_, tail)| tail);
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            s = rest.split_once("*/").map_or("", |(_, tail)| tail);
-        } else {
-            break;
-        }
-    }
-    let s = s.trim_end();
-    if !s.is_empty() {
-        out.push(s.to_string());
-    }
 }
 
 /// Test one pair on `engine` and print its report.
