@@ -125,8 +125,8 @@ fn a_qualified_order_key_over_its_own_column_is_that_column() {
 }
 
 /// In a grouped query nothing above the `Group` can address the FROM scope, so a qualified key is
-/// only usable when the select list has the same expression. `t.a` is not projected here, so the
-/// pair is refused rather than sorted by the output column that happens to be called `a`.
+/// only usable when it is the value of a select item. `t.a` is grouped but not selected here, so the
+/// pair is refused rather than sorted by the output column that happens to be called `a`, `u.a`.
 #[test]
 fn a_qualified_order_key_under_group_by_is_refused_unless_projected() {
     refused(
@@ -144,6 +144,81 @@ fn a_qualified_order_key_under_group_by_is_refused_unless_projected() {
         r#"SELECT DISTINCT "t"."a" FROM "t" ORDER BY "t"."a" LIMIT 1"#,
         r#"SELECT DISTINCT "t"."a" FROM "t" ORDER BY 1 LIMIT 1"#,
     ));
+}
+
+/// A grouped query's key that is not an output name is the select item it lowers to, however the
+/// two are written, and then it lowers as that item's position does: `t.a` is the item `a`, and the
+/// bare `a`, which names no output column, is the item `t.a AS g`.
+#[test]
+fn a_grouped_order_key_is_the_item_it_lowers_to() {
+    let pairs = [
+        (
+            r#"SELECT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY "t"."a" LIMIT 3"#,
+            r#"SELECT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY 1 LIMIT 3"#,
+        ),
+        (
+            r#"SELECT "t"."a" AS "g", COUNT(*) AS "n" FROM "t" GROUP BY "t"."a" ORDER BY "a" DESC LIMIT 3"#,
+            r#"SELECT "t"."a" AS "g", COUNT(*) AS "n" FROM "t" GROUP BY "t"."a" ORDER BY "g" DESC LIMIT 3"#,
+        ),
+        // An item that is not the first, and a key that is an expression.
+        (
+            r#"SELECT COUNT(*) AS "n", "t"."a" + 1 AS "s" FROM "t" GROUP BY "a" ORDER BY "a" + 1 LIMIT 3"#,
+            r#"SELECT COUNT(*) AS "n", "t"."a" + 1 AS "s" FROM "t" GROUP BY "a" ORDER BY 2 LIMIT 3"#,
+        ),
+        // Over a join, where the bare `a` can only be `t.a`.
+        (
+            r#"SELECT "a", COUNT(*) FROM "t" JOIN "w" ON "t"."k" = "w"."id" GROUP BY "a" ORDER BY "t"."a" LIMIT 3"#,
+            r#"SELECT "a", COUNT(*) FROM "t" JOIN "w" ON "t"."k" = "w"."id" GROUP BY "a" ORDER BY 1 LIMIT 3"#,
+        ),
+        // Over a self-join, the instance `y` spelled unquoted, which the tree match does not see.
+        (
+            r#"SELECT "y"."a", COUNT(*) FROM "t" AS "x" JOIN "t" AS "y" ON "x"."b" = "y"."k" GROUP BY "x"."a", "y"."a" ORDER BY Y."a" LIMIT 1"#,
+            r#"SELECT "y"."a", COUNT(*) FROM "t" AS "x" JOIN "t" AS "y" ON "x"."b" = "y"."k" GROUP BY "x"."a", "y"."a" ORDER BY 1 LIMIT 1"#,
+        ),
+        // A grouped `DISTINCT` keeps its output positions, so the match holds there too.
+        (
+            r#"SELECT DISTINCT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY "t"."a" LIMIT 3"#,
+            r#"SELECT DISTINCT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY 1 LIMIT 3"#,
+        ),
+        // A key with an aggregate in it is matched as it is written.
+        (
+            r#"SELECT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY COUNT(*) DESC, "t"."a" LIMIT 3"#,
+            r#"SELECT "a", COUNT(*) AS "n" FROM "t" GROUP BY "a" ORDER BY 2 DESC, 1 LIMIT 3"#,
+        ),
+    ];
+    for (q, by_position) in pairs {
+        assert!(identical(q, by_position), "{q}");
+    }
+    // The `Sort` points at the item's own column, past the count, and nothing is appended to the
+    // grouped output.
+    let v = lower_in(pairs[2].0, pairs[2].1, CatalogSource::Declared).unwrap();
+    let sort = find_with_field(&v["queries"][0], "collation").unwrap();
+    assert_eq!(sort["collation"][0][0], 1);
+    assert!(v["queries"][0].get("sort").is_some(), "{}", v["queries"][0]);
+}
+
+/// The match is by binding, the column of the relation instance a name resolves to, never by the
+/// name. An item and a key that share a name and read two instances of one table, or this query's
+/// column and an enclosing query's, are two values, and the key is refused rather than read as the
+/// item.
+#[test]
+fn a_grouped_order_key_is_not_an_item_of_the_same_name() {
+    // `t = {(1, 2, 2), (2, 1, 1)}` as `(k, a, b)`: the groups `(x.a, y.a)` are `(2, 1)` and `(1, 2)`,
+    // so the first returns 2 and the second 1.
+    refused(
+        r#"SELECT "y"."a", COUNT(*) FROM "t" AS "x" JOIN "t" AS "y" ON "x"."b" = "y"."k" GROUP BY "x"."a", "y"."a" ORDER BY "x"."a" LIMIT 1"#,
+        r#"SELECT "y"."a", COUNT(*) FROM "t" AS "x" JOIN "t" AS "y" ON "x"."b" = "y"."k" GROUP BY "x"."a", "y"."a" ORDER BY "y"."a" LIMIT 1"#,
+        "unsupported",
+        "ORDER BY key is not an output column",
+    );
+    // `t = {(1, 1), (2, 2)}` and `u.a = {1, 2}`: the enclosing `t.a` is one value for the whole
+    // subquery, so the first keeps the least `u.a` and returns `k = 1`, the second the greatest.
+    refused(
+        r#"SELECT "k" FROM "t" WHERE "a" IN (SELECT "a" FROM "u" GROUP BY "a" ORDER BY "t"."a" DESC, "a" LIMIT 1)"#,
+        r#"SELECT "k" FROM "t" WHERE "a" IN (SELECT "a" FROM "u" GROUP BY "a" ORDER BY "u"."a" DESC, "a" LIMIT 1)"#,
+        "unsupported",
+        "ORDER BY key is not an output column",
+    );
 }
 
 /// Above a `DISTINCT`, an input expression is usable when it is the value of an output column,

@@ -516,7 +516,11 @@ what it is or refused:
   is named after the column or function. A bare key that two output columns carry is refused, and
   so is one that matches no output name while an output column's name is one the frontend cannot
   tell. Above a `GROUP BY` or `DISTINCT` an input expression cannot be addressed, so such a key is
-  refused unless the select list writes the same expression.
+  refused unless it is the value of a select-list item. As in Postgres, the two are compared as
+  lowered over the `FROM` clause, where a column is the relation instance its name resolves to and
+  not the name: under `GROUP BY a`, `ORDER BY t.a` is the item `a`, while under `t AS x JOIN t AS y`
+  the key `x.a` is not the item `y.a`. A key with an aggregate in it has to be written as the item
+  is, and a grouped key that no item selects is refused.
 
 ## A query that raises an error
 

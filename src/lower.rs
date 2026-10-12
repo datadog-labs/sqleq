@@ -610,15 +610,25 @@ fn apply_pagination(
 ) -> Result<Value> {
     refuse_distinct_on_over_dropped_order(q)?;
     let Some((limit, offset)) = row_slice(cat, fns, q)? else { return Ok(rel) };
-    let collation = match collation(q, out_cols, sortable.is_none())? {
+    let collation = match collation(cat, fns, q, out_cols, sortable)? {
         CollationPlan::Direct(c) => c,
         // At least one key is an input expression, so the `Sort` has nothing to point at until it
         // is lowered in the select's FROM scope; only a select has one. See [`sort_sandwich`].
         CollationPlan::NeedsExtension => {
-            let Some(sortable) = sortable else {
-                return Err(unsupported("ORDER BY key is not an output column"));
+            return match sortable {
+                Some(SortScope { scope, outputs: SortOutputs::Widened }) => {
+                    sort_sandwich(cat, fns, scope, None, q, rel, out_cols, limit, offset)
+                }
+                Some(SortScope { scope, outputs: SortOutputs::Distinct(outputs) }) => {
+                    sort_sandwich(cat, fns, scope, Some(outputs), q, rel, out_cols, limit, offset)
+                }
+                // A grouped select's keys were matched to its items in [`collation`] already, so
+                // this one orders by a value no output column holds, and nothing above the `Group`
+                // can address the FROM scope to add one.
+                Some(SortScope { outputs: SortOutputs::Grouped(_), .. }) | None => {
+                    Err(unsupported("ORDER BY key is not an output column"))
+                }
             };
-            return sort_sandwich(cat, fns, sortable, q, rel, out_cols, limit, offset);
         }
     };
     refuse_slice_over_dropped_order(q, &collation, out_cols.len())?;
@@ -679,10 +689,12 @@ fn refuse_distinct_on_over_dropped_order(q: &Query) -> Result<()> {
 /// directly over the FROM relation can be widened. A `DISTINCT` or a `DISTINCT ON` puts a `Group`
 /// in between, and a FROM-scope expression cannot be addressed through one — appending it there
 /// would silently order by whatever column happens to sit at that index — so there the key must
-/// already be the value of an output column, which is Postgres's own rule for `SELECT DISTINCT`
-/// (its `ORDER BY` expressions must appear in the select list), and is refused otherwise. A
-/// `GROUP BY` gets no scope at all, nor do set operations and `VALUES`, which have no single FROM
-/// scope to resolve against; those keep the refusal.
+/// already be the value of an output column (`outputs`, `Some` for exactly this), which is
+/// Postgres's own rule for `SELECT DISTINCT` (its `ORDER BY` expressions must appear in the select
+/// list), and is refused otherwise. A `GROUP BY` puts a `Group` in between too, and its key must be
+/// a select item's value in the same way; that is matched in [`collation`] ([`grouped_position`]),
+/// and a grouped select never comes here. Set operations and `VALUES` get no scope at all, having
+/// no single FROM scope to resolve against; those keep the refusal.
 ///
 /// Keys are resolved by [`resolve_order_key`], so an output name or position here means what it
 /// means in [`collation`], and ambiguity is still refused rather than resolved.
@@ -690,7 +702,8 @@ fn refuse_distinct_on_over_dropped_order(q: &Query) -> Result<()> {
 fn sort_sandwich(
     cat: &Catalog,
     fns: &Fns,
-    sortable: &SortScope,
+    scope: &Scope,
+    outputs: Option<&[Value]>,
     q: &Query,
     rel: Value,
     out_cols: &OutCols,
@@ -707,10 +720,9 @@ fn sort_sandwich(
         return Err(unsupported("ORDER BY ALL"));
     };
 
-    let scope = &sortable.scope;
     let base = scope.base;
-    let (mut targets, source) = match &sortable.outputs {
-        Some(outputs) => (outputs.clone(), Value::Null),
+    let (mut targets, source) = match outputs {
+        Some(outputs) => (outputs.to_vec(), Value::Null),
         None => split_projection(&rel, out_cols, base),
     };
     let mut collation = Vec::with_capacity(keys.len());
@@ -719,7 +731,7 @@ fn sort_sandwich(
             return Err(unsupported("ORDER BY ... WITH FILL"));
         }
         let v = order_key_value(cat, scope, fns, &key.expr, &targets, out_cols, "ORDER BY")?;
-        if sortable.outputs.is_some() && !targets.contains(&v) {
+        if outputs.is_some() && !targets.contains(&v) {
             return Err(unsupported("ORDER BY key is not an output column"));
         }
         let ty = ty_of(&v);
@@ -885,10 +897,18 @@ fn count(cat: &Catalog, fns: &Fns, e: &Expr) -> Result<Value> {
 ///
 /// Empty is legal and meaningful — `LIMIT 5` with no `ORDER BY` lowers to a bare `limit` HOp.
 ///
-/// An input-expression key asks for [`sort_sandwich`], which lowers it in the select's FROM scope.
-/// Only when there is no such scope to go to (`by_tree`: a grouped select) is the key matched here,
-/// against a select-list item written the same way ([`projected_as`]).
-fn collation(q: &Query, out_cols: &OutCols, by_tree: bool) -> Result<CollationPlan> {
+/// An input-expression key of a plain or a `DISTINCT` select asks for [`sort_sandwich`], which
+/// lowers it in the select's FROM scope. A grouped select's key is matched here instead, to the
+/// select item whose value it is ([`grouped_position`]), as nothing above its `Group` can address
+/// that scope. With no scope at all (`sortable` is `None`), it is matched to a select-list item
+/// written the same way ([`projected_as`]).
+fn collation(
+    cat: &Catalog,
+    fns: &Fns,
+    q: &Query,
+    out_cols: &OutCols,
+    sortable: Option<&SortScope>,
+) -> Result<CollationPlan> {
     use sqlparser::ast::OrderByKind;
 
     let Some(order_by) = &q.order_by else { return Ok(CollationPlan::Direct(Vec::new())) };
@@ -905,10 +925,19 @@ fn collation(q: &Query, out_cols: &OutCols, by_tree: bool) -> Result<CollationPl
         }
         let idx = match resolve_order_key(&key.expr, out_cols, "ORDER BY")? {
             OrderKey::Output(i) => i,
-            OrderKey::Input(e) => match by_tree.then(|| projected_as(q, e)).flatten() {
-                Some(i) => i,
-                None => return Ok(CollationPlan::NeedsExtension),
-            },
+            OrderKey::Input(e) => {
+                let found = match sortable {
+                    Some(SortScope { outputs: SortOutputs::Widened | SortOutputs::Distinct(_), .. }) => None,
+                    Some(SortScope { scope, outputs: SortOutputs::Grouped(items) }) => {
+                        grouped_position(cat, fns, q, scope, items, out_cols, e)?
+                    }
+                    None => projected_as(q, e),
+                };
+                match found {
+                    Some(i) => i,
+                    None => return Ok(CollationPlan::NeedsExtension),
+                }
+            }
         };
         out.push(json!([idx, out_cols[idx].1, ord_string(&key.options)?]));
     }
@@ -945,9 +974,9 @@ enum OrderKey<'e> {
 /// the output column `"A"`.
 ///
 /// Every caller shares this, and what each does with [`OrderKey::Input`] is its own business:
-/// [`sort_sandwich`] and [`distinct_on`] lower it in the FROM scope, while [`collation`], which has
-/// no FROM scope, can only use a select-list item written the same way ([`projected_as`]), and
-/// does so only for a grouped select, which passes no scope up.
+/// [`sort_sandwich`] and [`distinct_on`] lower it in the FROM scope, and so does [`collation`] for a
+/// grouped select, to find the select item it is ([`grouped_position`]); with no FROM scope,
+/// [`collation`] can only use a select-list item written the same way ([`projected_as`]).
 ///
 /// Refused rather than resolved, because there is no answer that is right whichever way the
 /// query meant it:
@@ -999,7 +1028,8 @@ fn resolve_order_key<'e>(e: &'e Expr, out_cols: &OutCols, clause: &str) -> Resul
 /// select-list item that is the same expression (`findTargetlistEntrySQL99`). This is that rule
 /// cut down to what can be checked without lowering: the same tree, in the same select, over the
 /// same scope, is the same expression. Postgres also matches trees that differ only in spelling
-/// (`t.a` against `a`); those find nothing here and are refused a level up, which is the
+/// (`t.a` against `a`); those find nothing here. A grouped select matches them by what they lower
+/// to ([`grouped_position`]); a select with no FROM scope refuses them a level up, which is the
 /// conservative side.
 ///
 /// A wildcard item makes the item index stop being the output position, so a select carrying one
@@ -1012,6 +1042,66 @@ fn projected_as(q: &Query, e: &Expr) -> Option<usize> {
     }
     let e = unwrap_nested(e);
     s.projection.iter().position(|it| item_expr(it).is_some_and(|x| unwrap_nested(x) == e))
+}
+
+/// The output position of the select item whose value a grouped select's `ORDER BY` key `e` is, if
+/// there is one; `e` is an input expression ([`OrderKey::Input`]) and `items` the select's items
+/// lowered in its FROM scope `scope` ([`grouped_items`]).
+///
+/// This is Postgres's rule in full, where [`projected_as`] is the part of it that needs no
+/// lowering. Postgres lowers the key in the FROM scope and looks for a select-list item that is the
+/// same expression, comparing the two as lowered, not as written (`findTargetlistEntrySQL99`), so
+/// `ORDER BY t.a` is the item `a` when both read the column `a` of the relation `t`. Here the key is
+/// lowered in the same scope as the items and compared with each. On a match the `Sort` points at
+/// that output column, exactly as for `ORDER BY 1`. On none, Postgres orders by a value of the key's
+/// own, which would have to be added to the grouped output; that is not done, and
+/// [`apply_pagination`] refuses the query. That costs the pairs whose key is grouped but not
+/// selected, and never reads a key as another column.
+///
+/// # Why a match is that output column
+///
+/// Output column `i` holds, for each group, the value of item `i`. An item with no aggregate in it
+/// is lowered above the `Group` through the group keys alone ([`AggCtx::lower_post`] refuses a column
+/// that is neither a key nor determined by one), so it takes one value in each group, and that value
+/// is the item's expression on any row of the group. A key that lowers to the same IR in the same
+/// scope is the same function of the row, so on every row of a group it takes that value too, and
+/// ordering the groups by it is ordering them by column `i`. Two items that lower alike hold one
+/// value in every group, so taking the first of them is no choice.
+///
+/// # By binding, never by name
+///
+/// In the IR a column is its absolute level ([`crate::scope`]), the position of one column of one
+/// relation instance, and its name is not there at all. So `x.a` and `y.a` under
+/// `t AS x JOIN t AS y` are two levels, and so are an enclosing query's `t.a` and the subquery's own
+/// `a`: two lowered values are equal only when they read the same columns of the same instances.
+/// Matching by name instead, the last part of `t.a` against the item `u.a`, orders
+/// `SELECT u.a … ORDER BY t.a` by `u.a`.
+///
+/// # A key with an aggregate in it
+///
+/// It has no value over the FROM scope, and [`lower_expr`] refuses one there, so it is matched only
+/// to an item written the same way. Every key is tried that way first, which keeps the position
+/// [`projected_as`] gave before there was a second way; when both find one, the two items lower
+/// alike, so it is the same value.
+fn grouped_position(
+    cat: &Catalog,
+    fns: &Fns,
+    q: &Query,
+    scope: &Scope,
+    items: &[Option<Value>],
+    out_cols: &OutCols,
+    e: &Expr,
+) -> Result<Option<usize>> {
+    if let Some(i) = projected_as(q, e) {
+        return Ok(Some(i));
+    }
+    // One item per output column, which [`lower_aggregate`] sees to by refusing a wildcard; checked
+    // anyway, since the position is used as a column index.
+    if contains_agg(fns, e) || items.len() != out_cols.len() {
+        return Ok(None);
+    }
+    let v = lower_expr(cat, scope, fns, e)?;
+    Ok(items.iter().position(|it| it.as_ref() == Some(&v)))
 }
 
 /// The direction tag for one collation entry.
@@ -1060,13 +1150,26 @@ enum OrderCtx<'a> {
 
 /// What an enclosing `Sort` can do with an `ORDER BY` key that is an input expression rather than
 /// an output column: the select's own FROM scope to lower it in, and, where the select's result
-/// cannot be widened, the values its output columns hold over that scope. See [`sort_sandwich`].
+/// cannot be widened, the values its output columns hold over that scope. See [`sort_sandwich`]
+/// and [`grouped_position`].
 struct SortScope {
     scope: Scope,
-    /// `None` for a plain select, whose projection sits directly on the FROM relation and is
-    /// widened with the key. `Some` for a `DISTINCT` or `DISTINCT ON` select, whose key has to be
-    /// one of these values already.
-    outputs: Option<Vec<Value>>,
+    outputs: SortOutputs,
+}
+
+/// What a select's result offers an input-expression `ORDER BY` key, by what sits between its
+/// output columns and the FROM relation.
+enum SortOutputs {
+    /// A plain select, whose projection sits directly on the FROM relation and is widened with the
+    /// key ([`sort_sandwich`]).
+    Widened,
+    /// A `DISTINCT` or `DISTINCT ON` select, whose key has to be one of these values already: its
+    /// output columns, lowered in the FROM scope.
+    Distinct(Vec<Value>),
+    /// A grouped select, whose key has to be the value of one of its select items already
+    /// ([`grouped_position`]). One entry per item, in order: the item lowered in the FROM scope, or
+    /// `None` for an item with an aggregate in it, which has no value there.
+    Grouped(Vec<Option<Value>>),
 }
 
 /// Lower a set-expression body: a plain SELECT, a set operation, a parenthesized query, or VALUES.
@@ -1269,15 +1372,30 @@ fn lower_select_ctx(
     };
 
     // Only a projection sitting directly on the FROM relation can be widened with an ORDER BY key;
-    // above a `DISTINCT`'s `Group` the key can only be an output value, and an aggregate's output
-    // values are not over the FROM scope at all. See [`sort_sandwich`].
+    // above a `DISTINCT`'s `Group` the key can only be an output value. An aggregate's output values
+    // are not over the FROM scope at all, so a grouped select's key is matched to its items as they
+    // read there. See [`sort_sandwich`] and [`grouped_position`].
     let outputs = match &s.distinct {
-        _ if aggregated => None,
-        None | Some(Distinct::All) => Some(None),
-        Some(_) => Some(Some(split_projection(&result, &out_cols, scope.base).0)),
+        _ if aggregated => SortOutputs::Grouped(grouped_items(cat, &scope, fns, s)),
+        None | Some(Distinct::All) => SortOutputs::Widened,
+        Some(_) => SortOutputs::Distinct(split_projection(&result, &out_cols, scope.base).0),
     };
     let (rel, cols) = apply_distinct(cat, fns, &scope, s, result, out_cols, ord, aggregated)?;
-    Ok((rel, cols, outputs.map(|outputs| SortScope { scope, outputs })))
+    Ok((rel, cols, Some(SortScope { scope, outputs })))
+}
+
+/// A grouped select's items lowered in its FROM scope, for [`grouped_position`]: `None` for one with
+/// an aggregate in it, which [`lower_expr`] refuses there, and for a wildcard, which
+/// [`lower_aggregate`] has already refused.
+///
+/// Any other item lowers. [`AggCtx::lower_post`] has just lowered the same expression in the same
+/// scope, as it first asks whether the item is a group key ([`AggCtx::key_match`]), and an error there
+/// would have refused the query. So the `ok()` loses nothing.
+fn grouped_items(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Vec<Option<Value>> {
+    s.projection
+        .iter()
+        .map(|it| item_expr(it).filter(|e| !contains_agg(fns, e)).and_then(|e| lower_expr(cat, scope, fns, e).ok()))
+        .collect()
 }
 
 /// `SELECT DISTINCT` -> Group keyed on all output columns (matches Calcite's canonical form, where
