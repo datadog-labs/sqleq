@@ -137,6 +137,8 @@ pub fn replay_plan(case: &Case, p: &LeanPair) -> Value {
                             recognize::GenKind::Fresh => "fresh",
                             recognize::GenKind::Once => "once",
                         }}),
+                        // The replay binds `$n` to a sequence of its own, as the witness assumes.
+                        translate::LCell::SeqP(n) => json!({"gen": "fresh", "seq_param": n}),
                     })
                     .collect()
             })

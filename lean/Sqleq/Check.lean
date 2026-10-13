@@ -81,6 +81,7 @@ def cellOk (k j t : Nat) : Cell → Bool
   | .pc n c => c == t && slotOk k j n
   | .null => true
   | .gen _ => false
+  | .seqp _ => false
 
 /-- A `VALUES` row has exactly one admissible cell per column. `j` counts the columns seen. -/
 def rowOk (k : Nat) : Nat → List Nat → List Cell → Bool
@@ -126,10 +127,10 @@ def EquivGather (a b : Insert) : Prop :=
 
 /-! ## Generated cells
 
-`checkGatherGen` admits `VALUES` cells the database fills in (`DEFAULT`, `now()`, `nextval('s')`)
-where the unnest side supplies that column's array itself. Its claim, `EquivGatherGen`, is weaker
-than `EquivGather`: B reproduces A when B's arrays hold the values A's generated cells evaluated
-to. -/
+`checkGatherGen` admits `VALUES` cells the database fills in (`DEFAULT`, `now()`, `nextval('s')`,
+`nextval($n)`) where the unnest side supplies that column's array itself. Its claim,
+`EquivGatherGen`, is weaker than `EquivGather`: B reproduces A when B's arrays hold the values A's
+generated cells evaluated to. -/
 
 /-- A cell's type, for the generated-cell checker: a cast must be to the column's own type. Where
 a parameter may sit is checked apart, by `pinSeq`. -/
@@ -146,12 +147,14 @@ def rowsOkG (tys : List Nat) : List (List Cell) → Bool
   | [] => true
   | r :: rs => rowOkG tys r && rowsOkG tys rs
 
-/-- Reading one row, where the next parameter cell must be `$nx`: the number expected after the
-row, or `0` once a cell breaks the order. `NULL` and generated cells take no number. -/
+/-- Reading one row, where the next parameter must be `$nx`: the number expected after the row,
+or `0` once a cell breaks the order. `NULL` and generated cells take no number, except
+`nextval($n)`, whose sequence name is a parameter. -/
 def seqRow : Nat → List Cell → Nat
   | nx, [] => nx
   | nx, .p n :: cs => if nx != 0 && n == nx then seqRow (nx + 1) cs else 0
   | nx, .pc n _ :: cs => if nx != 0 && n == nx then seqRow (nx + 1) cs else 0
+  | nx, .seqp n :: cs => if nx != 0 && n == nx then seqRow (nx + 1) cs else 0
   | nx, _ :: cs => seqRow nx cs
 
 def seqRows : Nat → List (List Cell) → Nat
@@ -159,18 +162,19 @@ def seqRows : Nat → List (List Cell) → Nat
   | nx, r :: rs => seqRows (seqRow nx r) rs
 
 /-- The parameters are `$1, $2, …` in reading order, each exactly once: row-major numbering that
-skips `NULL` and generated cells.
+skips `NULL` and generated cells, but not the sequence name of `nextval($n)`.
 
-A modelling precondition, like `slotOk`. A parameter used once sits in one column, so Postgres
-types it from that column. With no gaps, no parameter is left untyped, which would fail type
-inference before any row is read. The slot rule does not carry over, because a generated cell
-takes a column but no number. -/
+A modelling precondition, like `slotOk`. A parameter used once sits in one place, so Postgres
+types it from there: a cell from its column, a sequence name as `nextval`'s `regclass`. With no
+gaps, no parameter is left untyped, which would fail type inference before any row is read. The
+slot rule does not carry over, because a generated cell takes a column but no number. -/
 def pinSeq (rows : List (List Cell)) : Bool :=
   seqRows 1 rows != 0
 
 def hasGenRow : List Cell → Bool
   | [] => false
   | .gen _ :: _ => true
+  | .seqp _ :: _ => true
   | _ :: cs => hasGenRow cs
 
 /-- Some cell is generated. This makes "`proved-gather-generated` ⇒ A really has a generated

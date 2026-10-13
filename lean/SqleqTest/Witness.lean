@@ -94,6 +94,10 @@ example : witness (keyedBy plain) (three (dfltRows .once)) = .unique 0 := by dec
 example : witness (keyedBy ⟨false, .fresh, true⟩) (three (dfltRows .dflt)) = .generated 0 := by
   decide +kernel
 
+-- `nextval($n)` is fresh too: every sequence-name parameter names the same new sequence.
+def seqRows : List (List Cell) := [[.seqp 1, .p 2, .p 3], [.seqp 4, .p 5, .p 6]]
+example : witness (keyedBy plain) (three seqRows) = .ok 2 := by decide +kernel
+
 /-- A fresh generated cell and an omitted serial draw distinct values from the same counter. -/
 def freshPair : Spec := ⟨[serial, plain, plain], [⟨[0], false⟩, ⟨[1], false⟩], [1, 2], .none⟩
 example : witness freshPair (two [[.gen .fresh, .p 1], [.gen .fresh, .p 2]]) = .ok 2 := by

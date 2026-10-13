@@ -81,8 +81,29 @@ pub struct Generated {
     pub kind: GenKind,
     /// `default`, or the generator's name.
     pub func: String,
-    /// The sequence `nextval` draws from, as [`seq_name`] reads its argument.
-    pub seq: Option<String>,
+    /// The sequence `nextval` draws from.
+    pub seq: Option<Seq>,
+}
+
+/// The sequence a `nextval` call names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Seq {
+    /// A string literal, as [`seq_name`] reads it.
+    Named(String),
+    /// A parameter, `nextval($n)`: which sequence is known only when the statement runs.
+    Param(u32),
+}
+
+impl Cell {
+    /// The parameter number this cell takes in reading order: its own, or the sequence name's in
+    /// `nextval($n)`.
+    pub fn number(&self) -> Option<u32> {
+        match self {
+            Cell::Param(n, _) => Some(*n),
+            Cell::Gen(Generated { seq: Some(Seq::Param(n)), .. }) => Some(*n),
+            _ => None,
+        }
+    }
 }
 
 const UUID: &[&str] = &["uuid"];
@@ -90,7 +111,7 @@ const CLOCK: &[&str] = &["timestamptz", "timestamp", "date"];
 /// The column types `nextval`'s `bigint` may be assigned to.
 pub const SEQUENCE_TYPES: &[&str] = &["int8", "int4", "int2", "numeric"];
 
-/// The generator calls a `VALUES` cell may be, besides `nextval('s')`: called with no argument and
+/// The generator calls a `VALUES` cell may be, besides `nextval`: called with no argument and
 /// nothing else, each with the kind of value it gives and the column base types that value may be
 /// assigned to. Kept short on purpose. The claim holds for any value a cell could take, so this list
 /// is not what makes a proof true; it is what keeps "generated" meaning a cell the database fills in,
@@ -260,8 +281,8 @@ fn has_placeholder(e: &Expr) -> bool {
 }
 
 /// A generator call: an unqualified (or `pg_catalog.`) name from [`GENERATORS`] with no argument, or
-/// `nextval` of one string literal, optionally cast to `regclass`; and no `FILTER`, `OVER`,
-/// `DISTINCT` or other clause.
+/// `nextval` of one string literal or parameter, optionally cast to `regclass`; and no `FILTER`,
+/// `OVER`, `DISTINCT` or other clause.
 pub(crate) fn generator(f: &sqlparser::ast::Function) -> Result<Generated, Refusal> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     let not_one = || unsupported(format!("VALUES cell calls {}, which is not a generator the checker models", f.name));
@@ -275,8 +296,9 @@ pub(crate) fn generator(f: &sqlparser::ast::Function) -> Result<Generated, Refus
     if name != "nextval" && !GENERATORS.iter().any(|(g, _, _)| *g == name) {
         return Err(not_one());
     }
-    if has_placeholder(&Expr::Function(f.clone())) {
-        return Err(unsupported(format!("VALUES cell calls {name} with a parameter")));
+    let with_param = || unsupported(format!("VALUES cell calls {name} with a parameter"));
+    if name != "nextval" && has_placeholder(&Expr::Function(f.clone())) {
+        return Err(with_param());
     }
     let plain = !f.uses_odbc_syntax
         && matches!(f.parameters, FunctionArguments::None)
@@ -294,7 +316,7 @@ pub(crate) fn generator(f: &sqlparser::ast::Function) -> Result<Generated, Refus
     };
     if name == "nextval" {
         let [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))] = args else { return Err(not_one()) };
-        let lit = match strip(e) {
+        let arg = match strip(e) {
             Expr::Cast { kind, expr, data_type, format: None, .. }
                 if postgres_cast(kind) && data_type.to_string().eq_ignore_ascii_case("regclass") =>
             {
@@ -302,9 +324,15 @@ pub(crate) fn generator(f: &sqlparser::ast::Function) -> Result<Generated, Refus
             }
             other => other,
         };
-        let Expr::Value(v) = lit else { return Err(not_one()) };
+        if let Some(n) = placeholder(arg) {
+            return Ok(Generated { kind: GenKind::Fresh, func: name, seq: Some(Seq::Param(n)) });
+        }
+        if has_placeholder(arg) {
+            return Err(with_param());
+        }
+        let Expr::Value(v) = arg else { return Err(not_one()) };
         let Value::SingleQuotedString(s) = &v.value else { return Err(not_one()) };
-        return Ok(Generated { kind: GenKind::Fresh, func: name, seq: Some(seq_name(s)) });
+        return Ok(Generated { kind: GenKind::Fresh, func: name, seq: Some(Seq::Named(seq_name(s))) });
     }
     match GENERATORS.iter().find(|(g, _, _)| *g == name) {
         Some(&(_, kind, _)) if args.is_empty() => Ok(Generated { kind, func: name, seq: None }),
@@ -643,24 +671,26 @@ mod tests {
             ("INSERT INTO t (a) VALUES (current_date)", GenKind::Once, "current_date", None),
             ("INSERT INTO t (a) VALUES (pg_catalog.now())", GenKind::Once, "now", None),
             ("INSERT INTO t (a) VALUES (gen_random_uuid())", GenKind::Fresh, "gen_random_uuid", None),
-            ("INSERT INTO t (a) VALUES (nextval('s'))", GenKind::Fresh, "nextval", Some("s")),
-            ("INSERT INTO t (a) VALUES (nextval('public.\"S\"'::regclass))", GenKind::Fresh, "nextval", Some("S")),
-            ("INSERT INTO t (a) VALUES (nextval('My_Seq'))", GenKind::Fresh, "nextval", Some("my_seq")),
+            ("INSERT INTO t (a) VALUES (nextval('s'))", GenKind::Fresh, "nextval", Some(Seq::Named("s".into()))),
+            ("INSERT INTO t (a) VALUES (nextval('public.\"S\"'::regclass))", GenKind::Fresh, "nextval", Some(Seq::Named("S".into()))),
+            ("INSERT INTO t (a) VALUES (nextval('My_Seq'))", GenKind::Fresh, "nextval", Some(Seq::Named("my_seq".into()))),
+            ("INSERT INTO t (a) VALUES (nextval($1))", GenKind::Fresh, "nextval", Some(Seq::Param(1))),
+            ("INSERT INTO t (a) VALUES (nextval ( $3 ))", GenKind::Fresh, "nextval", Some(Seq::Param(3))),
+            ("INSERT INTO t (a) VALUES (nextval(($2)::regclass))", GenKind::Fresh, "nextval", Some(Seq::Param(2))),
         ] {
             let got = first_cell(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-            assert_eq!(
-                got,
-                Cell::Gen(Generated { kind, func: func.into(), seq: seq.map(String::from) }),
-                "{sql}"
-            );
+            assert_eq!(got, Cell::Gen(Generated { kind, func: func.into(), seq }), "{sql}");
         }
+        assert_eq!(first_cell("INSERT INTO t (a) VALUES (nextval($4))").unwrap().number(), Some(4));
+        assert_eq!(first_cell("INSERT INTO t (a) VALUES (nextval('s'))").unwrap().number(), None);
     }
 
     #[test]
     fn calls_that_are_not_plain_generators_are_refused() {
         for sql in [
-            // A parameter inside, as the sequence name.
-            "INSERT INTO t (a) VALUES (nextval($1))",
+            // A parameter inside the sequence name, or cast to something other than `regclass`.
+            "INSERT INTO t (a) VALUES (nextval('s' || $1))",
+            "INSERT INTO t (a) VALUES (nextval($1::text))",
             // An argument where the generator takes none, or a sequence that is not a literal.
             "INSERT INTO t (a) VALUES (now(1))",
             "INSERT INTO t (a) VALUES (nextval(x))",

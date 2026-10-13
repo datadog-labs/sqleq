@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use sqlparser::ast::{ConflictTarget, OnConflictAction, OnInsert, Statement};
 
-use crate::recognize::{recognize, Cell, GenKind, Parts, Refusal, Source, Tail, GENERATORS, SEQUENCE_TYPES};
+use crate::recognize::{recognize, Cell, GenKind, Parts, Refusal, Seq, Source, Tail, GENERATORS, SEQUENCE_TYPES};
 use crate::schema::{fold, last_name, type_key, DefaultKind, DefaultSource, Schema, Table, TypeKey, Unique};
 
 /// The `VALUES` side's sub-shape, reported so that one shape cannot hide inside another's numbers.
@@ -50,6 +50,8 @@ pub enum LCell {
     Pc(u32, u32),
     Null,
     Gen(GenKind),
+    /// `nextval($n)`: a fresh generated cell whose sequence name is parameter `n`.
+    SeqP(u32),
 }
 
 /// What a pair's generated cells are, for its record: the claim is the same for all of them, but
@@ -62,9 +64,9 @@ pub struct GenSummary {
     pub columns: Vec<String>,
     /// Some column holds a generated cell in one row and a parameter or `NULL` in another.
     pub mixed: bool,
-    /// Some generated cell draws from a sequence: an explicit `nextval`, or `DEFAULT` on a serial,
-    /// identity or `nextval` default. B then supplies those values itself and leaves the sequence
-    /// behind them, so as a rewrite it is not safe, though the claim holds.
+    /// Some generated cell draws from a sequence: an explicit `nextval` (of a name or a parameter),
+    /// or `DEFAULT` on a serial, identity or `nextval` default. B then supplies those values itself
+    /// and leaves the sequence behind them, so as a rewrite it is not safe, though the claim holds.
     pub sequence: bool,
     /// Some `DEFAULT` cell's column default is a constant or `NULL`, so its value is fixed by the
     /// schema.
@@ -332,12 +334,13 @@ fn shape(rows: &[Vec<Cell>]) -> Shape {
     if rows.iter().all(|r| r == &rows[0]) {
         return Shape::Repeated;
     }
-    // A generated cell takes no parameter number, so it does not break row-major numbering.
+    // A generated cell takes no parameter number, so it does not break row-major numbering; the
+    // sequence name of `nextval($n)` does take one.
     let mut next = 1;
     for c in rows.iter().flatten() {
-        match c {
-            Cell::Param(n, _) if *n == next => next += 1,
-            Cell::Gen(_) => {}
+        match (c, c.number()) {
+            (_, Some(n)) if n == next => next += 1,
+            (Cell::Gen(_), None) => {}
             _ => return Shape::Other,
         }
     }
@@ -345,12 +348,13 @@ fn shape(rows: &[Vec<Cell>]) -> Shape {
 }
 
 /// `Sqleq.pinSeq`: with generated cells, the parameters must be `$1, $2, …` in reading order, each
-/// exactly once. `NULL` and generated cells take no number.
+/// exactly once. `NULL` and generated cells take no number, except the sequence name of
+/// `nextval($n)` ([`Cell::number`]).
 fn pin_seq(rows: &[Vec<Cell>]) -> Result<(), Refusal> {
     let mut next = 1;
     for c in rows.iter().flatten() {
-        if let Cell::Param(n, _) = c {
-            if *n != next {
+        if let Some(n) = c.number() {
+            if n != next {
                 return Err(unsupported(format!(
                     "${n} is out of reading order, where ${next} was expected: with generated cells, \
                      the parameters must be $1, $2, … in reading order, each once"
@@ -408,12 +412,16 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
 /// - a generator whose value the column's type cannot take makes A fail where B need not;
 /// - two generators in one column (`DEFAULT` from one sequence, `nextval` of another) can produce
 ///   colliding values the witness model treats as distinct.
+///
+/// A sequence named by a parameter, `nextval($n)`, could be any sequence, so where a named one is
+/// refused for "the same sequence", it is refused for any.
 pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> Result<GenSummary, Refusal> {
     let mut sum = GenSummary::default();
     let mut seqs: Vec<String> = Vec::new();
+    let mut unknown_seq = false;
     for (j, c) in a.cols.iter().enumerate() {
         let col = &table.columns[table.column(c).expect("resolved by lower")];
-        let mut gens: Vec<(String, Option<String>)> = Vec::new();
+        let mut gens: Vec<(String, Option<Seq>)> = Vec::new();
         let mut other = false;
         for r in rows {
             let Cell::Gen(g) = &r[j] else {
@@ -421,8 +429,14 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
                 continue;
             };
             *sum.funcs.entry(g.func.clone()).or_default() += 1;
-            if !gens.contains(&(g.func.clone(), g.seq.clone())) {
-                gens.push((g.func.clone(), g.seq.clone()));
+            // Every `nextval($n)` in a column is one generator: the witness, and the replay with it,
+            // name the same sequence in every sequence-name parameter.
+            let key = match &g.seq {
+                Some(Seq::Param(_)) => (g.func.clone(), Some(Seq::Param(0))),
+                seq => (g.func.clone(), seq.clone()),
+            };
+            if !gens.contains(&key) {
+                gens.push(key);
             }
             if col.always {
                 return Err(unsupported(format!(
@@ -444,8 +458,12 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
                 },
                 GenKind::Fresh | GenKind::Once => {
                     let types: &[&str] = match &g.seq {
-                        Some(s) => {
+                        Some(Seq::Named(s)) => {
                             seqs.push(s.clone());
+                            SEQUENCE_TYPES
+                        }
+                        Some(Seq::Param(_)) => {
+                            unknown_seq = true;
                             SEQUENCE_TYPES
                         }
                         None => GENERATORS.iter().find(|(f, _, _)| *f == g.func).map_or(&[], |x| x.2),
@@ -473,7 +491,7 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
              could not be read, alters it, or only parsed after simplification)",
         ));
     }
-    sum.sequence = !seqs.is_empty();
+    sum.sequence = !seqs.is_empty() || unknown_seq;
     if sum.sequence {
         let tail = format!("{} {}", a.tail.on.as_deref().unwrap_or(""), a.tail.returning.as_deref().unwrap_or(""));
         if words(&tail).any(|w| matches!(w.as_str(), "nextval" | "currval" | "lastval" | "setval" | "default")) {
@@ -497,6 +515,14 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
                 return Err(unsupported(format!(
                     "a generated cell draws from a sequence, and the default of omitted column {} is \
                      not recognised, so it could read the same sequence state",
+                    col.name
+                )));
+            }
+            // A sequence a parameter names could be any, so drawing from any sequence draws from it.
+            if unknown_seq && !col.seqs.is_empty() {
+                return Err(unsupported(format!(
+                    "a generated cell draws from the sequence a parameter names, which could be any, \
+                     and the default of omitted column {} draws from a sequence",
                     col.name
                 )));
             }
@@ -669,7 +695,10 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
                     continue;
                 }
                 Cell::Gen(g) => {
-                    out.push(LCell::Gen(g.kind));
+                    out.push(match g.seq {
+                        Some(Seq::Param(n)) => LCell::SeqP(n),
+                        _ => LCell::Gen(g.kind),
+                    });
                     continue;
                 }
                 Cell::Param(n, _) => *n,
@@ -822,7 +851,9 @@ mod tests {
         CREATE TRIGGER t BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION f();\
         CREATE TABLE al (id serial PRIMARY KEY, name text);\
         ALTER TABLE al ADD COLUMN extra int;\
-        CREATE TABLE gk (id serial PRIMARY KEY, name text, ts timestamptz, k int DEFAULT pick());";
+        CREATE TABLE gk (id serial PRIMARY KEY, name text, ts timestamptz, k int DEFAULT pick());\
+        CREATE TABLE q (id bigint PRIMARY KEY, name text, ts timestamptz DEFAULT now());\
+        CREATE TABLE qs (id bigint PRIMARY KEY, name text, n serial);";
 
     fn gpair(a: &str, b: &str) -> Result<LeanPair, Refusal> {
         let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
@@ -944,6 +975,62 @@ mod tests {
             "INSERT INTO al (id, name) SELECT * FROM unnest($1::int[], $2::text[])",
         );
         assert!(r.contains("read in full"), "{r}");
+    }
+
+    const QB: &str = "INSERT INTO q (id, name) SELECT * FROM unnest($1::int8[], $2::text[])";
+
+    #[test]
+    fn a_sequence_named_by_a_parameter_takes_its_number_in_reading_order() {
+        let p = gpair("INSERT INTO q (id, name) VALUES (nextval($1), $2), (nextval($3), $4)", QB).unwrap();
+        let s = gen(&p);
+        assert_eq!(s.funcs.get("nextval"), Some(&2));
+        assert_eq!(s.columns, ["id"]);
+        assert!(s.sequence);
+        assert_eq!(p.shape, Shape::RowMajor);
+        let LSource::Values(rows) = &p.a.src else { panic!() };
+        assert_eq!(rows[1], [LCell::SeqP(3), LCell::P(4)]);
+        // Numbered as if the name took no number, one name reused, and out of order.
+        for a in [
+            "INSERT INTO q (id, name) VALUES (nextval($1), $1), (nextval($2), $2)",
+            "INSERT INTO q (id, name) VALUES (nextval($1), $2), (nextval($1), $3)",
+            "INSERT INTO q (id, name) VALUES (nextval($2), $1)",
+        ] {
+            assert!(grefused(a, QB).contains("reading order"), "{a}");
+        }
+        // A named sequence in the same column is a second generator.
+        assert!(grefused("INSERT INTO q (id, name) VALUES (nextval($1), $2), (nextval('s'), $3)", QB).contains("more than one generator"));
+        // A column nextval's bigint cannot fill.
+        let r = grefused(
+            "INSERT INTO q (name, id) VALUES (nextval($1), $2)",
+            "INSERT INTO q (name, id) SELECT * FROM unnest($1::text[], $2::int8[])",
+        );
+        assert!(r.contains("cannot fill"), "{r}");
+    }
+
+    #[test]
+    fn a_sequence_named_by_a_parameter_could_be_any_sequence() {
+        // An omitted column drawing from some sequence (a serial)...
+        let r = grefused(
+            "INSERT INTO qs (id, name) VALUES (nextval($1), $2)",
+            "INSERT INTO qs (id, name) SELECT * FROM unnest($1::int8[], $2::text[])",
+        );
+        assert!(r.contains("could be any"), "{r}");
+        // ...which a named sequence it does not draw from leaves alone.
+        assert!(gpair(
+            "INSERT INTO qs (id, name) VALUES (nextval('other'), $1)",
+            "INSERT INTO qs (id, name) SELECT * FROM unnest($1::int8[], $2::text[])",
+        )
+        .is_ok());
+        // An omitted column whose default is not recognised, refused as for any sequence.
+        let r = grefused(
+            "INSERT INTO gk (id, name) VALUES (nextval($1), $2)",
+            "INSERT INTO gk (id, name) SELECT * FROM unnest($1::int[], $2::text[])",
+        );
+        assert!(r.contains("omitted column k is not recognised"), "{r}");
+        // A tail that reads sequence state, as for a named sequence.
+        let tail = " RETURNING currval('q_seq')";
+        let r = grefused(&format!("INSERT INTO q (id, name) VALUES (nextval($1), $2){tail}"), &format!("{QB}{tail}"));
+        assert!(r.contains("sequence state or a default"), "{r}");
     }
 
     /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.

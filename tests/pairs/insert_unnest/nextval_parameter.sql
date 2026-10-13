@@ -11,9 +11,10 @@
 -- expect sqlsolver-jvm: no-plan
 -- expect lean: unsupported
 -- binding: gather-generated
--- origin: the Lean axis's fragment boundary: a generator whose sequence is a parameter
+-- origin: the Lean axis's fragment boundary: one parameter names the sequence in every row
 -- argument: B's array $1 is column 1 of A's rows, the values nextval($1) drew, and B's $2 is
---   column 2, A's $2 and $3; so B inserts A's rows. Lean refuses the cell, soundly
+--   column 2, A's $2 and $3; so B inserts A's rows. Lean takes nextval($n) only with the
+--   parameters in reading order, each once, so it refuses the reused $1, soundly
 CREATE SEQUENCE label_seq;
 CREATE TABLE labels (id bigint PRIMARY KEY, name text);
 INSERT INTO labels (id, name) VALUES (nextval($1), $2), (nextval($1), $3);

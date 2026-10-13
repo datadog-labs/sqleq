@@ -117,9 +117,9 @@ pub enum Outcome {
 /// The only names a definition in a batch may mention: the Lean package's constructors. With
 /// these, numerals and booleans, a definition is pure data. It cannot refer to a theorem, an axiom
 /// or another definition.
-const CONSTRUCTORS: [&str; 24] = [
+const CONSTRUCTORS: [&str; 25] = [
     "Sqleq.Insert.mk", "Sqleq.Source.values", "Sqleq.Source.unnest", "Sqleq.Arg.mk",
-    "Sqleq.Cell.p", "Sqleq.Cell.pc", "Sqleq.Cell.null", "Sqleq.Cell.gen", "Sqleq.GenKind.dflt",
+    "Sqleq.Cell.p", "Sqleq.Cell.pc", "Sqleq.Cell.null", "Sqleq.Cell.gen", "Sqleq.Cell.seqp", "Sqleq.GenKind.dflt",
     "Sqleq.GenKind.fresh", "Sqleq.GenKind.once", "Sqleq.Tok.word", "Sqleq.Tok.param",
     "Sqleq.Spec.mk", "Sqleq.Col.mk", "Sqleq.Dflt.null", "Sqleq.Dflt.same", "Sqleq.Dflt.fresh",
     "Sqleq.Uniq.mk", "Sqleq.Conflict.none", "Sqleq.Conflict.nothing", "Sqleq.Conflict.nothingOn",
