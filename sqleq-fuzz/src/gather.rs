@@ -37,7 +37,16 @@ pub enum Cell {
     /// `$n`, and the type it is cast to, as written, when it is.
     Param(u32, Option<String>),
     Null,
+    /// A cell Postgres evaluates itself: a generator such as `DEFAULT` or `nextval(…)`, or an
+    /// expression. The rule has no parameter to take its column's array from, so only
+    /// [`recognize_for_probe`] reads a pair with one.
+    Opaque,
 }
+
+/// [`recognize`]'s refusal for a `VALUES` cell that generates its own value.
+pub const GENERATED: &str = "generated cells";
+/// [`recognize`]'s refusal for any other `VALUES` cell that is not a parameter or `NULL`.
+pub const NOT_A_PARAM: &str = "a VALUES cell that is not a parameter or NULL";
 
 /// A pair read under the gather rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,15 +158,15 @@ fn cell(e: &Expr) -> Result<Cell, String> {
             ..
         } if postgres_cast(kind) => match placeholder(expr) {
             Some(n) => Ok(Cell::Param(n, Some(data_type.to_string()))),
-            None => Err("a VALUES cell that is not a parameter or NULL".to_string()),
+            None => Err(NOT_A_PARAM.to_string()),
         },
         Expr::Identifier(id)
             if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") =>
         {
-            Err("generated cells".to_string())
+            Err(GENERATED.to_string())
         }
-        Expr::Function(_) => Err("generated cells".to_string()),
-        _ => Err("a VALUES cell that is not a parameter or NULL".to_string()),
+        Expr::Function(_) => Err(GENERATED.to_string()),
+        _ => Err(NOT_A_PARAM.to_string()),
     }
 }
 
@@ -290,6 +299,24 @@ fn placeholder_count(sql: &str) -> Option<usize> {
 /// the cells and the arguments, as in a conflict clause, where the two sides number them
 /// differently.
 pub fn recognize(a: &str, b: &str) -> Option<Result<Gather, String>> {
+    recognize_with(a, b, false)
+}
+
+/// Whether a refusal of [`recognize`] is one the rejection probe reads past: a `VALUES` cell the rule
+/// has no parameter for. The other refusals say the two sides do not line up at all.
+pub fn probe_eligible(why: &str) -> bool {
+    why == GENERATED || why == NOT_A_PARAM
+}
+
+/// The pair as [`recognize`] reads it, with a cell the rule cannot gather taken as [`Cell::Opaque`]
+/// rather than refused, for the rejection probe in `crate::pg` alone. That probe asks only whether
+/// the `unnest` side prepares as written. The arrays an opaque cell's column would be given are made
+/// up, so nothing run under this binding is compared as an outcome of the pair.
+pub fn recognize_for_probe(a: &str, b: &str) -> Option<Gather> {
+    recognize_with(a, b, true)?.ok()
+}
+
+fn recognize_with(a: &str, b: &str, lenient: bool) -> Option<Result<Gather, String>> {
     let parse = |sql: &str| {
         let mut v = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
         (v.len() == 1).then(|| v.remove(0))
@@ -319,7 +346,14 @@ pub fn recognize(a: &str, b: &str) -> Option<Result<Gather, String>> {
         .collect::<Option<Vec<_>>>()?;
     let rows = match raw_rows
         .iter()
-        .map(|r| r.iter().map(cell).collect::<Result<Vec<_>, _>>())
+        .map(|r| {
+            r.iter()
+                .map(|e| match cell(e) {
+                    Err(why) if lenient && probe_eligible(&why) => Ok(Cell::Opaque),
+                    c => c,
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(rows) => rows,
@@ -335,7 +369,9 @@ pub fn recognize(a: &str, b: &str) -> Option<Result<Gather, String>> {
         .flatten()
         .filter(|c| matches!(c, Cell::Param(..)))
         .count();
-    if placeholder_count(vals_sql) != Some(in_cells) {
+    // An opaque cell may hold parameters of its own (`nextval($1)`); the probe binds every parameter of
+    // the `VALUES` side as drawn, so only a strict reading needs them all to be cells.
+    if !lenient && placeholder_count(vals_sql) != Some(in_cells) {
         return Some(Err("a parameter outside the VALUES rows".to_string()));
     }
     if placeholder_count(unn_sql) != Some(args.len()) {
@@ -593,6 +629,34 @@ mod tests {
         ] {
             assert_eq!(recognize(v, u), None, "{u}");
         }
+    }
+
+    /// The probe's reading: a cell the rule cannot gather is opaque rather than refused, and so is
+    /// a parameter inside one; [`recognize`] itself is unchanged. A refusal that says the two sides
+    /// do not line up is not one the probe reads past.
+    #[test]
+    fn the_probe_reads_a_generated_or_expression_cell_as_opaque() {
+        let u = "INSERT INTO t (a, b) SELECT * FROM unnest($1::int[], $2::text[])";
+        for v in [
+            "INSERT INTO t (a, b) VALUES (DEFAULT, $1), (DEFAULT, $2)",
+            "INSERT INTO t (a, b) VALUES (nextval($1), $2)",
+            "INSERT INTO t (a, b) VALUES (CAST($1::text AS int), $2)",
+        ] {
+            let why = match recognize(v, u) {
+                Some(Err(why)) => why,
+                other => panic!("{v}: {other:?}"),
+            };
+            assert!(probe_eligible(&why), "{v}: {why}");
+            let g = recognize_for_probe(v, u).unwrap_or_else(|| panic!("{v}"));
+            assert!(g.rows.iter().all(|r| r[0] == Cell::Opaque), "{v}: {:?}", g.rows);
+            assert!(g.rows.iter().all(|r| matches!(r[1], Cell::Param(..))), "{v}");
+        }
+        // A conflict clause numbering a parameter apart is not a cell: the sides do not line up.
+        assert!(!probe_eligible("a parameter outside the VALUES rows"));
+        assert!(!probe_eligible("unnest argument $3 has no VALUES column 3"));
+        // A pair the strict reading binds is the same pair to the probe.
+        let v = "INSERT INTO t (a, b) VALUES ($1, $2)";
+        assert_eq!(recognize_for_probe(v, u), recognize(v, u).and_then(Result::ok));
     }
 
     #[test]

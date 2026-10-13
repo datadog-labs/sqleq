@@ -1530,8 +1530,15 @@ fn analyze(
 pub fn test_pair_pg(client: &mut Client, a: &str, b: &str, ddl: &str, cfg: Config) -> Outcome {
     let mut db = Db { c: client, trips: 0 };
     let mut timing = Timing::default();
+    let mut probe = None;
     let verdict = match db.exec("BEGIN") {
-        Ok(()) => run_pair(&mut db, a, b, ddl, cfg, &mut timing),
+        Ok(()) => match run_pair(&mut db, a, b, ddl, cfg, &mut timing, &mut probe) {
+            // The rejection probe refutes the pair or ends in the refusal it started from. A DDL
+            // Postgres will not apply, or a value it cannot draw, stops it before its question and
+            // says nothing about the pair.
+            v @ Verdict::NotEquivalentGather(_) => v,
+            v => probe.map_or(v, |why| Verdict::NotComparable(format!("gather: {why}"))),
+        },
         Err(e) => Verdict::Error(e),
     };
     let _ = db.exec("ROLLBACK");
@@ -1539,7 +1546,16 @@ pub fn test_pair_pg(client: &mut Client, a: &str, b: &str, ddl: &str, cfg: Confi
     Outcome { verdict, timing }
 }
 
-fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut Timing) -> Verdict {
+/// `probe_out` is set to the refusal the rejection probe started from, if the probe reads the pair.
+fn run_pair(
+    db: &mut Db,
+    a: &str,
+    b: &str,
+    ddl: &str,
+    cfg: Config,
+    timing: &mut Timing,
+    probe_out: &mut Option<String>,
+) -> Verdict {
     // The clock is an input of each trial, like a placeholder: every read of it, in the DDL's
     // defaults and in both statements, reads the instant the trial sets (see [`clocks`]), as reads
     // of one transaction's clock agree.
@@ -1580,11 +1596,22 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     };
     // A pair of the gather rule's shape is run under that rule: the `unnest` side's arrays are built
     // from the values drawn for the `VALUES` side, so the value heuristics read that side alone.
-    let gathered: Option<Gather> = match gather::recognize(a, b) {
-        None => None,
+    //
+    // One the rule cannot bind, because a `VALUES` cell has no parameter (a generator, an expression),
+    // is still a refutation when Postgres will not prepare its `unnest` side as written while its
+    // `VALUES` side runs. No array makes the first run, so no binding makes the two agree. That is
+    // all the rejection probe (`probe`) asks: it compares nothing else, and every other outcome of it
+    // is the refusal it started from (`test_pair_pg` makes it so).
+    let (gathered, probe): (Option<Gather>, Option<String>) = match gather::recognize(a, b) {
+        None => (None, None),
+        Some(Ok(g)) => (Some(g), None),
+        Some(Err(why)) if gather::probe_eligible(&why) => match gather::recognize_for_probe(a, b) {
+            Some(g) => (Some(g), Some(why)),
+            None => return Verdict::NotComparable(format!("gather: {why}")),
+        },
         Some(Err(why)) => return Verdict::NotComparable(format!("gather: {why}")),
-        Some(Ok(g)) => Some(g),
     };
+    probe_out.clone_from(&probe);
     let (pa, pb, ph_draw) = match &gathered {
         Some(g) if g.values_first => (a, "", &ph_a),
         Some(_) => (b, "", &ph_b),
@@ -1601,7 +1628,8 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         None => ph_a.iter().chain(&ph_b).map(|p| p.n).collect(),
     };
     let read = analyze((pa, pb), (a, b), &finals, &schema, gathered.as_ref(), ph_draw);
-    if read.skip {
+    // The probe compares no outcomes, so what makes them nondeterministic does not stop it.
+    if read.skip && probe.is_none() {
         return Verdict::NondetSkip;
     }
 
@@ -1764,7 +1792,7 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
         scan.insert(k.clone(), scan_view(&tables[k], &kids));
     }
     let held = analyze((pa, pb), (a, b), &finals, &scan, gathered.as_ref(), ph_draw);
-    if held.skip {
+    if held.skip && probe.is_none() {
         return Verdict::NondetSkip;
     }
     let nondet = read.nondet || held.nondet;
@@ -1865,6 +1893,15 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     let prepared = gathered
         .as_ref()
         .map(|_| (prepares(db, a, &ph_a), prepares(db, b, &ph_b)));
+    // The probe goes on only where Postgres will not prepare the `unnest` side as written and will
+    // prepare the `VALUES` side. Anywhere else the arrays it would hand an opaque cell's column are
+    // made up, and nothing run under them is an outcome of the pair.
+    if let (Some(why), Some(g), Some((pa, pb))) = (&probe, &gathered, prepared) {
+        let (values_prepares, unnest_prepares) = if g.values_first { (pa, pb) } else { (pb, pa) };
+        if unnest_prepares || !values_prepares {
+            return Verdict::NotComparable(format!("gather: {why}"));
+        }
+    }
     // One `$N` is one value, of one type, in both statements. Where a side leaves a placeholder
     // untyped (`SELECT $2 AS x`, which Postgres cannot prepare without being told), the type the
     // other side gives it is the one the application bound; untyped, it would be read as text.
@@ -2215,7 +2252,9 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                     .iter()
                     .map(|r| match &r[c] {
                         gather::Cell::Param(n, _) => binds.get(n).cloned().unwrap_or(Val::Null),
-                        gather::Cell::Null => Val::Null,
+                        // Only the probe binds a pair with one, and it compares nothing run under
+                        // what is made up here (see `probe`).
+                        gather::Cell::Null | gather::Cell::Opaque => Val::Null,
                     })
                     .collect();
                 arrays.insert(*p, Val::List(column));
@@ -2358,10 +2397,28 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
                     } else {
                         *unheard
                     };
+                    // Under the probe only the `unnest` side raising is a finding: it is the side that
+                    // does not prepare. The `VALUES` side raising says that trial's values did not run.
+                    let unnest_side = match &gathered {
+                        Some(g) if g.values_first => "B",
+                        _ => "A",
+                    };
+                    let why_not = match why_not {
+                        None if probe.is_some() && who != unnest_side => {
+                            Some("under the probe, only the unnest side's raising is a finding")
+                        }
+                        w => w,
+                    };
                     match why_not {
                         None => {
                             timing.typed_params = typed.len();
-                            let raised = format!("{who} raises {code} ({}); {other} does not", e.msg);
+                            let raised = match &probe {
+                                Some(_) => format!(
+                                    "{who} does not prepare as written: {code} ({}); {other} runs",
+                                    e.msg
+                                ),
+                                None => format!("{who} raises {code} ({}); {other} does not", e.msg),
+                            };
                             let w = describe_gather(&binds, &arrays, &kept, &session, Some(raised));
                             return Verdict::NotEquivalentGather(w);
                         }
@@ -2458,6 +2515,9 @@ fn run_pair(db: &mut Db, a: &str, b: &str, ddl: &str, cfg: Config, timing: &mut 
     }
     timing.typed_params = typed.len();
 
+    if let Some(why) = &probe {
+        return Verdict::NotComparable(format!("gather: {why}"));
+    }
     if gathered.is_some() {
         return match (ok_trials, last_err) {
             (0, Some(e)) => Verdict::Error(e),
