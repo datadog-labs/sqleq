@@ -64,3 +64,10 @@ opt-level = 3
 [profile.dev.package.z3-sys]
 opt-level = 3
 debug = false
+
+# sqlparser 0.63.0 plus the two PostgreSQL INSERT clauses it cannot parse yet: `OVERRIDING
+# { SYSTEM | USER } VALUE` and the `ON CONFLICT` target's `WHERE index_predicate`
+# (apache/datafusion-sqlparser-rs#2626, #2627). Drop this, and bump the version, once a release
+# carries both.
+[patch.crates-io]
+sqlparser = { git = "https://github.com/zvonimir-dd/datafusion-sqlparser-rs", rev = "23962bd728db232b2408f1180882fbe9fa3b270e" }
