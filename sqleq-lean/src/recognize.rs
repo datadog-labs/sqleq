@@ -484,6 +484,18 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     if matches!(i.on, Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_))) {
         return Err(unsupported("ON DUPLICATE KEY UPDATE"));
     }
+    // Not in the fragment. The re-render check below would refuse it too, as `Parts` does not
+    // carry it; naming it gives a better reason.
+    if i.overriding.is_some() {
+        return Err(unsupported("INSERT ... OVERRIDING { SYSTEM | USER } VALUE"));
+    }
+    // Which unique index is the arbiter depends on this predicate, and the schema model reads every
+    // unique index as total. The re-render check cannot catch it: `Parts` carries the whole
+    // `ON CONFLICT` clause, so the predicate renders back and would be silently left out of the
+    // model. It has to be refused by name.
+    if matches!(&i.on, Some(sqlparser::ast::OnInsert::OnConflict(c)) if c.conflict_target_predicate.is_some()) {
+        return Err(unsupported("ON CONFLICT target with a WHERE predicate (a partial-index arbiter)"));
+    }
     let TableObject::TableName(name) = &i.table else {
         return Err(unsupported("INSERT target is not a plain table"));
     };

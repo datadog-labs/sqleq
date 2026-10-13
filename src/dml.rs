@@ -1057,6 +1057,11 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
     if !i.assignments.is_empty() {
         return Err(unsupported("INSERT ... SET"));
     }
+    // `OVERRIDING { SYSTEM | USER } VALUE` decides whether an identity column stores the value the
+    // source supplies or the one its sequence generates, which the source bag does not say.
+    if i.overriding.is_some() {
+        return Err(unsupported("INSERT ... OVERRIDING { SYSTEM | USER } VALUE"));
+    }
     if i.multi_table_insert_type.is_some()
         || !i.multi_table_into_clauses.is_empty()
         || !i.multi_table_when_clauses.is_empty()
