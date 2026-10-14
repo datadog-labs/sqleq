@@ -31,8 +31,9 @@ ids the rows get, which of two duplicates `DO NOTHING` keeps, and the order `RET
 
 ### Generated cells
 
-A `VALUES` cell can be one the database fills in: `DEFAULT`, `nextval('s')`, or a generator such as
-`now()` or `gen_random_uuid()`. Often the `unnest` side supplies that column's array itself:
+A `VALUES` cell can be one the database fills in: `DEFAULT`, `nextval('s')`, `nextval($n)`, or a
+generator such as `now()` or `gen_random_uuid()`. Often the `unnest` side supplies that column's
+array itself:
 
 ```sql
 INSERT INTO t (id, name) VALUES (DEFAULT, $1), (DEFAULT, $2);
@@ -85,15 +86,19 @@ everything else:
   - With a mismatched type the two sides apply different coercions. `text[]` into a `uuid` column
     always errors, and `int4[]` into `bigint` differs on overflow. `sqleq-fuzz` refutes such pairs
     under the gather rule ([its README](../sqleq-fuzz/README.md#the-gather-rule)).
-  - A generated cell is `DEFAULT`, `nextval('s')`, or one of a short list of generators called with
-    no argument: the clocks (`now()`, `current_timestamp`, `localtimestamp`, `clock_timestamp()`,
-    …) and the uuid generators. A generator with a parameter, a cast over one, and any other
-    function are refused.
+  - A generated cell is `DEFAULT`, `nextval` of a string literal or of a bare parameter (either
+    optionally cast to `regclass`), or one of a short list of generators called with no argument:
+    the clocks (`now()`, `current_timestamp`, `localtimestamp`, `clock_timestamp()`, …) and the
+    uuid generators. Any other parameter in a generator, a cast over one, and any other function
+    are refused.
 - **Parameter placement.** Each `VALUES` parameter is pinned to one column: `$n` sits in column
   `(n − 1) mod k`. A parameter spread over columns of different types fails Postgres's type
   inference, and the model cannot see that failure. Nor may a parameter number go unused, which
   would leave it with no type at all. With generated cells, which take a column but no number,
-  the parameters must instead be `$1, $2, …` in reading order, each once.
+  the parameters must instead be `$1, $2, …` in reading order, each once. The sequence name in
+  `nextval($n)` takes its number like any other parameter, so `(nextval($1), $2), (nextval($3),
+  $4)` is in order; it is the `VALUES` side's parameter only, and the claim holds whatever sequence
+  it names.
 - **The tail.** The two tails are identical once their identifiers are resolved as Postgres
   resolves them, and mention no parameter.
   - Resolving folds an unquoted name to lower case (ASCII only) and takes it to be the quoted name,
@@ -118,7 +123,8 @@ value:
   column's default, or a trigger. The `VALUES` side advances the sequence row by row and the
   `unnest` side does not. An omitted column's default the checker does not recognise counts as
   reading it, since it could call a function that does; a stored generated column's expression
-  cannot, as Postgres requires it to be immutable;
+  cannot, as Postgres requires it to be immutable. A sequence a parameter names could be any, so
+  then an omitted column whose default draws from any sequence is refused too;
 - `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
 - a generator whose value the column's type cannot take, or two generators in one column.
 
@@ -148,7 +154,8 @@ The model covers:
   including a domain's default for a column of that domain;
 - generated cells: `DEFAULT` filled as an omitted column would be, a per-row generator as a fresh
   value, and any other generator as the column's once-per-statement value, which maximises
-  collisions;
+  collisions. The canonical binding names one new sequence in every sequence-name parameter
+  (`nextval($n)`), so those cells are fresh values too;
 - NOT NULL;
 - unique constraints and unique indexes, including `NULLS NOT DISTINCT`;
 - conflict-target inference, `DO NOTHING`, and `DO UPDATE`, which cannot touch a row the same
@@ -256,7 +263,8 @@ For a pair with generated cells, a probe first runs the `VALUES` clause into a c
 that has the target's defaults and identities but no constraints, and reads back what the generated
 cells evaluated to. Postgres does the `DEFAULT` substitution, the coercion and the evaluation order
 itself. The `unnest` side is then run with those values gathered into its arrays, a fresh set for
-each execution. A difference between the sides that the probe explains (the `VALUES` side inserted
+each execution. Every sequence-name parameter (`nextval($n)`) is bound to one sequence the run
+creates, as the witness model assumes. A difference between the sides that the probe explains (the `VALUES` side inserted
 other generated values than it found) is reported as inconclusive rather than as an alarm.
 
     python3 tools/lean_replay.py --setup --plan plan.json --json replay.json --host <socket dir>

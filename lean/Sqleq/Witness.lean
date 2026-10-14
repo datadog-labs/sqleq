@@ -17,7 +17,9 @@ concrete run.
 ## The run
 
 The table starts **empty**. The binding is **canonical**: every parameter gets its own non-NULL
-value, `WVal.param n`, distinct from every other parameter's and from every default's.
+value, `WVal.param n`, distinct from every other parameter's and from every default's. The one
+exception is a parameter naming a sequence, as in `nextval($n)`: every such parameter names the same
+new sequence, so its cells draw distinct values, which is how the model reads them.
 
 Canonical is the strongest choice. With distinct non-NULL parameters, two rows collide on a key
 only where the statement forces it: the same parameter in both, or the same once-per-statement
@@ -33,8 +35,9 @@ parameters fails, and none of them is a witness.
     collisions;
   - `fresh`: a new value per row, as a sequence or `gen_random_uuid()` gives.
 - **Generated cells**: a `DEFAULT` cell is filled exactly as an omitted column would be. A
-  generator call with a new value per row (`nextval('s')`, `gen_random_uuid()`) is `fresh`, and any
-  other (`now()`, `clock_timestamp()`) shares the column's once-per-statement value.
+  generator call with a new value per row (`nextval('s')`, `nextval($n)`, `gen_random_uuid()`) is
+  `fresh`, and any other (`now()`, `clock_timestamp()`) shares the column's once-per-statement
+  value.
 - **NOT NULL** is checked before the conflict clause, as Postgres does.
 - **Unique constraints**: two rows collide when every key column is non-NULL and equal, or, under
   `NULLS NOT DISTINCT`, equal treating NULLs as equal.
@@ -145,6 +148,7 @@ def cellW (c : Col) (i fr : Nat) : Cell → Option WVal × Nat
   | .gen .dflt => dfltW c i fr
   | .gen .fresh => (some (.fresh fr), fr + 1)
   | .gen .once => (some (.same i), fr)
+  | .seqp _ => (some (.fresh fr), fr + 1)
 
 /-- The full table row for one `VALUES` row, starting at table column `i`, with `fr` the next
 fresh value. Returns the row and the next fresh value. -/

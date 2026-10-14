@@ -57,6 +57,7 @@ impl Display for LCell {
                 };
                 write!(f, "Sqleq.Cell.gen Sqleq.GenKind.{k}")
             }
+            LCell::SeqP(n) => write!(f, "Sqleq.Cell.seqp {n}"),
         }
     }
 }
@@ -254,6 +255,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Sqleq.Cell.gen Sqleq.GenKind.dflt", "Sqleq.Cell.gen Sqleq.GenKind.fresh", "Sqleq.Cell.gen Sqleq.GenKind.once"]
         );
+        assert_eq!(LCell::SeqP(8).to_string(), "Sqleq.Cell.seqp 8");
         assert_eq!(LSource::Unnest(vec![(1, 3), (2, 4)]).to_string(), "Sqleq.Source.unnest [Sqleq.Arg.mk 1 3, Sqleq.Arg.mk 2 4]");
         assert_eq!(LSource::Values(vec![]).to_string(), "Sqleq.Source.values []");
         let spec = LSpec {

@@ -44,6 +44,10 @@ inductive Cell where
   /-- A cell the database fills in: `DEFAULT`, or a generator call such as `now()`. Only
   `checkGatherGen` admits it. -/
   | gen (k : GenKind)
+  /-- `nextval($n)`: a generated cell, as `gen .fresh`, whose sequence is named by parameter `n`.
+  Its value is the database's, never `$n`'s; `n` is kept only so that `pinSeq` can see that every
+  parameter is used. Only `checkGatherGen` admits it. -/
+  | seqp (n : Nat)
   deriving DecidableEq, Repr
 
 /-- One argument of a multi-argument `unnest`: `$param::ty[]`, where `ty` is the element type. -/
@@ -89,6 +93,7 @@ def cellVal (β : Scalars V) : Cell → Option V
   | .pc n _ => β n
   | .null => none
   | .gen _ => none
+  | .seqp _ => none
 
 /-- The rows `VALUES` produces, in order. -/
 def valuesRows (β : Scalars V) (rows : List (List Cell)) : List (List (Option V)) :=
@@ -128,6 +133,7 @@ def cellValG (β : Scalars V) (v : Option V) : Cell → Option V
   | .pc n _ => β n
   | .null => none
   | .gen _ => v
+  | .seqp _ => v
 
 /-- The rows `VALUES` produces when its generated cells evaluate to `g`. -/
 def valuesRowsG (β : Scalars V) (g : Generated V) (rows : List (List Cell)) :

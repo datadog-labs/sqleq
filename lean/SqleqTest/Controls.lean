@@ -143,8 +143,18 @@ example : checkGatherGen tys2
     ⟨1, cols2, .values [[.gen .fresh, .pc 1 4], [.null, .gen .once], [.p 2, .null]], tail0⟩
     unnest2 = true := by decide +kernel
 
+/-- `INSERT INTO t (c1, c2) VALUES (nextval($1), $2), (nextval($3), $4)`: each sequence name is a
+parameter, and takes its number in reading order. -/
+def seqParam : Insert := ⟨1, cols2, .values [[.seqp 1, .p 2], [.seqp 3, .p 4]], tail0⟩
+
+example : checkGatherGen tys2 seqParam unnest2 = true := by decide +kernel
+/-- Next to the other generators, `VALUES (nextval($1), $2), (DEFAULT, $3)`. -/
+example : checkGatherGen tys2 ⟨1, cols2, .values [[.seqp 1, .p 2], [.gen .dflt, .p 3]], tail0⟩
+    unnest2 = true := by decide +kernel
+
 /-- `checkGather` refuses a generated cell: its claim has no value for one. -/
 example : checkGather tys2 dfltCol unnest2 = false := by decide +kernel
+example : checkGather tys2 seqParam unnest2 = false := by decide +kernel
 example : checkGather tys2 ⟨1, cols2, .values [[.pc 1 3, .gen .once]], tail0⟩ unnest2 = false := by
   decide +kernel
 
@@ -159,6 +169,13 @@ example : checkGatherGen tys2 ⟨1, cols2, .values [[.gen .dflt, .p 2], [.gen .d
 /-- A gap, `VALUES (DEFAULT, $1), (DEFAULT, $3)`: nothing types `$2`, so Postgres rejects the
 statement before reading a row. -/
 example : checkGatherGen tys2 ⟨1, cols2, .values [[.gen .dflt, .p 1], [.gen .dflt, .p 3]], tail0⟩
+    unnest2 = false := by decide +kernel
+
+/-- A sequence name that takes no number, `VALUES (nextval($1), $1)`, or numbered as if it took
+none, `VALUES (nextval($1), $1), (nextval($2), $2)`. -/
+example : checkGatherGen tys2 ⟨1, cols2, .values [[.seqp 1, .p 1]], tail0⟩ unnest2 = false := by
+  decide +kernel
+example : checkGatherGen tys2 ⟨1, cols2, .values [[.seqp 1, .p 1], [.seqp 2, .p 2]], tail0⟩
     unnest2 = false := by decide +kernel
 
 /-- One parameter twice, `VALUES (DEFAULT, $1), (DEFAULT, $1)`. -/
@@ -184,6 +201,8 @@ example : checkGatherGen tys2 ⟨1, cols2, .values [[.gen .dflt, .p 1], [.p 2]],
 /-- **Swapped unnest arguments** with a generated column: refused, and genuinely not equivalent. -/
 example : checkGatherGen tys2 dfltCol swapped = false := by decide +kernel
 example : ¬ EquivGatherGen dfltCol swapped := not_equivGen_of_rows (by decide)
+example : checkGatherGen tys2 seqParam swapped = false := by decide +kernel
+example : ¬ EquivGatherGen seqParam swapped := not_equivGen_of_rows (by decide)
 
 /-- **Ragged rows** with a generated column: genuinely not equivalent. -/
 example : ¬ EquivGatherGen ⟨1, cols2, .values [[.gen .dflt, .p 1], [.p 2]], tail0⟩ unnest2 :=

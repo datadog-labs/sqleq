@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use sqleq_frontend::internals::enforced_per_statement;
 use sqlparser::ast::{DataType, Expr, Ident, ObjectName, Statement, Value};
 
+use crate::recognize::{Generated, Seq};
+
 /// A column type, canonical enough that two spellings of one Postgres type compare equal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TypeKey {
@@ -191,7 +193,9 @@ pub fn default_source(e: &Expr) -> DefaultSource {
         Expr::Cast { expr, .. } => default_source(expr),
         Expr::Function(f) => match crate::recognize::generator(f) {
             Ok(g) => match g.seq {
-                Some(s) => DefaultSource::Sequence(s),
+                Some(Seq::Named(s)) => DefaultSource::Sequence(s),
+                // A DDL default has no parameter to name a sequence with.
+                Some(Seq::Param(_)) => DefaultSource::Other,
                 None => DefaultSource::Generator,
             },
             Err(_) => DefaultSource::Other,
@@ -210,8 +214,8 @@ pub fn sequence_use(e: &Expr) -> (Vec<String>, bool) {
         if let Expr::Function(f) = x {
             match last_name(&f.name).as_deref() {
                 Some("nextval") => match crate::recognize::generator(f) {
-                    Ok(g) => seqs.extend(g.seq),
-                    Err(_) => state = true,
+                    Ok(Generated { seq: Some(Seq::Named(s)), .. }) => seqs.push(s),
+                    _ => state = true,
                 },
                 Some("currval" | "lastval" | "setval") => state = true,
                 _ => {}

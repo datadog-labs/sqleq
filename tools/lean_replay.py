@@ -206,8 +206,19 @@ def array_literal(items: list[str | None]) -> str:
 # One pair.
 
 def is_param(cell) -> bool:
-    """A plan cell is a parameter number, `None` for `NULL`, or `{"gen": kind}` for a generated cell."""
+    """A plan cell is a parameter number, `None` for `NULL`, or `{"gen": kind}` for a generated cell;
+    `nextval($n)` is `{"gen": "fresh", "seq_param": n}`."""
     return isinstance(cell, int) and not isinstance(cell, bool)
+
+
+# The one sequence every sequence-name parameter (`nextval($n)`) names, as the witness model
+# assumes: its cells then draw distinct values. Created by the run, like the generator streams.
+SEQ_PARAM = "sqleq_replay_seqparam"
+
+
+def seq_params(plan: dict) -> set[int]:
+    """The parameters that name a sequence."""
+    return {c["seq_param"] for r in plan["rows"] for c in r if isinstance(c, dict) and "seq_param" in c}
 
 
 # A parameter in a column that also holds generated cells is offset by this much, so that its
@@ -233,14 +244,16 @@ def bindings(plan: dict) -> list[str]:
     insert = plan["insert"]
     rows = plan["rows"]
     col_of = param_columns(plan)
+    seqs = seq_params(plan)
     gen_cols = {j for r in rows for j, cell in enumerate(r) if isinstance(cell, dict)}
-    if not col_of:
+    if not col_of and not seqs:
         return []
-    top = max(col_of)
-    missing = [n for n in range(1, top + 1) if n not in col_of]
+    top = max(col_of.keys() | seqs)
+    missing = [n for n in range(1, top + 1) if n not in col_of and n not in seqs]
     if missing:
         raise NoValue(f"parameter ${missing[0]} is not used, so Postgres cannot type it")
-    return [value_for(types[insert[col_of[n]]], n + (GEN_OFFSET if col_of[n] in gen_cols else 0), enums)
+    return [SEQ_PARAM if n in seqs else
+            value_for(types[insert[col_of[n]]], n + (GEN_OFFSET if col_of[n] in gen_cols else 0), enums)
             for n in range(1, top + 1)]
 
 
@@ -469,6 +482,8 @@ def localise(plan: dict) -> dict:
     if plan.get("values_clause") is not None:
         out["values_clause"] = determinise(u(plan["values_clause"]), st.shared("v"))
     out["sequences"] = [f"sqleq_replay_{n}" for n in sorted(st.names.values())]
+    if seq_params(plan):
+        out["sequences"].append(SEQ_PARAM)
     return out
 
 
