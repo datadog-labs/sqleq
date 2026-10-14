@@ -68,9 +68,15 @@ pub fn type_key(dt: &DataType) -> TypeKey {
         }
         None => (s, false),
     };
-    // `pg_catalog` is where the built-in types live, so `pg_catalog.date` is `date`.
+    // `pg_catalog` is where the built-in types live, so `pg_catalog.date` is `date`; and schema
+    // qualifiers are dropped, as everywhere else in sqleq, so `public.e` is `e`.
     if base.len() > 11 && base[..11].eq_ignore_ascii_case("pg_catalog.") {
         base = base[11..].to_string();
+    }
+    for public in ["public.", "\"public\"."] {
+        if base.len() > public.len() && base[..public.len()].eq_ignore_ascii_case(public) {
+            base = base[public.len()..].to_string();
+        }
     }
     // A quoted name is exactly its contents (`"json"` is `json`); an unquoted one folds to lower case.
     let lower = match base.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
@@ -335,6 +341,9 @@ impl Table {
 #[derive(Default, Debug)]
 pub struct Schema {
     tables: HashMap<String, Option<Table>>,
+    /// The DDL declares a cast of its own (`CREATE CAST`), which can stand in for a type's input
+    /// function. Read off the raw text, so a mention in a comment counts too.
+    pub user_casts: bool,
 }
 
 impl Schema {
@@ -588,6 +597,8 @@ impl Schema {
             }
         }
         let mut s = Schema::from_statements(statements.iter().map(|(s, r)| (s, *r)));
+        let words: Vec<String> = raw.split_whitespace().map(str::to_ascii_lowercase).collect();
+        s.user_casts = words.windows(2).any(|w| w[0] == "create" && w[1].starts_with("cast"));
         // A domain sqlparser cannot read (it has no domain-level `NOT NULL`, for one) constrains
         // every column of its type, and those statements never name a table.
         let domains: Vec<String> = unread.iter().filter_map(|u| unread_domain(u)).collect();
@@ -684,6 +695,20 @@ mod tests {
         assert!(key("char").modded, "bare char is char(1)");
         assert!(key("int[]").array);
         assert!(!key("text").modded && !key("text").array);
+    }
+
+    #[test]
+    fn the_public_schema_qualifier_is_dropped_from_a_type() {
+        let key = |t: &str| {
+            let st = format!("CREATE TABLE x (c {t})");
+            let Statement::CreateTable(ct) = &Parser::parse_sql(&sqleq_frontend::internals::DIALECT, &st).unwrap()[0] else {
+                panic!()
+            };
+            type_key(&ct.columns[0].data_type)
+        };
+        assert_eq!(key("public.document_state"), key("document_state"));
+        assert_eq!(key("\"public\".\"document_state\""), key("document_state"));
+        assert_ne!(key("other.document_state"), key("document_state"));
     }
 
     #[test]

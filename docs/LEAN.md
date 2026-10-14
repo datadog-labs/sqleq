@@ -66,7 +66,13 @@ everything else:
 
 - **Types.** Each `unnest` element type is its column's declared base type, with aliases resolved,
   or one that holds every value of it. A `VALUES` cell is `$n`, `$n` cast to its column's base
-  type, or `NULL`.
+  type, or `NULL`. The cast may be written twice (`$n::t::t`), which is the identity, or through a
+  string type with no length (`CAST($n::varchar AS t)`, `$n::text::t`): a cast from `text` or
+  `varchar` is `t`'s input function, the same parse the `unnest` side's array elements get, for
+  every `t` but the string types and those with a cast of their own from text (`char`, `"char"`,
+  `name`, `regclass`, `xml`). A pair whose DDL declares a cast (`CREATE CAST`) is refused, since
+  that cast could stand in for the input function. A `public.` qualifier on a type is dropped, as
+  schema qualifiers are elsewhere.
   - The element types that may differ from the column's are a fixed list, `widens` in
     `lean/Sqleq/Check.lean`: `int8[]` into an `int4` or `int2` column, `int4[]` into `int2`, and
     `text[]` and `varchar[]` into each other. Under the gather binding, B's array holds A's values,
