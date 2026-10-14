@@ -562,6 +562,54 @@ fn a_gather_pair_the_rule_cannot_bind_is_not_compared() {
     );
 }
 
+/// The rejection probe: a gather pair the rule cannot bind, because a `VALUES` cell has no
+/// parameter, is refuted when Postgres will not prepare its `unnest` side as written and its `VALUES`
+/// side runs. No array makes the `unnest` side run, so no binding makes the two agree.
+#[test]
+fn a_gather_pair_whose_unnest_side_cannot_prepare_is_refuted() {
+    // An array column fed the scalars `unnest` yields: the unnest side is `text` into `text[]`.
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "tags") VALUES (DEFAULT, $1), (DEFAULT, $2)"#,
+        r#"INSERT INTO "s" ("id", "tags") SELECT * FROM unnest($1::int[], $2::text[])"#,
+        r#"create table "s" ("id" SERIAL PRIMARY KEY, "tags" TEXT[])"#,
+        "NOT-EQUIVALENT-GATHER"
+    );
+    // A cast Postgres makes only when asked: `text` into `numeric` on the unnest side.
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "amount") VALUES (DEFAULT, $1), (DEFAULT, $2)"#,
+        r#"INSERT INTO "s" ("id", "amount") SELECT * FROM unnest($1::int[], $2::text[])"#,
+        r#"create table "s" ("id" SERIAL PRIMARY KEY, "amount" NUMERIC)"#,
+        "NOT-EQUIVALENT-GATHER"
+    );
+}
+
+/// What the probe does not count: an unnest side that prepares (both sides then fail alike, here on
+/// the NOT NULL key neither supplies), one that fails for want of something the DDL may just not
+/// declare, and a pair the probe never gets to ask about, because Postgres will not apply its DDL.
+#[test]
+fn the_rejection_probe_counts_only_an_unnest_side_that_cannot_prepare() {
+    assert_kind!(
+        r#"INSERT INTO "s" ("name") VALUES (lower($1)), (lower($2))"#,
+        r#"INSERT INTO "s" ("name") SELECT * FROM unnest($1::text[])"#,
+        r#"create table "s" ("id" INTEGER NOT NULL, "name" TEXT)"#,
+        "NOT-COMPARABLE"
+    );
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "name") VALUES (DEFAULT, $1), (DEFAULT, $2)"#,
+        r#"INSERT INTO "s" ("id", "name") SELECT * FROM unnest($1::int[], $2::no_such_type[])"#,
+        r#"create table "s" ("id" SERIAL PRIMARY KEY, "name" TEXT)"#,
+        "NOT-COMPARABLE"
+    );
+    // A default naming another column, which Postgres rejects: the pair stays as not comparable as
+    // it was before the probe, rather than becoming an error.
+    assert_kind!(
+        r#"INSERT INTO "s" ("id", "tags") VALUES (DEFAULT, $1), (DEFAULT, $2)"#,
+        r#"INSERT INTO "s" ("id", "tags") SELECT * FROM unnest($1::int[], $2::text[])"#,
+        r#"create table "s" ("id" SERIAL PRIMARY KEY, "tags" TEXT[], "n" INTEGER DEFAULT "id")"#,
+        "NOT-COMPARABLE"
+    );
+}
+
 // -- Rows for the tables the DDL leaves (issue #143) ---------------------------------------------
 //
 // The rows are generated for each table as Postgres's catalog holds it once the DDL has run: its
