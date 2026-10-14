@@ -550,6 +550,7 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
         (Source::Values(_), Source::Values(_)) => return Err(unsupported("both sides are VALUES")),
         (Source::Unnest { .. }, Source::Unnest { .. }) => return Err(unsupported("both sides are unnest")),
     };
+    let (a, b) = (implicit_cols(a, schema)?, implicit_cols(b, schema)?);
     let Lowered { tys, a: la, b: lb, shape, generated, widened } = lower(&a, &b, schema)?;
     let table = schema.table(&a.target).expect("resolved by lower");
     let mut unmodelled = Vec::new();
@@ -595,6 +596,36 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
             })
             .collect(),
     })
+}
+
+/// An INSERT without a column list targets the table's columns in declared order, or the first `n`
+/// of them when its source supplies only `n`, as Postgres reads it. Filled in from the DDL, which is
+/// authoritative about column order, and refused where the DDL may not give the table's real order:
+/// one that alters the table (`ADD COLUMN` appends), drops a column, or was not read in full.
+fn implicit_cols(mut p: Parts, schema: &Schema) -> Result<Parts, Refusal> {
+    if !p.implicit_cols {
+        return Ok(p);
+    }
+    let table = schema.table(&p.target).map_err(|e| unsupported(format!("schema: {e}")))?;
+    if table.unread || table.altered || table.retried {
+        return Err(unsupported(
+            "INSERT without a column list, and the target's DDL is not read in full, so its column \
+             order is not certain",
+        ));
+    }
+    let n = match &p.src {
+        Source::Values(rows) => rows.first().map_or(0, Vec::len),
+        Source::Unnest { args, .. } => args.len(),
+    };
+    if n > table.columns.len() {
+        return Err(Refusal::InvalidSql(format!(
+            "INSERT has {n} expressions per row for the {} columns of {}",
+            table.columns.len(),
+            table.name
+        )));
+    }
+    p.cols = table.columns[..n].iter().map(|c| c.name.clone()).collect();
+    Ok(p)
 }
 
 fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
@@ -1031,6 +1062,30 @@ mod tests {
         let tail = " RETURNING currval('q_seq')";
         let r = grefused(&format!("INSERT INTO q (id, name) VALUES (nextval($1), $2){tail}"), &format!("{QB}{tail}"));
         assert!(r.contains("sequence state or a default"), "{r}");
+    }
+
+    #[test]
+    fn an_insert_without_a_column_list_takes_the_tables_columns_in_order() {
+        let ddl = "CREATE TABLE w (a text, b int, c int);\
+            CREATE TABLE wa (a text, b int); ALTER TABLE wa ADD COLUMN c int;";
+        let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
+        let tr = |a: &str, b: &str| translate(&p(a), &p(b), &Schema::from_ddl(ddl));
+        let w3 = "INSERT INTO w SELECT * FROM unnest($1::text[], $2::int[], $3::int[])";
+        // Both sides without a list: every column, in declared order.
+        let pair = tr("INSERT INTO w VALUES ($1, $2, $3), ($4, $5, $6)", w3).unwrap();
+        assert_eq!(pair.replay.insert, ["a", "b", "c"]);
+        // The first n columns when the source supplies n, against a side that lists them.
+        let pair = tr("INSERT INTO w VALUES ($1), ($2)", "INSERT INTO w (a) SELECT * FROM unnest($1::text[])").unwrap();
+        assert_eq!(pair.replay.insert, ["a"]);
+        // A list other than the one the other side implies.
+        let r = tr("INSERT INTO w VALUES ($1, $2)", "INSERT INTO w (b, a) SELECT * FROM unnest($1::int[], $2::text[])");
+        assert!(r.expect_err("not refused").reason().contains("column lists differ"));
+        // A table whose DDL alters it: its column order is not certain.
+        let r = tr("INSERT INTO wa VALUES ($1, $2)", "INSERT INTO wa SELECT * FROM unnest($1::text[], $2::int[])");
+        assert!(r.expect_err("not refused").reason().contains("column order is not certain"));
+        // More expressions than the table has columns.
+        let r = tr("INSERT INTO w VALUES ($1, $2, $3, $4)", "INSERT INTO w SELECT * FROM unnest($1::text[], $2::int[], $3::int[], $4::int[])");
+        assert!(matches!(r, Err(Refusal::InvalidSql(_))), "{r:?}");
     }
 
     /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.

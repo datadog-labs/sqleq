@@ -208,7 +208,8 @@ pub struct Parts {
     /// two sides are compared on.
     pub target_path: Vec<String>,
     target_obj: ObjectName,
-    /// Target columns, folded.
+    /// Target columns, folded. Empty for an INSERT without a column list until the translator, which
+    /// has the table, fills it in (see [`Parts::implicit_cols`]).
     pub cols: Vec<String>,
     col_text: Vec<String>,
     pub src: Source,
@@ -222,6 +223,9 @@ pub struct Parts {
     pub key: Tail,
     /// The conflict clause itself, for the witness. The tail already carries it as text.
     pub on: Option<sqlparser::ast::OnInsert>,
+    /// The INSERT has no column list: Postgres then targets the table's columns in declared order,
+    /// or the first `n` of them when the source supplies only `n`.
+    pub implicit_cols: bool,
 }
 
 fn placeholder(e: &Expr) -> Option<u32> {
@@ -456,11 +460,8 @@ impl Parts {
         let alias = self.tail.alias.as_ref().map(|a| format!(" {a}")).unwrap_or_default();
         let on = self.tail.on.as_ref().map(|o| format!(" {o}")).unwrap_or_default();
         let ret = self.tail.returning.as_ref().map(|r| format!(" RETURNING {r}")).unwrap_or_default();
-        format!(
-            "INSERT INTO {}{alias} ({}) {src}{on}{ret}",
-            self.target_obj,
-            self.col_text.join(", ")
-        )
+        let cols = if self.implicit_cols { String::new() } else { format!(" ({})", self.col_text.join(", ")) };
+        format!("INSERT INTO {}{alias}{cols} {src}{on}{ret}", self.target_obj)
     }
 }
 
@@ -536,9 +537,7 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let Some(q) = i.source.as_deref() else {
         return Err(unsupported("INSERT ... DEFAULT VALUES"));
     };
-    if i.columns.is_empty() {
-        return Err(unsupported("INSERT without a column list"));
-    }
+    let implicit_cols = i.columns.is_empty();
     let mut cols = Vec::new();
     let mut col_text = Vec::new();
     for c in &i.columns {
@@ -561,7 +560,19 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let (mut alias, mut on, mut returning) = (i.table_alias.clone(), i.on.clone(), i.returning.clone());
     crate::idents::resolve(&mut alias, &mut on, &mut returning);
     let key = Tail::of(&alias, &on, &returning);
-    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, key, on: i.on.clone() })
+    Ok(Parts {
+        target,
+        target_path,
+        target_obj: name.clone(),
+        cols,
+        col_text,
+        src,
+        src_text,
+        tail,
+        key,
+        on: i.on.clone(),
+        implicit_cols,
+    })
 }
 
 /// The original text of each `VALUES` cell (one inner list per row), or of each `unnest` argument
@@ -648,11 +659,19 @@ mod tests {
             "INSERT INTO t (a) VALUES (lower($1))",
             "INSERT INTO t (a) SELECT * FROM unnest($1)",
             "INSERT INTO t (a) SELECT * FROM unnest(CAST($1 AS INT ARRAY))",
-            "INSERT INTO t VALUES ($1)",
             "INSERT INTO t DEFAULT VALUES",
         ] {
             assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
         }
+    }
+
+    #[test]
+    fn an_insert_without_a_column_list_is_read_and_re_rendered() {
+        for sql in ["INSERT INTO t VALUES ($1, $2)", "INSERT INTO t SELECT * FROM unnest($1::int[], $2::text[])"] {
+            let p = rec(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(p.implicit_cols && p.cols.is_empty(), "{sql}");
+        }
+        assert!(!rec("INSERT INTO t (a) VALUES ($1)").unwrap().implicit_cols);
     }
 
     fn first_cell(sql: &str) -> Result<Cell, Refusal> {
