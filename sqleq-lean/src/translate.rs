@@ -532,6 +532,21 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
                 "a generated cell draws from a sequence, and the table has a trigger, which could read it",
             ));
         }
+        // The words above see only what the tail writes itself, as `sequence_use` does for a
+        // default (#171), and a CHECK is not read at all. A function called from either could read
+        // the sequence state the generated cells advance (#178).
+        if a.tail_calls {
+            return Err(unsupported(
+                "a generated cell draws from a sequence, and the conflict clause or RETURNING calls a \
+                 function, which could read it",
+            ));
+        }
+        if table.check_calls {
+            return Err(unsupported(
+                "a generated cell draws from a sequence, and a CHECK on the target calls a function, \
+                 which could read it",
+            ));
+        }
     }
     Ok(sum)
 }
@@ -851,6 +866,7 @@ mod tests {
         CREATE TRIGGER t BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION f();\
         CREATE TABLE al (id serial PRIMARY KEY, name text);\
         ALTER TABLE al ADD COLUMN extra int;\
+        CREATE TABLE gc (id serial PRIMARY KEY, name text CHECK (char_length(name) > 0));\
         CREATE TABLE gk (id serial PRIMARY KEY, name text, ts timestamptz, k int DEFAULT pick());\
         CREATE TABLE q (id bigint PRIMARY KEY, name text, ts timestamptz DEFAULT now());\
         CREATE TABLE qs (id bigint PRIMARY KEY, name text, n serial);";
@@ -964,6 +980,23 @@ mod tests {
             "INSERT INTO gk (ts, name) SELECT * FROM unnest($1::timestamptz[], $2::text[])",
         )
         .is_ok());
+        // A function called from RETURNING or from a CHECK, which could read the sequence; with no
+        // generated cell drawing from one, the same RETURNING is fine.
+        let r = grefused(
+            "INSERT INTO g (id, name) VALUES (DEFAULT, $1) RETURNING lower(name)",
+            &format!("{GB} RETURNING lower(name)"),
+        );
+        assert!(r.contains("RETURNING calls a function"), "{r}");
+        assert!(gpair(
+            "INSERT INTO g (ts, name) VALUES (now(), $1) RETURNING lower(name)",
+            "INSERT INTO g (ts, name) SELECT * FROM unnest($1::timestamptz[], $2::text[]) RETURNING lower(name)",
+        )
+        .is_ok());
+        let r = grefused(
+            "INSERT INTO gc (id, name) VALUES (DEFAULT, $1)",
+            "INSERT INTO gc (id, name) SELECT * FROM unnest($1::int[], $2::text[])",
+        );
+        assert!(r.contains("a CHECK on the target calls a function"), "{r}");
         // A trigger, which could read the sequence; and an altered table, whose DDL is not read whole.
         let r = grefused(
             "INSERT INTO tr (id, name) VALUES (DEFAULT, $1)",

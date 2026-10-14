@@ -284,6 +284,9 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub uniques: Vec<Unique>,
     pub has_check: bool,
+    /// Some `CHECK` on the table, one of its columns or a column's domain calls a function, which
+    /// could read anything, sequence state included.
+    pub check_calls: bool,
     pub has_fk: bool,
     /// Parsed only after the frontend's retry, which can drop a `NOT NULL`. Nullability is then
     /// not trustworthy in the direction a witness needs, so such a table gets none.
@@ -361,12 +364,13 @@ impl Schema {
         let statements: Vec<(&Statement, bool)> = statements.into_iter().collect();
         // Domains first, whatever the order of the DDL: a column of a domain type takes the
         // domain's default unless it declares its own, and the domain's CHECK applies to it.
-        let mut domains: HashMap<String, (Option<&Expr>, bool)> = HashMap::new();
+        let mut domains: HashMap<String, (Option<&Expr>, bool, bool)> = HashMap::new();
         for (st, _) in &statements {
             if let Statement::CreateDomain(d) = st {
                 if let Some(name) = last_name(&d.name) {
-                    let check = d.constraints.iter().any(|c| matches!(c, C::Check(_)));
-                    domains.insert(name, (d.default.as_ref(), check));
+                    let checks = || d.constraints.iter().filter(|c| matches!(c, C::Check(_)));
+                    let check_calls = checks().any(crate::recognize::calls_a_function);
+                    domains.insert(name, (d.default.as_ref(), checks().next().is_some(), check_calls));
                 }
             }
         }
@@ -397,6 +401,7 @@ impl Schema {
                 columns: Vec::new(),
                 uniques: Vec::new(),
                 has_check: false,
+                check_calls: false,
                 has_fk: false,
                 retried,
                 altered: false,
@@ -426,7 +431,7 @@ impl Schema {
                     seqs: if serial { vec![implicit_seq.clone()] } else { Vec::new() },
                     seq_state: false,
                 };
-                if let Some(&(default, check)) = domains.get(unqualified(&col.ty.name)).filter(|_| !col.ty.array) {
+                if let Some(&(default, check, check_calls)) = domains.get(unqualified(&col.ty.name)).filter(|_| !col.ty.array) {
                     if let Some(e) = default {
                         col.default = default_kind(e);
                         col.default_text = Some(e.to_string());
@@ -434,6 +439,7 @@ impl Schema {
                         (col.seqs, col.seq_state) = sequence_use(e);
                     }
                     t.has_check |= check;
+                    t.check_calls |= check_calls;
                 }
                 let idx = t.columns.len();
                 for o in &c.options {
@@ -459,7 +465,10 @@ impl Schema {
                             let deferrable = !enforced_per_statement(uc.characteristics.as_ref());
                             t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, expr: false, deferrable });
                         }
-                        O::Check(_) => t.has_check = true,
+                        O::Check(e) => {
+                            t.has_check = true;
+                            t.check_calls |= crate::recognize::calls_a_function(e);
+                        }
                         O::ForeignKey(_) => t.has_fk = true,
                         O::Generated { generated_as, generation_expr, .. } => {
                             if generation_expr.is_some() {
@@ -496,8 +505,9 @@ impl Schema {
                     C::PrimaryKey(pk) => {
                         (pk.name.as_ref(), &pk.columns, false, true, !enforced_per_statement(pk.characteristics.as_ref()))
                     }
-                    C::Check(_) => {
+                    C::Check(c) => {
                         t.has_check = true;
+                        t.check_calls |= crate::recognize::calls_a_function(c);
                         continue;
                     }
                     C::ForeignKey(_) => {
