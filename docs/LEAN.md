@@ -116,7 +116,9 @@ value:
 - a generated cell drawing from a sequence while something else in the statement reads that
   sequence's state: the tail (`nextval`, `currval`, `DEFAULT` in `DO UPDATE SET`), an omitted
   column's default, or a trigger. The `VALUES` side advances the sequence row by row and the
-  `unnest` side does not;
+  `unnest` side does not. An omitted column's default the checker does not recognise counts as
+  reading it, since it could call a function that does; a stored generated column's expression
+  cannot, as Postgres requires it to be immutable;
 - `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
 - a generator whose value the column's type cannot take, or two generators in one column.
 
