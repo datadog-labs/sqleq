@@ -64,6 +64,10 @@ without error.
 The checker enforces the conditions that make "typed rows" the same on both sides, and refuses
 everything else:
 
+- **Columns.** Both sides target the same table and the same columns, in the same order. A side
+  without a column list targets the table's columns in declared order, or the first `n` of them when
+  its source supplies `n`, as Postgres reads it; the list is taken from the DDL, and refused where
+  the DDL alters the table or was not read in full, since then the order is not certain.
 - **Types.** Each `unnest` element type is its column's declared base type, with aliases resolved,
   or one that holds every value of it. A `VALUES` cell is `$n`, `$n` cast to its column's base
   type, or `NULL`.
