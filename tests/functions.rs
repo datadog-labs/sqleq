@@ -21,6 +21,14 @@ fn ok(sql: &str) -> serde_json::Value {
     lower_sql(sql).unwrap_or_else(|e| panic!("expected Ok, got {e}"))
 }
 
+/// Assert `sql` is refused as text Postgres's own grammar rejects.
+fn not_postgres(sql: &str) {
+    match lower_sql(sql) {
+        Err(FrontendError::Parse(_)) => {}
+        other => panic!("expected a parse refusal, got {other:?}: {sql}"),
+    }
+}
+
 /// Assert `sql` is refused as unsupported, with `needle` in the reason.
 fn refused(sql: &str, needle: &str) {
     match lower_sql(sql) {
@@ -203,7 +211,9 @@ mod aggregates {
                     group_call(&v, &f.to_uppercase()).is_some(),
                     "{f} lowered, but not as an aggregate: {v}"
                 ),
-                Err(FrontendError::Unsupported(_)) => {}
+                // A parse refusal is a refusal too: Postgres spells the SQL/JSON aggregates with a
+                // grammar of their own, which this plain call does not match.
+                Err(FrontendError::Unsupported(_) | FrontendError::Parse(_)) => {}
                 Err(e) => panic!("{f}: {e}"),
             }
         }
@@ -324,7 +334,8 @@ mod call_parts {
     #[test]
     fn a_star_argument_is_refused_off_count() {
         refused(&same(r#"SELECT row_to_json("t".*) FROM "t""#), "argument");
-        refused(&same(r#"SELECT coalesce(*) FROM "t""#), "`*` argument");
+        // `COALESCE` has a grammar of its own, which takes no `*`.
+        not_postgres(&same(r#"SELECT coalesce(*) FROM "t""#));
     }
 
     #[test]
@@ -346,7 +357,8 @@ mod call_parts {
     #[test]
     fn a_where_inside_an_aggregate_call_is_refused() {
         // sqlparser reads `count(a WHERE p)` in every dialect, and it used to lower as `count(a)`.
-        refused(&same(r#"SELECT count("a" WHERE "a" > 1) FROM "t""#), "WHERE");
+        // Postgres's grammar has no such clause.
+        not_postgres(&same(r#"SELECT count("a" WHERE "a" > 1) FROM "t""#));
     }
 
     #[test]
@@ -354,7 +366,8 @@ mod call_parts {
         // Postgres accepts either only on an aggregate. `DISTINCT` was dropped on the scalar path,
         // and `FILTER` on a call over an aggregate result.
         refused(&same(r#"SELECT upper(DISTINCT "b") FROM "t""#), "DISTINCT or FILTER");
-        refused(&same(r#"SELECT coalesce(sum("a"), 0) FILTER (WHERE "a" > 1) FROM "t""#), "DISTINCT or FILTER");
+        // `COALESCE`'s own grammar takes no `FILTER`.
+        not_postgres(&same(r#"SELECT coalesce(sum("a"), 0) FILTER (WHERE "a" > 1) FROM "t""#));
         refused(&same(r#"SELECT upper(DISTINCT max("b")) FROM "t""#), "DISTINCT or FILTER");
     }
 

@@ -470,19 +470,7 @@ type ParsedInput = (
 /// of the split would be two things to keep in step, and the whole point of the reflexivity check is
 /// that it sees the same tree the shipping path sees.
 fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser::ast::Statement>)> {
-    let mut fns: HashMap<String, FnDecl> = HashMap::new();
-    let mut sql_lines: Vec<&str> = Vec::new();
-    for line in src.lines() {
-        let t = line.trim_start().to_lowercase();
-        if t.starts_with("declare ") && t.contains("function") {
-            if let Some((name, ret)) = parse_declare(line) {
-                fns.insert(name, ret);
-            }
-        } else {
-            sql_lines.push(line);
-        }
-    }
-    let sql = sql_lines.join("\n");
+    let (fns, sql) = split_declares(src);
     check_number_spellings(&sql)?;
     // The default nesting limit (50) is below what generated SQL reaches; the parser's own recursion
     // is stack-protected, and the lowering walks an `AND`/`OR` chain iteratively.
@@ -495,6 +483,41 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
     // recursion limit.
     depth::check(&mut statements)?;
     Ok((fns, statements))
+}
+
+/// The input with its `declare ... function` DSL lines split off: the functions they declare, and the
+/// SQL that is left.
+fn split_declares(src: &str) -> (HashMap<String, FnDecl>, String) {
+    let mut fns: HashMap<String, FnDecl> = HashMap::new();
+    let mut sql_lines: Vec<&str> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim_start().to_lowercase();
+        if t.starts_with("declare ") && t.contains("function") {
+            if let Some((name, ret)) = parse_declare(line) {
+                fns.insert(name, ret);
+            }
+        } else {
+            sql_lines.push(line);
+        }
+    }
+    (fns, sql_lines.join("\n"))
+}
+
+/// Refuse, as [`FrontendError::Parse`], text that Postgres's own grammar does not accept.
+///
+/// sqlparser reads more than Postgres does (`TOP`, `TRY_CAST`, `QUALIFY`, a number run into a name)
+/// and less (`SELECT;`, `TABLE t`), so whether it parses cannot say whether the text is Postgres.
+/// libpg_query can: it is Postgres's parser, built from the Postgres source it vendors. Only the
+/// grammar runs; nothing is resolved or typed. The lowering path asks this before sqlparser, so a
+/// sqlparser failure after it is Postgres syntax this frontend does not read. [`reflexive`] does not
+/// ask: it compares what sqlparser reads, as before.
+fn postgres_parses(src: &str) -> Result<()> {
+    let (_, sql) = split_declares(src);
+    match pg_query::split_with_parser(&sql) {
+        Ok(_) => Ok(()),
+        Err(pg_query::Error::Split(m)) => Err(FrontendError::Parse(m)),
+        Err(e) => Err(FrontendError::Parse(e.to_string())),
+    }
 }
 
 /// Refuse a number run into the name after it, with nothing in between: `0b101`, `0o17`, `0X1F`,
@@ -881,7 +904,14 @@ fn parse_input(
     ddl_catalog: Option<catalog::Catalog>,
     resolve: bool,
 ) -> Result<ParsedInput> {
-    let (fns, mut statements) = parse_statements(src)?;
+    postgres_parses(src)?;
+    // Postgres parses the text, so if sqlparser does not, that is a gap in this frontend's parser.
+    let (fns, mut statements) = parse_statements(src).map_err(|e| match e {
+        FrontendError::Parse(m) => {
+            error::unsupported(format!("Postgres syntax the frontend's parser does not read: {m}"))
+        }
+        e => e,
+    })?;
     // Before anything reads the tree: sqlparser mis-parses `IS [NOT] DISTINCT FROM`, and lowering
     // the mis-parse is a false-proof channel. See `normalize`.
     normalize::fix_precedence(&mut statements)?;

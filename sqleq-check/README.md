@@ -121,7 +121,7 @@ sqleq-check --keep ./work rewrites/
 |--------|---------|
 | `provable` | The prover proved the two queries equivalent. |
 | `unprovable` | The prover ran but could not prove equivalence. |
-| `refused` | The frontend would not lower the SQL: it exited 1 with its reason on stderr, as it does for every refusal. Sub-classified as `refuse_kind`: `parse` (sqlparser rejected the text), `unsupported` (Postgres accepts the SQL and we decline to lower it), `parameter-misaligned` (the two queries' `$N` do not line up), `schema` (Postgres rejects the SQL, as with an unknown table or column, or the input is not a pair: bad DDL, wrong number of queries). |
+| `refused` | The frontend would not lower the SQL: it exited 1 with its reason on stderr, as it does for every refusal. Sub-classified as `refuse_kind`: `parse` (Postgres's own grammar rejects the text), `unsupported` (Postgres accepts the SQL and we decline to lower it), `parameter-misaligned` (the two queries' `$N` do not line up), `schema` (Postgres rejects the SQL, as with an unknown table or column, or the input is not a pair: bad DDL, wrong number of queries). |
 | `panic` | The prover panicked/crashed on the case. |
 | `timeout` | Exceeded the per-case wall-clock budget. |
 | `error` | Anything else: an unreadable result, or a frontend that failed instead of refusing — a panic (exit 101), a signal (a stack overflow aborts), any other exit code, or no plan and no reason. The message names the exit code or the signal. Like a prover crash, it is retried, and `--bless` never pins it. |

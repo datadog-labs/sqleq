@@ -52,6 +52,10 @@ internals = []
 serde_json = { workspace = true }
 sqlparser = { workspace = true }
 csv = { workspace = true }
+# Postgres's own grammar (libpg_query, compiled from the Postgres source it vendors). It decides
+# whether a refusal is `parse`: text Postgres cannot parse, as opposed to Postgres syntax this
+# frontend's parser does not read. See `FrontendError::Parse`.
+pg_query = "6.2"
 
 # Profiles are workspace-wide and may only be set at the root (moved here from sqleq-fuzz).
 [profile.release]

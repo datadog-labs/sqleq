@@ -82,7 +82,8 @@ takes one shape where the dropped detail is load-bearing.
 
 So refusals are a feature and are reported as such, in four kinds: `parse`, `unsupported`, `schema`,
 and `parameter-misaligned`. `unsupported` is a query Postgres runs and the frontend declines;
-`schema` is one Postgres rejects as well, so no lowering could ever decide it. A refusal costs
+`schema` is one Postgres rejects as well, and `parse` text its grammar rejects, so no lowering could
+ever decide either. A refusal costs
 coverage, which is visible and fixable. A wrong answer costs trust, which is not.
 
 The cost is real and paid knowingly: guards that refuse a shape rather than assume a property have

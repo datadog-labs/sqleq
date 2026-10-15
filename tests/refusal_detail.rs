@@ -4,8 +4,9 @@
 // Copyright 2026-Present Datadog, Inc.
 
 //! Two refusals and what they say. A cast Postgres does not have (`TRY_CAST`, `SAFE_CAST`) is
-//! refused rather than lowered as the `CAST` sqlparser builds it as, and a bare column that more than
-//! one table in scope could own is refused naming the column and those tables.
+//! refused, as text Postgres does not parse, rather than lowered as the `CAST` sqlparser builds it as;
+//! and a bare column that more than one table in scope could own is refused naming the column and
+//! those tables.
 
 use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
 
@@ -15,32 +16,32 @@ const T: &str = r#"create table "t" ("id" INTEGER, "b" VARCHAR, unique ("id"));"
 const SOURCES: [CatalogSource; 3] =
     [CatalogSource::Declared, CatalogSource::InferredSeeded, CatalogSource::Inferred];
 
-fn unsupported(src: &str, source: CatalogSource) -> String {
+fn not_postgres(src: &str, source: CatalogSource) {
     match lower_with(src, source) {
-        Err(FrontendError::Unsupported(m)) => m,
-        other => panic!("{source:?}: expected an unsupported refusal, got {other:?}\n{src}"),
+        Err(FrontendError::Parse(_)) => {}
+        other => panic!("{source:?}: expected a parse refusal, got {other:?}\n{src}"),
     }
 }
 
 #[test]
 fn try_cast_and_safe_cast_are_refused_rather_than_lowered_as_cast() {
     // `TRY_CAST('x' AS integer)` is NULL where `CAST` raises, so the two sides are not one query;
-    // read as a plain `CAST`, both used to lower to the same plan.
+    // read as a plain `CAST`, both used to lower to the same plan. Postgres's grammar has neither.
     for kw in ["TRY_CAST", "SAFE_CAST"] {
         for source in SOURCES {
             let one_side = format!(
                 "{T}\nSELECT \"id\", {kw}(\"b\" AS integer) FROM \"t\";\nSELECT \"id\", CAST(\"b\" AS integer) FROM \"t\";"
             );
-            assert_eq!(unsupported(&one_side, source), kw);
+            not_postgres(&one_side, source);
             // Both sides alike is refused too: what is refused is lowering the construct, and two
             // copies of it would still be lowered as something they are not.
             let both = format!("{T}\nSELECT {kw}(\"b\" AS integer) FROM \"t\";\nSELECT {kw}(\"b\" AS integer) FROM \"t\" WHERE true;");
-            assert_eq!(unsupported(&both, source), kw);
+            not_postgres(&both, source);
             // Wherever it sits, a subquery's WHERE included.
             let nested = format!(
                 "{T}\nSELECT \"id\" FROM \"t\" WHERE \"id\" IN (SELECT \"id\" FROM \"t\" WHERE {kw}(\"b\" AS integer) = 1);\nSELECT \"id\" FROM \"t\";"
             );
-            assert_eq!(unsupported(&nested, source), kw);
+            not_postgres(&nested, source);
         }
     }
 }

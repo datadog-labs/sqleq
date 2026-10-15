@@ -3,8 +3,9 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! A refusal's kind says what Postgres makes of the input (see `FrontendError`): `schema` when
-//! Postgres rejects it, `unsupported` when Postgres accepts it and the frontend declines. Each pair
+//! A refusal's kind says what Postgres makes of the input (see `FrontendError`): `parse` when its
+//! grammar rejects the text, `schema` when Postgres parses it and rejects it, `unsupported` when
+//! Postgres accepts it and the frontend declines, its own parser included. Each pair
 //! below was run through Postgres 17, and what it said about side A is written beside the pair: its
 //! error, or that it prepares. A tie-break refusal is `unsupported` although the input shown fails in
 //! Postgres, because the same refusal also meets input Postgres accepts and the syntax in front of
@@ -19,6 +20,7 @@ const BOTH: [CatalogSource; 2] = [CatalogSource::Declared, CatalogSource::Inferr
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
+    Parse,
     Schema,
     Unsupported,
 }
@@ -37,7 +39,19 @@ const fn row(kind: Kind, a: &'static str, b: &'static str, reason: &'static str,
     Row { kind, a, b, reason, postgres }
 }
 
-use Kind::{Schema, Unsupported};
+use Kind::{Parse, Schema, Unsupported};
+
+/// Text Postgres's grammar rejects, whatever sqlparser made of it.
+const NOT_POSTGRES: &[Row] = &[
+    row(Parse, r#"SELECT TOP 1 "a" FROM "t""#, r#"SELECT "a" FROM "t" LIMIT 1"#, "syntax error",
+        r#"42601 syntax error at or near "1""#),
+    row(Parse, r#"SELECT TRY_CAST("b" AS TEXT) FROM "t""#, r#"SELECT CAST("b" AS TEXT) FROM "t""#, "syntax error",
+        r#"42601 syntax error at or near "AS""#),
+    row(Parse, r#"SELECT "a" FROM "t" QUALIFY "a" > 1"#, r#"SELECT "a" FROM "t""#, "syntax error",
+        r#"42601 syntax error at or near "a", with QUALIFY read as the table's alias"#),
+    row(Parse, r#"SELECT 1x FROM "t""#, r#"SELECT 1 FROM "t""#, "trailing junk",
+        r#"42601 trailing junk after numeric literal at or near "1x""#),
+];
 
 /// Input Postgres rejects.
 const REJECTED: &[Row] = &[
@@ -77,6 +91,9 @@ const REJECTED: &[Row] = &[
 
 /// Input Postgres accepts.
 const ACCEPTED: &[Row] = &[
+    // Postgres syntax the frontend's parser does not read.
+    row(Unsupported, "SELECT", "SELECT 1", "parser does not read", "prepares: a select list may be empty"),
+    row(Unsupported, r#"TABLE "t""#, r#"SELECT * FROM "t""#, "parser does not read", "prepares"),
     row(Unsupported, r#"DELETE FROM "t""#, r#"SELECT "a" FROM "t""#, "DELETE paired with non-DELETE", "prepares"),
     row(Unsupported, r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN DELETE"#,
         r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN UPDATE SET "b" = 1"#, "MERGE", "prepares"),
@@ -113,7 +130,9 @@ fn assert_refused(ddl: &str, r: &Row, sources: &[CatalogSource]) {
     let src = format!("{ddl}\n{};\n{};", r.a, r.b);
     for &source in sources {
         match (r.kind, lower_with(&src, source)) {
-            (Schema, Err(FrontendError::Schema(m))) | (Unsupported, Err(FrontendError::Unsupported(m))) => {
+            (Parse, Err(FrontendError::Parse(m)))
+            | (Schema, Err(FrontendError::Schema(m)))
+            | (Unsupported, Err(FrontendError::Unsupported(m))) => {
                 assert!(m.contains(r.reason), "{source:?}: refused for {m:?}, not {:?}\n{src}", r.reason)
             }
             (kind, other) => panic!(
@@ -121,6 +140,13 @@ fn assert_refused(ddl: &str, r: &Row, sources: &[CatalogSource]) {
                 r.reason, r.postgres
             ),
         }
+    }
+}
+
+#[test]
+fn a_refusal_of_text_postgres_cannot_parse_is_parse() {
+    for r in NOT_POSTGRES {
+        assert_refused(T, r, &BOTH);
     }
 }
 

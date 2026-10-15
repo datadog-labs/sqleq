@@ -155,7 +155,9 @@ fn a_quantified_like_pattern_is_refused() {
     // `NULL LIKE ALL('{}')` is TRUE, so the quantified form is not a strict `LIKE`.
     refused("SELECT id FROM t WHERE s LIKE ALL($1)", "SELECT id FROM t WHERE s LIKE $1", "LIKE ALL");
     refused("SELECT id FROM t WHERE s LIKE SOME($1)", "SELECT id FROM t WHERE s LIKE $1", "LIKE SOME");
-    refused("SELECT id FROM t WHERE s SIMILAR TO ANY($1)", "SELECT id FROM t WHERE s LIKE $1", "SIMILAR TO ANY");
+    // Postgres's grammar quantifies `LIKE` and `ILIKE` only, so this one does not parse.
+    let similar = format!("{T}\nSELECT id FROM t WHERE s SIMILAR TO ANY($1);\nSELECT id FROM t WHERE s LIKE $1;");
+    assert!(matches!(lower_with(&similar, CatalogSource::InferredSeeded), Err(FrontendError::Parse(_))));
 }
 
 #[test]
