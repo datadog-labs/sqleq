@@ -1251,9 +1251,12 @@ pub fn add_system_columns(cat: &mut Catalog, queries: &[Query]) {
 ///
 /// Anything that is not a query is dropped here rather than refused by name: by the time this runs the
 /// DML reduction has already turned every `DELETE`/`UPDATE` pair into a pair of queries and refused
-/// the shapes it cannot, so what is left to drop is the `CREATE TABLE`s — and an `INSERT` or `MERGE`,
-/// which has no reduction and shows up as a missing query.
+/// the shapes it cannot, so what is left to drop is the `CREATE TABLE`s. A `MERGE` has no reduction;
+/// Postgres runs it, so it is refused by name rather than counted as a missing query.
 pub fn collect_queries(statements: Vec<Statement>) -> Result<Vec<Query>> {
+    if statements.iter().any(|st| matches!(st, Statement::Merge(_))) {
+        return Err(unsupported("MERGE"));
+    }
     let queries: Vec<Query> = statements
         .into_iter()
         .filter_map(|st| match st {

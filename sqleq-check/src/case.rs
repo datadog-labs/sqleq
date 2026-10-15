@@ -170,10 +170,10 @@ impl Case {
 /// Map the frontend's stderr to (refuse_kind, one-line reason).
 ///
 /// The four kinds mirror `FrontendError`: a `PARSE ERROR:` prefix means sqlparser rejected the
-/// text, `unsupported:` means we declined to lower a construct, `parameter-misaligned:` means the
-/// two queries' `$N` do not line up, and anything else is a schema/shape complaint (unresolved
-/// column, wrong number of queries, bad DDL) -- which `Display` leaves unprefixed because those
-/// messages are already self-describing.
+/// text, `unsupported:` means Postgres accepts the input and we declined to lower it,
+/// `parameter-misaligned:` means the two queries' `$N` do not line up, and anything else is input
+/// Postgres rejects or that is not a pair (unresolved column, wrong number of queries, bad DDL) --
+/// which `Display` leaves unprefixed because those messages are already self-describing.
 pub fn classify_refusal(err: &str) -> (String, String) {
     let reason = tail(err);
     let reason = if reason.is_empty() { "frontend produced no JSON output".to_string() } else { reason };

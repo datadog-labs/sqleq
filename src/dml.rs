@@ -211,7 +211,8 @@ use std::ops::ControlFlow;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     visit_expressions, CaseWhen, CastKind, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, Insert, ObjectName, Query, SelectItem, SelectItemQualifiedWildcardKind,
+    FunctionArguments, Ident, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, SelectItem,
+    SelectItemQualifiedWildcardKind,
     SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
     WildcardAdditionalOptions,
 };
@@ -220,7 +221,7 @@ use sqlparser::parser::Parser;
 use serde_json::Value;
 
 use crate::catalog::{obj_name, Catalog, Table};
-use crate::error::{schema, unsupported, Result};
+use crate::error::{schema, unsupported, FrontendError, Result};
 use crate::types::coarse_class;
 
 /// Replace every top-level `DELETE`/`UPDATE`/`INSERT` in `statements` with the query that computes
@@ -284,9 +285,9 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             install(&mut statements[i], ra)?;
             install(&mut statements[j], rb)?;
         }
-        // Both sides have to be a `DELETE`; see the module docs. This also covers an input carrying
-        // three of them, which is not a pair whatever else it is.
-        _ => return Err(unsupported("DELETE paired with non-DELETE")),
+        // Both sides have to be a `DELETE`; see the module docs. [`unpaired`] tells two kinds of
+        // statement, which Postgres runs, from an input that is not a pair at all.
+        _ => return Err(unpaired(statements, "DELETE")),
     }
 
     match updates.len() {
@@ -300,7 +301,7 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             install(&mut statements[j], qb)?;
             stores = sa;
         }
-        _ => return Err(unsupported("UPDATE paired with non-UPDATE")),
+        _ => return Err(unpaired(statements, "UPDATE")),
     }
 
     match inserts.len() {
@@ -312,9 +313,29 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             install(&mut statements[j], qb)?;
             stores = sa;
         }
-        _ => return Err(unsupported("INSERT paired with non-INSERT")),
+        _ => return Err(unpaired(statements, "INSERT")),
     }
     Ok(stores)
+}
+
+/// The refusal for a `kind` statement with no partner of its own kind. Two statements of two kinds
+/// are a pair Postgres runs and the reduction does not compare; any other number of statements is
+/// not a pair at all, which [`crate::catalog::collect_queries`] reports in the same words.
+fn unpaired(statements: &[Statement], kind: &str) -> FrontendError {
+    let n = statements
+        .iter()
+        .filter(|s| {
+            matches!(s, Statement::Query(_) | Statement::Merge(_))
+                || as_delete(s).is_some()
+                || as_update(s).is_some()
+                || as_insert(s).is_some()
+        })
+        .count();
+    if n == 2 {
+        unsupported(format!("{kind} paired with non-{kind}"))
+    } else {
+        schema(format!("expected 2 queries, got {n}"))
+    }
 }
 
 /// Refuse a DML statement that uses the keyword `DEFAULT` as a value.
@@ -755,7 +776,7 @@ fn set_map<'a>(cat: &Catalog, u: &'a Update) -> Result<Parts<'a>> {
         // Two assignments to one column: Postgres rejects it, and the projection has one slot per
         // column so it could only keep one of them.
         if sets.iter().any(|(seen, _)| *seen == col) {
-            return Err(unsupported(format!("SET assigns {col} twice")));
+            return Err(schema(format!("SET assigns {col} twice")));
         }
         sets.push((col, &a.value));
     }
@@ -1041,7 +1062,12 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
     // Upsert is `T := f_S(T)`: which rows it writes is decided by which rows already match, so the
     // effect is not bag addition and the two sources are not the observable. MySQL's
     // `ON DUPLICATE KEY UPDATE` is the same shape under another name.
-    if i.on.is_some() {
+    if let Some(on) = &i.on {
+        // `DO UPDATE` needs a conflict target to say which row it updates; Postgres rejects one
+        // without.
+        if let OnInsert::OnConflict(OnConflict { conflict_target: None, action: OnConflictAction::DoUpdate(_), .. }) = on {
+            return Err(schema("INSERT ... ON CONFLICT DO UPDATE without a conflict target"));
+        }
         return Err(unsupported("INSERT ... ON CONFLICT / ON DUPLICATE KEY"));
     }
     // Every one of these changes what is stored, or how much of it, in a way the source bag does
@@ -1108,7 +1134,7 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
         // Postgres rejects a repeated target column; the guard below reads the list as a set, so
         // it would not notice.
         if cols.contains(&col) {
-            return Err(unsupported(format!("INSERT lists {col} twice")));
+            return Err(schema(format!("INSERT lists {col} twice")));
         }
         cols.push(col);
     }

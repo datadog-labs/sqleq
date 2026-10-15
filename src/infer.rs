@@ -243,7 +243,9 @@ impl Clash {
         let (x, y) = self.from;
         let from =
             if x == y { x.label() } else { format!("{} vs {}", x.label(), y.label()) };
-        schema(format!("type conflict {}/{} {at} ({from})", self.a.sql(), self.b.sql()))
+        // Not a schema refusal: each query may type on its own in Postgres, which also converts
+        // between number types where this inference does not, so the conflict is this frontend's.
+        unsupported(format!("type conflict {}/{} {at} ({from})", self.a.sql(), self.b.sql()))
     }
 }
 
@@ -730,8 +732,11 @@ impl<'a> Attributor<'a> {
                         }
                     }
                     _ => {
+                        // Postgres reads a name a `JOIN ... USING` merged as one column, which this
+                        // attribution does not see, so two declaring bindings are not always an
+                        // ambiguity to Postgres.
                         let by = bindings(top.base.iter().filter(|(_, t)| declares(cat, t, &col)));
-                        return Err(schema(format!(
+                        return Err(unsupported(format!(
                             "ambiguous unqualified column {col} (declared by {by})"
                         )));
                     }

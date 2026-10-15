@@ -157,7 +157,9 @@ Two consequences:
   them, not because a prover gave up. `sqleq-check --corpus <corpus.csv> --axes frontend --expect
   report-only` counts the refusals by kind; for the finer list, the frontend's own corpus mode,
   `sqleq-frontend --csv <corpus.csv> -o <dir>`, prints the top refusal reasons, bucketed by
-  construct, at the end of the run. That list is the work queue.
+  construct, at the end of the run. That list is the work queue, and its `unsupported` part is
+  the queue proper: queries Postgres runs that the frontend declines. A `schema` refusal is
+  input Postgres rejects too.
 * **Counterexample quality** in `sqleq-fuzz` — instance generation that reaches cases the current
   generators do not, without ever manufacturing a witness that is not one.
 * **Defects in the method itself.** [`docs/VALIDATION.md`](docs/VALIDATION.md) lists what this
