@@ -222,6 +222,9 @@ pub struct Parts {
     pub key: Tail,
     /// The conflict clause itself, for the witness. The tail already carries it as text.
     pub on: Option<sqlparser::ast::OnInsert>,
+    /// The conflict clause or `RETURNING` calls a function, which could read anything, sequence
+    /// state included.
+    pub tail_calls: bool,
 }
 
 fn placeholder(e: &Expr) -> Option<u32> {
@@ -561,7 +564,29 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let (mut alias, mut on, mut returning) = (i.table_alias.clone(), i.on.clone(), i.returning.clone());
     crate::idents::resolve(&mut alias, &mut on, &mut returning);
     let key = Tail::of(&alias, &on, &returning);
-    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, key, on: i.on.clone() })
+    let tail_calls = calls_a_function(&i.on) || calls_a_function(&i.returning);
+    Ok(Parts {
+        target,
+        target_path,
+        target_obj: name.clone(),
+        cols,
+        col_text,
+        src,
+        src_text,
+        tail,
+        key,
+        on: i.on.clone(),
+        tail_calls,
+    })
+}
+
+/// A function call anywhere inside `node`.
+pub(crate) fn calls_a_function<V: sqlparser::ast::Visit>(node: &V) -> bool {
+    sqlparser::ast::visit_expressions(node, |e| match e {
+        Expr::Function(_) => std::ops::ControlFlow::Break(()),
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// The original text of each `VALUES` cell (one inner list per row), or of each `unnest` argument
