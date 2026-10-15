@@ -51,6 +51,13 @@ const NOT_POSTGRES: &[Row] = &[
         r#"42601 syntax error at or near "a", with QUALIFY read as the table's alias"#),
     row(Parse, r#"SELECT 1x FROM "t""#, r#"SELECT 1 FROM "t""#, "trailing junk",
         r#"42601 trailing junk after numeric literal at or near "1x""#),
+    // Two clauses sqlparser accepts and the lowering used to drop, so that each side lowered like the
+    // other: Postgres's grammar has neither.
+    row(Parse, r#"SELECT CAST("a" AS TEXT FORMAT 'YYYY') FROM "t""#, r#"SELECT CAST("a" AS TEXT) FROM "t""#,
+        "syntax error", r#"42601 syntax error at or near "FORMAT""#),
+    row(Parse, r#"SELECT "a", count(*) FROM "t" GROUP BY "a" GROUPING SETS (("a"), ())"#,
+        r#"SELECT "a", count(*) FROM "t" GROUP BY "a""#, "syntax error",
+        r#"42601 syntax error at or near "GROUPING""#),
 ];
 
 /// Input Postgres rejects.
