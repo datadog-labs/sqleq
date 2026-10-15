@@ -156,7 +156,7 @@ fn cell(e: &Expr) -> Result<Cell, String> {
             data_type,
             format: None,
             ..
-        } if postgres_cast(kind) => match placeholder(expr) {
+        } if postgres_cast(kind) => match placeholder(expr).or_else(|| string_cast_param(expr)) {
             Some(n) => Ok(Cell::Param(n, Some(data_type.to_string()))),
             None => Err(NOT_A_PARAM.to_string()),
         },
@@ -168,6 +168,27 @@ fn cell(e: &Expr) -> Result<Cell, String> {
         Expr::Function(_) => Err(GENERATED.to_string()),
         _ => Err(NOT_A_PARAM.to_string()),
     }
+}
+
+/// `$n` in `CAST(CAST($n AS text) AS t)` or `$n::varchar::t`: a parameter cast to a string type with
+/// no length, then to the cell's type. Postgres runs both sides as written, so this only says which
+/// parameter fills the column; its values are drawn for the outer type.
+fn string_cast_param(inner: &Expr) -> Option<u32> {
+    let Expr::Cast {
+        kind,
+        expr,
+        data_type,
+        format: None,
+        ..
+    } = strip(inner)
+    else {
+        return None;
+    };
+    let string = matches!(
+        data_type,
+        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None)
+    );
+    placeholder(expr).filter(|_| string && postgres_cast(kind))
 }
 
 /// An `unnest` argument `$p::T[]`: the parameter and the element type `T`.
@@ -640,7 +661,7 @@ mod tests {
         for v in [
             "INSERT INTO t (a, b) VALUES (DEFAULT, $1), (DEFAULT, $2)",
             "INSERT INTO t (a, b) VALUES (nextval($1), $2)",
-            "INSERT INTO t (a, b) VALUES (CAST($1::text AS int), $2)",
+            "INSERT INTO t (a, b) VALUES (CAST(lower($1) AS int), $2)",
         ] {
             let why = match recognize(v, u) {
                 Some(Err(why)) => why,
@@ -657,6 +678,23 @@ mod tests {
         // A pair the strict reading binds is the same pair to the probe.
         let v = "INSERT INTO t (a, b) VALUES ($1, $2)";
         assert_eq!(recognize_for_probe(v, u), recognize(v, u).and_then(Result::ok));
+    }
+
+    /// A parameter cast through a string type with no length fills its column; Postgres runs both
+    /// sides as written, so this only says which parameter that is.
+    #[test]
+    fn a_parameter_cast_through_a_string_type_is_gathered() {
+        let u = "INSERT INTO t (a, b) SELECT * FROM unnest($1::uuid[], $2::text[])";
+        for v in [
+            "INSERT INTO t (a, b) VALUES (CAST($1::varchar AS uuid), $2)",
+            "INSERT INTO t (a, b) VALUES ($1::text::uuid, $2)",
+        ] {
+            let g = recognize(v, u).and_then(Result::ok).unwrap_or_else(|| panic!("{v}"));
+            assert!(matches!(g.rows[0][0], Cell::Param(1, Some(_))), "{v}: {:?}", g.rows);
+        }
+        // A length truncates, so the parameter is not what the cell holds.
+        let v = "INSERT INTO t (a, b) VALUES (CAST($1::varchar(8) AS uuid), $2)";
+        assert!(matches!(recognize(v, u), Some(Err(_))), "{v}");
     }
 
     #[test]
