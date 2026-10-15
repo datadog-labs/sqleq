@@ -660,6 +660,12 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
         return Err(unsupported("the two sides' alias, conflict clause or RETURNING differ"));
     }
     let table = schema.table(&a.target).map_err(|e| unsupported(format!("schema: {e}")))?;
+    if a.string_casts && schema.user_casts {
+        return Err(unsupported(
+            "a VALUES cell casts a parameter through a string type, and the DDL declares a cast of its \
+             own, which could stand in for the target type's input",
+        ));
+    }
     let k = a.cols.len();
 
     // Postgres rejects these outright, so there is no equivalence question.
@@ -1119,6 +1125,18 @@ mod tests {
         // More expressions than the table has columns.
         let r = tr("INSERT INTO w VALUES ($1, $2, $3, $4)", "INSERT INTO w SELECT * FROM unnest($1::text[], $2::int[], $3::int[], $4::int[])");
         assert!(matches!(r, Err(Refusal::InvalidSql(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_string_cast_cell_is_refused_where_the_ddl_declares_a_cast() {
+        let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
+        let a = "INSERT INTO u (id, n) VALUES (CAST($1::varchar AS uuid), $2), (CAST($3::varchar AS uuid), $4)";
+        let b = "INSERT INTO u (id, n) SELECT * FROM unnest($1::uuid[], $2::int[])";
+        let ddl = "CREATE TABLE u (id uuid PRIMARY KEY, n int);";
+        assert!(translate(&p(a), &p(b), &Schema::from_ddl(ddl)).is_ok());
+        let with_cast = format!("{ddl} CREATE CAST (varchar AS uuid) WITH INOUT;");
+        let r = translate(&p(a), &p(b), &Schema::from_ddl(&with_cast));
+        assert!(r.expect_err("not refused").reason().contains("declares a cast of its own"));
     }
 
     /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.
