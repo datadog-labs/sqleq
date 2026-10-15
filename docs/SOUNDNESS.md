@@ -504,6 +504,10 @@ what it is or refused:
   or `public` table of the name, is refused. A view, or a table whose columns the catalog does not
   read, keeps its name in this: `FROM t` with a view `t` and a table `s.t` is refused, not read as
   `s.t`.
+- **`ONLY` is a keyword.** In `FROM ONLY t`, `UPDATE ONLY t` or `DELETE FROM ONLY t` it leaves `t`'s
+  inheritance children out. The parser reads it only in `TRUNCATE`, `ALTER TABLE` and `LOCK`, and
+  elsewhere takes it as a table named `ONLY` with the alias `t`, which would resolve to a table or CTE
+  named `only`. Postgres reserves the word, so an unquoted `ONLY` as a relation name is refused.
 - **`DEFAULT` is a keyword.** In `UPDATE … SET a = DEFAULT`, or a `VALUES` row of an `INSERT`, it
   stands for the column's default, which the reductions do not model, so it is refused rather than
   read as a column named `default`.
