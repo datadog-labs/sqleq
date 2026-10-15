@@ -147,7 +147,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     Array, ArrayElemTypeDef, BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
+    FunctionArguments, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 
 use crate::casts::unwrap_nested;
@@ -317,8 +317,66 @@ fn cols(cs: &BTreeSet<Col>) -> String {
 /// This is the same principle [`root_cause`] applies one level up — *a refusal the frontend's own
 /// assumption manufactured is not the pair's fault* — arriving here by construction rather than by a
 /// counterfactual, because a set the check never sees cannot be reasoned about wrongly.
+///
+/// A parameter [`dead_in_exists`] finds counts only where the other query mentions it: then its number
+/// is one the two share, and leaving it out of one side would manufacture a misalignment. Where the
+/// other query does not mention it, it is left out, so `EXISTS (SELECT $1 FROM t ..) .. LIMIT $2`
+/// against `EXISTS (SELECT 1 FROM t ..) .. LIMIT $2` compares `{2}` with `{2}`.
 pub fn mentioned(queries: &[Query]) -> Vec<BTreeSet<u32>> {
-    queries.iter().map(|q| side_of(q, None).seen).collect()
+    let sides: Vec<(BTreeSet<u32>, BTreeSet<u32>)> = queries
+        .iter()
+        .map(|q| {
+            let dead = dead_in_exists(q);
+            (side_of(q, None).seen.difference(&dead).copied().collect(), dead)
+        })
+        .collect();
+    sides
+        .iter()
+        .enumerate()
+        .map(|(i, (live, dead))| {
+            let other: BTreeSet<u32> = sides
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .flat_map(|(_, (l, d))| l.iter().chain(d))
+                .copied()
+                .collect();
+            live.iter().copied().chain(dead.intersection(&other).copied()).collect()
+        })
+        .collect()
+}
+
+/// The parameters `q` mentions only as the whole of a select-list item of an `EXISTS` over a plain
+/// `SELECT`, as in `EXISTS (SELECT $1 FROM t WHERE ..)`. Such a `$k` cannot change the result:
+/// `EXISTS` asks only whether the subquery returns a row, which no select-list item of a plain
+/// `SELECT` decides. Postgres infers no type for it, so it takes the type the application binds it
+/// with, and any value of that type binds. A cast one (`$1::int`) is not dead, since binding a value
+/// the cast cannot take is an error, and neither is one under a set operation, where the values
+/// decide which rows `INTERSECT` and `EXCEPT` keep.
+fn dead_in_exists(q: &Query) -> BTreeSet<u32> {
+    let mut total: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut dead: BTreeMap<u32, usize> = BTreeMap::new();
+    let _ = sweep(q, |e| {
+        if let Some(n) = param_index(e) {
+            *total.entry(n).or_default() += 1;
+        }
+        if let Expr::Exists { subquery, .. } = e {
+            if let SetExpr::Select(sel) = subquery.body.as_ref() {
+                for item in &sel.projection {
+                    let (SelectItem::UnnamedExpr(x) | SelectItem::ExprWithAlias { expr: x, .. }) = item else {
+                        continue;
+                    };
+                    if let Expr::Value(_) = unwrap_nested(x) {
+                        if let Some(n) = param_index(unwrap_nested(x)) {
+                            *dead.entry(n).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    dead.into_iter().filter(|(n, c)| total.get(n) == Some(c)).map(|(n, _)| n).collect()
 }
 
 /// The `arity` sub-reason: do the two queries mention *corresponding* sets of `$N`?

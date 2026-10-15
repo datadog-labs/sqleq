@@ -129,8 +129,10 @@ value:
   column's default, or a trigger. The `VALUES` side advances the sequence row by row and the
   `unnest` side does not. An omitted column's default the checker does not recognise counts as
   reading it, since it could call a function that does; a stored generated column's expression
-  cannot, as Postgres requires it to be immutable. A sequence a parameter names could be any, so
-  then an omitted column whose default draws from any sequence is refused too;
+  cannot, as Postgres requires it to be immutable. So does a function called from the conflict
+  clause or `RETURNING`, or from a `CHECK` on the table, one of its columns or a column's domain.
+  A sequence a parameter names could be any, so then an omitted column whose default draws from
+  any sequence is refused too;
 - `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
 - a generator whose value the column's type cannot take, or two generators in one column.
 
