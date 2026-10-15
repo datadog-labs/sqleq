@@ -64,9 +64,19 @@ without error.
 The checker enforces the conditions that make "typed rows" the same on both sides, and refuses
 everything else:
 
+- **Columns.** Both sides target the same table and the same columns, in the same order. A side
+  without a column list targets the table's columns in declared order, or the first `n` of them when
+  its source supplies `n`, as Postgres reads it; the list is taken from the DDL, and refused where
+  the DDL alters the table or was not read in full, since then the order is not certain.
 - **Types.** Each `unnest` element type is its column's declared base type, with aliases resolved,
   or one that holds every value of it. A `VALUES` cell is `$n`, `$n` cast to its column's base
-  type, or `NULL`.
+  type, or `NULL`. The cast may be written twice (`$n::t::t`), which is the identity, or through a
+  string type with no length (`CAST($n::varchar AS t)`, `$n::text::t`): a cast from `text` or
+  `varchar` is `t`'s input function, the same parse the `unnest` side's array elements get, for
+  every `t` but the string types and those with a cast of their own from text (`char`, `"char"`,
+  `name`, `regclass`, `xml`). A pair whose DDL declares a cast (`CREATE CAST`) is refused, since
+  that cast could stand in for the input function. A `public.` qualifier on a type is dropped, as
+  schema qualifiers are elsewhere.
   - The element types that may differ from the column's are a fixed list, `widens` in
     `lean/Sqleq/Check.lean`: `int8[]` into an `int4` or `int2` column, `int4[]` into `int2`, and
     `text[]` and `varchar[]` into each other. Under the gather binding, B's array holds A's values,
@@ -123,8 +133,10 @@ value:
   column's default, or a trigger. The `VALUES` side advances the sequence row by row and the
   `unnest` side does not. An omitted column's default the checker does not recognise counts as
   reading it, since it could call a function that does; a stored generated column's expression
-  cannot, as Postgres requires it to be immutable. A sequence a parameter names could be any, so
-  then an omitted column whose default draws from any sequence is refused too;
+  cannot, as Postgres requires it to be immutable. So does a function called from the conflict
+  clause or `RETURNING`, or from a `CHECK` on the table, one of its columns or a column's domain.
+  A sequence a parameter names could be any, so then an omitted column whose default draws from
+  any sequence is refused too;
 - `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
 - a generator whose value the column's type cannot take, or two generators in one column.
 

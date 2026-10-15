@@ -26,7 +26,7 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::schema::{fold, last_name};
+use crate::schema::{fold, last_name, type_key};
 
 /// Why a statement or pair gets no proof attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,7 +208,8 @@ pub struct Parts {
     /// two sides are compared on.
     pub target_path: Vec<String>,
     target_obj: ObjectName,
-    /// Target columns, folded.
+    /// Target columns, folded. Empty for an INSERT without a column list until the translator, which
+    /// has the table, fills it in (see [`Parts::implicit_cols`]).
     pub cols: Vec<String>,
     col_text: Vec<String>,
     pub src: Source,
@@ -222,6 +223,15 @@ pub struct Parts {
     pub key: Tail,
     /// The conflict clause itself, for the witness. The tail already carries it as text.
     pub on: Option<sqlparser::ast::OnInsert>,
+    /// The conflict clause or `RETURNING` calls a function, which could read anything, sequence
+    /// state included.
+    pub tail_calls: bool,
+    /// The INSERT has no column list: Postgres then targets the table's columns in declared order,
+    /// or the first `n` of them when the source supplies only `n`.
+    pub implicit_cols: bool,
+    /// Some `VALUES` cell is a parameter cast through a string type, which is `$n::t` only by `t`'s
+    /// input function: refused where the DDL declares a cast of its own.
+    pub string_casts: bool,
 }
 
 fn placeholder(e: &Expr) -> Option<u32> {
@@ -254,9 +264,14 @@ fn cell(e: &Expr) -> Result<Cell, Refusal> {
     match strip(e) {
         Expr::Value(v) if matches!(v.value, Value::Null) => Ok(Cell::Null),
         Expr::Cast { kind, expr, data_type, format: None, .. } => {
-            let (true, Some(n)) = (postgres_cast(kind), placeholder(expr)) else {
-                return Err(unsupported("VALUES cell is a cast of something other than a parameter"));
-            };
+            let n = postgres_cast(kind)
+                .then(|| {
+                    placeholder(expr)
+                        .or_else(|| string_cast_param(expr, data_type))
+                        .or_else(|| repeated_cast_param(expr, data_type))
+                })
+                .flatten()
+                .ok_or_else(|| unsupported("VALUES cell is a cast of something other than a parameter"))?;
             Ok(Cell::Param(n, Some(data_type.clone())))
         }
         Expr::Identifier(id) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") => {
@@ -265,6 +280,40 @@ fn cell(e: &Expr) -> Result<Cell, Refusal> {
         Expr::Function(f) => generator(f).map(Cell::Gen),
         _ => Err(unsupported("VALUES cell is not a parameter, a cast parameter, NULL or a generator")),
     }
+}
+
+/// `$n` in `CAST(CAST($n AS text) AS t)` or `$n::varchar::t`: a parameter cast to a string type and
+/// then to `outer`. A cast from a string type to `t` is `t`'s input function, the same parse the
+/// unnest side's array elements get, for every `t` but the string types and those with a cast of
+/// their own from `text` or `varchar` (`bpchar`, `"char"`, `name`, `regclass`, `xml`). So the cell is
+/// `$n::t`, as Postgres would read the value. The inner cast must take no length, which would
+/// truncate. A cast the DDL declares itself could stand in for the input function; the translator
+/// refuses a pair with one ([`Parts::string_casts`]).
+fn string_cast_param(inner: &Expr, outer: &DataType) -> Option<u32> {
+    let Expr::Cast { kind, expr, data_type, format: None, .. } = strip(inner) else { return None };
+    let n = placeholder(expr).filter(|_| postgres_cast(kind))?;
+    let (via, to) = (type_key(data_type), type_key(outer));
+    let string = |name: &str| matches!(name, "text" | "varchar");
+    let own_cast = matches!(to.name.as_str(), "bpchar" | "char" | "character" | "name" | "regclass" | "xml");
+    (string(&via.name) && via.plain() && !string(&to.name) && !own_cast).then_some(n)
+}
+
+/// `$n` in `$n::t::t`: a cast to the type the operand already has is the identity, so the cell is
+/// `$n::t`. The type must take no modifier, which the second cast would apply again.
+fn repeated_cast_param(inner: &Expr, outer: &DataType) -> Option<u32> {
+    let Expr::Cast { kind, expr, data_type, format: None, .. } = strip(inner) else { return None };
+    let n = placeholder(expr).filter(|_| postgres_cast(kind))?;
+    let via = type_key(data_type);
+    (via.plain() && via == type_key(outer)).then_some(n)
+}
+
+/// Some `VALUES` cell is a parameter cast through a string type ([`string_cast_param`]).
+fn has_string_cast(q: &Query) -> bool {
+    let SetExpr::Values(v) = q.body.as_ref() else { return false };
+    v.rows.iter().flat_map(|r| &r.content).any(|e| match strip(e) {
+        Expr::Cast { expr, data_type, .. } => placeholder(expr).is_none() && string_cast_param(expr, data_type).is_some(),
+        _ => false,
+    })
 }
 
 /// A placeholder anywhere inside `e`.
@@ -456,11 +505,8 @@ impl Parts {
         let alias = self.tail.alias.as_ref().map(|a| format!(" {a}")).unwrap_or_default();
         let on = self.tail.on.as_ref().map(|o| format!(" {o}")).unwrap_or_default();
         let ret = self.tail.returning.as_ref().map(|r| format!(" RETURNING {r}")).unwrap_or_default();
-        format!(
-            "INSERT INTO {}{alias} ({}) {src}{on}{ret}",
-            self.target_obj,
-            self.col_text.join(", ")
-        )
+        let cols = if self.implicit_cols { String::new() } else { format!(" ({})", self.col_text.join(", ")) };
+        format!("INSERT INTO {}{alias}{cols} {src}{on}{ret}", self.target_obj)
     }
 }
 
@@ -536,9 +582,7 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let Some(q) = i.source.as_deref() else {
         return Err(unsupported("INSERT ... DEFAULT VALUES"));
     };
-    if i.columns.is_empty() {
-        return Err(unsupported("INSERT without a column list"));
-    }
+    let implicit_cols = i.columns.is_empty();
     let mut cols = Vec::new();
     let mut col_text = Vec::new();
     for c in &i.columns {
@@ -557,11 +601,36 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     }
     let src = source(q)?;
     let src_text = source_text(q);
+    let string_casts = has_string_cast(q);
     let tail = Tail::of(&i.table_alias, &i.on, &i.returning);
     let (mut alias, mut on, mut returning) = (i.table_alias.clone(), i.on.clone(), i.returning.clone());
     crate::idents::resolve(&mut alias, &mut on, &mut returning);
     let key = Tail::of(&alias, &on, &returning);
-    Ok(Parts { target, target_path, target_obj: name.clone(), cols, col_text, src, src_text, tail, key, on: i.on.clone() })
+    let tail_calls = calls_a_function(&i.on) || calls_a_function(&i.returning);
+    Ok(Parts {
+        target,
+        target_path,
+        target_obj: name.clone(),
+        cols,
+        col_text,
+        src,
+        src_text,
+        tail,
+        key,
+        on: i.on.clone(),
+        tail_calls,
+        implicit_cols,
+        string_casts,
+    })
+}
+
+/// A function call anywhere inside `node`.
+pub(crate) fn calls_a_function<V: sqlparser::ast::Visit>(node: &V) -> bool {
+    sqlparser::ast::visit_expressions(node, |e| match e {
+        Expr::Function(_) => std::ops::ControlFlow::Break(()),
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// The original text of each `VALUES` cell (one inner list per row), or of each `unnest` argument
@@ -648,11 +717,19 @@ mod tests {
             "INSERT INTO t (a) VALUES (lower($1))",
             "INSERT INTO t (a) SELECT * FROM unnest($1)",
             "INSERT INTO t (a) SELECT * FROM unnest(CAST($1 AS INT ARRAY))",
-            "INSERT INTO t VALUES ($1)",
             "INSERT INTO t DEFAULT VALUES",
         ] {
             assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
         }
+    }
+
+    #[test]
+    fn an_insert_without_a_column_list_is_read_and_re_rendered() {
+        for sql in ["INSERT INTO t VALUES ($1, $2)", "INSERT INTO t SELECT * FROM unnest($1::int[], $2::text[])"] {
+            let p = rec(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(p.implicit_cols && p.cols.is_empty(), "{sql}");
+        }
+        assert!(!rec("INSERT INTO t (a) VALUES ($1)").unwrap().implicit_cols);
     }
 
     fn first_cell(sql: &str) -> Result<Cell, Refusal> {
@@ -683,6 +760,39 @@ mod tests {
         }
         assert_eq!(first_cell("INSERT INTO t (a) VALUES (nextval($4))").unwrap().number(), Some(4));
         assert_eq!(first_cell("INSERT INTO t (a) VALUES (nextval('s'))").unwrap().number(), None);
+    }
+
+    #[test]
+    fn a_parameter_cast_through_a_string_type_is_the_parameter_cast_to_the_cell_type() {
+        for sql in [
+            "INSERT INTO t (a) VALUES (CAST($1::varchar AS uuid))",
+            "INSERT INTO t (a) VALUES ($1::text::uuid)",
+            "INSERT INTO t (a) VALUES (CAST(CAST($1 AS character varying) AS my_enum))",
+        ] {
+            match first_cell(sql) {
+                Ok(Cell::Param(1, Some(_))) => {}
+                other => panic!("{sql}: {other:?}"),
+            }
+            assert!(rec(sql).unwrap().string_casts, "{sql}");
+        }
+        assert!(!rec("INSERT INTO t (a) VALUES ($1::uuid)").unwrap().string_casts);
+        // A cast to the type the operand already has is the identity.
+        assert!(matches!(first_cell("INSERT INTO t (a) VALUES ($1::uuid::UUID)"), Ok(Cell::Param(1, Some(_)))));
+        assert!(!rec("INSERT INTO t (a) VALUES ($1::uuid::UUID)").unwrap().string_casts);
+        for sql in [
+            // A length truncates; a string target and the types with a cast of their own from text are
+            // not their input function; a cast through a non-string type is not one at all.
+            "INSERT INTO t (a) VALUES (CAST($1::varchar(8) AS uuid))",
+            "INSERT INTO t (a) VALUES ($1::text::varchar)",
+            "INSERT INTO t (a) VALUES ($1::text::regclass)",
+            "INSERT INTO t (a) VALUES ($1::text::name)",
+            "INSERT INTO t (a) VALUES ($1::text::xml)",
+            "INSERT INTO t (a) VALUES ($1::text::char(3))",
+            "INSERT INTO t (a) VALUES ($1::int::bigint)",
+            "INSERT INTO t (a) VALUES ($1::varchar(3)::varchar(3))",
+        ] {
+            assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
+        }
     }
 
     #[test]

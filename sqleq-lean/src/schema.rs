@@ -68,9 +68,15 @@ pub fn type_key(dt: &DataType) -> TypeKey {
         }
         None => (s, false),
     };
-    // `pg_catalog` is where the built-in types live, so `pg_catalog.date` is `date`.
+    // `pg_catalog` is where the built-in types live, so `pg_catalog.date` is `date`; and schema
+    // qualifiers are dropped, as everywhere else in sqleq, so `public.e` is `e`.
     if base.len() > 11 && base[..11].eq_ignore_ascii_case("pg_catalog.") {
         base = base[11..].to_string();
+    }
+    for public in ["public.", "\"public\"."] {
+        if base.len() > public.len() && base[..public.len()].eq_ignore_ascii_case(public) {
+            base = base[public.len()..].to_string();
+        }
     }
     // A quoted name is exactly its contents (`"json"` is `json`); an unquoted one folds to lower case.
     let lower = match base.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
@@ -284,6 +290,9 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub uniques: Vec<Unique>,
     pub has_check: bool,
+    /// Some `CHECK` on the table, one of its columns or a column's domain calls a function, which
+    /// could read anything, sequence state included.
+    pub check_calls: bool,
     pub has_fk: bool,
     /// Parsed only after the frontend's retry, which can drop a `NOT NULL`. Nullability is then
     /// not trustworthy in the direction a witness needs, so such a table gets none.
@@ -335,6 +344,9 @@ impl Table {
 #[derive(Default, Debug)]
 pub struct Schema {
     tables: HashMap<String, Option<Table>>,
+    /// The DDL declares a cast of its own (`CREATE CAST`), which can stand in for a type's input
+    /// function. Read off the raw text, so a mention in a comment counts too.
+    pub user_casts: bool,
 }
 
 impl Schema {
@@ -361,12 +373,13 @@ impl Schema {
         let statements: Vec<(&Statement, bool)> = statements.into_iter().collect();
         // Domains first, whatever the order of the DDL: a column of a domain type takes the
         // domain's default unless it declares its own, and the domain's CHECK applies to it.
-        let mut domains: HashMap<String, (Option<&Expr>, bool)> = HashMap::new();
+        let mut domains: HashMap<String, (Option<&Expr>, bool, bool)> = HashMap::new();
         for (st, _) in &statements {
             if let Statement::CreateDomain(d) = st {
                 if let Some(name) = last_name(&d.name) {
-                    let check = d.constraints.iter().any(|c| matches!(c, C::Check(_)));
-                    domains.insert(name, (d.default.as_ref(), check));
+                    let checks = || d.constraints.iter().filter(|c| matches!(c, C::Check(_)));
+                    let check_calls = checks().any(crate::recognize::calls_a_function);
+                    domains.insert(name, (d.default.as_ref(), checks().next().is_some(), check_calls));
                 }
             }
         }
@@ -397,6 +410,7 @@ impl Schema {
                 columns: Vec::new(),
                 uniques: Vec::new(),
                 has_check: false,
+                check_calls: false,
                 has_fk: false,
                 retried,
                 altered: false,
@@ -426,7 +440,7 @@ impl Schema {
                     seqs: if serial { vec![implicit_seq.clone()] } else { Vec::new() },
                     seq_state: false,
                 };
-                if let Some(&(default, check)) = domains.get(unqualified(&col.ty.name)).filter(|_| !col.ty.array) {
+                if let Some(&(default, check, check_calls)) = domains.get(unqualified(&col.ty.name)).filter(|_| !col.ty.array) {
                     if let Some(e) = default {
                         col.default = default_kind(e);
                         col.default_text = Some(e.to_string());
@@ -434,6 +448,7 @@ impl Schema {
                         (col.seqs, col.seq_state) = sequence_use(e);
                     }
                     t.has_check |= check;
+                    t.check_calls |= check_calls;
                 }
                 let idx = t.columns.len();
                 for o in &c.options {
@@ -459,7 +474,10 @@ impl Schema {
                             let deferrable = !enforced_per_statement(uc.characteristics.as_ref());
                             t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, expr: false, deferrable });
                         }
-                        O::Check(_) => t.has_check = true,
+                        O::Check(e) => {
+                            t.has_check = true;
+                            t.check_calls |= crate::recognize::calls_a_function(e);
+                        }
                         O::ForeignKey(_) => t.has_fk = true,
                         O::Generated { generated_as, generation_expr, .. } => {
                             if generation_expr.is_some() {
@@ -496,8 +514,9 @@ impl Schema {
                     C::PrimaryKey(pk) => {
                         (pk.name.as_ref(), &pk.columns, false, true, !enforced_per_statement(pk.characteristics.as_ref()))
                     }
-                    C::Check(_) => {
+                    C::Check(c) => {
                         t.has_check = true;
+                        t.check_calls |= crate::recognize::calls_a_function(c);
                         continue;
                     }
                     C::ForeignKey(_) => {
@@ -588,6 +607,8 @@ impl Schema {
             }
         }
         let mut s = Schema::from_statements(statements.iter().map(|(s, r)| (s, *r)));
+        let words: Vec<String> = raw.split_whitespace().map(str::to_ascii_lowercase).collect();
+        s.user_casts = words.windows(2).any(|w| w[0] == "create" && w[1].starts_with("cast"));
         // A domain sqlparser cannot read (it has no domain-level `NOT NULL`, for one) constrains
         // every column of its type, and those statements never name a table.
         let domains: Vec<String> = unread.iter().filter_map(|u| unread_domain(u)).collect();
@@ -684,6 +705,20 @@ mod tests {
         assert!(key("char").modded, "bare char is char(1)");
         assert!(key("int[]").array);
         assert!(!key("text").modded && !key("text").array);
+    }
+
+    #[test]
+    fn the_public_schema_qualifier_is_dropped_from_a_type() {
+        let key = |t: &str| {
+            let st = format!("CREATE TABLE x (c {t})");
+            let Statement::CreateTable(ct) = &Parser::parse_sql(&sqleq_frontend::internals::DIALECT, &st).unwrap()[0] else {
+                panic!()
+            };
+            type_key(&ct.columns[0].data_type)
+        };
+        assert_eq!(key("public.document_state"), key("document_state"));
+        assert_eq!(key("\"public\".\"document_state\""), key("document_state"));
+        assert_ne!(key("other.document_state"), key("document_state"));
     }
 
     #[test]

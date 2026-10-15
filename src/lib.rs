@@ -918,6 +918,8 @@ fn parse_input(
     // Also before anything reads the tree: sqlparser gives `TRY_CAST`/`SAFE_CAST` a `CAST`'s node,
     // and every rewrite and lowering below would treat it as one.
     casts::refuse_foreign_kinds(&statements)?;
+    // Also before any rewrite, which writes calls of its own under names this refuses.
+    lower::refuse_reserved_call_names(&statements)?;
     // Before the shape check and the placeholder passes, which see a `$N` only in an expression
     // position, and a typed literal's `DATE $1` is not one.
     normalize::desugar_special_forms(&mut statements);

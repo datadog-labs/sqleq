@@ -462,6 +462,63 @@ pub fn is_volatile(name: &str) -> bool {
     VOLATILE_FUNCTIONS.iter().any(|v| v.eq_ignore_ascii_case(name))
 }
 
+/// Names the provers read as operators of their own, which a call must not lower to. See
+/// [`refuse_reserved_call_names`].
+const RESERVED_CALL_NAMES: &[&str] = &[
+    // Connectives, tests and syntax forms, none of them a Postgres function. The quantifiers are
+    // [`QUANTIFIER_CALL_NAMES`], refused later.
+    "AND", "OR", "NOT", "CASE", "CAST", "QCAST", "IN", "EXISTS", "IS", "NULL", "TRUE", "FALSE",
+    // The word forms of comparison and arithmetic. Postgres has a `div`, which truncates; the
+    // provers read `DIV` as `/`.
+    "EQ", "NE", "NEQ", "LT", "LE", "GT", "GE", "PLUS", "MINUS", "MULT", "DIV", "UPPERCASE",
+];
+
+/// The quantifiers, which the provers also read as their own. sqlparser builds the pattern of
+/// `s LIKE ALL($1)` as a call of `ALL`, which the `LIKE` lowering refuses by name, so these are
+/// refused where a call is lowered (after it) rather than by [`refuse_reserved_call_names`].
+const QUANTIFIER_CALL_NAMES: &[&str] = &["ANY", "ALL", "SOME"];
+
+/// SOUNDNESS GUARD (#163): see [`QUANTIFIER_CALL_NAMES`].
+fn reject_quantifier_call(full: &str, bare: &str) -> Result<()> {
+    if QUANTIFIER_CALL_NAMES.contains(&bare) {
+        return Err(unsupported(format!("a call of a function named {full}, which the IR reads as its own operator")));
+    }
+    Ok(())
+}
+
+/// Whether a call with the upper-cased bare name `bare` would lower to an operator the provers
+/// interpret: a name with punctuation or a space in it (`<`, `||`, `IS NULL`), one of
+/// [`RESERVED_CALL_NAMES`], or one of the frontend's own symbols, `QP<n>` (parameter `$n`) and the
+/// `Q_` family that `casts.rs` and `normalize.rs` write.
+fn is_reserved_call_name(bare: &str) -> bool {
+    bare.bytes().any(|b| b.is_ascii() && !(b.is_ascii_alphanumeric() || b == b'_' || b == b'$'))
+        || RESERVED_CALL_NAMES.contains(&bare)
+        || bare.starts_with("Q_")
+        || bare.strip_prefix("QP").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// SOUNDNESS GUARD (#163): a call is lowered as an operator named after it, `{"operator": NAME}`,
+/// and some names already mean something to the provers. `"<"("a", 1)` calls a function the DDL may
+/// declare, but lowered by its name it is the comparison `a < 1`; `qp1()` would be parameter `$1`.
+/// Run on the parsed input before any rewrite, since the rewrites write `Q_` and `QP` calls of
+/// their own. Postgres's operators and syntax never parse as calls, so refusing these names costs
+/// nothing a query could otherwise mean.
+pub(crate) fn refuse_reserved_call_names(statements: &[sqlparser::ast::Statement]) -> Result<()> {
+    for st in statements {
+        let found = visit_expressions(st, |e| match e {
+            Expr::Function(f) => {
+                let (full, bare) = fn_names(f);
+                if is_reserved_call_name(&bare) { ControlFlow::Break(full) } else { ControlFlow::Continue(()) }
+            }
+            _ => ControlFlow::Continue(()),
+        });
+        if let ControlFlow::Break(full) = found {
+            return Err(unsupported(format!("a call of a function named {full}, which the IR reads as its own operator")));
+        }
+    }
+    Ok(())
+}
+
 /// SOUNDNESS GUARD: see [`VOLATILE_FUNCTIONS`]. Matched on the *bare* name, because
 /// `pg_catalog.random` is still `random` and widening a refusal can only ever cost completeness.
 fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {
@@ -2773,6 +2830,7 @@ impl AggCtx<'_> {
             Expr::Function(f) => {
                 // a scalar function over keys/aggregates (is_agg_call already returned false)
                 let (name, bare) = fn_names(f);
+                reject_quantifier_call(&name, &bare)?;
                 reject_qualified_builtin_agg(&name, &bare)?;
                 reject_nondeterministic(&name, &bare)?;
                 reject_order_sensitive_agg(&name, &bare)?;
@@ -3276,6 +3334,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 return Err(unsupported(format!("aggregate {name} in scalar position")));
             }
             let (name, bare) = fn_names(f);
+            reject_quantifier_call(&name, &bare)?;
             reject_qualified_builtin_agg(&name, &bare)?;
             reject_nondeterministic(&name, &bare)?;
             reject_order_sensitive_agg(&name, &bare)?;

@@ -532,6 +532,21 @@ pub fn generated_preconditions(a: &Parts, rows: &[Vec<Cell>], table: &Table) -> 
                 "a generated cell draws from a sequence, and the table has a trigger, which could read it",
             ));
         }
+        // The words above see only what the tail writes itself, as `sequence_use` does for a
+        // default (#171), and a CHECK is not read at all. A function called from either could read
+        // the sequence state the generated cells advance (#178).
+        if a.tail_calls {
+            return Err(unsupported(
+                "a generated cell draws from a sequence, and the conflict clause or RETURNING calls a \
+                 function, which could read it",
+            ));
+        }
+        if table.check_calls {
+            return Err(unsupported(
+                "a generated cell draws from a sequence, and a CHECK on the target calls a function, \
+                 which could read it",
+            ));
+        }
     }
     Ok(sum)
 }
@@ -550,6 +565,7 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
         (Source::Values(_), Source::Values(_)) => return Err(unsupported("both sides are VALUES")),
         (Source::Unnest { .. }, Source::Unnest { .. }) => return Err(unsupported("both sides are unnest")),
     };
+    let (a, b) = (implicit_cols(a, schema)?, implicit_cols(b, schema)?);
     let Lowered { tys, a: la, b: lb, shape, generated, widened } = lower(&a, &b, schema)?;
     let table = schema.table(&a.target).expect("resolved by lower");
     let mut unmodelled = Vec::new();
@@ -597,6 +613,36 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
     })
 }
 
+/// An INSERT without a column list targets the table's columns in declared order, or the first `n`
+/// of them when its source supplies only `n`, as Postgres reads it. Filled in from the DDL, which is
+/// authoritative about column order, and refused where the DDL may not give the table's real order:
+/// one that alters the table (`ADD COLUMN` appends), drops a column, or was not read in full.
+fn implicit_cols(mut p: Parts, schema: &Schema) -> Result<Parts, Refusal> {
+    if !p.implicit_cols {
+        return Ok(p);
+    }
+    let table = schema.table(&p.target).map_err(|e| unsupported(format!("schema: {e}")))?;
+    if table.unread || table.altered || table.retried {
+        return Err(unsupported(
+            "INSERT without a column list, and the target's DDL is not read in full, so its column \
+             order is not certain",
+        ));
+    }
+    let n = match &p.src {
+        Source::Values(rows) => rows.first().map_or(0, Vec::len),
+        Source::Unnest { args, .. } => args.len(),
+    };
+    if n > table.columns.len() {
+        return Err(Refusal::InvalidSql(format!(
+            "INSERT has {n} expressions per row for the {} columns of {}",
+            table.columns.len(),
+            table.name
+        )));
+    }
+    p.cols = table.columns[..n].iter().map(|c| c.name.clone()).collect();
+    Ok(p)
+}
+
 fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
     let (Source::Values(rows), Source::Unnest { args, .. }) = (&a.src, &b.src) else {
         unreachable!("oriented by translate")
@@ -614,6 +660,12 @@ fn lower(a: &Parts, b: &Parts, schema: &Schema) -> Result<Lowered, Refusal> {
         return Err(unsupported("the two sides' alias, conflict clause or RETURNING differ"));
     }
     let table = schema.table(&a.target).map_err(|e| unsupported(format!("schema: {e}")))?;
+    if a.string_casts && schema.user_casts {
+        return Err(unsupported(
+            "a VALUES cell casts a parameter through a string type, and the DDL declares a cast of its \
+             own, which could stand in for the target type's input",
+        ));
+    }
     let k = a.cols.len();
 
     // Postgres rejects these outright, so there is no equivalence question.
@@ -851,6 +903,7 @@ mod tests {
         CREATE TRIGGER t BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION f();\
         CREATE TABLE al (id serial PRIMARY KEY, name text);\
         ALTER TABLE al ADD COLUMN extra int;\
+        CREATE TABLE gc (id serial PRIMARY KEY, name text CHECK (char_length(name) > 0));\
         CREATE TABLE gk (id serial PRIMARY KEY, name text, ts timestamptz, k int DEFAULT pick());\
         CREATE TABLE q (id bigint PRIMARY KEY, name text, ts timestamptz DEFAULT now());\
         CREATE TABLE qs (id bigint PRIMARY KEY, name text, n serial);";
@@ -964,6 +1017,23 @@ mod tests {
             "INSERT INTO gk (ts, name) SELECT * FROM unnest($1::timestamptz[], $2::text[])",
         )
         .is_ok());
+        // A function called from RETURNING or from a CHECK, which could read the sequence; with no
+        // generated cell drawing from one, the same RETURNING is fine.
+        let r = grefused(
+            "INSERT INTO g (id, name) VALUES (DEFAULT, $1) RETURNING lower(name)",
+            &format!("{GB} RETURNING lower(name)"),
+        );
+        assert!(r.contains("RETURNING calls a function"), "{r}");
+        assert!(gpair(
+            "INSERT INTO g (ts, name) VALUES (now(), $1) RETURNING lower(name)",
+            "INSERT INTO g (ts, name) SELECT * FROM unnest($1::timestamptz[], $2::text[]) RETURNING lower(name)",
+        )
+        .is_ok());
+        let r = grefused(
+            "INSERT INTO gc (id, name) VALUES (DEFAULT, $1)",
+            "INSERT INTO gc (id, name) SELECT * FROM unnest($1::int[], $2::text[])",
+        );
+        assert!(r.contains("a CHECK on the target calls a function"), "{r}");
         // A trigger, which could read the sequence; and an altered table, whose DDL is not read whole.
         let r = grefused(
             "INSERT INTO tr (id, name) VALUES (DEFAULT, $1)",
@@ -1031,6 +1101,42 @@ mod tests {
         let tail = " RETURNING currval('q_seq')";
         let r = grefused(&format!("INSERT INTO q (id, name) VALUES (nextval($1), $2){tail}"), &format!("{QB}{tail}"));
         assert!(r.contains("sequence state or a default"), "{r}");
+    }
+
+    #[test]
+    fn an_insert_without_a_column_list_takes_the_tables_columns_in_order() {
+        let ddl = "CREATE TABLE w (a text, b int, c int);\
+            CREATE TABLE wa (a text, b int); ALTER TABLE wa ADD COLUMN c int;";
+        let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
+        let tr = |a: &str, b: &str| translate(&p(a), &p(b), &Schema::from_ddl(ddl));
+        let w3 = "INSERT INTO w SELECT * FROM unnest($1::text[], $2::int[], $3::int[])";
+        // Both sides without a list: every column, in declared order.
+        let pair = tr("INSERT INTO w VALUES ($1, $2, $3), ($4, $5, $6)", w3).unwrap();
+        assert_eq!(pair.replay.insert, ["a", "b", "c"]);
+        // The first n columns when the source supplies n, against a side that lists them.
+        let pair = tr("INSERT INTO w VALUES ($1), ($2)", "INSERT INTO w (a) SELECT * FROM unnest($1::text[])").unwrap();
+        assert_eq!(pair.replay.insert, ["a"]);
+        // A list other than the one the other side implies.
+        let r = tr("INSERT INTO w VALUES ($1, $2)", "INSERT INTO w (b, a) SELECT * FROM unnest($1::int[], $2::text[])");
+        assert!(r.expect_err("not refused").reason().contains("column lists differ"));
+        // A table whose DDL alters it: its column order is not certain.
+        let r = tr("INSERT INTO wa VALUES ($1, $2)", "INSERT INTO wa SELECT * FROM unnest($1::text[], $2::int[])");
+        assert!(r.expect_err("not refused").reason().contains("column order is not certain"));
+        // More expressions than the table has columns.
+        let r = tr("INSERT INTO w VALUES ($1, $2, $3, $4)", "INSERT INTO w SELECT * FROM unnest($1::text[], $2::int[], $3::int[], $4::int[])");
+        assert!(matches!(r, Err(Refusal::InvalidSql(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_string_cast_cell_is_refused_where_the_ddl_declares_a_cast() {
+        let p = |s: &str| Parser::parse_sql(&sqleq_frontend::internals::DIALECT, s).unwrap().remove(0);
+        let a = "INSERT INTO u (id, n) VALUES (CAST($1::varchar AS uuid), $2), (CAST($3::varchar AS uuid), $4)";
+        let b = "INSERT INTO u (id, n) SELECT * FROM unnest($1::uuid[], $2::int[])";
+        let ddl = "CREATE TABLE u (id uuid PRIMARY KEY, n int);";
+        assert!(translate(&p(a), &p(b), &Schema::from_ddl(ddl)).is_ok());
+        let with_cast = format!("{ddl} CREATE CAST (varchar AS uuid) WITH INOUT;");
+        let r = translate(&p(a), &p(b), &Schema::from_ddl(&with_cast));
+        assert!(r.expect_err("not refused").reason().contains("declares a cast of its own"));
     }
 
     /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.
