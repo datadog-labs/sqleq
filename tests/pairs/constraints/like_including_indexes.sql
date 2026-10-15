@@ -4,7 +4,7 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: equivalent
--- expect frontend: refuse:parse
+-- expect frontend: refuse:unsupported
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan

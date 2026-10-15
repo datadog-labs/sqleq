@@ -377,6 +377,15 @@ mod prefixed_numbers {
         assert!(m.contains("numeric literal"), "{q0}: {m}");
     }
 
+    /// A spelling Postgres's own grammar rejects is a parse refusal, whatever sqlparser made of it.
+    fn not_postgres(q0: &str, q1: &str) {
+        let src = format!("{T}\n{q0};\n{q1};");
+        match lower_with(&src, CatalogSource::Declared) {
+            Err(FrontendError::Parse(m)) => assert!(m.contains("trailing junk"), "{q0}: {m}"),
+            other => panic!("expected a parse refusal, got {other:?}\n{src}"),
+        }
+    }
+
     #[test]
     fn a_prefixed_integer_is_not_zero_and_an_alias() {
         // Postgres reads 5, 15 and 31; sqlparser read `0` and a column alias.
@@ -399,10 +408,10 @@ mod prefixed_numbers {
     #[test]
     fn trailing_junk_is_refused() {
         // A syntax error in Postgres since 16, and `1 AS x` or `5` to sqlparser.
-        refused(r#"SELECT 1x FROM "t""#, r#"SELECT 1 FROM "t""#);
-        refused(r#"SELECT 1.5e FROM "t""#, r#"SELECT 1.5 FROM "t""#);
-        refused(r#"SELECT 5L FROM "t""#, r#"SELECT 5 FROM "t""#);
-        refused(r#"SELECT "id" FROM "t" LIMIT 1OFFSET 0"#, r#"SELECT "id" FROM "t" LIMIT 1"#);
+        not_postgres(r#"SELECT 1x FROM "t""#, r#"SELECT 1 FROM "t""#);
+        not_postgres(r#"SELECT 1.5e FROM "t""#, r#"SELECT 1.5 FROM "t""#);
+        not_postgres(r#"SELECT 5L FROM "t""#, r#"SELECT 5 FROM "t""#);
+        not_postgres(r#"SELECT "id" FROM "t" LIMIT 1OFFSET 0"#, r#"SELECT "id" FROM "t" LIMIT 1"#);
     }
 
     #[test]

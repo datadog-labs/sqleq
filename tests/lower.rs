@@ -53,6 +53,14 @@ fn refused(sql: &str, needle: &str) {
     }
 }
 
+/// Assert `sql` is refused as text Postgres's own grammar rejects.
+fn not_postgres(sql: &str) {
+    match lower_sql(sql) {
+        Err(FrontendError::Parse(_)) => {}
+        other => panic!("expected a parse refusal, got {other:?}: {sql}"),
+    }
+}
+
 /// Assert `sql` is refused as input Postgres rejects (a schema refusal), with `needle` in the reason.
 fn rejected(sql: &str, needle: &str) {
     match lower_sql(sql) {
@@ -614,8 +622,9 @@ fn refuses_tablesample() {
 
 #[test]
 fn refuses_with_ordinality() {
-    // Adds a row-number column, so the output shape differs from the bare scan.
-    refused(&same(r#"SELECT "a" FROM "t" WITH ORDINALITY"#), "WITH ORDINALITY");
+    // Adds a row-number column, so the output shape differs from the bare scan. Postgres takes it
+    // only after a function in FROM, so on a table it does not parse.
+    not_postgres(&same(r#"SELECT "a" FROM "t" WITH ORDINALITY"#));
 }
 
 #[test]
