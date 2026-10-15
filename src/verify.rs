@@ -38,7 +38,7 @@
 
 use serde_json::Value;
 
-use crate::error::{schema, Result};
+use crate::error::{unsupported, Result};
 
 /// Check every column reference in a prover `Input`. `Err` means the IR is ill-formed and must not
 /// be emitted.
@@ -68,7 +68,8 @@ fn tagged(rel: &Value) -> Result<(&str, &Value)> {
 }
 
 fn ir(msg: impl std::fmt::Display) -> crate::error::FrontendError {
-    schema(format!("internal: ill-formed IR: {msg}"))
+    // The frontend's own fault, never the input's.
+    unsupported(format!("internal: ill-formed IR: {msg}"))
 }
 
 /// An expression's type, without the declared type an opaque column's carries

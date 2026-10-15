@@ -53,6 +53,15 @@ fn refused(sql: &str, needle: &str) {
     }
 }
 
+/// Assert `sql` is refused as input Postgres rejects (a schema refusal), with `needle` in the reason.
+fn rejected(sql: &str, needle: &str) {
+    match lower_sql(sql) {
+        Err(FrontendError::Schema(m)) => assert!(m.contains(needle), "rejected, but for {m:?} rather than {needle:?}"),
+        Err(e) => panic!("expected a schema refusal mentioning {needle:?}, got {e}"),
+        Ok(_) => panic!("expected a schema refusal mentioning {needle:?}, but it lowered"),
+    }
+}
+
 /// Every value under a `key` field anywhere in `v` — for the tests that need *both* sides' nodes
 /// rather than the first one [`find_with_field`] happens to reach.
 fn collect_field(v: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
@@ -336,14 +345,15 @@ fn a_resolvable_order_key_does_not_widen_the_projection() {
 }
 
 /// Two output columns of the same name is a resolution question, not a missing column: widening the
-/// projection would not answer it, so it stays refused.
+/// projection would not answer it, so it stays refused. Unsupported, not schema: Postgres accepts the
+/// key when the two outputs are one expression, and only their names are compared here.
 #[test]
 fn refuses_an_ambiguous_order_key() {
     match lower_sql(&pair(
         r#"SELECT "a" AS "x", "b" AS "x" FROM "t" ORDER BY "x" LIMIT 5"#,
         r#"SELECT "a" FROM "t""#,
     )) {
-        Err(FrontendError::Schema(m)) => assert!(m.contains("ambiguous ORDER BY key"), "{m}"),
+        Err(FrontendError::Unsupported(m)) => assert!(m.contains("ambiguous ORDER BY key"), "{m}"),
         other => panic!("expected the ambiguity refusal, got {other:?}"),
     }
 }
@@ -367,18 +377,23 @@ fn refuses_order_by_using() {
 fn refuses_to_widen_past_a_group() {
     for q in [
         r#"SELECT "a" FROM "t" GROUP BY "a" ORDER BY MAX("b") LIMIT 5"#,
-        r#"SELECT DISTINCT "a" FROM "t" ORDER BY "b" LIMIT 5"#,
         r#"SELECT COUNT(*) FROM "t" GROUP BY "a" ORDER BY "t"."a" LIMIT 5"#,
         r#"SELECT COUNT(*) FROM "t" GROUP BY "a" ORDER BY "a" LIMIT 5"#,
     ] {
         refused(&pair(q, r#"SELECT "a" FROM "t""#), "ORDER BY key is not an output column");
     }
+    // Under a plain `DISTINCT`, Postgres itself requires the key in the select list.
+    rejected(
+        &pair(r#"SELECT DISTINCT "a" FROM "t" ORDER BY "b" LIMIT 5"#, r#"SELECT "a" FROM "t""#),
+        "ORDER BY key is not an output column of a SELECT DISTINCT",
+    );
 }
 
-/// A set operation has no single FROM scope to resolve a key against.
+/// A set operation has no single FROM scope to resolve a key against, and Postgres orders its result
+/// only by output columns.
 #[test]
 fn refuses_to_widen_a_set_operation() {
-    refused(
+    rejected(
         &pair(
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY "b" LIMIT 5"#,
             r#"SELECT "a" FROM "t""#,
@@ -1340,14 +1355,15 @@ fn a_table_alias_column_list_renames_the_columns_in_order() {
     assert_eq!(col(r#"SELECT "a" FROM "t" AS "x"("b", "a")"#), serde_json::json!({ "column": 1, "type": "VARCHAR" }));
     // A short list renames a prefix; the rest keep their names.
     assert_eq!(col(r#"SELECT "x"."c" FROM "t" AS "x"("p")"#), serde_json::json!({ "column": 2, "type": "VARBINARY" }));
-    for (q, needle) in [
-        (r#"SELECT 1 FROM "t" AS "x"("p", "q", "r", "s")"#, "fewer columns"),
-        (r#"SELECT 1 FROM "t" AS "x"("b")"#, "two columns"),
-    ] {
-        match lower_sql(&same(q)) {
-            Err(FrontendError::Schema(m)) => assert!(m.contains(needle), "unexpected reason: {m}"),
-            other => panic!("expected a schema refusal for {q}, got {other:?}"),
-        }
+    // Too many names is an error in Postgres. Two columns left with one name is not, so that refusal
+    // is the frontend's.
+    match lower_sql(&same(r#"SELECT 1 FROM "t" AS "x"("p", "q", "r", "s")"#)) {
+        Err(FrontendError::Schema(m)) => assert!(m.contains("fewer columns"), "unexpected reason: {m}"),
+        other => panic!("expected a schema refusal, got {other:?}"),
+    }
+    match lower_sql(&same(r#"SELECT 1 FROM "t" AS "x"("b")"#)) {
+        Err(FrontendError::Unsupported(m)) => assert!(m.contains("two columns"), "unexpected reason: {m}"),
+        other => panic!("expected an unsupported refusal, got {other:?}"),
     }
 }
 
@@ -1714,7 +1730,7 @@ fn a_permutation_across_types_is_caught_by_inference_instead() {
         r#"SELECT "a" FROM "t" WHERE "a" = $2 AND "b" = $1"#,
     );
     match lower_with(&sql, CatalogSource::InferredSeeded) {
-        Err(FrontendError::Schema(m)) => assert!(m.contains("type conflict"), "{m}"),
+        Err(FrontendError::Unsupported(m)) => assert!(m.contains("type conflict"), "{m}"),
         other => panic!("expected a type conflict, got {other:?}"),
     }
 }
@@ -1749,7 +1765,7 @@ fn a_conflict_the_misalignment_could_not_have_created_is_still_the_conflict() {
         r#"SELECT "x" FROM "p" WHERE "x" = $1"#,
     );
     match lower_with(&sql, CatalogSource::InferredSeeded) {
-        Err(FrontendError::Schema(m)) => assert!(m.contains("type conflict"), "{m}"),
+        Err(FrontendError::Unsupported(m)) => assert!(m.contains("type conflict"), "{m}"),
         other => panic!("expected a type conflict, got {other:?}"),
     }
 }

@@ -64,7 +64,9 @@ SELECT x FROM t a, u, v WHERE a.id = u.id AND u.id = v.id;
 SELECT a.x FROM t a, u, v WHERE a.id = u.id AND u.id = v.id;"#;
     let e = lower_with(src, CatalogSource::InferredSeeded).expect_err("ambiguous").to_string();
     // `v` does not declare `x`, so it is not a candidate; an alias is shown as the FROM clause binds it.
-    assert_eq!(e, "ambiguous unqualified column x (declared by t a, u)");
+    // Unsupported: a name a `JOIN ... USING` merged is one column to Postgres, which this attribution
+    // does not see.
+    assert_eq!(e, "unsupported: ambiguous unqualified column x (declared by t a, u)");
 }
 
 #[test]

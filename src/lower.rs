@@ -626,6 +626,11 @@ fn apply_pagination(
                 // this one orders by a value no output column holds, and nothing above the `Group`
                 // can address the FROM scope to add one.
                 Some(SortScope { outputs: SortOutputs::Grouped(_), .. }) | None => {
+                    // A set operation's result can be ordered only by its own output columns, so
+                    // Postgres rejects this one outright.
+                    if matches!(q.body.as_ref(), SetExpr::SetOperation { .. }) {
+                        return Err(schema("ORDER BY key is not an output column of a set operation"));
+                    }
                     Err(unsupported("ORDER BY key is not an output column"))
                 }
             };
@@ -732,6 +737,11 @@ fn sort_sandwich(
         }
         let v = order_key_value(cat, scope, fns, &key.expr, &targets, out_cols, "ORDER BY")?;
         if outputs.is_some() && !targets.contains(&v) {
+            // Under a plain `DISTINCT` Postgres rejects a key outside the select list; under
+            // `DISTINCT ON` it accepts one.
+            if matches!(q.body.as_ref(), SetExpr::Select(s) if matches!(s.distinct, Some(Distinct::Distinct))) {
+                return Err(schema("ORDER BY key is not an output column of a SELECT DISTINCT"));
+            }
             return Err(unsupported("ORDER BY key is not an output column"));
         }
         let ty = ty_of(&v);
@@ -993,7 +1003,9 @@ fn resolve_order_key<'e>(e: &'e Expr, out_cols: &OutCols, clause: &str) -> Resul
     match crate::casts::unwrap_nested(e) {
         Expr::Value(v) => {
             if let SqlValue::Number(n, _) = &v.value {
-                let pos: usize = n.parse().map_err(|_| unsupported(format!("{clause} position {n}")))?;
+                // A number that is not a position, such as `1.5`, Postgres rejects as a non-integer
+                // constant.
+                let pos: usize = n.parse().map_err(|_| schema(format!("{clause} position {n}")))?;
                 return match pos.checked_sub(1).filter(|&i| i < out_cols.len()) {
                     Some(i) => Ok(OrderKey::Output(i)),
                     None => Err(schema(format!("{clause} position {pos} out of range"))),
@@ -1008,7 +1020,9 @@ fn resolve_order_key<'e>(e: &'e Expr, out_cols: &OutCols, clause: &str) -> Resul
                 (Some((i, _)), None) => return Ok(OrderKey::Output(i)),
                 // Which one the key means is a resolution question we decline rather than answer
                 // arbitrarily. Widening the projection would not help: the ambiguity is in the name.
-                (Some(_), Some(_)) => return Err(schema(format!("ambiguous {clause} key {name}"))),
+                // Postgres accepts the key when the two outputs are one expression and rejects it
+                // otherwise; only their names are here, so the refusal is unsupported.
+                (Some(_), Some(_)) => return Err(unsupported(format!("ambiguous {clause} key {name}"))),
                 (None, _) => {}
             }
             if out_cols.iter().any(|(n, _)| is_unnamed(n)) {
@@ -1287,7 +1301,9 @@ fn lower_fromless_select(cat: &Catalog, fns: &Fns, s: &Select, outer: &[Binding]
         let (e, name) = match item {
             SelectItem::UnnamedExpr(e) => (e, expr_name(e, idx)),
             SelectItem::ExprWithAlias { expr, alias } => (expr, fold_name(alias)),
-            // A wildcard needs a FROM to expand against, so this is not valid SQL to begin with.
+            // A bare `*` has nothing to expand against, and Postgres rejects it; `t.*` can still
+            // name an enclosing query's binding.
+            SelectItem::Wildcard(_) => return Err(schema("FROM-less SELECT *")),
             other => return Err(unsupported(format!("FROM-less SELECT projection {other:?}"))),
         };
         // An aggregate here has no rows to fold over; `contains_agg` keeps it out of both shapes,
@@ -1967,10 +1983,11 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                     col.0 = fold_name(&c.name);
                 }
                 // Up to case, as `Catalog::check_case_collisions` compares a table's own columns.
+                // Postgres accepts such an alias; only a reference to the shared name is ambiguous.
                 let declared = &cols[..cat.tables[idx].n_declared];
                 let same = |m: &str, n: &str| m.to_lowercase() == n.to_lowercase();
                 if declared.iter().enumerate().any(|(i, (n, _))| declared[..i].iter().any(|(m, _)| same(m, n))) {
-                    return Err(schema(format!("table alias leaves two columns of {tn} with one name")));
+                    return Err(unsupported(format!("table alias leaves two columns of {tn} with one name")));
                 }
             }
             // The name a qualified reference finds this instance by: its alias, which hides the
@@ -2001,14 +2018,20 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 return Err(unsupported("LATERAL derived table"));
             }
             let (rel, out_cols) = lower_query_ctx(cat, fns, subquery, outer)?;
-            let a = alias.as_ref().ok_or_else(|| schema("derived table requires an alias"))?;
+            // Postgres 16 and later accept a derived table with no alias.
+            let a = alias.as_ref().ok_or_else(|| unsupported("derived table without an alias"))?;
             let cols: OutCols = if a.columns.is_empty() {
                 // Output names are already folded as Postgres folds them (see [`fold_name`]), which
                 // is the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
                 out_cols
             } else {
-                if a.columns.len() != out_cols.len() {
-                    return Err(schema("derived table column-alias count mismatch"));
+                // A longer list is an error in Postgres. A shorter one renames the first columns
+                // and keeps the rest, which is not modelled here.
+                if a.columns.len() > out_cols.len() {
+                    return Err(schema("derived table has fewer columns than its alias names"));
+                }
+                if a.columns.len() < out_cols.len() {
+                    return Err(unsupported("derived table alias list shorter than its columns"));
                 }
                 a.columns.iter().zip(out_cols).map(|(c, (_, t))| (fold_name(&c.name), t)).collect()
             };
@@ -2157,6 +2180,10 @@ fn expand_projection(cat: &Catalog, scope: &Scope, fns: &Fns, s: &Select) -> Res
                     }
                 }
                 if !found {
+                    // An enclosing query's binding is a qualifier Postgres accepts here.
+                    if scope.binds.iter().any(|b| b.alias == q) {
+                        return Err(unsupported(format!("{q}.* over an enclosing query's binding")));
+                    }
                     return Err(schema(format!("unknown qualifier {q}.*")));
                 }
             }
@@ -2531,8 +2558,10 @@ fn agg_of(e: &Expr) -> Result<Agg> {
     // `COUNT(*) FILTER (WHERE p)` counts matching rows, so it needs *something* to count; `1` is
     // the standard stand-in and makes the rewrite below `COUNT(CASE WHEN p THEN 1 END)`.
     if filter.is_some() && args.is_empty() {
+        // No other builtin aggregate this reaches has a form without an argument, so Postgres
+        // rejects the call.
         if name != "COUNT" {
-            return Err(unsupported(format!("FILTER on argument-less {name}")));
+            return Err(schema(format!("FILTER on argument-less {name}")));
         }
         args.push(Expr::Value(
             SqlValue::Number("1".to_string(), false).with_empty_span(),
@@ -3067,11 +3096,14 @@ fn lower_group_key(
     // `GROUP BY 1` is a 1-based position in the select list, not the integer 1, and nothing here
     // resolves it — `group_by_exprs` has no positional arm, so it would lower as the literal and
     // group every row together. There are no such rows in any corpus measured, so this is a guard
-    // against a silent wrong answer rather than a feature declined. A non-integer constant is
-    // refused by Postgres outright, which lands in the same place.
+    // against a silent wrong answer rather than a feature declined. Position 0, or a constant that
+    // is not a position at all, Postgres refuses outright.
     if let Expr::Value(v) = e {
         if let SqlValue::Number(n, _) = &v.value {
-            return Err(unsupported(format!("GROUP BY position {n}")));
+            return Err(match n.parse::<usize>() {
+                Ok(p) if p > 0 => unsupported(format!("GROUP BY position {n}")),
+                _ => schema(format!("GROUP BY position {n} is not in the select list")),
+            });
         }
     }
     let err = match lower_expr(cat, scope, fns, e) {
@@ -3097,17 +3129,23 @@ fn lower_group_key(
 /// the two cases where an item does carry it but using it would be wrong.
 fn alias_target<'a>(fns: &Fns, s: &'a Select, id: &sqlparser::ast::Ident) -> Result<Option<&'a Expr>> {
     let name = fold_name(id);
-    let mut found = s.projection.iter().filter_map(|it| match it {
-        SelectItem::ExprWithAlias { expr, alias } if fold_name(alias) == name => Some(expr),
-        _ => None,
-    });
-    match (found.next(), found.next()) {
-        (Some(e), None) if contains_agg(fns, e) => {
-            Err(schema(format!("aggregate in GROUP BY key {name}")))
+    let found: Vec<&Expr> = s
+        .projection
+        .iter()
+        .filter_map(|it| match it {
+            SelectItem::ExprWithAlias { expr, alias } if fold_name(alias) == name => Some(expr),
+            _ => None,
+        })
+        .collect();
+    match found.as_slice() {
+        [e] if contains_agg(fns, e) => Err(schema(format!("aggregate in GROUP BY key {name}"))),
+        [e] => Ok(Some(*e)),
+        [] => Ok(None),
+        // Postgres accepts one expression aliased twice, and rejects two different ones.
+        [e, rest @ ..] if rest.iter().all(|r| r == e) => {
+            Err(unsupported(format!("GROUP BY key {name} names one expression twice")))
         }
-        (Some(e), None) => Ok(Some(e)),
-        (Some(_), Some(_)) => Err(schema(format!("ambiguous GROUP BY key {name}"))),
-        _ => Ok(None),
+        _ => Err(schema(format!("ambiguous GROUP BY key {name}"))),
     }
 }
 
@@ -3375,8 +3413,9 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                         }
                         _ => return Err(unsupported("row IN list item that is neither a row nor a parameter")),
                     };
+                    // Postgres rejects rows of two widths, as it does in a row comparison.
                     if relems.len() != ls.len() {
-                        return Err(unsupported("row IN arity mismatch"));
+                        return Err(schema("row IN arity mismatch"));
                     }
                     let m = row_match(&ls, relems, cat, scope, fns)?;
                     terms.push(if *negated { not_bool(m) } else { m });
@@ -3931,6 +3970,10 @@ fn col_ref(scope: &Scope, qual: Option<&str>, name: &str) -> Result<Value> {
     }
     match scope.try_resolve(qual, name)? {
         Some((idx, ty)) => Ok(json!({ "column": idx, "type": ty })),
+        // A bare name that is a binding's own is Postgres's whole-row reference.
+        None if qual.is_none() && scope.binds.iter().any(|b| b.alias == name) => {
+            Err(unsupported(format!("whole-row reference {name}")))
+        }
         None => Err(schema(format!(
             "unresolved column {}{} (correlated subquery or unknown column)",
             qual.map(|q| format!("{q}.")).unwrap_or_default(),

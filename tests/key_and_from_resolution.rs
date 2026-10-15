@@ -223,7 +223,7 @@ fn a_grouped_order_key_is_not_an_item_of_the_same_name() {
 
 /// Above a `DISTINCT`, an input expression is usable when it is the value of an output column,
 /// however that column was written — Postgres's rule, which requires the expression in the select
-/// list — and refused when it is not, since nothing above the `Group` can address it.
+/// list — and refused when it is not, as input Postgres rejects.
 #[test]
 fn a_qualified_order_key_under_distinct_must_be_an_output_value() {
     // `t.*` outputs `k, a, b, x`, so `t.a` is its second column.
@@ -238,7 +238,7 @@ fn a_qualified_order_key_under_distinct_must_be_an_output_value() {
     refused(
         r#"SELECT DISTINCT "t".* FROM "t" JOIN "u" ON "t"."k" = "u"."k" ORDER BY "u"."a" LIMIT 1"#,
         r#"SELECT DISTINCT "t".* FROM "t" JOIN "u" ON "t"."k" = "u"."k" ORDER BY 2 LIMIT 1"#,
-        "unsupported",
+        "schema",
         "ORDER BY key is not an output column",
     );
 }

@@ -12,13 +12,25 @@
 use std::fmt;
 
 /// Why a SQL pair could not be lowered to the prover's IR.
+///
+/// [`Schema`](FrontendError::Schema) and [`Unsupported`](FrontendError::Unsupported) say what
+/// Postgres makes of the input, taking Postgres 17 as the reference: `Schema` when Postgres rejects
+/// it, `Unsupported` when Postgres accepts it and the frontend declines. A kind describes the reason
+/// the frontend gives, which is the first refusal it reaches, not every defect the input may have.
+/// When the condition a refusal tests is met both by input Postgres accepts and by input it rejects,
+/// and the frontend cannot tell the two apart from the syntax in front of it (a function it does not
+/// know, a column functionally dependent through a key, an implicit coercion), the refusal is
+/// `Unsupported`.
 #[derive(Debug, Clone)]
 pub enum FrontendError {
     /// The SQL text could not be parsed (sqlparser error).
     Parse(String),
-    /// A construct we deliberately refuse (to preserve soundness) or do not yet support.
+    /// Postgres accepts the input, and the frontend refuses it (to preserve soundness) or does not
+    /// yet support it. Also every internal error: the fault is the frontend's, not the input's.
     Unsupported(String),
-    /// Malformed or incomplete input: unknown table/column, bad DDL, wrong number of queries.
+    /// Postgres rejects the input (an unknown table or column, a column assigned twice, rows of two
+    /// widths compared), or the input is malformed for the frontend: not two statements, no DDL, or a
+    /// table or column the DDL does not declare.
     Schema(String),
     /// The two queries' `$N` placeholders do not line up, so the frontend's index binding (`$N` in one
     /// query is `$N` in the other) cannot be the correspondence the caller means. The message opens
