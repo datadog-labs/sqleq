@@ -237,16 +237,14 @@ pub fn resolve<'a>(schema: &'a Schema, parts: &[String]) -> Option<&'a String> {
         .map(|(k, _)| k)
 }
 
-/// Undo the CSV cell escaping used by the corpus (surrounding quotes + `\n`/`\"`/`\'`/`\t`).
+/// The DDL as the reader takes it: trimmed, and otherwise the text Postgres runs.
+///
+/// This used to undo an escaping of the corpus cell (surrounding quotes, `\n`, `\"`, `\'`, `\t`)
+/// on every DDL, which rewrote real SQL: a `\'` inside an `E'…'` string moved where the string
+/// ends. Every input now arrives unescaped (a pair file as written, a corpus row through a CSV
+/// reader), so the model reads exactly what the Postgres engine runs.
 pub fn clean_ddl(s: &str) -> String {
-    let mut s = s.trim().to_string();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s = s[1..s.len() - 1].to_string();
-    }
-    s.replace("\\n", "\n")
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\t", "\t")
+    s.trim().to_string()
 }
 
 /// How a declared column type is materialized: its generation domain, whether it is an array, and --
@@ -434,31 +432,25 @@ fn split_top(body: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Byte index of the `)` matching the `(` at `open`.
-fn matching(s: &str, open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for (i, ch) in s.char_indices().skip_while(|(i, _)| *i < open) {
-        match quote {
-            Some(q) => {
-                if ch == q {
-                    quote = None;
+/// Byte index of the `)` matching the `(` at `open`, as Postgres's lexer reads the text from there:
+/// a parenthesis inside a literal (an `E'…'` one with its escapes, a dollar-quoted body), a quoted
+/// name or a comment counts for nothing. `Err` with the tokenizer's message if that text does not
+/// lex, `Ok(None)` if the `(` is never closed.
+fn matching(s: &str, open: usize) -> Result<Option<usize>, String> {
+    let mut depth = 0usize;
+    for t in crate::lex::lex_as_postgres(&s[open..])? {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok(Some(open + t.start));
                 }
             }
-            None => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            },
+            _ => {}
         }
     }
-    None
+    Ok(None)
 }
 
 /// Take a leading (optionally double-quoted) identifier, returning it lower-cased with the rest.
@@ -578,7 +570,7 @@ fn type_region(s: &str) -> String {
 /// column names (an expression, an operator class, a sort option — anything we would be guessing at).
 fn plain_key(s: &str) -> Option<Vec<String>> {
     let open = s.find('(')?;
-    let close = matching(s, open)?;
+    let close = matching(s, open).ok().flatten()?;
     let mut cols = Vec::new();
     for part in split_top(&s[open + 1..close])? {
         let (name, rest) = take_ident(&part)?;
@@ -590,29 +582,25 @@ fn plain_key(s: &str) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
 }
 
-/// A column definition's trailing options with string literals and parenthesised groups removed, so
-/// `DEFAULT 'not null'` and `REFERENCES t(unique_col)` cannot be mistaken for constraints.
-fn opts_text(s: &str) -> String {
-    let mut out = String::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for ch in s.chars() {
-        match quote {
-            Some(q) => {
-                if ch == q {
-                    quote = None;
-                }
+/// A column definition's trailing options as the unquoted words Postgres reads outside any
+/// parentheses, lower-cased, each with a space either side: literals (a dollar-quoted or `E'…'` one
+/// too), quoted names, comments, operators and parenthesised groups are left out, so neither
+/// `DEFAULT 'not null'` nor `REFERENCES t(unique_col)` reads as a constraint, and `DEFAULT $$it's$$
+/// UNIQUE` still declares its key. `None` if the text does not lex.
+fn opts_text(s: &str) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    for t in crate::lex::lex_as_postgres(s).ok()? {
+        match &t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(w) if depth == 0 && w.quote_style.is_none() => {
+                words.push(w.value.to_ascii_lowercase())
             }
-            None => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ if depth == 0 => out.push(ch.to_ascii_lowercase()),
-                _ => {}
-            },
+            _ => {}
         }
     }
-    format!(" {} ", out.split_whitespace().collect::<Vec<_>>().join(" "))
+    Some(format!(" {} ", words.join(" ")))
 }
 
 /// Whether a `CREATE TABLE` body item is a table-level constraint rather than a column definition,
@@ -762,7 +750,7 @@ fn recover_body(body: &str) -> Option<Body> {
                 // one does; those columns may be declared after the constraint, so that is applied
                 // once the whole table is built ([`Reader::add_key`]).
                 let primary = take_ident(item).is_some_and(|(w, _)| w == "primary");
-                let nnd = opts_text(item).contains(" nulls not distinct ");
+                let nnd = opts_text(item)?.contains(" nulls not distinct ");
                 b.keys
                     .push(KeyDecl::new(Key::Cols(key, nnd), primary, false, label));
             }
@@ -781,7 +769,7 @@ fn recover_body(body: &str) -> Option<Body> {
                 let array = array_suffix(rest);
                 let ct = col_type(&type_region(rest));
                 let (_, opts) = take_ident(rest)?;
-                let opts = opts_text(opts);
+                let opts = opts_text(opts)?;
                 // An identity column is NOT NULL, and so is a serial one (`ColType::serial`).
                 let sequenced = ct.serial || opts.contains(" as identity ");
                 let mut notnull = opts.contains(" not null ") || sequenced;
@@ -1891,8 +1879,10 @@ impl Reader {
             return;
         }
         let open = caps.get(0).unwrap().end() - 1;
-        let Some(close) = matching(text, open) else {
-            return;
+        let close = match matching(text, open) {
+            Ok(Some(close)) => close,
+            Ok(None) => return,
+            Err(why) => return self.create_unreadable(schema, name, &why),
         };
         let Some(body) = recover_body(&text[open + 1..close]) else {
             return;
@@ -1902,6 +1892,59 @@ impl Reader {
             .map(|c| c[1].split(',').map(target_of_raw).filter(|t| !t.1.is_empty()).collect())
             .unwrap_or_default();
         self.create(schema, name, body, parents);
+    }
+
+    /// Declare the table `caps` matched in text that does not lex as unreadable, rather than read
+    /// columns and keys from text whose literals and comments cannot be told apart from its code.
+    fn recover_unlexed(&mut self, caps: &regex::Captures, why: &str) {
+        let (schema, name) = target_of_raw(&caps[1]);
+        if name.is_empty() || self.seen.contains(&(schema.clone(), name.clone())) {
+            return;
+        }
+        self.create_unreadable(schema, name, why);
+    }
+
+    fn create_unreadable(&mut self, schema: Option<String>, name: String, why: &str) {
+        let body = Body {
+            unreadable: Some(format!("a CREATE TABLE in text that does not lex: {why}")),
+            ..Body::default()
+        };
+        self.create(schema, name, body, Vec::new());
+    }
+
+    /// The regex fallback's `CREATE TABLE`s in `text`, read where Postgres's lexer puts them in code:
+    /// a match inside a comment or a literal is no statement and is skipped, except that a
+    /// dollar-quoted body (a function's) is read again on its own. Text that does not lex declares
+    /// each table it matches unreadable.
+    fn recover_in(&mut self, text: &str) {
+        let toks = match crate::lex::lex_as_postgres(text) {
+            Ok(toks) => toks,
+            Err(why) => {
+                for caps in TBL_RE.captures_iter(text) {
+                    self.recover_unlexed(&caps, &why);
+                }
+                return;
+            }
+        };
+        for caps in TBL_RE.captures_iter(text) {
+            let at = caps.get(0).unwrap().start();
+            let hidden = toks
+                .iter()
+                .find(|t| t.start <= at && at < t.end)
+                .is_some_and(|t| t.is_blank() || crate::lex::is_literal_token(&t.token));
+            if !hidden {
+                self.recover(text, &caps);
+            }
+        }
+        for t in &toks {
+            if let Token::DollarQuotedString(d) = &t.token {
+                // `$tag$…$tag$`: the body is what lies between the two delimiters.
+                let delim = d.tag.as_deref().map_or(2, |tag| tag.len() + 2);
+                if t.end - t.start >= 2 * delim {
+                    self.recover_in(&text[t.start + delim..t.end - delim]);
+                }
+            }
+        }
     }
 
     /// The tables as read: each declaration's keys folded into its [`Table`], keyed as [`Schema`]
@@ -2043,11 +2086,10 @@ pub fn parse_schema_stats(ddl: &str) -> (Schema, usize) {
 
     // Regex fallback over the raw text, for what no statement above declared: a `CREATE TABLE` (an
     // unquoted reserved word for a column name is the corpus's usual reason the parser rejects one)
-    // and a plain-column `CREATE UNIQUE INDEX`, wherever the text holds one -- a function body's
-    // included. Only ever adds tables and keys, after every statement has applied.
-    for caps in TBL_RE.captures_iter(&cleaned) {
-        r.recover(&cleaned, &caps);
-    }
+    // and a plain-column `CREATE UNIQUE INDEX`, wherever the text holds one -- a dollar-quoted
+    // function body's included, though not a comment or another literal. Only ever adds tables and
+    // keys, after every statement has applied.
+    r.recover_in(&cleaned);
     for caps in IDX_RE.captures_iter(&cleaned) {
         let parts: Vec<String> = caps[1].split('.').map(|p| p.to_lowercase()).collect();
         let name = parts.last().cloned().unwrap_or_default();

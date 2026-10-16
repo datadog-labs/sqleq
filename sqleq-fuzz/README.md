@@ -66,7 +66,12 @@ How the Postgres engine differs from the DuckDB one:
   the DDL creates a table of that name itself does not count: an unqualified `t` beside an `s.t` is
   `public.t`), a table the queries name by one other schema is moved there, a type nothing declares
   is read as `text`, and a column default that calls a function nothing declares is dropped. The
-  last two are reported as a `caveat`, since a verdict then rests on more than the DDL says.
+  last two are reported as a `caveat`, since a verdict then rests on more than the DDL says. Where
+  the build's `uuid-ossp` cannot load, its functions are defined under their own names instead:
+  `uuid_generate_v4()` and the time-based `uuid_generate_v1()` and `uuid_generate_v1mc()` draw a
+  fresh random uuid (no pair can depend on which), and `uuid_generate_v3()`, and
+  `uuid_generate_v5()` where pgcrypto loads, are computed exactly. A pair no trial could run after a
+  default calling a function of such an extension was dropped is `NOT-COMPARABLE`, naming it.
 - **The rows are rows of the tables the DDL leaves.** Once the DDL has run, each table's rows are
   generated from Postgres's catalog: its own columns under their own names, every one filled, and
   `NULL` in some rows exactly where Postgres admits a `NULL`. Whatever the DDL did on the way —
@@ -179,7 +184,10 @@ deterministic, on either engine. The rules:
   at the `;`s the tokenizer reads as Postgres's lexer does: not inside a literal (`E'…'` with its
   backslash escapes too), a quoted name, a dollar-quoted body or a nested comment, nor inside
   parentheses or a routine's `BEGIN ATOMIC` body, as psql does. Text it cannot lex is never cut on
-  every `;`: `file` mode stops with an error, and DDL is `NO-SCHEMA`.
+  every `;`: `file` mode stops with an error, and DDL is `NO-SCHEMA`. The DDL is read as written,
+  with no backslash sequence unescaped first, and a `CREATE TABLE` the parser rejects is read over
+  the same tokens, so a key or `NOT NULL` after a dollar-quoted or `E'…'` default is still seen; one
+  in text that does not lex is a table read as unreadable.
 - **Don't invent a parameter correspondence.** See the next section.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
