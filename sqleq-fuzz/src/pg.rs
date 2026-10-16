@@ -73,7 +73,7 @@ const EXTENSIONS: &[&str] = &[
 pub const MAJOR: u32 = 17;
 
 /// Bumped whenever what the cached template holds changes, so an old template is never reused.
-const TEMPLATE_FORMAT: u32 = 3;
+const TEMPLATE_FORMAT: u32 = 4;
 
 /// Where the Postgres binaries are: `$SQLEQ_PG_BIN` when it is set, else the PostgreSQL the build
 /// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
@@ -311,14 +311,27 @@ fn conninfo(sock: &Path, db: &str) -> String {
     format!("host={} port=5432 user=postgres dbname={db}", sock.display())
 }
 
-/// The `uuid-ossp` functions core PostgreSQL computes exactly, defined under their own names where the
-/// extension cannot load: the one a build carries may need a library the system lacks (the fetched
-/// Linux build links OSSP's libuuid), and a schema that calls them must run on every build alike.
-/// `gen_random_uuid()` draws a version-4 uuid as `uuid_generate_v4()` does; the namespace constants
-/// are RFC 4122's.
+/// The `uuid-ossp` functions core PostgreSQL can stand in for, defined under their own names where
+/// the extension cannot load: the one a build carries may need a library the system lacks (the
+/// fetched Linux build links OSSP's libuuid), and a schema that calls them must run on every build
+/// alike. `gen_random_uuid()` draws a version-4 uuid as `uuid_generate_v4()` does. The time-based
+/// `uuid_generate_v1()` and `uuid_generate_v1mc()` depend on the clock and a MAC address or a random
+/// node, so no pair can depend on which value they give, only on its being fresh: they draw a random
+/// uuid and mark it version 1, volatile as the extension's are. `uuid_generate_v3()` is RFC 4122's
+/// name-based MD5 uuid, computed exactly; the namespace constants are RFC 4122's.
 const UUID_OSSP_CORE: &str = "\
     CREATE FUNCTION uuid_generate_v4() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE \
         AS 'SELECT gen_random_uuid()'; \
+    CREATE FUNCTION uuid_generate_v1() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE \
+        AS $$SELECT overlay(gen_random_uuid()::text PLACING '1' FROM 15 FOR 1)::uuid$$; \
+    CREATE FUNCTION uuid_generate_v1mc() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE \
+        AS $$SELECT overlay(gen_random_uuid()::text PLACING '1' FROM 15 FOR 1)::uuid$$; \
+    CREATE FUNCTION uuid_generate_v3(namespace uuid, name text) RETURNS uuid LANGUAGE sql \
+        IMMUTABLE STRICT PARALLEL SAFE AS $$ \
+        SELECT (substr(h, 1, 12) || '3' || substr(h, 14, 3) \
+                || to_hex((('x' || substr(h, 17, 1))::bit(4)::int & 3) | 8) || substr(h, 18))::uuid \
+        FROM (SELECT md5(decode(replace(namespace::text, '-', ''), 'hex') \
+                         || convert_to(name, 'UTF8')) AS h) AS s $$; \
     CREATE FUNCTION uuid_nil() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
         AS $$SELECT '00000000-0000-0000-0000-000000000000'::uuid$$; \
     CREATE FUNCTION uuid_ns_dns() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
@@ -329,6 +342,45 @@ const UUID_OSSP_CORE: &str = "\
         AS $$SELECT '6ba7b812-9dad-11d1-80b4-00c04fd430c8'::uuid$$; \
     CREATE FUNCTION uuid_ns_x500() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE \
         AS $$SELECT '6ba7b814-9dad-11d1-80b4-00c04fd430c8'::uuid$$;";
+
+/// `uuid_generate_v5()`, RFC 4122's name-based SHA-1 uuid, computed exactly. Core PostgreSQL has no
+/// SHA-1, so this is defined beside [`UUID_OSSP_CORE`] only where pgcrypto's `digest` loaded.
+const UUID_OSSP_V5: &str = "\
+    CREATE FUNCTION uuid_generate_v5(namespace uuid, name text) RETURNS uuid LANGUAGE sql \
+        IMMUTABLE STRICT PARALLEL SAFE AS $$ \
+        SELECT (substr(h, 1, 12) || '5' || substr(h, 14, 3) \
+                || to_hex((('x' || substr(h, 17, 1))::bit(4)::int & 3) | 8) || substr(h, 18, 15))::uuid \
+        FROM (SELECT encode(public.digest(decode(replace(namespace::text, '-', ''), 'hex') \
+                                          || convert_to(name, 'UTF8'), 'sha1'), 'hex') AS h) AS s $$;";
+
+/// The functions of the extensions [`EXTENSIONS`] installs that a build may be unable to load, by
+/// extension. A column default that calls one is dropped like one calling a function nothing
+/// declares, and a pair no trial could then run says so instead of failing.
+const EXTENSION_FUNCTIONS: &[(&str, &[&str])] = &[(
+    "uuid-ossp",
+    &[
+        "uuid_generate_v1",
+        "uuid_generate_v1mc",
+        "uuid_generate_v3",
+        "uuid_generate_v4",
+        "uuid_generate_v5",
+        "uuid_nil",
+        "uuid_ns_dns",
+        "uuid_ns_url",
+        "uuid_ns_oid",
+        "uuid_ns_x500",
+    ],
+)];
+
+/// The extension a function belongs to, if it is one of [`EXTENSION_FUNCTIONS`], by its unqualified
+/// name.
+fn extension_of(function: &str) -> Option<&'static str> {
+    let bare = function.rsplit('.').next().unwrap_or(function).trim_matches('"');
+    EXTENSION_FUNCTIONS
+        .iter()
+        .find(|(_, fs)| fs.iter().any(|f| f.eq_ignore_ascii_case(bare)))
+        .map(|(ext, _)| *ext)
+}
 
 /// The functions every read of the transaction clock becomes ([`pat::clock_reads`]), one per type a
 /// read can have, each the instant the setting `sqleq.clock` holds -- the one a trial sets -- as
@@ -401,6 +453,13 @@ fn template(bin: &Path, ver: &str) -> Result<PathBuf, String> {
                 .unwrap_or(true);
             if !has_uuid {
                 t.batch_execute(UUID_OSSP_CORE).map_err(|e| msg(&e))?;
+                let has_digest = t
+                    .query_one("SELECT to_regprocedure('public.digest(bytea,text)') IS NOT NULL", &[])
+                    .map(|r| r.get::<_, bool>(0))
+                    .unwrap_or(false);
+                if has_digest {
+                    t.batch_execute(UUID_OSSP_V5).map_err(|e| msg(&e))?;
+                }
             }
             t.batch_execute(&format!("SET sqleq.clock = '{}'; {CLOCK_FUNCTIONS}", clocks()[1]))
                 .map_err(|e| msg(&e))?;
@@ -1680,9 +1739,11 @@ fn run_pair(
         }
     }
     let mut stubs: Vec<String> = Vec::new();
+    // The functions whose defaults were dropped, in the order the DDL met them.
+    let mut dropped: Vec<String> = Vec::new();
     loop {
         let mut sql = String::from("SAVEPOINT ddl;\n");
-        for s in stubs.iter().filter(|s| !s.is_empty()) {
+        for s in &stubs {
             sql.push_str(&format!("CREATE DOMAIN {s} AS text;\n"));
         }
         sql.push_str(&placed);
@@ -1701,22 +1762,30 @@ fn run_pair(
                 });
                 // A column default that calls a function nothing declares is dropped, as DuckDB drops
                 // every default: only an INSERT that omits the column can tell.
-                let dropped = MISSING_FUNCTION
+                let without = MISSING_FUNCTION
                     .captures(&e)
-                    .and_then(|c| drop_defaults(&placed, &c[1]));
-                match (missing, dropped) {
-                    (Some(m), _) if stubs.len() < 25 && !stubs.contains(&m) => stubs.push(m),
-                    (None, Some(d)) if stubs.len() < 25 => {
+                    .and_then(|c| drop_defaults(&placed, &c[1]).map(|d| (c[1].to_string(), d)));
+                match (missing, without) {
+                    (Some(m), _) if stubs.len() + dropped.len() < 25 && !stubs.contains(&m) => {
+                        stubs.push(m)
+                    }
+                    (None, Some((f, d))) if stubs.len() + dropped.len() < 25 => {
                         placed = d;
-                        stubs.push(String::new());
+                        dropped.push(f);
                     }
                     _ => return Verdict::Error(format!("ddl: {e}")),
                 }
             }
         }
     }
-    timing.stand_ins = stubs.iter().filter(|s| !s.is_empty()).count();
-    timing.dropped_defaults = stubs.iter().filter(|s| s.is_empty()).count();
+    timing.stand_ins = stubs.len();
+    timing.dropped_defaults = dropped.len();
+    // A pair no trial ran, on a table whose default called a function of an extension this build
+    // cannot load: not comparable here, rather than the error the dropped default caused.
+    let unloaded = dropped.iter().find_map(|f| {
+        extension_of(f).map(|ext| format!("ddl: {f}() from {ext} does not load here"))
+    });
+    let failed = |e: String| unloaded.clone().map_or(Verdict::Error(e), Verdict::NotComparable);
 
     // A table the queries name by one schema, created in another, moves there: it is one table under
     // the spelling the queries use. Named by two schemas, it is two tables to the queries.
@@ -2520,18 +2589,18 @@ fn run_pair(
     }
     if gathered.is_some() {
         return match (ok_trials, last_err) {
-            (0, Some(e)) => Verdict::Error(e),
+            (0, Some(e)) => failed(e),
             (ok, e) => Verdict::NoCounterexampleGather(e.map(|e| (ok, e))),
         };
     }
     if let Some(detail) = misaligned {
         return match (ok_trials, last_err) {
-            (0, Some(e)) => Verdict::Error(e),
+            (0, Some(e)) => failed(e),
             _ => Verdict::ParamMisaligned(detail),
         };
     }
     match (ok_trials, last_err) {
-        (0, Some(e)) => Verdict::Error(e),
+        (0, Some(e)) => failed(e),
         (_, Some(e)) => Verdict::NoCounterexamplePartial {
             ok: ok_trials,
             last_err: e,
@@ -2543,6 +2612,63 @@ fn run_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `uuid-ossp` stand-ins give what the extension gives: RFC 4122's name-based uuids exactly,
+    /// and a fresh version-1 uuid per call from the time-based ones. Defined in a scratch schema, so
+    /// this holds whether or not the build's own extension loads.
+    #[test]
+    fn the_uuid_ossp_stand_ins_compute_what_the_extension_does() {
+        let server = match Server::start(1) {
+            Ok(s) => s,
+            Err(e) if std::env::var_os("SQLEQ_PG_REQUIRED").is_none() => {
+                eprintln!("skipped, no PostgreSQL {MAJOR}: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let mut c = server.worker(0).expect("connect");
+        c.batch_execute("BEGIN; CREATE SCHEMA ossp_check; SET LOCAL search_path = ossp_check, public")
+            .expect("schema");
+        c.batch_execute(UUID_OSSP_CORE).expect("core stand-ins");
+        let one = |c: &mut Client, q: &str| -> String { c.query_one(q, &[]).expect(q).get(0) };
+        assert_eq!(
+            one(&mut c, "SELECT ossp_check.uuid_generate_v3(ossp_check.uuid_ns_dns(), 'python.org')::text"),
+            "6fa459ea-ee8a-3ca4-894e-db77e160355e"
+        );
+        assert_eq!(
+            one(&mut c, "SELECT ossp_check.uuid_generate_v3(ossp_check.uuid_ns_url(), 'https://example.com/a')::text"),
+            "a257f385-897f-3805-9a3a-db29b1f92977"
+        );
+        for f in ["uuid_generate_v1", "uuid_generate_v1mc"] {
+            let (a, b): (String, String) = {
+                let r = c
+                    .query_one(&format!("SELECT ossp_check.{f}()::text, ossp_check.{f}()::text"), &[])
+                    .expect(f);
+                (r.get(0), r.get(1))
+            };
+            assert_ne!(a, b, "{f} gave one value twice");
+            assert_eq!(&a[14..15], "1", "{f} is not version 1: {a}");
+        }
+        let has_digest: bool = c
+            .query_one("SELECT to_regprocedure('public.digest(bytea,text)') IS NOT NULL", &[])
+            .expect("digest")
+            .get(0);
+        if has_digest {
+            c.batch_execute(UUID_OSSP_V5).expect("v5 stand-in");
+            assert_eq!(
+                one(&mut c, "SELECT ossp_check.uuid_generate_v5(ossp_check.uuid_ns_dns(), 'python.org')::text"),
+                "886313e1-3b8a-5372-9b90-0c9aee199e5d"
+            );
+        }
+        c.batch_execute("ROLLBACK").expect("rollback");
+    }
+
+    #[test]
+    fn a_uuid_ossp_function_is_known_by_its_extension() {
+        assert_eq!(extension_of("uuid_generate_v1mc"), Some("uuid-ossp"));
+        assert_eq!(extension_of("public.uuid_generate_v1"), Some("uuid-ossp"));
+        assert_eq!(extension_of("gen_id"), None);
+    }
 
     /// A scan of a table that another inherits from reads the other's rows too, which its key does
     /// not bind: an order by that key is no total order there, and a NOT NULL the child dropped is

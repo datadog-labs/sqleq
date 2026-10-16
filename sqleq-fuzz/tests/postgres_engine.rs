@@ -313,6 +313,28 @@ fn an_undeclared_type_is_read_as_text_and_said_so() {
     assert!(o.timing.caveat().unwrap().contains("read as text"));
 }
 
+/// A default calling `uuid-ossp`'s time-based generator is kept, whether or not the build's own
+/// extension loads: an INSERT that omits the column stores a fresh uuid, as it does on Postgres.
+#[test]
+fn a_uuid_generate_v1mc_default_is_kept() {
+    let ddl = "CREATE TABLE events (id uuid PRIMARY KEY DEFAULT uuid_generate_v1mc(), kind text NOT NULL)";
+    let Some(o) = outcome(
+        "INSERT INTO events (kind) VALUES ($1)",
+        "INSERT INTO events (kind) SELECT $1",
+        ddl,
+    ) else {
+        return;
+    };
+    assert_eq!(o.verdict.label(), "NO-COUNTEREXAMPLE");
+    assert_eq!(o.timing.dropped_defaults, 0);
+    assert_kind!(
+        "INSERT INTO events (kind) VALUES ($1), ($2)",
+        "INSERT INTO events (kind) SELECT * FROM unnest($1::text[])",
+        ddl,
+        "NO-COUNTEREXAMPLE-GATHER"
+    );
+}
+
 #[test]
 fn a_default_calling_an_undeclared_function_is_dropped_and_said_so() {
     let ddl = r#"CREATE TABLE t (id uuid PRIMARY KEY DEFAULT gen_id(), a integer)"#;

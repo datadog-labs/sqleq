@@ -66,7 +66,12 @@ How the Postgres engine differs from the DuckDB one:
   the DDL creates a table of that name itself does not count: an unqualified `t` beside an `s.t` is
   `public.t`), a table the queries name by one other schema is moved there, a type nothing declares
   is read as `text`, and a column default that calls a function nothing declares is dropped. The
-  last two are reported as a `caveat`, since a verdict then rests on more than the DDL says.
+  last two are reported as a `caveat`, since a verdict then rests on more than the DDL says. Where
+  the build's `uuid-ossp` cannot load, its functions are defined under their own names instead:
+  `uuid_generate_v4()` and the time-based `uuid_generate_v1()` and `uuid_generate_v1mc()` draw a
+  fresh random uuid (no pair can depend on which), and `uuid_generate_v3()`, and
+  `uuid_generate_v5()` where pgcrypto loads, are computed exactly. A pair no trial could run after a
+  default calling a function of such an extension was dropped is `NOT-COMPARABLE`, naming it.
 - **The rows are rows of the tables the DDL leaves.** Once the DDL has run, each table's rows are
   generated from Postgres's catalog: its own columns under their own names, every one filled, and
   `NULL` in some rows exactly where Postgres admits a `NULL`. Whatever the DDL did on the way —
