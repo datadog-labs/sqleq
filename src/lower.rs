@@ -3282,7 +3282,7 @@ fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
             let ty = ty_of(&inner);
             Ok(json!({ "operator": "-", "operand": [inner], "type": ty }))
         }
-        UnaryOperator::Not => Ok(not_bool(inner)),
+        UnaryOperator::Not => Ok(not_bool(coerce_bool(inner))),
         other => Err(unsupported(format!("unary op {other:?}"))),
     }
 }

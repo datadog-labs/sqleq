@@ -517,3 +517,49 @@ fn an_in_subquery_operand_that_cannot_take_the_columns_type_is_refused() {
     let ddl = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" TEXT);"#;
     refused(ddl, r#"SELECT "id" FROM "t" WHERE "s" IN (SELECT "a" FROM "t")"#, r#"SELECT "id" FROM "t""#, "IN subquery");
 }
+
+/// Every `NOT` in the plan, with the sort of the operand it negates.
+fn not_operand_types(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.get("operator").and_then(Value::as_str) == Some("NOT") {
+                let t = m["operand"][0].get("type").and_then(Value::as_str).unwrap_or("?");
+                out.push(t.to_string());
+            }
+            m.values().for_each(|x| not_operand_types(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| not_operand_types(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn a_nots_operand_is_boolean_wherever_it_is_lowered() {
+    // `NOT` over a demoted boolean operator or an undeclared call, outside a WHERE, reached the QED
+    // prover applied to a VARBINARY term, which panicked it (#186). Every `NOT` takes a BOOLEAN.
+    let ddl = r#"create table "t" ("id" INTEGER, "s" TEXT, "u" TEXT, unique ("id"));"#;
+    let cases = [
+        r#"SELECT ("s" ~ 'y') IS FALSE FROM "t""#,
+        r#"SELECT ("s" !~ 'y') IS TRUE FROM "t""#,
+        r#"SELECT NOT ("s" ~ 'y') FROM "t""#,
+        r#"SELECT NOT starts_with("s", 'x') FROM "t""#,
+        r#"SELECT "id" FROM "t" WHERE (NOT ("s" ~ 'y')) IS TRUE"#,
+    ];
+    for q in cases {
+        for mode in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+            let v = lower_in(ddl, q, q, mode);
+            let mut types = Vec::new();
+            not_operand_types(&v, &mut types);
+            assert!(!types.is_empty(), "{q}: no NOT in the plan");
+            assert!(types.iter().all(|t| t == "BOOLEAN"), "{q} ({mode:?}): NOT over {types:?}");
+        }
+    }
+    // The two spellings of the #186 pair read one plan, in the declared catalog too.
+    let a = r#"SELECT "id" FROM "t" WHERE ("s" ~ 'y') IS FALSE"#;
+    let b = r#"SELECT "id" FROM "t" WHERE ("s" !~ 'y') IS TRUE"#;
+    for mode in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        let mut types = Vec::new();
+        not_operand_types(&lower_in(ddl, a, b, mode), &mut types);
+        assert!(types.iter().all(|t| t == "BOOLEAN"), "{mode:?}: {types:?}");
+    }
+}

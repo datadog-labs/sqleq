@@ -122,9 +122,9 @@ const SAME_TYPE: [&str; 7] =
 ///
 /// * a core function that returns `box`, `circle`, `lseg` or `line` returns that type
 ///   ([`crate::types::unfaithful_result`]), whose `=` is not even transitive;
-/// * a symbol whose name says it returns text or a boolean (`q_str_jsonx`, which `->>` becomes, and
-///   the other `q_str_` and `q_bool_` names) returns a value whose `=` is identity,
-///   [`IDENTITY_OPAQUE`];
+/// * a symbol whose name says it returns text (`q_str_jsonx`, which `->>` becomes, and the other
+///   `q_str_` names) returns a value whose `=` is identity, [`IDENTITY_OPAQUE`]; one that says it
+///   returns a boolean (the `q_bool_` names) returns `BOOLEAN`;
 /// * a [`PASS_THROUGH`] function over a value whose `=` is not identity returns a value of the same
 ///   kind, so `coalesce(x, 0)` over a `numeric` `x` gets `x`'s class as a
 ///   [`COARSE_OPAQUE`](crate::types::COARSE_OPAQUE) name;
@@ -138,8 +138,13 @@ pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
     if let Some(t) = unfaithful_result(name) {
         return t.to_string();
     }
-    if matches!(crate::infer::builtin_rtype(name), Some(crate::infer::Ty::Str | crate::infer::Ty::Bool)) {
-        return IDENTITY_OPAQUE.to_string();
+    match crate::infer::builtin_rtype(name) {
+        Some(crate::infer::Ty::Str) => return IDENTITY_OPAQUE.to_string(),
+        // A boolean is its own sort, and `=` on it is identity. Typed so, a declared catalog agrees
+        // with the inferring ones, which declare these symbols BOOLEAN, and a `NOT` over one is
+        // well-sorted.
+        Some(crate::infer::Ty::Bool) => return "BOOLEAN".to_string(),
+        _ => {}
     }
     if PASS_THROUGH.contains(&name) {
         let types: Vec<String> = operand.iter().map(ty_of).collect();
