@@ -24,7 +24,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
 use crate::error::{schema, unsupported, Result};
-use crate::scope::{is_unnamed, unnamed, Binding, Scope};
+use crate::scope::{is_unnamed, nameless, unnamed, Binding, Scope};
 use crate::types::*;
 
 /// Output columns of a (sub)query: `(name, prover type)`.
@@ -1257,16 +1257,24 @@ fn lower_setexpr_ctx(
         // its own `Sort` (if any) is already in place, so there is nothing left to widen.
         SetExpr::Query(q) => lower_query_ctx(cat, fns, q, outer).map(|(v, c)| (v, c, None)),
         SetExpr::SetOperation { op, set_quantifier, left, right } => {
-            let (lv, lcols, _) = lower_setexpr_ctx(cat, fns, left, outer, OrderCtx::Unknown)?;
-            let (rv, rcols, _) = lower_setexpr_ctx(cat, fns, right, outer, OrderCtx::Unknown)?;
-            // Postgres resolves each output column to one type across both branches, promoting a
-            // DATE branch against a TIMESTAMP one. The prover takes the columns as they stand, so a
-            // branch pair that differs across a temporal boundary would put two units in one column;
-            // with no conversion to insert inside a branch from here, it is refused.
-            if let Some(((_, a), (_, b))) =
-                lcols.iter().zip(&rcols).find(|((_, a), (_, b))| temporal_mismatch(a, b) || hides_coarse(a, b))
-            {
-                return Err(unsupported(format!("set operation over columns of type {a} and {b}")));
+            let (mut lv, mut lcols, _) = lower_setexpr_ctx(cat, fns, left, outer, OrderCtx::Unknown)?;
+            let (mut rv, rcols, _) = lower_setexpr_ctx(cat, fns, right, outer, OrderCtx::Unknown)?;
+            // Postgres resolves each output column to one type across both branches. The prover
+            // takes the columns as they stand and asserts that every branch matches the first, so
+            // each column is given one type here, or the pair is refused.
+            if lcols.len() != rcols.len() {
+                return Err(schema(format!(
+                    "each set operation query must have the same number of columns ({} and {})",
+                    lcols.len(),
+                    rcols.len()
+                )));
+            }
+            let base = Scope::outer_width(outer);
+            let mut rcols = rcols;
+            for j in 0..lcols.len() {
+                let ct = unify_set_column([(&mut lv, &mut lcols), (&mut rv, &mut rcols)], j, base)?;
+                lcols[j].1 = ct.clone();
+                rcols[j].1 = ct;
             }
             let all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
             let rel = match op {
@@ -1296,27 +1304,209 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
         return Err(unsupported("empty VALUES"));
     }
     let empty = Scope::empty();
-    let content: Vec<Vec<Value>> = v
+    let mut content: Vec<Vec<Value>> = v
         .rows
         .iter()
         .map(|row| row.iter().map(|e| lower_expr(cat, &empty, fns, e)).collect::<Result<Vec<_>>>())
         .collect::<Result<Vec<_>>>()?;
-    let schema_tys: Vec<String> = content[0].iter().map(ty_of).collect();
-    // Same reason as the set operations: the column type is the first row's, and a later row of
-    // another temporal type would hold a value in another unit, or one whose `=` is not identity a
-    // value the column's type does not say that of.
-    for row in &content[1..] {
-        if let Some((a, b)) = schema_tys
+    if content.iter().any(|row| row.len() != content[0].len()) {
+        return Err(schema("VALUES lists must all be the same length"));
+    }
+    // Postgres gives each column one type across its rows, and the prover asserts that every row
+    // holds the schema's type. A NULL or an untyped parameter is read as the column's type, a string
+    // literal as an integer or boolean one, and an integer beside a numeric one is converted to it;
+    // any other difference is refused.
+    let mut schema_tys: Vec<String> = Vec::with_capacity(content[0].len());
+    for j in 0..content[0].len() {
+        let voters: Vec<String> = content
             .iter()
-            .zip(row.iter().map(ty_of))
-            .find(|(a, b)| temporal_mismatch(a, b) || hides_coarse(a, b))
-        {
-            return Err(unsupported(format!("VALUES column of type {a} holding a {b}")));
+            .map(|row| &row[j])
+            .filter(|c| !takes_any_type(c) && !is_string_literal(c))
+            .map(ty_of)
+            .collect();
+        let ct = match voters.first() {
+            None if content.iter().any(|row| is_string_literal(&row[j])) => "VARCHAR".to_string(),
+            None => ty_of(&content[0][j]),
+            Some(first) => {
+                let mut ct = first.clone();
+                for b in &voters[1..] {
+                    ct = column_type(&ct, b).ok_or_else(|| {
+                        unsupported(format!("VALUES column of type {ct} holding a {b}"))
+                    })?;
+                }
+                ct
+            }
+        };
+        for row in &mut content {
+            let cell = &row[j];
+            let t = ty_of(cell);
+            if t == ct || (is_opaque(&t) && is_opaque(&ct) && !is_null_lit(cell)) {
+                continue;
+            }
+            if !flexible_cell(cell, &ct) && !(is_integer_in_real(&t, &ct)) {
+                return Err(unsupported(format!("VALUES column of type {ct} holding a {t}")));
+            }
+            row[j] = take_type(row[j].take(), &ct);
         }
+        schema_tys.push(ct);
     }
     let out_cols: OutCols =
         schema_tys.iter().enumerate().map(|(i, t)| (unnamed(i), t.clone())).collect();
     Ok((json!({ "values": { "schema": schema_tys, "content": content } }), out_cols))
+}
+
+/// Whether `v` is a parameter the inference left untyped, which it types opaque. Postgres types such a
+/// parameter from where it is used, so in a set operation's or a `VALUES` list's column it takes the
+/// column's type, as a NULL does. Inference gives a parameter one type for the whole pair, so an
+/// opaque one is untyped everywhere it occurs; and were one occurrence of it given another type than
+/// another, the two would only be read as two independent values, which a proof over every value
+/// covers.
+fn is_untyped_param(v: &Value) -> bool {
+    v.get("operator").and_then(Value::as_str).and_then(|o| o.strip_prefix("QP")).is_some_and(|d| {
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+    }) && is_opaque(&ty_of(v))
+}
+
+/// Whether `cell` takes any type a column needs without a conversion: a NULL is the null of any
+/// type, and an untyped parameter is a value of whatever type it is used at.
+fn takes_any_type(cell: &Value) -> bool {
+    is_null_lit(cell) || is_untyped_param(cell)
+}
+
+/// Whether `cell` takes the type `ct` without a conversion that has a meaning to the prover: one that
+/// [`takes_any_type`], or a string literal read as an integer or a boolean.
+fn flexible_cell(cell: &Value, ct: &str) -> bool {
+    takes_any_type(cell) || (is_string_literal(cell) && matches!(ct, "INTEGER" | "BOOLEAN"))
+}
+
+/// `cell` as a value of type `ct`: an untyped parameter relabelled, anything else through [`cast_to`],
+/// which relabels a NULL and reads a string literal.
+fn take_type(mut cell: Value, ct: &str) -> Value {
+    if is_untyped_param(&cell) {
+        cell["type"] = json!(ct);
+        return cell;
+    }
+    cast_to(cell, ct)
+}
+
+/// An INTEGER cell in a REAL column: `cast_to` makes it a `CAST`, exact in Postgres (an integer to a
+/// numeric) and in both provers.
+fn is_integer_in_real(t: &str, ct: &str) -> bool {
+    t == "INTEGER" && ct == "REAL"
+}
+
+/// The one type of a column holding values of types `a` and `b`, or `None` where the pair is
+/// refused. Only INTEGER beside REAL is converted. A temporal pair, a pair a column's `=` is not the
+/// same under ([`hides_coarse`]), two types of different sorts, or an opaque type beside another
+/// type is refused: Postgres errors on most of those, and the rest would need a conversion keyed on
+/// the opaque value's own shape.
+fn column_type(a: &str, b: &str) -> Option<String> {
+    if a == b {
+        return Some(a.to_string());
+    }
+    if matches!((a, b), ("INTEGER", "REAL") | ("REAL", "INTEGER")) {
+        return Some("REAL".to_string());
+    }
+    if temporal_mismatch(a, b) || hides_coarse(a, b) {
+        return None;
+    }
+    (is_opaque(a) && is_opaque(b)).then(|| a.to_string())
+}
+
+/// The cells column `j` of a branch is made of, when every one of them is written out in the
+/// branch's own projections: through a `UNION`/`INTERSECT`/`EXCEPT` and a `DISTINCT` over them, not
+/// through anything that refers to the column by position or type (a sort, a limit, a scan).
+fn branch_cells(rel: &Value, j: usize) -> Option<Vec<&Value>> {
+    let (kind, body) = rel.as_object()?.iter().next()?;
+    match kind.as_str() {
+        "project" => body["target"].as_array()?.get(j).map(|c| vec![c]),
+        "values" => body["content"].as_array()?.iter().map(|row| row.get(j)).collect(),
+        "distinct" => branch_cells(body, j),
+        "union" | "intersect" | "except" => {
+            let mut all = Vec::new();
+            for r in body.as_array()? {
+                all.extend(branch_cells(r, j)?);
+            }
+            Some(all)
+        }
+        _ => None,
+    }
+}
+
+/// Convert every cell of column `j` of a branch to `ct`, after [`branch_cells`] said they are all
+/// there to convert.
+fn convert_branch_cells(rel: &mut Value, j: usize, ct: &str) {
+    let Some((kind, body)) = rel.as_object_mut().and_then(|m| m.iter_mut().next()) else { return };
+    match kind.as_str() {
+        "project" => {
+            if let Some(c) = body["target"].get_mut(j) {
+                *c = take_type(c.take(), ct);
+            }
+        }
+        "values" => {
+            for row in body["content"].as_array_mut().into_iter().flatten() {
+                if let Some(c) = row.get_mut(j) {
+                    *c = take_type(c.take(), ct);
+                }
+            }
+            if let Some(t) = body["schema"].get_mut(j) {
+                *t = json!(ct);
+            }
+        }
+        "distinct" => convert_branch_cells(body, j, ct),
+        "union" | "intersect" | "except" => {
+            for r in body.as_array_mut().into_iter().flatten() {
+                convert_branch_cells(r, j, ct);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Give column `j` of the two branches of a set operation one type and return it, or refuse the
+/// pair. Each branch comes with its output columns.
+///
+/// A branch whose cells for the column are all NULL or untyped parameters takes the other branch's
+/// type ([`takes_any_type`]). One whose cells are all those or string literals takes an integer or
+/// boolean type from the other, as Postgres reads an `unknown` literal. An INTEGER branch beside a
+/// REAL one is converted to REAL, in either order; the column is then REAL throughout, so what
+/// [`hides_coarse`] guards against does not arise. Where the INTEGER branch's cells are not all
+/// written out in its own projections, the branch is wrapped in one that converts the column, as
+/// [`widen_in_subquery`] does; `base` is the width of the enclosing rows its column numbers start
+/// after. Everything else [`column_type`] refuses is refused.
+fn unify_set_column(mut branches: [(&mut Value, &mut OutCols); 2], j: usize, base: usize) -> Result<String> {
+    let (a, b) = (branches[0].1[j].1.clone(), branches[1].1[j].1.clone());
+    if a == b {
+        return Ok(a);
+    }
+    let refuse = || unsupported(format!("set operation over columns of type {a} and {b}"));
+    // A side whose cells are all NULL, then all NULL or literals, takes the other side's type.
+    for null_only in [true, false] {
+        for (this, other) in [(1, 0), (0, 1)] {
+            let ct = if other == 0 { &a } else { &b };
+            let takes = branch_cells(branches[this].0, j).is_some_and(|c| {
+                c.iter().all(|x| if null_only { takes_any_type(x) } else { flexible_cell(x, ct) })
+            });
+            if takes {
+                convert_branch_cells(branches[this].0, j, ct);
+                return Ok(ct.clone());
+            }
+        }
+    }
+    let ct = column_type(&a, &b).ok_or_else(refuse)?;
+    for (rel, cols) in branches.iter_mut() {
+        let t = cols[j].1.clone();
+        if t == ct || (is_opaque(&t) && is_opaque(&ct)) {
+            continue;
+        }
+        if branch_cells(rel, j).is_none() {
+            let target: Vec<Value> =
+                cols.iter().enumerate().map(|(k, (_, t))| json!({ "column": base + k, "type": t })).collect();
+            **rel = json!({ "project": { "target": target, "source": rel.take() } });
+        }
+        convert_branch_cells(rel, j, &ct);
+    }
+    Ok(ct)
 }
 
 /// Whether `e` is *closed*: no column reference and no nested query anywhere inside it.
@@ -2075,23 +2265,23 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 return Err(unsupported("LATERAL derived table"));
             }
             let (rel, out_cols) = lower_query_ctx(cat, fns, subquery, outer)?;
-            // Postgres 16 and later accept a derived table with no alias.
-            let a = alias.as_ref().ok_or_else(|| unsupported("derived table without an alias"))?;
-            let cols: OutCols = if a.columns.is_empty() {
-                // Output names are already folded as Postgres folds them (see [`fold_name`]), which
-                // is the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
-                out_cols
-            } else {
-                // A longer list is an error in Postgres. A shorter one renames the first columns
-                // and keeps the rest, which is not modelled here.
-                if a.columns.len() > out_cols.len() {
-                    return Err(schema("derived table has fewer columns than its alias names"));
-                }
-                if a.columns.len() < out_cols.len() {
-                    return Err(unsupported("derived table alias list shorter than its columns"));
-                }
-                a.columns.iter().zip(out_cols).map(|(c, (_, t))| (fold_name(&c.name), t)).collect()
+            // Postgres 16 and later accept a derived table with no alias: no qualifier can name it,
+            // so it is bound under a name nothing spells ([`nameless`]) and read by bare column.
+            let (name, list): (String, Vec<&sqlparser::ast::Ident>) = match alias {
+                Some(a) => (fold_name(&a.name), a.columns.iter().map(|c| &c.name).collect()),
+                None => (nameless(), Vec::new()),
             };
+            // Output names are already folded as Postgres folds them (see [`fold_name`]), which is
+            // the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
+            let mut cols: OutCols = out_cols;
+            // A longer list is an error in Postgres. A shorter one renames the first columns in
+            // order and keeps the rest, as it does for a base table.
+            if list.len() > cols.len() {
+                return Err(schema("derived table has fewer columns than its alias names"));
+            }
+            for (col, c) in cols.iter_mut().zip(list) {
+                col.0 = fold_name(c);
+            }
             // Two columns that share a name up to case are refused, as `Catalog::check_case_collisions`
             // refuses them in a table. A reference now tells `"b"` from `"B"`, so this is no longer
             // what keeps them apart; it stays because lifting it is a completeness change of its own.
@@ -2105,7 +2295,7 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             // A derived table's columns are its output, so all of them are visible.
             let n_declared = cols.len();
             Ok((
-                Binding { alias: fold_name(&a.name), cols, offset, table: None, n_declared },
+                Binding { alias: name, cols, offset, table: None, n_declared },
                 rel,
             ))
         }
@@ -3282,7 +3472,7 @@ fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
             let ty = ty_of(&inner);
             Ok(json!({ "operator": "-", "operand": [inner], "type": ty }))
         }
-        UnaryOperator::Not => Ok(not_bool(inner)),
+        UnaryOperator::Not => Ok(not_bool(coerce_bool(inner))),
         other => Err(unsupported(format!("unary op {other:?}"))),
     }
 }

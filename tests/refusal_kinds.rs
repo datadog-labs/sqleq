@@ -94,21 +94,31 @@ const REJECTED: &[Row] = &[
         r#"42P01 missing FROM-clause entry for table "z""#),
     row(Schema, r#"SELECT "a" AS "x", "b" AS "x" FROM "t" GROUP BY "x""#, r#"SELECT "a" FROM "t""#,
         "ambiguous GROUP BY key x", r#"42702 GROUP BY "x" is ambiguous"#),
+    // A `RETURNING` item is a name the statement can see, as a select-list item is.
+    row(Schema, r#"UPDATE "t" SET "a" = 1 RETURNING "zz""#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "zz""#, r#"DELETE FROM "t" WHERE true RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"INSERT INTO "t" ("a") VALUES (1) RETURNING "zz""#, r#"INSERT INTO "t" ("a") VALUES (2 - 1) RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "t"."zz""#, r#"DELETE FROM "t" WHERE true RETURNING "t"."zz""#,
+        "column t.zz does not exist", r#"42703 column t.zz does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "q".*"#, r#"DELETE FROM "t" WHERE true RETURNING "q".*"#,
+        "missing FROM-clause entry for table q", r#"42P01 missing FROM-clause entry for table "q""#),
+    row(Schema, r#"UPDATE "t" SET "a" = 1 RETURNING "old"."a""#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "old"."a""#,
+        "missing FROM-clause entry for table old", r#"42P01 missing FROM-clause entry for table "old" (Postgres 18 adds old and new)"#),
 ];
 
 /// Input Postgres accepts.
 const ACCEPTED: &[Row] = &[
     // Postgres syntax the frontend's parser does not read.
     row(Unsupported, "SELECT", "SELECT 1", "parser does not read", "prepares: a select list may be empty"),
+    row(Unsupported, r#"SELECT "a" FROM ONLY "t""#, r#"SELECT "a" FROM "t""#, "ONLY in a table reference", "prepares"),
     row(Unsupported, r#"TABLE "t""#, r#"SELECT * FROM "t""#, "parser does not read", "prepares"),
     row(Unsupported, r#"DELETE FROM "t""#, r#"SELECT "a" FROM "t""#, "DELETE paired with non-DELETE", "prepares"),
     row(Unsupported, r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN DELETE"#,
         r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN UPDATE SET "b" = 1"#, "MERGE", "prepares"),
     row(Unsupported, r#"SELECT 1 FROM "t" AS "x"("b")"#, r#"SELECT 1 FROM "t""#, "two columns", "prepares"),
-    row(Unsupported, r#"SELECT "a" FROM (SELECT "a" FROM "t")"#, r#"SELECT "a" FROM "t""#,
-        "derived table without an alias", "prepares (Postgres 16 and later)"),
-    row(Unsupported, r#"SELECT "x", "b" FROM (SELECT "a", "b" FROM "t") AS "s"("x")"#, r#"SELECT "a", "b" FROM "t""#,
-        "shorter than its columns", "prepares"),
     row(Unsupported, r#"SELECT "a" FROM "t" WHERE EXISTS (SELECT "t".* FROM "u")"#, r#"SELECT "a" FROM "t""#,
         "over an enclosing query's binding", "prepares"),
     row(Unsupported, r#"SELECT "t" FROM "t""#, r#"SELECT "a" FROM "t""#, "whole-row reference t", "prepares"),
@@ -190,11 +200,23 @@ fn the_valid_neighbours_still_lower() {
         (r#"SELECT "a" FROM "t" WHERE ("a", "b") IN ((1, 2))"#, r#"SELECT "a" FROM "t" WHERE "a" = 1 AND "b" = 2"#),
         (r#"SELECT "a" FROM "t" ORDER BY 1 LIMIT 1"#, r#"SELECT "a" FROM "t" ORDER BY "a" LIMIT 1"#),
         (r#"SELECT "x" FROM (SELECT "a" FROM "t") AS "s"("x")"#, r#"SELECT "a" FROM "t""#),
+        // Postgres 16 and later accept a derived table with no alias.
+        (r#"SELECT "a" FROM (SELECT "a" FROM "t")"#, r#"SELECT "a" FROM "t""#),
+        // A shorter list renames the first columns and keeps the rest.
+        (r#"SELECT "x", "b" FROM (SELECT "a", "b" FROM "t") AS "s"("x")"#, r#"SELECT "a", "b" FROM "t""#),
         (
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY "a" LIMIT 5"#,
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY 1 LIMIT 5"#,
         ),
         (r#"SELECT DISTINCT "a" FROM "t" ORDER BY "a" LIMIT 5"#, r#"SELECT DISTINCT "a" FROM "t" ORDER BY 1 LIMIT 5"#),
+        // `RETURNING` names that do resolve: a system column, a wildcard, an alias, an expression, and
+        // a subquery's own scope.
+        (r#"UPDATE "t" SET "a" = 1 RETURNING "ctid", "t".*"#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "ctid", "t".*"#),
+        (r#"DELETE FROM "t" AS "x" RETURNING "x"."a" + 1 AS "n", *"#, r#"DELETE FROM "t" AS "x" WHERE true RETURNING "x"."a" + 1 AS "n", *"#),
+        (r#"DELETE FROM "t" RETURNING (SELECT max("c") FROM "u")"#, r#"DELETE FROM "t" WHERE true RETURNING (SELECT max("c") FROM "u")"#),
+        (r#"INSERT INTO "t" ("a") VALUES (1) RETURNING "a", "ctid""#, r#"INSERT INTO "t" ("a") VALUES (2 - 1) RETURNING "a", "ctid""#),
+        (r#"UPDATE "t" SET "a" = 1 RETURNING make_interval(secs => "b")"#,
+            r#"UPDATE "t" SET "a" = 2 - 1 RETURNING make_interval(secs => "b")"#),
     ] {
         let src = format!("{T}\n{a};\n{b};");
         for source in BOTH {

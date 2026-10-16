@@ -35,6 +35,20 @@ pub fn is_unnamed(name: &str) -> bool {
     name.starts_with('\u{0}')
 }
 
+/// The binding name of a derived table that has no alias (Postgres 16 and later accept one).
+///
+/// No qualifier can name such a table, so its name must be one no reference spells: it starts with a
+/// NUL, as [`unnamed`] does, and [`Scope::try_resolve`] therefore never matches a qualifier to it. A
+/// bare column still resolves into it.
+pub fn nameless() -> String {
+    "\u{0}nameless".to_string()
+}
+
+/// What a binding is called in a message: its alias, or "an unnamed subquery" for a [`nameless`] one.
+fn shown_alias(alias: &str) -> &str {
+    if alias.starts_with('\u{0}') { "an unnamed subquery" } else { alias }
+}
+
 /// One relation instance in a FROM clause (a base table or a derived subquery), with its absolute
 /// column offset in the row scope and its output columns `(name, type)`.
 #[derive(Clone)]
@@ -188,7 +202,7 @@ impl Scope {
             let shown = qual.map(|q| format!("{q}.")).unwrap_or_default();
             unsupported(format!(
                 "column {shown}{col} missed by {}, which has a column whose name is not known",
-                b.alias
+                shown_alias(&b.alias)
             ))
         };
         let hit = |b: &Binding, i: usize| Some((b.offset + i, b.cols[i].1.clone()));

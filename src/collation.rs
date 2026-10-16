@@ -382,11 +382,18 @@ pub fn compare(
 /// comparisons [`compare`] built, `=` and the forms built on it (under a deterministic collation it
 /// is identity), the null tests, `||`, `CASE`, `COALESCE`, a cast, `COUNT` and `LIKE` (which matches
 /// characters, not their order or case). A function the frontend names (`q_cast_..`, `q_conv_..`,
-/// `qcastN`, the JSON lookups) is matched by [`blind`].
+/// `qcastN`) is matched by [`blind`].
+///
+/// The JSON entries are spelled as the IR spells them, upper case, because a call is named by its
+/// upper-cased name; `q_numeric` is the exception, written in lower case where it is emitted. Only the
+/// lookups that yield json or jsonb are here (`->`, `#>`, `jsonb_extract_path`). The ones that yield
+/// text (`->>`, `#>>`, `*_extract_path_text`) are not: the text they return inherits the collation of
+/// its argument, and the declared catalog types their call `VARBINARY`, so an operation over that
+/// result would escape the `VARCHAR` check in [`refuse`].
 pub const BLIND: &[&str] = &[
     "<", "<=", ">", ">=", "q_str_lt", "q_str_le", "=", "<>", "IS DISTINCT FROM", "IS NOT DISTINCT FROM", "IN",
     "= ANY", "<> ALL", "IS NULL", "IS NOT NULL", "||", "CASE", "COALESCE", "NULLIF", "CAST", "COUNT", "LIKE",
-    "q_numeric", "q_op_jsonx", "q_str_jsonx", "q_op_jsonpath", "q_str_jsonpath",
+    "q_numeric", "Q_OP_JSONX", "Q_OP_JSONPATH", "Q_OP_JSONPATH_ELEMS",
 ];
 
 /// Whether `op` is one of [`BLIND`], or one of the frontend's own casts and conversions, or a row
@@ -452,4 +459,87 @@ pub fn refuse(cat: &Catalog, input: &Value, one_plan: bool) -> Result<()> {
         }
     }
     input.get("queries").and_then(|q| walk(q, varies)).map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BLIND;
+    use crate::{lower_with, CatalogSource};
+
+    const DDL: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "s" TEXT COLLATE "en_US", "j" JSONB, "p" TEXT[], "q" INTEGER[]);"#;
+
+    /// A query that makes the lowering emit the BLIND name `op`, by the name's own spelling.
+    fn sample(op: &str) -> &'static str {
+        match op {
+            "<" => r#"SELECT "id" FROM "t" WHERE "id" < 5"#,
+            "<=" => r#"SELECT "id" FROM "t" WHERE "id" <= 5"#,
+            ">" => r#"SELECT "id" FROM "t" WHERE "id" > 5"#,
+            ">=" => r#"SELECT "id" FROM "t" WHERE "id" >= 5"#,
+            "=" => r#"SELECT "id" FROM "t" WHERE "id" = 5"#,
+            "<>" => r#"SELECT "id" FROM "t" WHERE "id" <> 5"#,
+            "IS DISTINCT FROM" => r#"SELECT "id" FROM "t" WHERE "id" IS DISTINCT FROM 5"#,
+            "IS NOT DISTINCT FROM" => r#"SELECT "id" FROM "t" WHERE "id" IS NOT DISTINCT FROM 5"#,
+            "IN" => r#"SELECT "id" FROM "t" WHERE "id" IN (SELECT "id" FROM "t")"#,
+            // Over a subquery these are `IN` and its negation, and over `ARRAY[..]` they expand, so
+            // only an array with no element list keeps the quantified symbol.
+            "= ANY" => r#"SELECT "id" FROM "t" WHERE "id" = ANY ("q")"#,
+            "<> ALL" => r#"SELECT "id" FROM "t" WHERE "id" <> ALL ("q")"#,
+            "IS NULL" => r#"SELECT "id" FROM "t" WHERE "id" IS NULL"#,
+            "IS NOT NULL" => r#"SELECT "id" FROM "t" WHERE "id" IS NOT NULL"#,
+            "||" => r#"SELECT 'x' || 'y' FROM "t""#,
+            "CASE" => r#"SELECT CASE WHEN "id" = 1 THEN 2 ELSE 3 END FROM "t""#,
+            "COALESCE" => r#"SELECT COALESCE("id", 1) FROM "t""#,
+            "NULLIF" => r#"SELECT NULLIF("id", 1) FROM "t""#,
+            "CAST" => r#"SELECT CAST("id" AS BIGINT) FROM "t""#,
+            "COUNT" => r#"SELECT COUNT("id") FROM "t""#,
+            "LIKE" => r#"SELECT "id" FROM "t" WHERE 'x' LIKE 'y'"#,
+            "q_numeric" => r#"SELECT "id" FROM "t" WHERE "id" = 0.1"#,
+            "Q_OP_JSONX" => r#"SELECT "j" -> 'k' FROM "t""#,
+            "Q_OP_JSONPATH" => r#"SELECT "j" #> "p" FROM "t""#,
+            "Q_OP_JSONPATH_ELEMS" => r#"SELECT "j" #> '{a,b}' FROM "t""#,
+            // The comparisons over a string that [`super::compare`] builds are not reachable from a
+            // column that declares no collation, so the test has no query to emit them with.
+            "q_str_lt" | "q_str_le" => "",
+            other => panic!("BLIND names {other}, and this test has no query that emits it: add one"),
+        }
+    }
+
+    fn operators(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(serde_json::Value::String(o)) = m.get("operator") {
+                    out.push(o.clone());
+                }
+                m.values().for_each(|x| operators(x, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| operators(x, out)),
+            _ => {}
+        }
+    }
+
+    /// A name that is spelled in the list but never emitted (as `q_op_jsonx` once was, while the IR
+    /// said `Q_OP_JSONX`) silently makes [`super::blind`] false for it. Every name must occur in the IR
+    /// of a query that is lowered beside a collated column.
+    #[test]
+    fn every_blind_name_is_emitted_as_spelled() {
+        let mut missing = Vec::new();
+        for op in BLIND {
+            let q = sample(op);
+            if q.is_empty() {
+                continue;
+            }
+            let mut found = false;
+            for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+                let v = lower_with(&format!("{DDL}\n{q};\n{q};"), src)
+                    .unwrap_or_else(|e| panic!("{op} ({src:?}): {q}: {e}"));
+                let mut ops = Vec::new();
+                operators(&v["queries"], &mut ops);
+                found |= ops.iter().any(|o| o == op);
+            }
+            if !found {
+                missing.push(format!("{op} (not in the IR of {q})"));
+            }
+        }
+        assert!(missing.is_empty(), "BLIND names operators the lowering does not emit: {missing:#?}");
+    }
 }
