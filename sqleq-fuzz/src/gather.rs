@@ -476,18 +476,61 @@ pub fn kind(ty: &str) -> Kind {
 
 /// A value for `$n` that neither the generated tables nor another parameter of the trial is likely to
 /// hold: `v`'s kind, moved out of the small domains the draws share with the tables. `ty` is the type
-/// Postgres gives `$n`. The draws repeat a handful of values, so the rows of an `INSERT` meet the
-/// rows already there, or each other, on a key, and both sides raise; on these values they need not.
-/// A kind with no room to move (a boolean, a date, a timestamp) keeps its value.
-pub fn fresh(v: &crate::gen::Val, n: u32, ty: &str) -> crate::gen::Val {
+/// Postgres gives `$n`, and `meet` the types its value meets on its way into the table. The draws
+/// repeat a handful of values, so the rows of an `INSERT` meet the rows already there, or each
+/// other, on a key, and both sides raise; on these values they need not. A kind with no room to move
+/// (a boolean, a date, a timestamp) keeps its value, and so does a value whose move would not fit
+/// one of `meet`: a number past a `numeric(p, s)`'s integer digits, or a string past a length. The
+/// type of `$n` itself carries no typmod, which Postgres does not give a parameter.
+pub fn fresh(v: &crate::gen::Val, n: u32, ty: &str, meet: &[String]) -> crate::gen::Val {
     use crate::gen::Val;
+    let digits = meet.iter().filter_map(|t| int_digits(t)).min();
+    let length = meet
+        .iter()
+        .filter_map(|t| match kind(t) {
+            Kind::Str(Some(l)) => Some(l),
+            _ => None,
+        })
+        .min();
+    let moved = 100 + n as i64;
+    let room = digits.is_none_or(|d| moved.unsigned_abs() < 10u64.saturating_pow(d));
     match v {
-        Val::Int(_) => Val::Int(100 + n as i64),
-        Val::Dbl(_) => Val::Dbl(100.0 + n as f64),
+        Val::Int(_) if room => Val::Int(moved),
+        Val::Dbl(_) if room => Val::Dbl(moved as f64),
         // Only a string type: a `Str` also carries `json` and `interval` values.
-        Val::Str(s) if matches!(kind(ty), Kind::Str(_)) => Val::Str(format!("{s}{n}")),
+        Val::Str(s) if matches!(kind(ty), Kind::Str(_)) => {
+            let longer = format!("{s}{n}");
+            if length.is_none_or(|l| longer.chars().count() <= l) {
+                Val::Str(longer)
+            } else {
+                v.clone()
+            }
+        }
         Val::Uuid(_) => Val::Uuid(format!("00000000-0000-4000-b000-{n:012}")),
         other => other.clone(),
+    }
+}
+
+/// How many digits a `numeric(p, s)` type holds before its point, `p - s`; `None` for any other type,
+/// a bare `numeric` among them.
+fn int_digits(ty: &str) -> Option<u32> {
+    let t = ty.trim().to_ascii_lowercase();
+    let t = t.trim_end_matches("[]").trim();
+    let t = t.strip_prefix("pg_catalog.").unwrap_or(t);
+    let (base, mods) = t.split_once('(')?;
+    if !matches!(base.trim(), "numeric" | "decimal") {
+        return None;
+    }
+    let nums: Vec<u32> = mods
+        .split(')')
+        .next()?
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    match nums.as_slice() {
+        [p] => Some(*p),
+        [p, s] => Some(p.saturating_sub(*s)),
+        _ => None,
     }
 }
 
@@ -766,13 +809,36 @@ mod tests {
     #[test]
     fn fresh_values_are_apart_from_the_draws_and_each_other() {
         use crate::gen::Val;
-        assert_eq!(fresh(&Val::Int(1), 3, "integer"), Val::Int(103));
-        assert_ne!(fresh(&Val::Int(1), 3, "integer"), fresh(&Val::Int(1), 4, "integer"));
-        assert_eq!(fresh(&Val::Str("a".into()), 7, "text"), Val::Str("a7".into()));
+        let none: &[String] = &[];
+        assert_eq!(fresh(&Val::Int(1), 3, "integer", none), Val::Int(103));
+        assert_ne!(fresh(&Val::Int(1), 3, "integer", none), fresh(&Val::Int(1), 4, "integer", none));
+        assert_eq!(fresh(&Val::Str("a".into()), 7, "text", none), Val::Str("a7".into()));
         // Not a string type: the text is a json or interval value, and stays one.
-        assert_eq!(fresh(&Val::Str("1 day".into()), 7, "interval"), Val::Str("1 day".into()));
-        assert_eq!(fresh(&Val::Bool(true), 7, "boolean"), Val::Bool(true));
-        assert_eq!(fresh(&Val::Uuid("x".into()), 12, "uuid"), Val::Uuid("00000000-0000-4000-b000-000000000012".into()));
+        assert_eq!(fresh(&Val::Str("1 day".into()), 7, "interval", none), Val::Str("1 day".into()));
+        assert_eq!(fresh(&Val::Bool(true), 7, "boolean", none), Val::Bool(true));
+        assert_eq!(fresh(&Val::Uuid("x".into()), 12, "uuid", none), Val::Uuid("00000000-0000-4000-b000-000000000012".into()));
+    }
+
+    #[test]
+    fn fresh_values_stay_within_the_types_they_meet() {
+        use crate::gen::Val;
+        let m = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // `numeric(3,1)` holds two digits before its point, so 103 does not fit and 1 stays.
+        assert_eq!(fresh(&Val::Dbl(1.0), 3, "numeric", &m(&["numeric(3,1)"])), Val::Dbl(1.0));
+        assert_eq!(fresh(&Val::Int(1), 3, "integer", &m(&["NUMERIC(3,1)"])), Val::Int(1));
+        assert_eq!(fresh(&Val::Dbl(1.0), 3, "numeric", &m(&["numeric(5,1)"])), Val::Dbl(103.0));
+        assert_eq!(fresh(&Val::Dbl(1.0), 3, "numeric", &m(&["numeric"])), Val::Dbl(103.0));
+        // A parameter Postgres types `character` is not `char(1)`: only the column's length counts.
+        assert_eq!(fresh(&Val::Str("a".into()), 7, "character", &m(&["character(1)"])), Val::Str("a".into()));
+        assert_eq!(fresh(&Val::Str("a".into()), 7, "character", &m(&["character(4)"])), Val::Str("a7".into()));
+        assert_eq!(
+            fresh(&Val::Str("a".into()), 17, "character varying", &m(&["character varying(2)"])),
+            Val::Str("a".into())
+        );
+        assert_eq!(int_digits("numeric(3,1)"), Some(2));
+        assert_eq!(int_digits("numeric(4)"), Some(4));
+        assert_eq!(int_digits("numeric"), None);
+        assert_eq!(int_digits("character(3)"), None);
     }
 
     #[test]

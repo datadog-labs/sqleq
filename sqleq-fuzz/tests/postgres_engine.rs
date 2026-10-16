@@ -759,3 +759,96 @@ fn a_changed_predicate_is_refuted() {
         "NOT-EQUIVALENT"
     );
 }
+
+// -- Types the generator draws Postgres's own values for -----------------------------------------
+
+/// The pair's verdict and partial-trial note, or `None` when no Postgres is there to ask.
+fn full(a: &str, b: &str, ddl: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let o = outcome(a, b, ddl)?;
+    let partial = o.verdict.partial().map(|(ok, e)| format!("{ok}: {e}"));
+    Some((o.verdict.label(), partial, o.timing.caveat()))
+}
+
+#[test]
+fn a_column_of_a_type_with_a_domain_of_its_own_is_gathered() {
+    // No key, so no trial is lost to two rows meeting on one.
+    for ty in ["time", "timetz", "inet", "cidr", "macaddr", "macaddr8", "hstore", "money", "xid8"] {
+        let ddl = format!(r#"create table "s" ("id" INTEGER, "v" {ty} NOT NULL)"#);
+        let a = r#"INSERT INTO "s" ("id", "v") VALUES ($1, $2), ($3, $4)"#;
+        let b = format!(r#"INSERT INTO "s" ("id", "v") SELECT * FROM unnest($1::int4[], $2::{ty}[])"#);
+        if let Some((label, partial, _)) = full(a, &b, &ddl) {
+            assert_eq!(label, "NO-COUNTEREXAMPLE-GATHER", "{ty}");
+            assert_eq!(partial, None, "{ty}");
+        }
+    }
+}
+
+#[test]
+fn a_moved_value_stays_within_its_columns_typmod() {
+    // A moved value past the column's typmod failed every other trial on both sides. Only the
+    // boundary trials, which try a value one past a length on purpose, may still fail now.
+    for ty in ["numeric(3,1)", "char(1)", "varchar(2)"] {
+        let ddl = format!(r#"create table "s" ("id" INTEGER, "v" {ty} NOT NULL)"#);
+        let a = r#"INSERT INTO "s" ("id", "v") VALUES ($1, $2), ($3, $4)"#;
+        let elem = ty.split('(').next().unwrap().replace("char", "bpchar").replace("varbpchar", "varchar");
+        let b = format!(r#"INSERT INTO "s" ("id", "v") SELECT * FROM unnest($1::int4[], $2::{elem}[])"#);
+        let Some(o) = outcome(a, &b, &ddl) else { return };
+        assert_eq!(o.verdict.label(), "NO-COUNTEREXAMPLE-GATHER", "{ty}");
+        let ran = o.verdict.partial().map_or(CFG.total_trials(), |(ok, _)| ok);
+        assert!(ran * 5 >= CFG.total_trials() * 4, "{ty}: {:?}", o.verdict.partial());
+    }
+}
+
+#[test]
+fn a_time_parameter_is_bound_a_time() {
+    let ddl = r#"create table "s" ("id" INTEGER, "v" TIME NOT NULL)"#;
+    if let Some((label, partial, _)) = full(
+        r#"INSERT INTO "s" ("id", "v") VALUES ($1, $2)"#,
+        r#"INSERT INTO "s" ("id", "v") SELECT $1, $2"#,
+        ddl,
+    ) {
+        assert_eq!(label, "NO-COUNTEREXAMPLE");
+        assert_eq!(partial, None);
+    }
+}
+
+#[test]
+fn a_table_with_a_time_column_holds_rows() {
+    // Drawn as `'a'`, every row was rejected, and the pair was compared over an empty table.
+    let ddl = r#"create table "s" ("id" INTEGER PRIMARY KEY, "v" TIME NOT NULL)"#;
+    assert_kind!(
+        r#"SELECT "id" FROM "s" WHERE "v" < '12:00:00'"#,
+        r#"SELECT "id" FROM "s" WHERE "v" <= '12:00:00'"#,
+        ddl,
+        "NOT-EQUIVALENT"
+    );
+}
+
+#[test]
+fn a_table_no_drawn_row_of_was_accepted_is_said_so() {
+    let ddl = r#"create table "e" ("id" INTEGER PRIMARY KEY, "v" INTEGER NOT NULL CHECK ("v" > 100))"#;
+    if let Some((label, _, caveat)) = full(
+        r#"SELECT "id" FROM "e" WHERE "v" < 5"#,
+        r#"SELECT "id" FROM "e" WHERE "v" <= 5"#,
+        ddl,
+    ) {
+        assert_eq!(label, "NO-COUNTEREXAMPLE");
+        assert_eq!(caveat.as_deref(), Some("no generated row of e was accepted"));
+    }
+    // A table that holds rows says nothing, though Postgres rejects the rows that repeat a key.
+    if let Some((_, _, caveat)) = full(r#"SELECT "id" FROM "t""#, r#"SELECT "id" FROM "t" WHERE true"#, T) {
+        assert_eq!(caveat, None);
+    }
+}
+
+#[test]
+fn a_gather_parameter_of_a_type_with_no_domain_is_not_compared() {
+    let ddl = r#"create table "s" ("id" INTEGER, "v" POINT NOT NULL)"#;
+    if let Some((label, _, _)) = full(
+        r#"INSERT INTO "s" ("id", "v") VALUES ($1, $2), ($3, $4)"#,
+        r#"INSERT INTO "s" ("id", "v") SELECT * FROM unnest($1::int4[], $2::point[])"#,
+        ddl,
+    ) {
+        assert!(label.starts_with("NOT-COMPARABLE:gather: no value drawn is of type point ($"), "{label}");
+    }
+}
