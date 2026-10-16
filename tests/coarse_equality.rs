@@ -220,23 +220,21 @@ fn a_numeric_does_not_hide_behind_a_query_block() {
         r#"SELECT CAST("b"."c" AS TEXT) FROM (SELECT coalesce("x", 0) AS "c" FROM "t") AS "a" JOIN (SELECT coalesce("x", 0) AS "c" FROM "u") AS "b" ON "a"."c" = "b"."c""#,
         "numeric",
     );
-    // A UNION ALL column takes its first branch's type, and a VALUES column its first row's: a numeric
-    // under an integer's name would be read as one.
+    // A UNION ALL column, or a VALUES column, holding an integer and a numeric is a numeric in
+    // Postgres, whichever comes first. It used to take its first branch's or row's type, so a numeric
+    // under an integer's name was read as one; now the integer is converted, and the column is read
+    // as the numeric it is.
     let ddl = r#"create table "t" ("i" INTEGER, "n" NUMERIC);"#;
-    for (q0, q1) in [
-        (r#"SELECT "i" FROM "t" UNION ALL SELECT "n" FROM "t""#, r#"SELECT 1 FROM "t""#),
-        (r#"SELECT "c" FROM (VALUES (1), (2.5)) AS "v" ("c")"#, r#"SELECT 1 FROM "t""#),
+    for q0 in [
+        r#"SELECT "i" FROM "t" UNION ALL SELECT "n" FROM "t""#,
+        r#"SELECT "n" FROM "t" UNION ALL SELECT "i" FROM "t""#,
+        r#"SELECT "c" FROM (VALUES (1), (2.5)) AS "v" ("c")"#,
     ] {
-        match lower_with(&pair(ddl, q0, q1), CatalogSource::Declared) {
-            Err(FrontendError::Unsupported(m)) => assert!(
-                m.contains("of type INTEGER and REAL") || m.contains("column of type INTEGER holding a REAL"),
-                "{m}"
-            ),
-            other => panic!("expected a refusal, got {other:?}"),
-        }
+        let v = lowers(ddl, q0, r#"SELECT 1 FROM "t""#);
+        let q = &v["queries"][0];
+        let ty = q["union"][0]["project"]["target"][0]["type"].as_str().or(q["project"]["target"][0]["type"].as_str());
+        assert_eq!(ty, Some("REAL"), "{q0}: {v}");
     }
-    // With the numeric branch first, the column is a numeric, and a read of it is sorted as one.
-    lowers(ddl, r#"SELECT "n" FROM "t" UNION ALL SELECT "i" FROM "t""#, r#"SELECT 1 FROM "t""#);
 }
 
 #[test]

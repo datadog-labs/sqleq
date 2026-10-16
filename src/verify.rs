@@ -39,6 +39,7 @@
 use serde_json::Value;
 
 use crate::error::{unsupported, Result};
+use crate::types::name_part;
 
 /// Check every column reference in a prover `Input`. `Err` means the IR is ill-formed and must not
 /// be emitted.
@@ -233,16 +234,41 @@ impl Verifier<'_> {
                 }
             }
             "union" | "intersect" | "except" => {
-                for r in v.as_array().ok_or_else(|| ir("set op without branches"))? {
+                let rels = v.as_array().ok_or_else(|| ir("set op without branches"))?;
+                // The prover takes the first branch's scope for the operation and asserts every
+                // other branch holds it: the same width, and in each column the same sort.
+                let first = rels.first().map(|r| self.scope(r)).transpose()?.unwrap_or_default();
+                for r in rels {
                     self.rel(r, subst)?;
+                    let s = self.scope(r)?;
+                    if s.len() != first.len()
+                        || s.iter().zip(&first).any(|(a, b)| name_part(a) != name_part(b))
+                    {
+                        return Err(ir(format!(
+                            "set operation branch of type ({}) beside one of ({})",
+                            s.join(", "),
+                            first.join(", ")
+                        )));
+                    }
                 }
             }
             "values" => {
                 // A `Values` row is evaluated one level *above* itself, so only closed expressions
                 // are well-formed here — which is what `lower_fromless_select` already guarantees.
+                let schema: Vec<&str> = arr(v, "schema")
+                    .iter()
+                    .map(|t| t.as_str().map(crate::types::untag).ok_or_else(|| ir("non-string type")))
+                    .collect::<Result<_>>()?;
                 for row in arr(v, "content") {
-                    for e in row.as_array().ok_or_else(|| ir("values row is not a list"))? {
+                    let cells = row.as_array().ok_or_else(|| ir("values row is not a list"))?;
+                    if cells.len() != schema.len() {
+                        return Err(ir(format!("values row of {} cells under a schema of {}", cells.len(), schema.len())));
+                    }
+                    for (e, col) in cells.iter().zip(&schema) {
                         self.expr(e, &[], "values row")?;
+                        if name_part(ty_of(e)?) != name_part(col) {
+                            return Err(ir(format!("values cell of type {} under a column of type {col}", ty_of(e)?)));
+                        }
                     }
                 }
             }
@@ -300,6 +326,26 @@ mod tests {
     fn rejects_an_index_past_the_end_of_the_row() {
         let e = check_levels(&input(json!({ "column": 7, "type": "VARCHAR" }))).unwrap_err();
         assert!(e.to_string().contains("past the end of a 3-wide row"), "{e}");
+    }
+
+    #[test]
+    fn a_set_operation_branch_of_another_sort_is_rejected() {
+        let branch = |ty: &str| json!({ "values": { "schema": [ty], "content": [[{ "operator": "1", "operand": [], "type": ty }]] } });
+        let q = |a: &str, b: &str| json!({ "schemas": [], "queries": [{ "union": [branch(a), branch(b)] }], "help": ["", ""] });
+        check_levels(&q("REAL", "REAL")).unwrap();
+        let e = check_levels(&q("REAL", "INTEGER")).unwrap_err();
+        assert!(e.to_string().contains("set operation branch of type (INTEGER) beside one of (REAL)"), "{e}");
+    }
+
+    #[test]
+    fn a_values_cell_of_another_sort_is_rejected() {
+        let v = |schema: &str, cell: &str| json!({ "schemas": [], "queries": [{ "values": { "schema": [schema],
+            "content": [[{ "operator": "1", "operand": [], "type": cell }]] } }], "help": ["", ""] });
+        check_levels(&v("REAL", "REAL")).unwrap();
+        let e = check_levels(&v("REAL", "INTEGER")).unwrap_err();
+        assert!(e.to_string().contains("values cell of type INTEGER under a column of type REAL"), "{e}");
+        let wide = json!({ "schemas": [], "queries": [{ "values": { "schema": ["INTEGER"], "content": [[]] } }], "help": ["", ""] });
+        assert!(check_levels(&wide).unwrap_err().to_string().contains("0 cells under a schema of 1"));
     }
 
     #[test]

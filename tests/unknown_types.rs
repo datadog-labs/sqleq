@@ -313,10 +313,12 @@ fn a_set_operation_does_not_hide_an_unknown_value_under_an_identity_column() {
         r#"SELECT CAST("x" AS TEXT) FROM (SELECT "i" AS "x" FROM "t") AS "s""#,
         "set operation over columns of type INTEGER and VARBINARY",
     );
-    // A timestamp column keeps its type in Postgres whatever else it holds, or the query fails.
-    lowers(
+    // A timestamp column beside a value of a type the frontend does not know: the IR would hold an
+    // opaque value under a TIMESTAMP column, and the provers would read it as neither (#177).
+    refused(
         ddl,
         r#"SELECT CAST("x" AS TEXT) FROM (SELECT "ts" AS "x" FROM "t" UNION ALL SELECT date_trunc('day', "ts") FROM "t") AS "s""#,
         r#"SELECT CAST("x" AS TEXT) FROM (SELECT "ts" AS "x" FROM "t") AS "s""#,
+        "set operation over columns of type TIMESTAMP and",
     );
 }

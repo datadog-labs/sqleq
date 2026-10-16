@@ -31,6 +31,14 @@ fn lower(q0: &str, q1: &str) -> Value {
     lower_in(T, q0, q1, CatalogSource::Declared)
 }
 
+/// Whether the pair lowers to byte-identical queries over `ddl`, in both modes that read it.
+fn identical_in(ddl: &str, q0: &str, q1: &str) -> bool {
+    [CatalogSource::Declared, CatalogSource::InferredSeeded].into_iter().all(|src| {
+        let v = lower_in(ddl, q0, q1, src);
+        v["queries"][0] == v["queries"][1]
+    })
+}
+
 /// Whether the pair lowers to byte-identical queries, in both modes that read the declared schema.
 fn identical(q0: &str, q1: &str) -> bool {
     let both: Vec<bool> = [CatalogSource::Declared, CatalogSource::InferredSeeded]
@@ -508,6 +516,108 @@ fn an_in_subquery_column_is_converted_to_the_operands_type() {
     let v = lower_with(&format!("{T}\n{};\n{};", in_sub(r#"abs("a")"#), r#"SELECT "id" FROM "t""#), CatalogSource::Declared)
         .unwrap_or_else(|e| panic!("expected Ok, got {e}"));
     assert!(v["queries"][0].to_string().contains("q_cast_"), "{}", v["queries"][0]);
+}
+
+/// Every set operation and every `VALUES` list in `v`: whether all its branches, or rows, have the
+/// same column types as the first. The QED prover asserts it, and panicked where they did not.
+fn set_columns_agree(v: &Value) -> bool {
+    fn scope<'v>(rel: &'v Value, schemas: &'v Value) -> Option<Vec<&'v str>> {
+        let (k, body) = rel.as_object()?.iter().next()?;
+        let types = |a: &'v Value| a.as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
+        match k.as_str() {
+            "scan" => types(&schemas[body.as_u64()? as usize]["types"]),
+            "project" => body["target"].as_array().map(|a| a.iter().filter_map(|c| c["type"].as_str()).collect()),
+            "values" => types(&body["schema"]),
+            "union" | "intersect" | "except" => scope(&body[0], schemas),
+            "group" => Some(
+                body["keys"].as_array()?.iter().chain(body["function"].as_array()?).filter_map(|c| c["type"].as_str()).collect(),
+            ),
+            "distinct" => scope(body, schemas),
+            _ => scope(&body["source"], schemas),
+        }
+    }
+    fn walk(x: &Value, schemas: &Value) -> bool {
+        match x {
+            Value::Object(m) => m.iter().all(|(k, v)| {
+                let here = match k.as_str() {
+                    "union" | "intersect" | "except" if v.is_array() => {
+                        let s: Vec<_> = v.as_array().unwrap().iter().map(|b| scope(b, schemas)).collect();
+                        s.iter().all(|b| *b == s[0])
+                    }
+                    "values" if v.get("schema").is_some() => v["content"].as_array().unwrap().iter().all(|row| {
+                        let t: Vec<_> = row.as_array().unwrap().iter().filter_map(|c| c["type"].as_str()).collect();
+                        t == v["schema"].as_array().unwrap().iter().filter_map(Value::as_str).collect::<Vec<_>>()
+                    }),
+                    _ => true,
+                };
+                here && walk(v, schemas)
+            }),
+            Value::Array(a) => a.iter().all(|y| walk(y, schemas)),
+            _ => true,
+        }
+    }
+    walk(&v["queries"], &v["schemas"])
+}
+
+#[test]
+fn a_set_operation_or_values_column_has_one_type() {
+    // Postgres resolves each column to one type across the branches, or the rows; the IR used to
+    // take the first one's and hand the prover a column holding values of another sort (#177).
+    let ddl = r#"create table "t" ("id" INTEGER, "a" NUMERIC, "i" INTEGER, "x" TEXT, "p" BOOLEAN);"#;
+    for (q0, q1) in [
+        // An integer beside a numeric is converted to it, in either order.
+        (r#"SELECT "a" FROM "t" UNION ALL SELECT "i" FROM "t""#, r#"SELECT "a" FROM "t" UNION ALL SELECT "i"::numeric FROM "t""#),
+        (r#"SELECT "i" FROM "t" UNION ALL SELECT "a" FROM "t""#, r#"SELECT "i"::numeric FROM "t" UNION ALL SELECT "a" FROM "t""#),
+        (r#"SELECT "a" FROM "t" UNION ALL SELECT "i" + 1 FROM "t""#, r#"SELECT "a" FROM "t""#),
+        (r#"SELECT "a" FROM "t" UNION ALL SELECT sum("i") FROM "t""#, r#"SELECT "a" FROM "t""#),
+        (r#"SELECT "a" FROM "t" UNION ALL (SELECT "i" FROM "t" ORDER BY "i" LIMIT 1)"#, r#"SELECT "a" FROM "t""#),
+        (r#"SELECT "x" FROM (VALUES (1.5), (1)) AS "v"("x")"#, r#"SELECT "x" FROM (VALUES (1.5), (1.0)) AS "v"("x")"#),
+        // A NULL is the null of the column's type, and a string literal is read as an integer.
+        (r#"SELECT NULL UNION ALL SELECT "x" FROM "t""#, r#"SELECT "x" FROM "t""#),
+        (r#"SELECT "p" FROM "t" UNION ALL SELECT NULL"#, r#"SELECT "p" FROM "t""#),
+        (r#"SELECT "y" FROM (VALUES (NULL), ('x')) AS "v"("y")"#, r#"SELECT 'x'"#),
+        (r#"SELECT '1' UNION ALL SELECT "i" FROM "t""#, r#"SELECT 1 UNION ALL SELECT "i" FROM "t""#),
+    ] {
+        for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+            let v = lower_in(ddl, q0, q1, src);
+            assert!(set_columns_agree(&v), "{src:?}: {q0}\n{v}");
+        }
+    }
+    // The issue's pair: the conversion written out on one side is the one the lowering inserts.
+    assert!(
+        identical_in(ddl, r#"SELECT "a" FROM "t" UNION ALL SELECT "i" FROM "t""#, r#"SELECT "a" FROM "t" UNION ALL SELECT "i"::numeric FROM "t""#),
+        "the converted branch differs from the written-out cast"
+    );
+    assert!(identical_in(ddl, r#"SELECT '1' UNION ALL SELECT "i" FROM "t""#, r#"SELECT 1 UNION ALL SELECT "i" FROM "t""#));
+}
+
+#[test]
+fn a_set_operation_or_values_column_of_two_sorts_is_refused() {
+    let ddl = r#"create table "t" ("id" INTEGER, "a" NUMERIC, "i" INTEGER, "x" TEXT, "p" BOOLEAN, "d" DATE, "f" FLOAT8, "u" UUID);"#;
+    for (q, why) in [
+        // Postgres rejects these.
+        (r#"SELECT "x" FROM "t" UNION SELECT "i" FROM "t""#, "set operation over columns of type VARCHAR and INTEGER"),
+        (r#"SELECT "p" FROM "t" UNION SELECT "i" FROM "t""#, "set operation over columns of type BOOLEAN and INTEGER"),
+        (r#"SELECT "u" FROM "t" UNION SELECT "x" FROM "t""#, "set operation over columns of type"),
+        // An opaque value beside another type would need a conversion keyed on its own shape.
+        (r#"SELECT "a" FROM "t" INTERSECT SELECT abs("a") FROM "t""#, "set operation over columns of type REAL and"),
+        (r#"SELECT upper("x") FROM "t" UNION ALL SELECT "x" FROM "t""#, "set operation over columns of type"),
+        (r#"SELECT "p" FROM "t" UNION ALL SELECT starts_with("x", 'a') FROM "t""#, "set operation over columns of type BOOLEAN and"),
+        (r#"SELECT "d" FROM "t" UNION ALL SELECT to_date("x", 'YYYY') FROM "t""#, "set operation over columns of type DATE and"),
+        (r#"SELECT "f" FROM "t" UNION ALL SELECT "i" FROM "t""#, "set operation over columns of type"),
+        (r#"SELECT "x" FROM (VALUES ('a'), (upper('b'))) AS "v"("x")"#, "VALUES column of type"),
+    ] {
+        refused(ddl, q, r#"SELECT "i" FROM "t""#, why);
+    }
+    // Branches, or rows, of two widths: Postgres's error, so a schema refusal.
+    for q in [r#"SELECT "a", "i" FROM "t" UNION ALL SELECT "i" FROM "t""#, r#"SELECT * FROM (VALUES (1, 2), (3)) AS "v"("m", "n")"#] {
+        for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+            match lower_with(&format!("{ddl}\n{q};\nSELECT 1;"), src) {
+                Err(FrontendError::Schema(m)) => assert!(m.contains("same number of columns") || m.contains("same length"), "{m}"),
+                other => panic!("{src:?}: expected a schema refusal, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[test]

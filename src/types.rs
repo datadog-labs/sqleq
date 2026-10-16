@@ -855,7 +855,7 @@ fn common_type_of_names(a: &str, b: &str) -> String {
 
 /// Whether `v` is a string literal: a nullary VARCHAR constant other than `NULL`. That is how the
 /// lowering writes one, and how both provers read one.
-fn is_string_literal(v: &Value) -> bool {
+pub(crate) fn is_string_literal(v: &Value) -> bool {
     ty_of(v) == "VARCHAR"
         && !is_null_lit(v)
         && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
