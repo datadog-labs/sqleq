@@ -94,6 +94,19 @@ const REJECTED: &[Row] = &[
         r#"42P01 missing FROM-clause entry for table "z""#),
     row(Schema, r#"SELECT "a" AS "x", "b" AS "x" FROM "t" GROUP BY "x""#, r#"SELECT "a" FROM "t""#,
         "ambiguous GROUP BY key x", r#"42702 GROUP BY "x" is ambiguous"#),
+    // A `RETURNING` item is a name the statement can see, as a select-list item is.
+    row(Schema, r#"UPDATE "t" SET "a" = 1 RETURNING "zz""#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "zz""#, r#"DELETE FROM "t" WHERE true RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"INSERT INTO "t" ("a") VALUES (1) RETURNING "zz""#, r#"INSERT INTO "t" ("a") VALUES (2 - 1) RETURNING "zz""#,
+        "column zz does not exist", r#"42703 column "zz" does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "t"."zz""#, r#"DELETE FROM "t" WHERE true RETURNING "t"."zz""#,
+        "column t.zz does not exist", r#"42703 column t.zz does not exist"#),
+    row(Schema, r#"DELETE FROM "t" RETURNING "q".*"#, r#"DELETE FROM "t" WHERE true RETURNING "q".*"#,
+        "missing FROM-clause entry for table q", r#"42P01 missing FROM-clause entry for table "q""#),
+    row(Schema, r#"UPDATE "t" SET "a" = 1 RETURNING "old"."a""#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "old"."a""#,
+        "missing FROM-clause entry for table old", r#"42P01 missing FROM-clause entry for table "old" (Postgres 18 adds old and new)"#),
 ];
 
 /// Input Postgres accepts.
@@ -196,6 +209,14 @@ fn the_valid_neighbours_still_lower() {
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY 1 LIMIT 5"#,
         ),
         (r#"SELECT DISTINCT "a" FROM "t" ORDER BY "a" LIMIT 5"#, r#"SELECT DISTINCT "a" FROM "t" ORDER BY 1 LIMIT 5"#),
+        // `RETURNING` names that do resolve: a system column, a wildcard, an alias, an expression, and
+        // a subquery's own scope.
+        (r#"UPDATE "t" SET "a" = 1 RETURNING "ctid", "t".*"#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "ctid", "t".*"#),
+        (r#"DELETE FROM "t" AS "x" RETURNING "x"."a" + 1 AS "n", *"#, r#"DELETE FROM "t" AS "x" WHERE true RETURNING "x"."a" + 1 AS "n", *"#),
+        (r#"DELETE FROM "t" RETURNING (SELECT max("c") FROM "u")"#, r#"DELETE FROM "t" WHERE true RETURNING (SELECT max("c") FROM "u")"#),
+        (r#"INSERT INTO "t" ("a") VALUES (1) RETURNING "a", "ctid""#, r#"INSERT INTO "t" ("a") VALUES (2 - 1) RETURNING "a", "ctid""#),
+        (r#"UPDATE "t" SET "a" = 1 RETURNING make_interval(secs => "b")"#,
+            r#"UPDATE "t" SET "a" = 2 - 1 RETURNING make_interval(secs => "b")"#),
     ] {
         let src = format!("{T}\n{a};\n{b};");
         for source in BOTH {

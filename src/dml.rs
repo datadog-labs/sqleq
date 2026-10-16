@@ -210,17 +210,17 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    visit_expressions, CaseWhen, CastKind, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    visit_expressions, visit_relations, CaseWhen, CastKind, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, SelectItem,
     SelectItemQualifiedWildcardKind,
     SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
-    WildcardAdditionalOptions,
+    Visit, Visitor, WildcardAdditionalOptions,
 };
 use sqlparser::parser::Parser;
 
 use serde_json::Value;
 
-use crate::catalog::{obj_name, Catalog, Table};
+use crate::catalog::{obj_name, Catalog, Table, SYSTEM_COLUMNS};
 use crate::error::{schema, unsupported, FrontendError, Result};
 use crate::types::coarse_class;
 
@@ -276,6 +276,8 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             target_not_shadowed(&statements[i], da)?;
             target_not_shadowed(&statements[j], db)?;
             let (qa, qb) = (target_qual(da)?, target_qual(db)?);
+            resolve_returning(a.returning.as_deref(), &delete_scope(cat, a, da)?)?;
+            resolve_returning(b.returning.as_deref(), &delete_scope(cat, b, db)?)?;
             check_using(cat, a, da, &qa)?;
             check_using(cat, b, db, &qb)?;
             same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "DELETE")?;
@@ -552,6 +554,32 @@ fn check_using(cat: &Catalog, d: &Delete, target: &TableWithJoins, qual: &str) -
     Ok(())
 }
 
+/// The relations a `DELETE`'s `RETURNING` can name: the target, then the `USING` relations.
+fn delete_scope(cat: &Catalog, d: &Delete, target: &TableWithJoins) -> Result<Vec<Scoped>> {
+    let mut scope = vec![scoped(cat, &target.relation)];
+    let mut factors = Vec::new();
+    for twj in d.using.iter().flatten() {
+        using_factors(&twj.relation, &mut factors);
+        twj.joins.iter().for_each(|j| using_factors(&j.relation, &mut factors));
+    }
+    scope.extend(factors.into_iter().map(|tf| scoped(cat, tf)));
+    Ok(scope)
+}
+
+/// The relations an `UPDATE`'s `RETURNING` can name: the target, then the `FROM` relations.
+fn update_scope(cat: &Catalog, u: &Update) -> Vec<Scoped> {
+    let mut scope = vec![scoped(cat, &u.table.relation)];
+    let mut factors = Vec::new();
+    if let Some(UpdateTableFromKind::AfterSet(from) | UpdateTableFromKind::BeforeSet(from)) = &u.from {
+        for twj in from {
+            using_factors(&twj.relation, &mut factors);
+            twj.joins.iter().for_each(|j| using_factors(&j.relation, &mut factors));
+        }
+    }
+    scope.extend(factors.into_iter().map(|tf| scoped(cat, tf)));
+    scope
+}
+
 /// The relations a `USING` item brings into scope, looking through parenthesised joins.
 fn using_factors<'a>(tf: &'a TableFactor, out: &mut Vec<&'a TableFactor>) {
     match tf {
@@ -704,6 +732,139 @@ fn ret_item<'a>(item: &'a SelectItem, qual: &str) -> RetItem<'a> {
     }
 }
 
+/// One relation a `RETURNING` item may name: the qualifier it answers to, and the columns it has, or
+/// `None` where they are not known (a derived table, a table function, an alias that renames columns,
+/// a table the catalog does not declare).
+type Scoped = (String, Option<Vec<String>>);
+
+/// The relation a plain table factor is, with the columns the catalog declares for it.
+fn scoped(cat: &Catalog, tf: &TableFactor) -> Scoped {
+    let qual = factor_name(tf).unwrap_or_default();
+    let cols = match tf {
+        TableFactor::Table { name, alias, args: None, .. } if alias.as_ref().is_none_or(|a| a.columns.is_empty()) => {
+            find_target(cat, &obj_name(name)).map(|i| {
+                let mut cols: Vec<String> = cat.tables[i].cols.iter().map(|(c, _)| c.clone()).collect();
+                // Every table also has the system columns, which a `RETURNING` item may read.
+                cols.extend(SYSTEM_COLUMNS.iter().map(|c| c.to_string()));
+                cols
+            })
+        }
+        _ => None,
+    };
+    (qual, cols)
+}
+
+/// SCHEMA CHECK: a `RETURNING` item names a relation the statement has and a column that relation has.
+///
+/// [`same_returning`] compares the two lists and nothing reads their names, so `RETURNING zz` over a
+/// table with no such column was lowered as readily as `RETURNING a`. Postgres rejects it on both
+/// sides (`42703`), so no proof about such a pair claims anything false; refusing it as a `schema`
+/// error says what the input is, as the query path does for an unknown column.
+///
+/// The scope is the target under the name [`target_qual`] gives it, then the relations a `USING` or
+/// `FROM` adds. A bare name must be a column of one of them, or the name of one (a whole-row
+/// reference, which lowering refuses). A qualified name needs its qualifier in scope, and its column
+/// where the qualifier's columns are known. When any relation's columns are not known a bare name
+/// cannot be checked and is let through. A subquery in an item has a scope of its own and is not
+/// looked into. Postgres 17 has no `old` or `new` in `RETURNING`, and `excluded` is not in scope
+/// there, so those are ordinary unknown qualifiers.
+fn resolve_returning(items: Option<&[SelectItem]>, scope: &[Scoped]) -> Result<()> {
+    let Some(items) = items else { return Ok(()) };
+    let known = scope.iter().all(|(_, cols)| cols.is_some());
+    let by_qual = |q: &str| scope.iter().find(|(n, _)| n == q);
+    let no_entry = |q: &str| schema(format!("missing FROM-clause entry for table {q} in RETURNING"));
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => {}
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
+                if let [q] = n.0.as_slice() {
+                    let q = q.as_ident().map(fold_ident).unwrap_or_default();
+                    if by_qual(&q).is_none() {
+                        return Err(no_entry(&q));
+                    }
+                }
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let mut v = Names { scope, known, depth: 0, arg_names: Vec::new() };
+                if let ControlFlow::Break(err) = Visit::visit(e, &mut v) {
+                    return Err(err);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// [`resolve_returning`]'s walk over one item's expression.
+struct Names<'a> {
+    scope: &'a [Scoped],
+    known: bool,
+    /// How many subqueries deep the walk is; a name inside one is not this clause's to resolve.
+    depth: usize,
+    /// The names of named function arguments met so far (`secs` in `make_interval(secs => x)`),
+    /// which the tree spells as identifiers but which name a parameter, not a column.
+    arg_names: Vec<*const Expr>,
+}
+
+impl Visitor for Names<'_> {
+    type Break = FrontendError;
+
+    fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<Self::Break> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<Self::Break> {
+        if self.depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        match e {
+            Expr::Function(f) => {
+                if let FunctionArguments::List(list) = &f.args {
+                    for a in &list.args {
+                        if let FunctionArg::ExprNamed { name, .. } = a {
+                            self.arg_names.push(name as *const Expr);
+                        }
+                    }
+                }
+            }
+            Expr::Identifier(_) if self.arg_names.contains(&(e as *const Expr)) => {}
+            Expr::Identifier(c) => {
+                let c = fold_ident(c);
+                let is_relation = self.scope.iter().any(|(n, _)| *n == c);
+                let is_column = self.scope.iter().any(|(_, cols)| cols.as_ref().is_some_and(|cs| cs.contains(&c)));
+                if self.known && !is_relation && !is_column {
+                    return ControlFlow::Break(schema(format!("column {c} does not exist in RETURNING")));
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let [q, c] = parts.as_slice() {
+                    let (q, c) = (fold_ident(q), fold_ident(c));
+                    match self.scope.iter().find(|(n, _)| *n == q) {
+                        None => {
+                            return ControlFlow::Break(schema(format!(
+                                "missing FROM-clause entry for table {q} in RETURNING"
+                            )))
+                        }
+                        Some((_, Some(cols))) if !cols.contains(&c) => {
+                            return ControlFlow::Break(schema(format!("column {q}.{c} does not exist in RETURNING")))
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Whether the pair carries a `RETURNING` clause at all, refusing one that is one-sided or that the
 /// two sides do not spell to the same projection.
 ///
@@ -755,6 +916,7 @@ fn set_map<'a>(cat: &Catalog, u: &'a Update) -> Result<Parts<'a>> {
         return Err(unsupported("UPDATE OR <conflict clause>"));
     }
     target_name(&u.table)?;
+    resolve_returning(u.returning.as_deref(), &update_scope(cat, u))?;
 
     let mut sets: Vec<(String, &Expr)> = Vec::new();
     for a in &u.assignments {
@@ -1179,6 +1341,40 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
     if ca != cb {
         return Err(unsupported("INSERT ... whose column lists differ"));
     }
+    // The target is replaced by its source below, so it never reaches the pair-wide check that keeps
+    // one bare name from being read through two qualifiers; ask it here, over the targets and the
+    // relations both sources read.
+    let mut names = vec![na.clone(), nb.clone()];
+    for src in [sa, sb] {
+        let _ = visit_relations(src, |n| {
+            names.push(n.clone());
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    // As in `resolve_tables`, a name the DDL declares exactly as written is that table and needs no
+    // stripping, so only a target that would be stripped is held to the check.
+    let declared = cat.declares(&name) && cat.declares(&other);
+    if !declared && !crate::normalize::safe_to_strip(&names) {
+        return Err(unsupported(format!(
+            "the INSERT target {name} and a relation its source reads name one table under two spellings"
+        )));
+    }
+    for (items, q, n) in [(a.returning.as_deref(), &qa, na), (b.returning.as_deref(), &qb, nb)] {
+        let target = TableFactor::Table {
+            name: n.clone(),
+            alias: None,
+            args: None,
+            with_hints: vec![],
+            version: None,
+            with_ordinality: false,
+            partitions: vec![],
+            json_path: None,
+            sample: None,
+            index_hints: vec![],
+        };
+        let (_, cols) = scoped(cat, &target);
+        resolve_returning(items, &[(q.clone(), cols)])?;
+    }
     same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "INSERT")?;
 
     let idx = find_target(cat, &name)
@@ -1400,6 +1596,13 @@ mod tests {
         }
     }
 
+    /// `t(a, b)` and `v(<cols>)`.
+    fn with_v(cols: &[&str]) -> Catalog {
+        let mut cat = catalog("t", &["a", "b"]);
+        cat.tables.push(volatile("v", cols, &[]).tables.remove(0));
+        cat
+    }
+
     /// Reduce a `;`-separated input and render whatever queries come out.
     fn reduced(cat: &Catalog, sql: &str) -> std::result::Result<Vec<String>, String> {
         let mut st = Parser::parse_sql(&crate::DIALECT, sql).expect("parses");
@@ -1494,9 +1697,91 @@ mod tests {
     /// A qualifier that does not name the target is not folded away, so the item stays structural.
     #[test]
     fn a_foreign_qualifier_is_not_folded() {
+        let two = with_v(&["a"]);
+        // With `v` in scope through `USING`, `v.a` is a real name that is not the target's.
+        assert!(err(&two, "DELETE FROM t AS u USING v RETURNING v.a; DELETE FROM t USING v RETURNING a;")
+            .contains("RETURNING"));
+    }
+
+    /// A `RETURNING` name has to be one the statement can see; Postgres rejects the rest (`42703`,
+    /// `42P01`) on both sides.
+    #[test]
+    fn returning_names_must_resolve() {
         let cat = catalog("t", &["a", "b"]);
-        assert!(err(&cat, "DELETE FROM t AS u RETURNING v.a; DELETE FROM t RETURNING a;")
-            .contains("RETURNING that differs"));
+        let two = with_v(&["c"]);
+        for (sql, want) in [
+            ("DELETE FROM t RETURNING zz; DELETE FROM t RETURNING zz;", "column zz does not exist"),
+            ("UPDATE t SET a = 1 RETURNING zz; UPDATE t SET a = 1 RETURNING zz;", "column zz does not exist"),
+            ("INSERT INTO t (a) SELECT 1 RETURNING zz; INSERT INTO t (a) SELECT 1 RETURNING zz;", "column zz does not exist"),
+            ("DELETE FROM t RETURNING t.zz; DELETE FROM t RETURNING t.zz;", "column t.zz does not exist"),
+            ("DELETE FROM t RETURNING q.a; DELETE FROM t RETURNING q.a;", "missing FROM-clause entry for table q"),
+            ("DELETE FROM t RETURNING q.*; DELETE FROM t RETURNING q.*;", "missing FROM-clause entry for table q"),
+            ("DELETE FROM t RETURNING a + zz; DELETE FROM t RETURNING a + zz;", "column zz does not exist"),
+            // An alias hides the table's own name.
+            ("UPDATE t AS u SET a = 1 RETURNING t.a; UPDATE t AS u SET a = 1 RETURNING t.a;", "missing FROM-clause entry for table t"),
+            // `old`, `new` and `excluded` are not in scope in Postgres 17.
+            ("DELETE FROM t RETURNING old.a; DELETE FROM t RETURNING old.a;", "missing FROM-clause entry for table old"),
+        ] {
+            let e = err(&cat, sql);
+            assert!(e.contains(want), "{sql}: {e}");
+        }
+        // `USING` and `FROM` bring their own columns into scope, and only those.
+        let e = err(&two, "DELETE FROM t USING v RETURNING zz; DELETE FROM t USING v RETURNING zz;");
+        assert!(e.contains("column zz does not exist"), "{e}");
+        let e = err(&two, "UPDATE t SET a = 1 FROM v RETURNING v.zz; UPDATE t SET a = 1 FROM v RETURNING v.zz;");
+        assert!(e.contains("column v.zz does not exist"), "{e}");
+    }
+
+    /// The neighbours that are valid still reduce: system columns, wildcards, expressions, a
+    /// subquery's own scope, a relation the columns of which are not known.
+    #[test]
+    fn valid_returning_names_still_reduce() {
+        let cat = catalog("t", &["a", "b"]);
+        let two = with_v(&["c"]);
+        for sql in [
+            "DELETE FROM t RETURNING ctid, tableoid, xmin; DELETE FROM t RETURNING ctid, tableoid, xmin;",
+            "DELETE FROM t RETURNING *; DELETE FROM t RETURNING *;",
+            "DELETE FROM t RETURNING t.*; DELETE FROM t RETURNING t.*;",
+            "DELETE FROM t AS u RETURNING u.*, u.a + 1 AS x; DELETE FROM t AS u RETURNING u.*, u.a + 1 AS x;",
+            "DELETE FROM t RETURNING (SELECT max(zz) FROM t), now(), 1, $1; DELETE FROM t RETURNING (SELECT max(zz) FROM t), now(), 1, $1;",
+            "UPDATE t SET a = 1 RETURNING a, b; UPDATE t SET a = 1 RETURNING a, b;",
+            "INSERT INTO t (a) SELECT 1 RETURNING a, ctid; INSERT INTO t (a) SELECT 1 RETURNING a, ctid;",
+            "INSERT INTO t AS u (a) SELECT 1 RETURNING u.a; INSERT INTO t AS u (a) SELECT 1 RETURNING u.a;",
+            // A named argument's name is a parameter of the function, not a column.
+            "UPDATE t SET a = 1 RETURNING make_interval(secs => b); UPDATE t SET a = 1 RETURNING make_interval(secs => b);",
+        ] {
+            assert!(reduced(&cat, sql).is_ok(), "{sql}: {:?}", reduced(&cat, sql));
+        }
+        // A `USING` relation's column is a name the statement can see.
+        let sql = "DELETE FROM t USING v RETURNING t.a; DELETE FROM t USING v RETURNING t.a;";
+        assert!(reduced(&two, sql).is_ok(), "{:?}", reduced(&two, sql));
+        // A `USING` relation whose columns the catalog does not give is no reason to refuse.
+        let sql = "DELETE FROM t USING (SELECT 1 AS q) AS d RETURNING t.a; DELETE FROM t USING (SELECT 1 AS q) AS d RETURNING t.a;";
+        assert!(reduced(&cat, sql).is_ok(), "{:?}", reduced(&cat, sql));
+    }
+
+    /// An `INSERT`'s target is replaced by its source, so it is asked, with the relations the sources
+    /// read, whether one bare name is spelled two ways.
+    #[test]
+    fn an_insert_target_is_checked_against_what_its_source_reads() {
+        let cat = catalog("t", &["a", "b"]);
+        let mixed = "INSERT INTO nosuch.t (a) SELECT a FROM t; INSERT INTO nosuch.t (a) SELECT a FROM t;";
+        let e = err(&cat, mixed);
+        assert!(e.contains("two spellings"), "{e}");
+        // With both `t` and `s.t` declared, each name is its own table, as `resolve_tables` reads
+        // them: a bare target beside a source reading `s.t` is two tables, not one spelled twice.
+        let mut both = catalog("t", &["a", "b"]);
+        both.tables.push(catalog("s.t", &["a", "b"]).tables.remove(0));
+        let two = "INSERT INTO t (a) SELECT a FROM s.t; INSERT INTO t (a) SELECT a FROM s.t;";
+        assert!(reduced(&both, two).is_ok(), "{:?}", reduced(&both, two));
+        // One qualifier throughout is the agreed-qualifier rule, as for `UPDATE` and `DELETE`.
+        for ok in [
+            "INSERT INTO nosuch.t (a) SELECT a FROM nosuch.t; INSERT INTO nosuch.t (a) SELECT a FROM nosuch.t;",
+            "INSERT INTO nosuch.t (a) VALUES (1); INSERT INTO nosuch.t (a) VALUES (1);",
+            "INSERT INTO t (a) SELECT a FROM t; INSERT INTO t (a) SELECT a FROM t;",
+        ] {
+            assert!(reduced(&cat, ok).is_ok(), "{ok}: {:?}", reduced(&cat, ok));
+        }
     }
 
     #[test]

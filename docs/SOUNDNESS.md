@@ -504,6 +504,8 @@ what it is or refused:
   or `public` table of the name, is refused. A view, or a table whose columns the catalog does not
   read, keeps its name in this: `FROM t` with a view `t` and a table `s.t` is refused, not read as
   `s.t`.
+  An `INSERT`'s target is replaced by its source, so it is put through the same check beside the
+  relations the two sources read.
 - **`ONLY` is a keyword.** In `FROM ONLY t`, `UPDATE ONLY t` or `DELETE FROM ONLY t` it leaves `t`'s
   inheritance children out. The parser reads it only in `TRUNCATE`, `ALTER TABLE` and `LOCK`, and
   elsewhere takes it as a table named `ONLY` with the alias `t`, which would resolve to a table or CTE
