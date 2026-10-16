@@ -119,10 +119,6 @@ const ACCEPTED: &[Row] = &[
     row(Unsupported, r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN DELETE"#,
         r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN UPDATE SET "b" = 1"#, "MERGE", "prepares"),
     row(Unsupported, r#"SELECT 1 FROM "t" AS "x"("b")"#, r#"SELECT 1 FROM "t""#, "two columns", "prepares"),
-    row(Unsupported, r#"SELECT "a" FROM (SELECT "a" FROM "t")"#, r#"SELECT "a" FROM "t""#,
-        "derived table without an alias", "prepares (Postgres 16 and later)"),
-    row(Unsupported, r#"SELECT "x", "b" FROM (SELECT "a", "b" FROM "t") AS "s"("x")"#, r#"SELECT "a", "b" FROM "t""#,
-        "shorter than its columns", "prepares"),
     row(Unsupported, r#"SELECT "a" FROM "t" WHERE EXISTS (SELECT "t".* FROM "u")"#, r#"SELECT "a" FROM "t""#,
         "over an enclosing query's binding", "prepares"),
     row(Unsupported, r#"SELECT "t" FROM "t""#, r#"SELECT "a" FROM "t""#, "whole-row reference t", "prepares"),
@@ -204,6 +200,10 @@ fn the_valid_neighbours_still_lower() {
         (r#"SELECT "a" FROM "t" WHERE ("a", "b") IN ((1, 2))"#, r#"SELECT "a" FROM "t" WHERE "a" = 1 AND "b" = 2"#),
         (r#"SELECT "a" FROM "t" ORDER BY 1 LIMIT 1"#, r#"SELECT "a" FROM "t" ORDER BY "a" LIMIT 1"#),
         (r#"SELECT "x" FROM (SELECT "a" FROM "t") AS "s"("x")"#, r#"SELECT "a" FROM "t""#),
+        // Postgres 16 and later accept a derived table with no alias.
+        (r#"SELECT "a" FROM (SELECT "a" FROM "t")"#, r#"SELECT "a" FROM "t""#),
+        // A shorter list renames the first columns and keeps the rest.
+        (r#"SELECT "x", "b" FROM (SELECT "a", "b" FROM "t") AS "s"("x")"#, r#"SELECT "a", "b" FROM "t""#),
         (
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY "a" LIMIT 5"#,
             r#"SELECT "a" FROM "t" UNION SELECT "a" FROM "t" ORDER BY 1 LIMIT 5"#,
