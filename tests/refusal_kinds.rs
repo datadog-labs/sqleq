@@ -113,6 +113,7 @@ const REJECTED: &[Row] = &[
 const ACCEPTED: &[Row] = &[
     // Postgres syntax the frontend's parser does not read.
     row(Unsupported, "SELECT", "SELECT 1", "parser does not read", "prepares: a select list may be empty"),
+    row(Unsupported, r#"SELECT "a" FROM ONLY "t""#, r#"SELECT "a" FROM "t""#, "ONLY in a table reference", "prepares"),
     row(Unsupported, r#"TABLE "t""#, r#"SELECT * FROM "t""#, "parser does not read", "prepares"),
     row(Unsupported, r#"DELETE FROM "t""#, r#"SELECT "a" FROM "t""#, "DELETE paired with non-DELETE", "prepares"),
     row(Unsupported, r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN DELETE"#,

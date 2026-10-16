@@ -482,7 +482,41 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
     // Before any pass that recurses on the tree: a loop in the parser can build one deeper than its
     // recursion limit.
     depth::check(&mut statements)?;
+    refuse_only_as_a_table_name(&statements)?;
     Ok((fns, statements))
+}
+
+/// SOUNDNESS GUARD (#190): refuse a relation named by the unquoted word `ONLY`.
+///
+/// sqlparser reads `ONLY` only where it is a statement's own keyword (`TRUNCATE`, `ALTER TABLE`,
+/// `LOCK`). In a table reference it takes `FROM ONLY t` as a table named `ONLY` with the alias `t`,
+/// and the catalog then resolves that name to whatever table or CTE is called `only`, so two
+/// different queries can lower to one. Postgres reserves `ONLY`: unquoted, it is never a relation
+/// name, only the marker that leaves a table's inheritance children out. So an unquoted `ONLY` as a
+/// relation name is always that marker misread. Lowering `ONLY t` as `t` would also need the catalog
+/// to rule out children, and the qualified and aliased forms do not parse at all, so this refuses.
+/// Statements the frontend reads as DDL are skipped: a view body is not lowered, and the catalog does
+/// not resolve its relations.
+fn refuse_only_as_a_table_name(statements: &[sqlparser::ast::Statement]) -> Result<()> {
+    use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
+    use std::ops::ControlFlow;
+    for st in statements {
+        if !matches!(st, Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)) {
+            continue;
+        }
+        let found = visit_relations(st, |name| match name.0.first() {
+            Some(ObjectNamePart::Identifier(id)) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("only") => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        });
+        if found.is_break() {
+            return Err(error::unsupported(
+                "ONLY in a table reference, which the frontend's parser reads as a table named ONLY",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The input with its `declare ... function` DSL lines split off: the functions they declare, and the
