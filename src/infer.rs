@@ -1173,7 +1173,107 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
             }
         }
         Ok(())
+    })?;
+
+    // 9. A parameter among the arguments of `coalesce`, `nullif`, `greatest` or `least` takes the
+    //    type of the others, as Postgres resolves them to one type: `COALESCE(a = $1, $2)` makes `$2`
+    //    a boolean. Only a parameter nothing else typed is set, and only from evidence: a literal's or
+    //    a cast's type, an atom's known type, or BOOLEAN for an argument that is a predicate. The
+    //    arguments' atoms are not unified, because a column next to a column of another numeric type
+    //    is valid Postgres that rule 3's union would refuse. Integer and real evidence together read
+    //    as real; any other mix says nothing.
+    sweep(q, |e| {
+        let Expr::Function(f) = e else { return Ok(()) };
+        let n = obj_name(&f.name).to_lowercase();
+        if !matches!(n.as_str(), "coalesce" | "nullif" | "greatest" | "least") || f.over.is_some() || f.filter.is_some() {
+            return Ok(());
+        }
+        let args: Vec<&Expr> = call_args(e)
+            .iter()
+            .filter_map(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Some(unnest_parens(x)),
+                _ => None,
+            })
+            .collect();
+        let mut evidence: Vec<Ty> = Vec::new();
+        for a in &args {
+            let t = match side_type(a)? {
+                Some((t, _)) => Some(t),
+                None if is_predicate(a) => Some(Ty::Bool),
+                None => side_key(at, a).and_then(|k| uf.get_type(&k)),
+            };
+            if let Some(t) = t.filter(|t| *t != Ty::Opaque) {
+                evidence.push(t);
+            }
+        }
+        let Some(t) = fold_numeric(&evidence) else { return Ok(()) };
+        for a in &args {
+            if let Some(k @ Atom::Param(_)) = side_key(at, a) {
+                if uf.get_type(&k).is_none() {
+                    uf.set_type(&k, t, Conf::Use)?;
+                }
+            }
+        }
+        Ok(())
     })
+}
+
+/// `e` without the parentheses around it.
+fn unnest_parens(mut e: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = e {
+        e = inner;
+    }
+    e
+}
+
+/// Whether `e` is a predicate: an expression whose value is a boolean by its shape alone.
+fn is_predicate(e: &Expr) -> bool {
+    match unnest_parens(e) {
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::GtEq
+                | BinaryOperator::LtEq
+                | BinaryOperator::And
+                | BinaryOperator::Or
+        ),
+        Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::IsDistinctFrom(..)
+        | Expr::IsNotDistinctFrom(..)
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::SimilarTo { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Between { .. }
+        | Expr::Exists { .. } => true,
+        Expr::Function(f) => builtin_rtype(&obj_name(&f.name)) == Some(Ty::Bool),
+        _ => false,
+    }
+}
+
+/// One type for a list of argument types, if they agree: all one type, or integers and reals
+/// together, which Postgres resolves to the real one.
+fn fold_numeric(types: &[Ty]) -> Option<Ty> {
+    let first = *types.first()?;
+    if types.iter().all(|t| *t == first) {
+        Some(first)
+    } else if types.iter().all(|t| matches!(t, Ty::Int | Ty::Real)) {
+        Some(Ty::Real)
+    } else {
+        None
+    }
 }
 
 /// The [`nid`]s of every `LIMIT`/`OFFSET`/`FETCH` count expression in `q`, at any nesting depth.
