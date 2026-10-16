@@ -504,8 +504,6 @@ what it is or refused:
   or `public` table of the name, is refused. A view, or a table whose columns the catalog does not
   read, keeps its name in this: `FROM t` with a view `t` and a table `s.t` is refused, not read as
   `s.t`.
-  An `INSERT`'s target is replaced by its source, so it is put through the same check beside the
-  relations the two sources read.
 - **`DEFAULT` is a keyword.** In `UPDATE … SET a = DEFAULT`, or a `VALUES` row of an `INSERT`, it
   stands for the column's default, which the reductions do not model, so it is refused rather than
   read as a column named `default`.
