@@ -140,6 +140,16 @@ elsewhere the value keeps its own type, which costs exactness and not soundness.
 would put two temporal types in one column with no comparison to hang a conversion on — a set
 operation, a `VALUES` list, `ts IN (SELECT d …)` — the pair is refused.
 
+More generally, a column of a set operation or a `VALUES` list has one type in Postgres, resolved
+across its branches or rows, and the provers read the column with the first branch's type. So the
+lowering gives each such column one type, or refuses. An integer beside a numeric is converted to
+numeric, which is exact; a `NULL` is the null of the column's type, and an untyped parameter a value
+of it; and a string literal beside an
+integer or a boolean is read as one, as Postgres reads an untyped literal. Any other pair of types
+is refused: Postgres rejects most of them (text beside an integer, a boolean beside an integer), and
+a value of a type the frontend does not know beside any other would need a conversion keyed on that
+value. Branches or rows of different widths are refused as Postgres refuses them.
+
 ### Types the provers would read with the wrong arithmetic or the wrong equality
 
 A Postgres type is mapped onto an IR type only where the IR type's operations are the Postgres
