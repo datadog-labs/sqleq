@@ -50,7 +50,11 @@ use crate::gen::{
     CastTarget, Val,
 };
 use crate::limits::{self, Count};
+use crate::literals;
 use crate::pair::{is_query, small_size, Config, Verdict, SMALL_STREAM};
+
+/// Seeds the literal trials' stream, apart from the full and the small trials' ones.
+const LITERAL_STREAM: u64 = 0x11e7_e4a1_5eed_0b0d;
 use crate::patterns as pat;
 use crate::schema::{parse_schema, Column, Schema, Table, VType};
 use crate::typing;
@@ -562,6 +566,9 @@ fn msg(e: &postgres::Error) -> String {
 pub struct Timing {
     pub ddl_ms: f64,
     pub trial_ms: Vec<f64>,
+    /// The trials the pair was given: [`Config::total_trials`], and the literal trials where a
+    /// column is compared with a literal.
+    pub trials: usize,
     pub rows_tried: usize,
     pub rows_kept: usize,
     /// Per table: the rows drawn for it over every trial, and the ones Postgres accepted.
@@ -2153,8 +2160,36 @@ fn run_pair(
     };
     timing.ddl_ms = started.elapsed().as_secs_f64() * 1000.0;
 
+    // The literals each column is compared with, as values of its type, per table in column order.
+    // Where there are any, another `--trials / 4` trials, drawn from a stream of their own after
+    // all the others, give each such column one of them in about half its rows. The trials before
+    // them draw exactly what they drew without, so a pair can only gain a counterexample.
+    let lits = literals::harvest(a, b);
+    let mut literal_pools: BTreeMap<String, Vec<Vec<Val>>> = BTreeMap::new();
+    for t in &loaded {
+        let tg = targets.iter().find(|(k, _)| k == t).map(|(_, tg)| tg);
+        let pools: Vec<Vec<Val>> = tables[t]
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                let ty = tg.and_then(|tg| tg.col_types.get(j).cloned().flatten());
+                match (lits.get(&c.name), ty) {
+                    (Some(ls), Some(ty)) if !c.array => literals::values(c.vt, &ty, ls),
+                    _ => Vec::new(),
+                }
+            })
+            .collect();
+        if pools.iter().any(|p| !p.is_empty()) {
+            literal_pools.insert(t.clone(), pools);
+        }
+    }
+    let literal_trials = if literal_pools.is_empty() { 0 } else { cfg.trials / 4 };
+    timing.trials = cfg.total_trials() + literal_trials;
+
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
     let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
+    let mut literal_rng = StdRng::seed_from_u64(cfg.seed ^ LITERAL_STREAM);
     let small_trials = cfg.trials / 4;
     let mut last_err: Option<String> = None;
     let mut ok_trials = 0usize;
@@ -2167,7 +2202,7 @@ fn run_pair(
         return Verdict::Error(e);
     }
 
-    for i in 0..cfg.total_trials() {
+    for i in 0..timing.trials {
         let t_trial = Instant::now();
         // By the trial's number, not the generator, so every value drawn is the one it would be.
         let clock = clocked.then(|| clocks[i % clocks.len()].as_str());
@@ -2192,8 +2227,11 @@ fn run_pair(
             .into_iter()
             .chain(zone.map(|z| format!("TimeZone: {z}")))
             .collect();
-        let small = i % 5 == 4 && i / 5 < small_trials;
-        let rng: &mut StdRng = if small {
+        let literal = i >= cfg.total_trials();
+        let small = !literal && i % 5 == 4 && i / 5 < small_trials;
+        let rng: &mut StdRng = if literal {
+            &mut literal_rng
+        } else if small {
             &mut small_rng
         } else {
             &mut full_rng
@@ -2207,8 +2245,19 @@ fn run_pair(
                 cfg.nrows
             };
             let mut rows: Vec<Vec<Val>> = Vec::with_capacity(size);
+            let pools = literal_pools.get(t).filter(|_| literal);
             for _ in 0..size {
-                let row: Vec<Val> = table.cols.iter().map(|c| randval_col(c, rng)).collect();
+                let row: Vec<Val> = table
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| match pools.map(|p| &p[j]) {
+                        Some(pool) if !pool.is_empty() && rng.random_bool(0.5) => {
+                            pool.choose(rng).unwrap().clone()
+                        }
+                        _ => randval_col(c, rng),
+                    })
+                    .collect();
                 if table.admits(&rows, &row) {
                     rows.push(row);
                 }
@@ -2631,7 +2680,7 @@ fn run_pair(
         // No trial ran because no value drawn was of its parameter's type: a type the generator
         // has no domain for, which says nothing about the pair. The last such trial's casts, one at
         // a time, say which.
-        if ok_trials == 0 && cast_failures == cfg.total_trials() {
+        if ok_trials == 0 && cast_failures == timing.trials {
             for (n, t, cast) in &failed_casts {
                 if db.guarded(|db| db.simple(&format!("SELECT {cast}"))).is_err() {
                     return Verdict::NotComparable(format!(

@@ -852,3 +852,31 @@ fn a_gather_parameter_of_a_type_with_no_domain_is_not_compared() {
         assert!(label.starts_with("NOT-COMPARABLE:gather: no value drawn is of type point ($"), "{label}");
     }
 }
+
+// -- Literals the queries compare their columns with ---------------------------------------------
+
+#[test]
+fn a_boundary_at_a_literal_outside_the_domain_is_refuted() {
+    for (ddl, a, b) in [
+        ("CREATE TABLE t (c int8 NOT NULL)", "SELECT * FROM t WHERE 334 <= c", "SELECT * FROM t WHERE 334 < c"),
+        ("CREATE TABLE t (c1 date)", "SELECT * FROM t WHERE c1 > '2000-01-01'::date", "SELECT * FROM t WHERE c1 >= '2000-01-01'::date"),
+        ("CREATE TABLE t (c0 numeric)", "SELECT * FROM t WHERE c0 >= '-820'::numeric", "SELECT * FROM t WHERE c0 > '-820'::numeric"),
+        ("CREATE TABLE t (c1 int8)", "SELECT * FROM t WHERE 334 <= c1", "SELECT * FROM t WHERE 335 <= c1"),
+        ("CREATE TABLE t (c int8 NOT NULL)", "SELECT * FROM t WHERE c BETWEEN 10 AND 20", "SELECT * FROM t WHERE c > 10 AND c < 20"),
+    ] {
+        assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
+fn a_literal_drawn_into_a_column_refutes_nothing_equivalent() {
+    for (ddl, a, b) in [
+        ("CREATE TABLE t (c int4 NOT NULL)", "SELECT * FROM t WHERE c < 334", "SELECT * FROM t WHERE c <= 333"),
+        ("CREATE TABLE t (c int4 NOT NULL)", "SELECT * FROM t WHERE c > 2.5", "SELECT * FROM t WHERE c >= 3"),
+        // The neighbour past the check is a row Postgres rejects.
+        ("CREATE TABLE t (c int4 NOT NULL CHECK (c < 100))", "SELECT * FROM t WHERE c >= 100", "SELECT * FROM t WHERE false"),
+        ("CREATE TABLE t (c smallint NOT NULL)", "SELECT * FROM t WHERE c <= 32767", "SELECT * FROM t"),
+    ] {
+        assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+    }
+}

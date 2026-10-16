@@ -361,7 +361,7 @@ read or an argument is missing (a missing file, a row out of range, a file that 
 has other than two statements besides its DDL, `row` without an index), or when a `csv` worker died
 and left rows without a verdict; `2` when the mode is missing or unknown, after printing the usage.
 
-### The generated value domain (why a literal can make a pair look equivalent)
+### The generated value domain (and the literals added to it)
 
 Column values are drawn from a deliberately small domain — `0,1,2` for integers, doubles and
 numerics, `'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs,
@@ -372,14 +372,18 @@ of its own is drawn as a string, which Postgres may reject. Every table gets `--
 trials, interleaved with those and drawn separately, give each table between 0 and `--rows` rows,
 mostly 0 or 1, which is where an aggregate over no rows, `EXISTS` or a scalar subquery tells two
 queries apart.
-Parameters are additionally biased toward a value the column really holds; a **literal is not**. A
-predicate against a literal outside the domain, `status = 'active'`, is therefore satisfied by no
-generated row: both sides return nothing on every trial and a non-equivalent pair reports
-`NO-COUNTEREXAMPLE`.
-
-This bites `file` mode hardest, since a hand-written pair carries literals where a corpus row
-carries `$N`. Write self-contained pairs against the generated domain — the committed
-[`examples/`](../examples) do, which is why they refute.
+Parameters are additionally biased toward a value the column really holds. A literal outside the
+domain, `status = 'active'` or `334 <= c`, would be satisfied by no generated row, so on the
+Postgres engine the literals the two statements compare a column with (in a comparison, a
+`BETWEEN`, an `IN` list or an `IS [NOT] DISTINCT FROM`) join that column's domain, an integer or a
+date with the values one either side of it, so that `334 <= c` and `334 < c` are told apart by the
+row `c = 334`. A column takes them in another `--trials / 4` trials, drawn from a stream of their
+own after the others, in about half its rows; a pair that compares no column with a literal runs
+exactly the trials it ran without. A literal is matched to columns by name, a qualifier dropped.
+The DuckDB engine, which does not enforce a `CHECK` a literal's neighbour may break, draws no
+literals: there a predicate against a literal outside the domain is satisfied by no generated row,
+and a non-equivalent pair can report `NO-COUNTEREXAMPLE`. Write pairs for it against the generated
+domain, as the committed [`examples/`](../examples) are.
 
 ## Validation
 
