@@ -316,3 +316,43 @@ fn an_order_comparison_after_grouping_is_uninterpreted() {
     assert_eq!(v["queries"][0], v["queries"][1], "{v}");
     assert!(!native_order(&v) && has(&v, "q_str_lt", 2), "{v}");
 }
+
+#[test]
+fn a_json_lookup_beside_a_collated_column_lowers() {
+    // `->`, `#>` and `jsonb_extract_path` yield json, which has no collation, and look keys up
+    // byte-wise: none reads the collation of the column beside them (#164).
+    let ddl = r#"create table "t" ("id" INTEGER PRIMARY KEY, "s" TEXT COLLATE "en_US", "j" JSONB, "p" TEXT[]);"#;
+    for (a, b) in [
+        (r#"SELECT "j" -> 'k' FROM "t" WHERE "id" = 1"#, r#"SELECT "j" -> 'k' FROM "t" WHERE 1 = "id""#),
+        (r#"SELECT "j" #> "p" FROM "t" WHERE "id" = 1"#, r#"SELECT "j" #> "p" FROM "t" WHERE 1 = "id""#),
+        (r#"SELECT "j" #> '{a,b}' FROM "t" WHERE "id" = 1"#, r#"SELECT "j" #> '{a,b}' FROM "t" WHERE 1 = "id""#),
+        (
+            r#"SELECT jsonb_extract_path("j", 'a') FROM "t" WHERE "id" = 1"#,
+            r#"SELECT jsonb_extract_path("j", 'a') FROM "t" WHERE 1 = "id""#,
+        ),
+    ] {
+        for src in MODES {
+            lower_in(ddl, a, b, src);
+        }
+    }
+}
+
+#[test]
+fn an_operation_over_a_json_text_lookup_beside_a_collated_column_stays_refused() {
+    // `->>` yields text, which inherits the collation of its argument, and the declared catalog types
+    // the call VARBINARY, so `upper` and `<` over it would escape the string check. Not in BLIND: the
+    // declared catalog refuses at the lookup, the inferred one (which types it VARCHAR) at `upper`.
+    let ddl = r#"create table "t" ("id" INTEGER PRIMARY KEY, "s" TEXT COLLATE "C", "j" JSON);"#;
+    refused(
+        ddl,
+        r#"SELECT upper("j" ->> "s") FROM "t" WHERE "s" = 'k'"#,
+        r#"SELECT upper("j" ->> 'k') FROM "t" WHERE "s" = 'k'"#,
+        "a column the pair reads declares",
+    );
+    refused(
+        ddl,
+        r#"SELECT "id" FROM "t" WHERE ("j" ->> "s") < 'x'"#,
+        r#"SELECT "id" FROM "t" WHERE ("j" ->> 'k') < 'x'"#,
+        "a column the pair reads declares",
+    );
+}
