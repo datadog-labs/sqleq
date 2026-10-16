@@ -227,3 +227,40 @@ fn a_parameter_in_arithmetic_takes_its_partners_type() {
     // the `numeric` Postgres gives it.
     assert_eq!(qp1_type(r#"SELECT sum("n") / $1 FROM "t""#), "VARBINARY");
 }
+
+/// The type the plan gives `$k`, by its `QPk` node.
+fn param_type(q: &str, k: u32) -> String {
+    fn find(v: &Value, name: &str) -> Option<String> {
+        match v {
+            Value::Object(m) if m.get("operator").and_then(Value::as_str) == Some(name) => {
+                m.get("type").and_then(Value::as_str).map(str::to_string)
+            }
+            Value::Object(m) => m.values().find_map(|x| find(x, name)),
+            Value::Array(a) => a.iter().find_map(|x| find(x, name)),
+            _ => None,
+        }
+    }
+    let ddl = r#"create table "t" ("id" INTEGER, "a" INTEGER, "n" NUMERIC, "s" TEXT, "p" BOOLEAN);"#;
+    let v = lower_with(&format!("{ddl}\n{q};\n{q};"), CatalogSource::InferredSeeded)
+        .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q}"));
+    find(&v["queries"][0], &format!("QP{k}")).unwrap_or_else(|| panic!("no QP{k} in {q}"))
+}
+
+#[test]
+fn a_parameter_among_coalesce_arguments_takes_the_others_type() {
+    // Postgres resolves the arguments of COALESCE, NULLIF, GREATEST and LEAST to one type, so a
+    // parameter there takes the others' (#174). It was opaque, and `NOT` over the opaque COALESCE
+    // reached the QED prover ill-sorted.
+    assert_eq!(param_type(r#"SELECT NOT COALESCE("s" = $1, $2) AS "x" FROM "t""#, 2), "BOOLEAN");
+    assert_eq!(param_type(r#"SELECT COALESCE("p", $1) FROM "t""#, 1), "BOOLEAN");
+    assert_eq!(param_type(r#"SELECT COALESCE("a", $1) FROM "t""#, 1), "INTEGER");
+    assert_eq!(param_type(r#"SELECT COALESCE("s", $1) FROM "t""#, 1), "VARCHAR");
+    assert_eq!(param_type(r#"SELECT NULLIF("a", $1) FROM "t""#, 1), "INTEGER");
+    assert_eq!(param_type(r#"SELECT GREATEST("a", 1.5, $1) FROM "t""#, 1), "REAL");
+    // Evidence that does not agree says nothing.
+    assert_eq!(param_type(r#"SELECT COALESCE("s", "a", $1) FROM "t""#, 1), "VARBINARY");
+    // A parameter something else typed keeps that type.
+    assert_eq!(param_type(r#"SELECT COALESCE("a", $1) FROM "t" WHERE $1 = "n""#, 1), "REAL");
+    // Two columns of two numeric types are not unified: `COALESCE(a, n)` still lowers.
+    lowers_in(CatalogSource::InferredSeeded, r#"SELECT COALESCE("a", "n") FROM "t""#, r#"SELECT COALESCE("a", "n") FROM "t""#);
+}
