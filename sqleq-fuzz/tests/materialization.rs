@@ -388,3 +388,42 @@ fn inheritance_is_withheld_on_duckdb() {
         assert!(v.starts_with("NOT-COMPARABLE:") && v.contains("inheritance"), "{v}");
     }
 }
+
+// -- The DDL is read as Postgres lexes it (issues #165, #166) ------------------------------------
+
+/// A `CREATE TABLE` the parser rejects is read by hand. Its options are read as tokens: a quote
+/// inside a dollar-quoted string, an escape string or a comment hides no constraint, and a `)` in one
+/// ends no column list. The column named `primary` is what makes the parser reject each of these.
+#[test]
+fn a_hand_read_table_sees_through_dollar_quotes_escape_strings_and_comments() {
+    let ddl = "CREATE TABLE q (primary boolean, k text NOT NULL DEFAULT $$it's$$ UNIQUE, v text DEFAULT $$'$$)";
+    assert_eq!(cols(ddl, "q"), ["primary", "k!", "v"]);
+    assert_eq!(keys(ddl, "q"), [["k"]]);
+    let ddl = "CREATE TABLE q (primary boolean, a text DEFAULT $$)$$, b integer NOT NULL)";
+    assert_eq!(cols(ddl, "q"), ["primary", "a", "b!"]);
+    let ddl = "CREATE TABLE q (primary boolean, a integer /* it's */ UNIQUE, b integer NOT NULL)";
+    assert_eq!(cols(ddl, "q"), ["primary", "a", "b!"]);
+    assert_eq!(keys(ddl, "q"), [["a"]]);
+    let ddl = r"CREATE TABLE q (primary boolean, k text DEFAULT E'it\'s' UNIQUE)";
+    assert_eq!(keys(ddl, "q"), [["k"]]);
+}
+
+/// The DDL is the text Postgres runs: no backslash sequence in it is rewritten first.
+#[test]
+fn the_ddl_is_read_without_unescaping() {
+    // An escape string whose `\'` is part of the string, not where it ends.
+    let ddl = r#"CREATE TABLE t (id integer PRIMARY KEY, p text DEFAULT E'x\';y', a integer)"#;
+    assert_eq!(cols(ddl, "t"), ["id!", "p", "a"]);
+    assert_eq!(keys(ddl, "t"), [["id"]]);
+    // A quoted name that ends in a backslash.
+    let ddl = r#"CREATE TABLE t ("a\" integer PRIMARY KEY, b integer)"#;
+    assert_eq!(cols(ddl, "t"), [r"a\!", "b"]);
+}
+
+/// A key the hand reader missed let DuckDB hold rows Postgres would reject: duplicate `k`s made
+/// `SELECT k` and `SELECT DISTINCT k` differ.
+#[test]
+fn a_key_after_a_dollar_quoted_default_is_enforced() {
+    let ddl = "CREATE TABLE q (primary boolean, k text NOT NULL DEFAULT $$it's$$ UNIQUE, v text DEFAULT $$'$$)";
+    assert_eq!(label("SELECT k FROM q", "SELECT DISTINCT k FROM q", ddl), "NO-COUNTEREXAMPLE");
+}

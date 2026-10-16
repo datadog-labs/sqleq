@@ -314,6 +314,16 @@ fn an_undeclared_type_is_read_as_text_and_said_so() {
 }
 
 #[test]
+fn an_escape_string_in_the_ddl_is_read_as_postgres_reads_it() {
+    // `\'` is part of the string: unescaped first, the string ended early and no table was read.
+    let ddl = r#"CREATE TABLE t (id integer PRIMARY KEY, p text DEFAULT E'x\';y', a integer)"#;
+    let Some(k) = kind("SELECT id FROM t WHERE a > 0", "SELECT id FROM t WHERE 0 < a", ddl) else {
+        return;
+    };
+    assert_eq!(k, "NO-COUNTEREXAMPLE");
+}
+
+#[test]
 fn a_default_calling_an_undeclared_function_is_dropped_and_said_so() {
     let ddl = r#"CREATE TABLE t (id uuid PRIMARY KEY DEFAULT gen_id(), a integer)"#;
     let Some(o) = outcome(
