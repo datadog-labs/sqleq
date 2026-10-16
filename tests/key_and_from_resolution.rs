@@ -457,3 +457,48 @@ fn a_using_name_twice_on_one_side_is_refused() {
     abc(r#"SELECT 1 FROM "a" JOIN "b" USING ("x") JOIN "c" USING ("x")"#, r#"SELECT 1 FROM "a""#).unwrap();
     abc(r#"SELECT 1 FROM "c" JOIN ("a" JOIN "b" USING ("x")) USING ("x")"#, r#"SELECT 1 FROM "a""#).unwrap();
 }
+
+#[test]
+fn a_derived_table_without_an_alias_is_read_by_bare_column() {
+    // Postgres 16 and later accept one (#192). A bare column resolves into it, `*` expands it, and
+    // the binding's name is the same IR as any alias would give.
+    assert!(identical(r#"SELECT "a" FROM (SELECT "a" FROM "t")"#, r#"SELECT "a" FROM (SELECT "a" FROM "t") AS "s""#));
+    assert!(identical(r#"SELECT * FROM (SELECT "a", "b" FROM "t")"#, r#"SELECT * FROM (SELECT "a", "b" FROM "t") AS "s""#));
+    // Two of them in one FROM clause, and a correlated reference into an enclosing table.
+    assert!(identical(
+        r#"SELECT "a", "id" FROM (SELECT "a" FROM "t"), (SELECT "id" FROM "w")"#,
+        r#"SELECT "x"."a", "y"."id" FROM (SELECT "a" FROM "t") AS "x", (SELECT "id" FROM "w") AS "y""#,
+    ));
+    assert!(identical(
+        r#"SELECT "k" FROM "t" WHERE EXISTS (SELECT 1 FROM (SELECT "a" AS "c" FROM "u") WHERE "c" = "t"."a")"#,
+        r#"SELECT "k" FROM "t" WHERE EXISTS (SELECT 1 FROM (SELECT "a" AS "c" FROM "u") AS "s" WHERE "s"."c" = "t"."a")"#,
+    ));
+    // No qualifier names it, not even the name Postgres gives it internally or the one this
+    // frontend binds it under.
+    for q in ["unnamed_subquery", "nameless", "s"] {
+        let src = format!(r#"SELECT "{q}"."a" FROM (SELECT "a" FROM "t")"#);
+        assert!(lower_in(&src, r#"SELECT "a" FROM "t""#, CatalogSource::Declared).is_err(), "{q}");
+    }
+    // A qualified reference that misses it reaches the enclosing table of that name, as in Postgres.
+    assert!(identical(
+        r#"SELECT "k" FROM "t" WHERE EXISTS (SELECT 1 FROM (SELECT "a" FROM "u") WHERE "t"."a" = 1)"#,
+        r#"SELECT "k" FROM "t" WHERE EXISTS (SELECT 1 FROM (SELECT "a" FROM "u") AS "s" WHERE "t"."a" = 1)"#,
+    ));
+}
+
+#[test]
+fn a_shorter_derived_column_list_renames_the_first_columns() {
+    // `AS s(x)` over two columns renames the first and keeps the second's name (#183).
+    assert!(identical(
+        r#"SELECT "x", "b" FROM (SELECT "a", "b" FROM "t") AS "s"("x")"#,
+        r#"SELECT "s"."x", "s"."b" FROM (SELECT "a" AS "x", "b" FROM "t") AS "s""#,
+    ));
+    assert!(!identical(
+        r#"SELECT "x" FROM (SELECT "b", "a" FROM "t") AS "s"("x")"#,
+        r#"SELECT "x" FROM (SELECT "a" AS "x", "b" FROM "t") AS "s""#,
+    ));
+    // The rename can leave two columns with one name, which stays refused; a longer list is a
+    // Postgres error.
+    refused(r#"SELECT 1 FROM (SELECT "a", "b" FROM "t") AS "s"("b")"#, r#"SELECT 1 FROM "t""#, "unsupported", "two columns named b");
+    refused(r#"SELECT 1 FROM (SELECT "a" FROM "t") AS "s"("x", "y")"#, r#"SELECT 1 FROM "t""#, "schema", "fewer columns than its alias names");
+}

@@ -536,7 +536,12 @@ what it is or refused:
   A `USING (k)` whose left or right side has two `k` columns that no earlier `USING` merged is
   refused, as Postgres rejects it, rather than compared with the first.
 - **An alias's column list renames by position.** In `t AS x(b, a)`, `x.b` is `t`'s first column,
-  whatever that column is called. A list that leaves two columns with one name is refused.
+  whatever that column is called. A list shorter than the columns, on a table or a derived table,
+  renames the first ones and leaves the rest their names. A list that leaves two columns with one name
+  is refused.
+- **A derived table without an alias has no name.** Postgres 16 and later accept one, and no
+  qualifier can name it: it is bound under a name no reference spells, so a bare column resolves into
+  it and a qualified one reaches past it to an enclosing table of that name, as in Postgres.
 - **Parentheses in a `FROM` clause group.** `a LEFT JOIN (b JOIN c ON p) ON q` is lowered with its
   grouping, since it is not `(a LEFT JOIN b ON q) JOIN c ON p`, and the inner `ON` sees only the
   inner join's own tables. An aliased one, `(b JOIN c) AS x`, is refused.
