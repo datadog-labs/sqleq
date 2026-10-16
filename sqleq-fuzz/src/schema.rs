@@ -77,6 +77,23 @@ pub enum VType {
     /// `interval`, as DuckDB `INTERVAL`. Its name contains `INT`, which is how it used to become an
     /// INTEGER filled with `0`, `1` and `2`.
     Interval,
+    /// `time` (without time zone). The domains from here on are named by the type Postgres gives a
+    /// column or a parameter (and `time` by a cast too): the DuckDB engine's DDL reader never yields
+    /// them, so their DuckDB column types below are never created. Drawn as text Postgres reads as the type, they replace a
+    /// string such as `'a'`, which Postgres rejects, so that a table with such a column holds rows.
+    Time,
+    /// `time with time zone`.
+    TimeTz,
+    Inet,
+    Cidr,
+    /// `macaddr`.
+    MacAddr,
+    /// `macaddr8`.
+    MacAddr8,
+    /// `hstore`, from the extension of that name.
+    Hstore,
+    /// `xid` and `xid8`, transaction ids, which take no integer but a string of digits.
+    Xid,
 }
 
 /// The DuckDB type a bare `numeric` (no typmod) is materialized as: DuckDB's own reading of a bare
@@ -98,16 +115,27 @@ impl VType {
             VType::Uuid => "UUID".to_string(),
             VType::Json => "JSON".to_string(),
             VType::Interval => "INTERVAL".to_string(),
+            VType::Time => "TIME".to_string(),
+            VType::TimeTz => "TIMETZ".to_string(),
+            VType::Inet
+            | VType::Cidr
+            | VType::MacAddr
+            | VType::MacAddr8
+            | VType::Hstore
+            | VType::Xid => "VARCHAR".to_string(),
         }
     }
 
     /// Whether two domains generate the same values -- so a value drawn from a column of one
     /// satisfies a cast to the other. `numeric` and the floating types share the `{0, 1, 2}` pool, and
-    /// a timestamp is generated alike with or without a time zone.
+    /// a timestamp is generated alike with or without a time zone. So is a time of day, and every
+    /// value of the `inet` and `cidr` domains is an input of both.
     pub fn same_domain(self, other: VType) -> bool {
         let class = |v: VType| match v {
             VType::Decimal(..) => VType::Double,
             VType::TimestampTz => VType::Timestamp,
+            VType::TimeTz => VType::Time,
+            VType::Cidr => VType::Inet,
             v => v,
         };
         class(self) == class(other)

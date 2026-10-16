@@ -241,7 +241,8 @@ Four things differ from index binding, all in this mode only:
   rows an `INSERT` writes mostly meet a row already there, or each other, on a key, and both sides
   raise. On every other trial each parameter instead takes a value of its own that the tables do not
   hold (an integer, a number, a string or a uuid moved out of those domains), so that the two sides
-  have rows to compare. Those are the trials that run in `America/New_York`, below.
+  have rows to compare. A value keeps its own where the move would not fit a type it meets: a number
+  past a `numeric(p, s)`'s digits before the point, a string past a `char(n)` or `varchar(n)`. Those are the trials that run in `America/New_York`, below.
 - **Values past a narrower type.** Some trials give a parameter a value just past the narrowest type
   its value meets on either side: one past an integer type's range, a string one character longer
   than a `char` or `varchar(n)`, one more decimal place than a `numeric(p, s)`, an integer a `real`
@@ -327,7 +328,8 @@ options: -j/--jobs N (csv workers, default 1)  --trials N (default 120)  --rows 
 `counterexample: …` line holding the instance, and a `NO-COUNTEREXAMPLE` that only some trials
 reached by a `partial: K trials compared both sides; last error: …` line. Those lines are what
 `sqleq-check` reads. An `engine: postgres 17.N` (or `engine: duckdb …`) line follows, and with the
-Postgres engine a `caveat: …` line when the verdict rests on a stood-in type or a dropped default.
+Postgres engine a `caveat: …` line when the verdict rests on a stood-in type or a dropped default,
+or when Postgres accepted no generated row of a table, which every trial then compared empty.
 
 `csv` mode takes each name in `names.txt` to the corpus row its digits number (`pairNNNN` is row
 `NNNN`), prints a `name: LABEL Tms` line per row as it finishes (with `(ok=K/N)` after the label when
@@ -342,8 +344,9 @@ Verdicts: `NOT-EQUIVALENT`, `NO-COUNTEREXAMPLE`, `NOT-EQUIVALENT-GATHER`,
 `PARAM-MISALIGNED:...`, `NOT-COMPARABLE:...`, `NO-SCHEMA`, `NO-TABLES`, `NONDET-SKIP`. The three that
 carry a message after a `:` still bucket correctly for a consumer that splits on the first one.
 `NOT-COMPARABLE` is a withheld verdict: the two sides share no observable, a `$N` is an array on one
-side and a scalar on the other, a pair of the gather rule's shape cannot be bound by it, a pair needs
-an ICU collation, or the generated instances cannot stand for the DDL.
+side and a scalar on the other, a pair of the gather rule's shape cannot be bound by it, no value
+drawn for one of its parameters is of the type Postgres gives it, a pair needs an ICU collation, or
+the generated instances cannot stand for the DDL.
 
 The exit code is `0` whatever the verdict, `NOT-EQUIVALENT` included; `1` when the input cannot be
 read or an argument is missing (a missing file, a row out of range, a file that does not lex or
@@ -353,9 +356,11 @@ and left rows without a verdict; `2` when the mode is missing or unknown, after 
 ### The generated value domain (why a literal can make a pair look equivalent)
 
 Column values are drawn from a deliberately small domain — `0,1,2` for integers, doubles and
-numerics, `'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs and
-a few small JSON documents — so that joins, `GROUP BY` and `DISTINCT` actually collide on small
-instances. Every table gets `--rows` rows in each of `--trials` trials; another `--trials / 4`
+numerics, `'a','b','c'` for strings, `true`/`false`, three dates, three timestamps, three UUIDs,
+a few small JSON documents, and, on the Postgres engine, three values each for the times of day,
+`inet`, `cidr`, `macaddr`, `macaddr8`, `hstore` and the transaction ids, and `money` as a number —
+so that joins, `GROUP BY` and `DISTINCT` actually collide on small instances. A type with no domain
+of its own is drawn as a string, which Postgres may reject. Every table gets `--rows` rows in each of `--trials` trials; another `--trials / 4`
 trials, interleaved with those and drawn separately, give each table between 0 and `--rows` rows,
 mostly 0 or 1, which is where an aggregate over no rows, `EXISTS` or a scalar subquery tells two
 queries apart.

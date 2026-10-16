@@ -6,7 +6,7 @@
 //! Random value generation and SQL literal rendering.
 //!
 //! Values are drawn from a tiny domain (ints {0,1,2}, doubles {0,1,2}, chars {a,b,c}, a few
-//! dates/timestamps/uuids, both booleans) so equality filters and joins actually collide across the
+//! dates/timestamps/uuids, both booleans, and a few values of each type Postgres names that has one) so equality filters and joins actually collide across the
 //! small instances — that collision is what surfaces DISTINCT / LIMIT / filter differences.
 
 use rand::rngs::StdRng;
@@ -70,6 +70,36 @@ pub const JSONS: [&str; 4] = [
 /// The interval domain, shared by `interval` columns and by `$N::interval` params.
 pub const INTERVALS: [&str; 3] = ["1 day", "2 hours", "7 days"];
 
+/// The time-of-day domain: midnight, midday and the last second of a day, as in [`TIMESTAMPS`].
+pub const TIMES: [&str; 3] = ["00:00:00", "12:00:00", "23:59:59"];
+
+/// The `time with time zone` domain: the same times, at UTC.
+pub const TIMETZS: [&str; 3] = ["00:00:00+00", "12:00:00+00", "23:59:59+00"];
+
+/// The `inet` domain: two hosts of one network and a network. Every one is a `cidr` input too.
+pub const INETS: [&str; 3] = ["10.0.0.1", "10.0.0.2", "192.168.1.0/24"];
+
+/// The `cidr` domain: two nested networks and the network [`INETS`] also holds, so an `inet`
+/// column and a `cidr` one can hold equal values.
+pub const CIDRS: [&str; 3] = ["10.0.0.0/8", "10.0.0.0/16", "192.168.1.0/24"];
+
+/// The `macaddr` domain.
+pub const MACADDRS: [&str; 3] = ["08:00:2b:01:02:01", "08:00:2b:01:02:02", "08:00:2b:01:02:03"];
+
+/// The `macaddr8` domain: the [`MACADDRS`] addresses widened to eight bytes, as Postgres widens one.
+pub const MACADDR8S: [&str; 3] = [
+    "08:00:2b:ff:fe:01:02:01",
+    "08:00:2b:ff:fe:01:02:02",
+    "08:00:2b:ff:fe:01:02:03",
+];
+
+/// The `hstore` domain: empty, one key, and that key beside another, with keys and values out of the
+/// `a`/`b` and `0`/`1`/`2` the other domains draw from.
+pub const HSTORES: [&str; 3] = ["", "a=>1", "a=>1,b=>2"];
+
+/// The transaction-id domain, the integers' `0`, `1` and `2` written as `xid` and `xid8` read them.
+pub const XIDS: [&str; 3] = ["0", "1", "2"];
+
 /// The date domain.
 pub const DATES: [&str; 3] = ["2020-01-01", "2020-01-02", "2020-01-03"];
 
@@ -119,6 +149,14 @@ pub fn randval(vt: VType, nullable: bool, rng: &mut StdRng) -> Val {
         VType::Json => Val::Str((*JSONS.choose(rng).unwrap()).to_string()),
         // The spellings an `interval` cast is drawn from, which DuckDB reads into its INTERVAL.
         VType::Interval => Val::Str((*INTERVALS.choose(rng).unwrap()).to_string()),
+        VType::Time => Val::Str((*TIMES.choose(rng).unwrap()).to_string()),
+        VType::TimeTz => Val::Str((*TIMETZS.choose(rng).unwrap()).to_string()),
+        VType::Inet => Val::Str((*INETS.choose(rng).unwrap()).to_string()),
+        VType::Cidr => Val::Str((*CIDRS.choose(rng).unwrap()).to_string()),
+        VType::MacAddr => Val::Str((*MACADDRS.choose(rng).unwrap()).to_string()),
+        VType::MacAddr8 => Val::Str((*MACADDR8S.choose(rng).unwrap()).to_string()),
+        VType::Hstore => Val::Str((*HSTORES.choose(rng).unwrap()).to_string()),
+        VType::Xid => Val::Str((*XIDS.choose(rng).unwrap()).to_string()),
     }
 }
 
@@ -153,7 +191,6 @@ pub enum CastTarget {
     V(VType),
     Interval,
     Json,
-    Time,
 }
 
 /// Classify a raw SQL cast type name. `None` for shapes we will not guess at (arrays, structs, and
@@ -189,7 +226,7 @@ pub fn cast_target(ty: &str) -> Option<CastTarget> {
     } else if base.starts_with("timestamp") || base == "datetime" {
         CastTarget::V(VType::Timestamp)
     } else if base.starts_with("time") {
-        CastTarget::Time
+        CastTarget::V(VType::Time)
     } else if base.contains("int") || base.contains("serial") {
         CastTarget::V(VType::Integer)
     } else if ["numeric", "decimal", "real", "double", "float", "money"].contains(&base) {
@@ -226,7 +263,6 @@ pub fn randval_cast(ct: CastTarget, rng: &mut StdRng) -> Val {
         // The same pool the column data is drawn from, which is the whole point of sharing it:
         // `j = $1::json` can only ever match if the param is spelled exactly as the column is.
         CastTarget::Json => pick(&JSONS, rng),
-        CastTarget::Time => pick(&["00:00:00", "12:00:00", "23:59:59"], rng),
     }
 }
 

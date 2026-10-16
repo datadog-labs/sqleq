@@ -505,6 +505,8 @@ pub struct Timing {
     pub trial_ms: Vec<f64>,
     pub rows_tried: usize,
     pub rows_kept: usize,
+    /// Per table: the rows drawn for it over every trial, and the ones Postgres accepted.
+    pub rows_by_table: BTreeMap<String, (usize, usize)>,
     /// Types nothing declared, stood in for by a `text` domain.
     pub stand_ins: usize,
     /// Column defaults dropped because they call a function nothing declared.
@@ -525,7 +527,8 @@ pub struct Outcome {
 
 impl Timing {
     /// What the verdict rests on beyond the DDL as written, if anything: a type read as text loses an
-    /// enum's order and labels, and a dropped default changes what an INSERT omitting its column stores.
+    /// enum's order and labels, a dropped default changes what an INSERT omitting its column stores,
+    /// and a table Postgres accepted no drawn row of was empty on every trial.
     pub fn caveat(&self) -> Option<String> {
         let mut parts = Vec::new();
         if self.stand_ins > 0 {
@@ -536,6 +539,17 @@ impl Timing {
                 "{} defaults calling undeclared functions dropped",
                 self.dropped_defaults
             ));
+        }
+        // Every row drawn for a table was rejected (a column whose type the generator has no domain
+        // for, a check no drawn value meets), so every trial compared the pair over it empty.
+        let empty: Vec<&str> = self
+            .rows_by_table
+            .iter()
+            .filter(|(_, (tried, kept))| *tried > 0 && *kept == 0)
+            .map(|(t, _)| t.as_str())
+            .collect();
+        if !empty.is_empty() {
+            parts.push(format!("no generated row of {} was accepted", empty.join(", ")));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
     }
@@ -943,10 +957,13 @@ fn vtype_of(name: &str) -> Option<(VType, bool)> {
         return vtype_of(elem).filter(|(_, arr)| !arr).map(|(v, _)| (v, true));
     }
     let base = name.split('(').next().unwrap_or(name).trim();
+    // An extension's type is named with its schema where that schema is not on the path.
+    let base = base.strip_prefix("public.").unwrap_or(base);
     Some((
         match base {
             "smallint" | "integer" | "bigint" | "oid" => VType::Integer,
-            "real" | "double precision" => VType::Double,
+            // `money` reads a number, and its values compare as numbers do.
+            "real" | "double precision" | "money" => VType::Double,
             "numeric" => VType::Decimal(38, 18),
             "boolean" => VType::Boolean,
             "date" => VType::Date,
@@ -956,6 +973,15 @@ fn vtype_of(name: &str) -> Option<(VType, bool)> {
             "uuid" => VType::Uuid,
             "json" | "jsonb" => VType::Json,
             "interval" => VType::Interval,
+            // `time(3) with time zone` puts its typmod before the zone.
+            "time" | "time without time zone" if !name.contains("with time zone") => VType::Time,
+            "time" | "time with time zone" => VType::TimeTz,
+            "inet" => VType::Inet,
+            "cidr" => VType::Cidr,
+            "macaddr" => VType::MacAddr,
+            "macaddr8" => VType::MacAddr8,
+            "hstore" => VType::Hstore,
+            "xid" | "xid8" => VType::Xid,
             _ => return None,
         },
         false,
@@ -2013,6 +2039,7 @@ fn run_pair(
                     .collect()
             };
             let mut boundary: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+            let mut meets: BTreeMap<u32, Vec<String>> = BTreeMap::new();
             let mut zoned = false;
             for &n in &pnums {
                 let (Some(c), Some(ty)) = (g.column_of_param(n), types_vals.get(&n)) else {
@@ -2030,6 +2057,7 @@ fn run_pair(
                 if !vs.is_empty() {
                     boundary.insert(n, vs);
                 }
+                meets.insert(n, meet);
             }
             let regs: Vec<String> = targets.iter().map(|(_, t)| t.reg.clone()).collect();
             db.trips += 1;
@@ -2050,7 +2078,7 @@ fn run_pair(
             } else {
                 None
             };
-            Some((boundary, zoned, unheard))
+            Some((boundary, zoned, unheard, meets))
         }
         None => None,
     };
@@ -2061,6 +2089,10 @@ fn run_pair(
     let small_trials = cfg.trials / 4;
     let mut last_err: Option<String> = None;
     let mut ok_trials = 0usize;
+    // Under the gather rule: the trials whose drawn values failed their parameters' types, and the
+    // last such trial's casts, one per parameter.
+    let mut cast_failures = 0usize;
+    let mut failed_casts: Vec<(u32, String, String)> = Vec::new();
     let mut typed: HashSet<u32> = HashSet::new();
     if let Err(e) = db.exec("SAVEPOINT trial") {
         return Verdict::Error(e);
@@ -2078,7 +2110,7 @@ fn run_pair(
         // Where a `timestamp` and a `timestamptz` meet under the gather rule, every other trial runs
         // in a zone with daylight saving, the one setting under which the two read a value apart.
         let zone = match &plan {
-            Some((_, true, _)) if i % 2 == 1 => Some(gather::DST_ZONE),
+            Some((_, true, _, _)) if i % 2 == 1 => Some(gather::DST_ZONE),
             _ => None,
         };
         if let Some(z) = zone {
@@ -2225,9 +2257,10 @@ fn run_pair(
         // The gather rule: on every other trial each parameter takes a value of its own, out of the
         // domains the draws share with the tables (`gather::fresh`), so that the rows meet neither
         // the table's nor each other on a key. These are the trials that run in another zone too.
-        if gathered.is_some() && i % 2 == 1 {
+        if let (true, Some((_, _, _, meets))) = (i % 2 == 1, &plan) {
             for (n, v) in binds.iter_mut() {
-                *v = gather::fresh(v, *n, types_vals.get(n).map_or("", String::as_str));
+                let meet = meets.get(n).map_or(&[][..], Vec::as_slice);
+                *v = gather::fresh(v, *n, types_vals.get(n).map_or("", String::as_str), meet);
             }
         }
         // On some trials a parameter takes a value just past a narrower type its value meets, then
@@ -2236,7 +2269,7 @@ fn run_pair(
         // Whether a boundary value was given: such a trial's error does not replace an earlier
         // one, which says more about why the ordinary trials did not run.
         let mut boundary_trial = false;
-        if let (Some(g), Some((boundary, _, _))) = (&gathered, &plan) {
+        if let (Some(g), Some((boundary, _, _, _))) = (&gathered, &plan) {
             if i % 3 == 2 {
                 for (n, vs) in boundary {
                     if rng.random_bool(0.5) {
@@ -2260,21 +2293,23 @@ fn run_pair(
                 arrays.insert(*p, Val::List(column));
             }
             // A value its parameter's own type does not hold is no binding of the `VALUES` side.
-            let mut checks: Vec<(u32, String)> = binds
+            let mut checks: Vec<(u32, String, String)> = binds
                 .iter()
                 .filter_map(|(n, v)| {
                     let t = types_vals.get(n)?;
-                    Some((*n, format!("CAST({} AS {})", pg_lit(v), param_type(t))))
+                    Some((*n, t.clone(), format!("CAST({} AS {})", pg_lit(v), param_type(t))))
                 })
                 .collect();
             checks.sort();
             if !checks.is_empty() {
-                let casts: Vec<String> = checks.into_iter().map(|(_, c)| c).collect();
+                let casts: Vec<&str> = checks.iter().map(|(_, _, c)| c.as_str()).collect();
                 let sql = format!("SELECT {}", casts.join(", "));
                 if let Err(e) = db.guarded(|db| db.simple(&sql)) {
                     if let Err(e2) = finish(db) {
                         return Verdict::Error(e2);
                     }
+                    cast_failures += 1;
+                    failed_casts = checks;
                     if !boundary_trial || last_err.is_none() {
                         last_err = Some(format!(
                             "gather: a value drawn is not of its parameter's type: {e}"
@@ -2332,6 +2367,11 @@ fn run_pair(
             kept.entry(t.clone()).or_default();
         }
         timing.rows_kept += kept.values().map(Vec::len).sum::<usize>();
+        for t in &loaded {
+            let e = timing.rows_by_table.entry(t.clone()).or_default();
+            e.0 += rowdata.get(t).map_or(0, Vec::len);
+            e.1 += kept.get(t).map_or(0, Vec::len);
+        }
 
         let (sub_a, sub_b) = match &gathered {
             // The `VALUES` side's parameters as Postgres types them; the `unnest` side's arrays as
@@ -2386,7 +2426,7 @@ fn run_pair(
                     (Some(g), Some((pa, pb))) => if g.values_first { pa } else { pb },
                     _ => false,
                 };
-                if let (Some((who, other, e, ran)), Some((_, _, unheard))) = (one_sided, &plan) {
+                if let (Some((who, other, e, ran)), Some((_, _, unheard, _))) = (one_sided, &plan) {
                     let code = e.code.as_deref().unwrap_or("-");
                     let why_not = if !tells_apart(e.code.as_deref()) {
                         Some("an error that does not tell the statements apart")
@@ -2519,6 +2559,18 @@ fn run_pair(
         return Verdict::NotComparable(format!("gather: {why}"));
     }
     if gathered.is_some() {
+        // No trial ran because no value drawn was of its parameter's type: a type the generator
+        // has no domain for, which says nothing about the pair. The last such trial's casts, one at
+        // a time, say which.
+        if ok_trials == 0 && cast_failures == cfg.total_trials() {
+            for (n, t, cast) in &failed_casts {
+                if db.guarded(|db| db.simple(&format!("SELECT {cast}"))).is_err() {
+                    return Verdict::NotComparable(format!(
+                        "gather: no value drawn is of type {t} (${n})"
+                    ));
+                }
+            }
+        }
         return match (ok_trials, last_err) {
             (0, Some(e)) => Verdict::Error(e),
             (ok, e) => Verdict::NoCounterexampleGather(e.map(|e| (ok, e))),
