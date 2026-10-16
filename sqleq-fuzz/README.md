@@ -179,7 +179,10 @@ deterministic, on either engine. The rules:
   at the `;`s the tokenizer reads as Postgres's lexer does: not inside a literal (`E'…'` with its
   backslash escapes too), a quoted name, a dollar-quoted body or a nested comment, nor inside
   parentheses or a routine's `BEGIN ATOMIC` body, as psql does. Text it cannot lex is never cut on
-  every `;`: `file` mode stops with an error, and DDL is `NO-SCHEMA`.
+  every `;`: `file` mode stops with an error, and DDL is `NO-SCHEMA`. The DDL is read as written,
+  with no backslash sequence unescaped first, and a `CREATE TABLE` the parser rejects is read over
+  the same tokens, so a key or `NOT NULL` after a dollar-quoted or `E'…'` default is still seen; one
+  in text that does not lex is a table read as unreadable.
 - **Don't invent a parameter correspondence.** See the next section.
 
 The frontend faces the same question from the proving side, where the consequence is a false *proof*
