@@ -24,7 +24,7 @@ use sqlparser::ast::{
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
 use crate::error::{schema, unsupported, Result};
-use crate::scope::{is_unnamed, unnamed, Binding, Scope};
+use crate::scope::{is_unnamed, nameless, unnamed, Binding, Scope};
 use crate::types::*;
 
 /// Output columns of a (sub)query: `(name, prover type)`.
@@ -2265,23 +2265,23 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 return Err(unsupported("LATERAL derived table"));
             }
             let (rel, out_cols) = lower_query_ctx(cat, fns, subquery, outer)?;
-            // Postgres 16 and later accept a derived table with no alias.
-            let a = alias.as_ref().ok_or_else(|| unsupported("derived table without an alias"))?;
-            let cols: OutCols = if a.columns.is_empty() {
-                // Output names are already folded as Postgres folds them (see [`fold_name`]), which
-                // is the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
-                out_cols
-            } else {
-                // A longer list is an error in Postgres. A shorter one renames the first columns
-                // and keeps the rest, which is not modelled here.
-                if a.columns.len() > out_cols.len() {
-                    return Err(schema("derived table has fewer columns than its alias names"));
-                }
-                if a.columns.len() < out_cols.len() {
-                    return Err(unsupported("derived table alias list shorter than its columns"));
-                }
-                a.columns.iter().zip(out_cols).map(|(c, (_, t))| (fold_name(&c.name), t)).collect()
+            // Postgres 16 and later accept a derived table with no alias: no qualifier can name it,
+            // so it is bound under a name nothing spells ([`nameless`]) and read by bare column.
+            let (name, list): (String, Vec<&sqlparser::ast::Ident>) = match alias {
+                Some(a) => (fold_name(&a.name), a.columns.iter().map(|c| &c.name).collect()),
+                None => (nameless(), Vec::new()),
             };
+            // Output names are already folded as Postgres folds them (see [`fold_name`]), which is
+            // the form a reference into the binding is looked up in ([`Scope::try_resolve`]).
+            let mut cols: OutCols = out_cols;
+            // A longer list is an error in Postgres. A shorter one renames the first columns in
+            // order and keeps the rest, as it does for a base table.
+            if list.len() > cols.len() {
+                return Err(schema("derived table has fewer columns than its alias names"));
+            }
+            for (col, c) in cols.iter_mut().zip(list) {
+                col.0 = fold_name(c);
+            }
             // Two columns that share a name up to case are refused, as `Catalog::check_case_collisions`
             // refuses them in a table. A reference now tells `"b"` from `"B"`, so this is no longer
             // what keeps them apart; it stays because lifting it is a completeness change of its own.
@@ -2295,7 +2295,7 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             // A derived table's columns are its output, so all of them are visible.
             let n_declared = cols.len();
             Ok((
-                Binding { alias: fold_name(&a.name), cols, offset, table: None, n_declared },
+                Binding { alias: name, cols, offset, table: None, n_declared },
                 rel,
             ))
         }
@@ -3472,7 +3472,7 @@ fn unary(op: &UnaryOperator, inner: Value) -> Result<Value> {
             let ty = ty_of(&inner);
             Ok(json!({ "operator": "-", "operand": [inner], "type": ty }))
         }
-        UnaryOperator::Not => Ok(not_bool(inner)),
+        UnaryOperator::Not => Ok(not_bool(coerce_bool(inner))),
         other => Err(unsupported(format!("unary op {other:?}"))),
     }
 }

@@ -514,6 +514,12 @@ what it is or refused:
   or `public` table of the name, is refused. A view, or a table whose columns the catalog does not
   read, keeps its name in this: `FROM t` with a view `t` and a table `s.t` is refused, not read as
   `s.t`.
+  An `INSERT`'s target is replaced by its source, so it is put through the same check beside the
+  relations the two sources read.
+- **`ONLY` is a keyword.** In `FROM ONLY t`, `UPDATE ONLY t` or `DELETE FROM ONLY t` it leaves `t`'s
+  inheritance children out. The parser reads it only in `TRUNCATE`, `ALTER TABLE` and `LOCK`, and
+  elsewhere takes it as a table named `ONLY` with the alias `t`, which would resolve to a table or CTE
+  named `only`. Postgres reserves the word, so an unquoted `ONLY` as a relation name is refused.
 - **`DEFAULT` is a keyword.** In `UPDATE … SET a = DEFAULT`, or a `VALUES` row of an `INSERT`, it
   stands for the column's default, which the reductions do not model, so it is refused rather than
   read as a column named `default`.
@@ -546,7 +552,12 @@ what it is or refused:
   A `USING (k)` whose left or right side has two `k` columns that no earlier `USING` merged is
   refused, as Postgres rejects it, rather than compared with the first.
 - **An alias's column list renames by position.** In `t AS x(b, a)`, `x.b` is `t`'s first column,
-  whatever that column is called. A list that leaves two columns with one name is refused.
+  whatever that column is called. A list shorter than the columns, on a table or a derived table,
+  renames the first ones and leaves the rest their names. A list that leaves two columns with one name
+  is refused.
+- **A derived table without an alias has no name.** Postgres 16 and later accept one, and no
+  qualifier can name it: it is bound under a name no reference spells, so a bare column resolves into
+  it and a qualified one reaches past it to an enclosing table of that name, as in Postgres.
 - **Parentheses in a `FROM` clause group.** `a LEFT JOIN (b JOIN c ON p) ON q` is lowered with its
   grouping, since it is not `(a LEFT JOIN b ON q) JOIN c ON p`, and the inner `ON` sees only the
   inner join's own tables. An aliased one, `(b JOIN c) AS x`, is refused.

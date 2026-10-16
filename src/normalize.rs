@@ -1752,7 +1752,7 @@ impl VisitorMut for StripQualifier {
 /// will look it up: `s1."T"` and `s2.t` end up at one table there, so they are one bare name here.
 /// The qualifier is compared under Postgres's folding instead, because nothing downstream sees it
 /// once it is stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
-fn safe_to_strip(names: &[ObjectName]) -> bool {
+pub(crate) fn safe_to_strip(names: &[ObjectName]) -> bool {
     let mut seen: HashMap<String, Vec<String>> = HashMap::new();
     for n in names {
         let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {

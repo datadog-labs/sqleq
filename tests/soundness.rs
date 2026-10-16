@@ -176,3 +176,45 @@ fn an_array_column_is_opaque_in_inline_ddl() {
     let types: Vec<&str> = v["schemas"][0]["types"].as_array().expect("types").iter().filter_map(|t| t.as_str()).collect();
     assert_eq!(types, ["INTEGER", "VARBINARY", "VARBINARY"], "{v}");
 }
+
+#[test]
+fn only_in_a_table_reference_is_never_a_table_named_only() {
+    // sqlparser reads `FROM ONLY "t"` as a table named ONLY aliased `t`, which then resolved to a
+    // table or CTE named `only`: two different queries, one IR (#190).
+    let ddl = r#"create table "t" ("a" INTEGER, "b" INTEGER); create table "only" ("a" INTEGER, "b" INTEGER);"#;
+    let pairs = [
+        (r#"SELECT "a" FROM ONLY "t""#, r#"SELECT "a" FROM "only""#),
+        (r#"SELECT "a" FROM "t" JOIN ONLY "t" ON true"#, r#"SELECT "a" FROM "t" JOIN "only" ON true"#),
+        (r#"SELECT "a" FROM "t" WHERE EXISTS (SELECT 1 FROM ONLY "t")"#, r#"SELECT "a" FROM "t" WHERE EXISTS (SELECT 1 FROM "only")"#),
+        (r#"UPDATE ONLY "t" SET "a" = 1"#, r#"UPDATE "only" SET "a" = 1"#),
+        (r#"DELETE FROM ONLY "t" WHERE "a" = 1"#, r#"DELETE FROM "only" WHERE "a" = 1"#),
+        (r#"INSERT INTO "t" SELECT * FROM ONLY "t""#, r#"INSERT INTO "t" SELECT * FROM "only""#),
+    ];
+    for (a, b) in pairs {
+        let src = format!("{ddl}\n{a};\n{b};");
+        for mode in [CatalogSource::Declared, CatalogSource::InferredSeeded, CatalogSource::Inferred] {
+            match lower_with(&src, mode) {
+                Err(FrontendError::Unsupported(m)) => assert!(m.contains("ONLY in a table reference"), "{a}: {m}"),
+                other => panic!("{a} ({mode:?}): expected the ONLY refusal, got {other:?}"),
+            }
+        }
+        assert!(!sqleq_frontend::reflexive(&src), "{a}: reflexive");
+    }
+    // With no DDL at all, `ONLY t` and `ONLY u` were one table named ONLY.
+    let infer = "SELECT \"a\" FROM ONLY \"t\";\nSELECT \"a\" FROM ONLY \"u\";";
+    assert!(matches!(lower_with(infer, CatalogSource::Inferred), Err(FrontendError::Unsupported(_))));
+    // A CTE named `only` captured the reference the same way.
+    let cte = r#"create table "t" ("a" INTEGER);
+WITH "only" AS (SELECT 1 AS "a") SELECT "a" FROM ONLY "t";
+WITH "only" AS (SELECT 1 AS "a") SELECT "a" FROM "only";"#;
+    assert!(matches!(lower_with(cte, CatalogSource::Declared), Err(FrontendError::Unsupported(_))));
+    assert!(!sqleq_frontend::reflexive(cte));
+    // Controls: a quoted name is a table, and the DDL's own `ALTER TABLE ONLY` is still read.
+    let quoted = format!("{ddl}\nSELECT \"a\" FROM \"only\";\nSELECT \"a\" FROM \"only\" WHERE true;");
+    assert!(lower_with(&quoted, CatalogSource::Declared).is_ok());
+    let alter = r#"create table "t" ("a" INTEGER, "b" INTEGER); ALTER TABLE ONLY "t" ADD PRIMARY KEY ("a");
+SELECT DISTINCT "a" FROM "t";
+SELECT "a" FROM "t";"#;
+    let v = lower_with(alter, CatalogSource::Declared).unwrap_or_else(|e| panic!("expected Ok, got {e}"));
+    assert_eq!(v["schemas"][0]["key"], serde_json::json!([[0]]), "{v}");
+}
