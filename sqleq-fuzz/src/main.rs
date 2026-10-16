@@ -188,22 +188,25 @@ enum Worker {
 }
 
 impl Worker {
-    /// The pair's verdict, and what it rests on beyond the DDL as written ([`pg::Timing::caveat`]).
-    fn test(&mut self, a: &str, b: &str, ddl: &str, cfg: Config) -> (Verdict, Option<String>) {
+    /// The pair's verdict, what it rests on beyond the DDL as written ([`pg::Timing::caveat`]), and
+    /// how many trials it was given ([`pg::Timing::trials`]).
+    fn test(&mut self, a: &str, b: &str, ddl: &str, cfg: Config) -> (Verdict, Option<String>, usize) {
         match self {
-            Worker::Duck => (guarded_test(a, b, ddl, cfg), None),
+            Worker::Duck => (guarded_test(a, b, ddl, cfg), None, cfg.total_trials()),
             Worker::Pg(client) => {
                 let mut caveat = None;
+                let mut trials = cfg.total_trials();
                 let v = guarded(|| {
                     let o = pg::test_pair_pg(client, a, b, ddl, cfg);
                     caveat = o.timing.caveat();
+                    trials = trials.max(o.timing.trials);
                     o.verdict
                 });
                 if v.label().starts_with("ERROR:panic") {
                     // A panic can leave the pair's transaction open.
                     let _ = client.batch_execute("ROLLBACK");
                 }
-                (v, caveat)
+                (v, caveat, trials)
             }
         }
     }
@@ -263,18 +266,18 @@ fn run_csv(args: &[String], cfg: Config, jobs: usize, engine: &str) -> Result<()
             }
             let (name, row) = &work[idx];
             let started = std::time::Instant::now();
-            let (label, partial, caveat) = match row.and_then(|r| corpus.get(r)) {
+            let (label, partial, caveat, trials) = match row.and_then(|r| corpus.get(r)) {
                 Some((a, b, ddl)) => {
-                    let (v, caveat) = worker.test(a, b, ddl, cfg);
+                    let (v, caveat, trials) = worker.test(a, b, ddl, cfg);
                     let p = v.partial().map(|(ok, e)| (ok, e.to_string()));
-                    (v.label(), p, caveat)
+                    (v.label(), p, caveat, trials)
                 }
-                None => ("NO-ROW".to_string(), None, None),
+                None => ("NO-ROW".to_string(), None, None, cfg.total_trials()),
             };
             let ms = started.elapsed().as_millis();
             match &partial {
                 Some((ok, _)) => {
-                    println!("{name}: {label} (ok={ok}/{}) {ms}ms", cfg.total_trials())
+                    println!("{name}: {label} (ok={ok}/{trials}) {ms}ms")
                 }
                 None => println!("{name}: {label} {ms}ms"),
             }
@@ -379,7 +382,7 @@ fn run_file(args: &[String], cfg: Config, engine: &str) -> Result<(), String> {
 /// Test one pair on `engine` and print its report.
 fn test_one(a: &str, b: &str, ddl: &str, cfg: Config, engine: &str) -> Result<(), String> {
     let runner = Runner::start(engine, 1)?;
-    let (v, caveat) = runner.worker(0)?.test(a, b, ddl, cfg);
+    let (v, caveat, _) = runner.worker(0)?.test(a, b, ddl, cfg);
     report(&v, &runner.engine(), caveat.as_deref());
     Ok(())
 }
