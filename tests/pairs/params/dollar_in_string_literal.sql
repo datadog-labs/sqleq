@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #63: sqleq-fuzz substituted a parameter value for `$1` inside a string literal
 -- argument: '$1' is a two-character string literal, not a placeholder, and '$' || '1' is the same string

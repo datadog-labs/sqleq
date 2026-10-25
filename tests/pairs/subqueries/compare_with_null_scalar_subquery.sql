@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #60: a comparison with a NULL-valued scalar subquery was read as FALSE, not UNKNOWN, so NOT made it TRUE
 -- witness: t = {(1, 5)}, s = {}: 5 = NULL is UNKNOWN, so A returns nothing, and UNKNOWN IS NOT TRUE holds, so B returns 1

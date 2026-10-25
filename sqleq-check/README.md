@@ -107,7 +107,7 @@ sqleq-check --keep ./work rewrites/
 | `--sqleq-solver-mem-gib G` / `--qed-mem-gib G` | Cap each sqleq-solver driver's or the QED prover's (z3 and cvc5 included) address space, as `ulimit -v` does. |
 | `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check, and deprecated. Same jobs, same result rows, same buckets. Not with `--sqleq-solver` or `--portfolio`. |
 | `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
-| `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding and its `model` a refutation under it, which decides a portfolio verdict and can be half of an [alarm](#alarms). The same as adding `cvc5` to `--axes`. |
+| `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding and its `model` a refutation of the plan, which is half of an [alarm](#alarms) against a proof over the same plan but decides no verdict on its own. The same as adding `cvc5` to `--axes`. |
 | `--cvc5-bin PATH` | The `sqleq-cvc5` binary ([lookup order](#requirements)). |
 | `--cvc5-semantics bags\|sets` | The semantics it encodes under (default `bags`, SQL's own; `sets` collapses duplicates and is far easier for the solver). |
 | `--cvc5-opt NAME=VALUE` | A further cvc5 option, repeatable: `bags-to-liastar=true`, say. |
@@ -279,14 +279,16 @@ false proofs that keep the fork a cross-check.
 ```
 
 `proved` is a proof under the encoding, and `model` a database on which cvc5's encodings of the
-two queries differ, checked by cvc5 against its own assertions: a refutation under the encoding's
-readings of the types (integers unbounded, numerics exact, opaque values compared by identity),
-claimed only when the problem had no uninterpreted symbol in it. It decides `not-equivalent` in a
-portfolio and is an alarm against a proof, but it is not an executed counterexample as sqleq-fuzz's
-is, and the report never calls it one. `no-proof` is cvc5's `unknown`, a model found under
-uninterpreted symbols (kept in the note as a candidate), or two queries whose rows the encoding
-cannot compare. [`../docs/CVC5.md`](../docs/CVC5.md) has the encoding, its approximations and
-how to build the binary.
+two queries differ, checked by cvc5 against its own assertions: a refutation of the plan, under the
+encoding's readings of the types (integers unbounded, numerics exact, opaque values compared by
+identity) and under the plan's constraints alone, claimed only when the problem had no
+uninterpreted symbol in it. It is an alarm against a proof over the same plan, but decides no
+verdict on its own -- the frontend drops the constraints it cannot carry, so the database may be
+one the DDL forbids -- and it is not an executed counterexample as sqleq-fuzz's is; the report
+never calls it one. `no-proof` is cvc5's `unknown`, a model found under uninterpreted symbols (kept
+in the note as a candidate), or two queries whose rows the encoding cannot compare.
+[`../docs/CVC5.md`](../docs/CVC5.md) has the encoding, its approximations and how to build the
+binary.
 
 ## Portfolio: every backend at once
 

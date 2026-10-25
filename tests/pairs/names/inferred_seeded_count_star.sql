@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #111: the seeded mode refused the pair as no base tables, because no column of t

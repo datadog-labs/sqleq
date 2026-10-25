@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #109: sqleq-solver bound MAX to an input by identity, so two numrange[] arrays that = calls equal and that print differently were two maxima
 -- witness: t = {(1, '{"[1.0,2.0)"}'), (2, '{"[1.00,2.00)"}')}: the two arrays are equal, so MAX returns one of them and A yields one row; neither is greater than the other, so B yields {"[1.0,2.0)"} and {"[1.00,2.00)"}

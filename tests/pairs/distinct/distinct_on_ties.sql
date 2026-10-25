@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz compared the row DuckDB kept among rows tied inside a DISTINCT ON key as
 --   a bag, though Postgres chooses it by physical order

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: an unqualified name that an outer JOIN ... USING merged must not resolve to the first
 --   binding of the name: after a RIGHT join it is the COALESCE of both sides. The frontend refuses

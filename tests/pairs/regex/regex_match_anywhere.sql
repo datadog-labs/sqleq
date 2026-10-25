@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: `~` reached DuckDB, where it is a full match; in Postgres it matches anywhere in the string
 -- argument: in Postgres x ~ 'a' is true when x contains an a, which is x LIKE '%a%'

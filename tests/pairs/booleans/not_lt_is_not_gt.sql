@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #92 item 1 (control): the negator of < is >=, not >, so a NOT put through with the wrong operator would prove this pair
 -- witness: t = {(1, 1)}: NOT (1 < 1) holds, so A returns 1, and 1 > 1 does not, so B returns nothing

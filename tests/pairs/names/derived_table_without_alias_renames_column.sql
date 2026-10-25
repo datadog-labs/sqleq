@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: the control beside derived_table_without_alias.sql (#192)
 -- witness: t = {(1, 2)}: A returns 2, B returns 1

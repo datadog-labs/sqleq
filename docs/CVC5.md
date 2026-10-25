@@ -10,13 +10,17 @@ but reads this repository's IR instead of Calcite plans.
 
 Two of its answers are claims, which is what sets it apart from the SQLSolver axes. `unsat` is a
 proof of equivalence under the encoding: `proved`. `sat` comes with a model, a database on which
-cvc5's encodings of the two queries differ: `model`. The second is a refutation under the encoding's
-readings of the types ([below](#what-the-encoding-approximates)), checked by cvc5 against its own
-assertions (`check-models`), but not an executed counterexample as `sqleq-fuzz`'s is, and the
-harness keeps the two words apart. It is claimed only from an **exact** problem, one with no
-uninterpreted symbol in it; a model found under an uninterpreted function also fixes that
-function's values, which the real one may not take, and is reported as a candidate under `no-proof`
-([below](#uninterpreted-symbols)).
+cvc5's encodings of the two queries differ: `model`. The second refutes **the plan**, not the pair:
+it is a database under the encoding's readings of the types ([below](#what-the-encoding-approximates))
+and under the plan's constraints alone, and the frontend drops the constraints it cannot carry (an
+expression or opclass unique index, `UNIQUE NULLS NOT DISTINCT`, a foreign key), so the database may
+be one the DDL forbids. cvc5 checks it against its own assertions (`check-models`), but it is not
+an executed counterexample as `sqleq-fuzz`'s is, and the harness keeps the two words apart: a
+`model` contradicts a proof over the same plan -- that is an alarm, and the cross-check this axis
+adds -- and decides no portfolio verdict on its own. It is claimed only from an **exact** problem,
+one with no uninterpreted symbol in it; a model found under an uninterpreted function also fixes
+that function's values, which the real one may not take, and is reported as a candidate under
+`no-proof` ([below](#uninterpreted-symbols)).
 
 ## Building it
 
@@ -46,7 +50,8 @@ sqleq-check --axes frontend,cvc5 --expect report-only -t 10 -j 6 pairs/
 # Set semantics, and a cvc5 option:
 sqleq-check --cvc5 --cvc5-semantics sets --expect report-only pairs/
 sqleq-check --cvc5 --cvc5-opt bags-to-liastar=true --expect report-only pairs/
-# In a portfolio, where a `model` decides `not-equivalent` and a proof `equivalent`:
+# In a portfolio, where a cvc5 proof decides `equivalent`, and a cvc5 model against a QED proof
+# is an alarm:
 sqleq-check --portfolio --axes qed,cvc5,fuzz --expect report-only -v pairs/
 ```
 
@@ -76,7 +81,7 @@ is `src/main.rs`'s module doc.
 |---|---|---|
 | `proved` | `EQ` | `unsat`: no database the encoding admits distinguishes the two queries. |
 | `proved-literal` | `EQ`, `literal` | The two IR trees were identical (tier 0); never a proof. |
-| `model` | `NEQ` with an exact model | `sat`: a database on which the two encodings differ, with no uninterpreted symbol in the problem. Refutes under index binding: `not-equivalent` in a portfolio, an alarm against a proof, an invariant failure on a pair pinned `truth: equivalent`. |
+| `model` | `NEQ` with an exact model | `sat`: a database on which the two encodings differ, with no uninterpreted symbol in the problem. Refutes the plan (the suite's `ir` binding): an alarm against a proof over the same plan; no verdict on its own, and no contradiction with a pair pinned `truth: equivalent`, whose equivalence may rest on a constraint the plan lacks -- `tests/pairs/constraints/expression_unique_index.sql` is one, and is pinned `model`. |
 | `no-proof` | `UNKNOWN`; `NEQ` under uninterpreted symbols; `NEQ` with no model | cvc5 gave up; or found a model that also interprets an unknown function, kept in the note as a candidate; or the two queries return rows of different sorts, which the IR's guard types can make of two queries that agree everywhere (`SUM` over integers is REAL to the frontend, a `CASE` over booleans and `NULL` INTEGER). |
 | `unsupported` | `NOTRANS`, `NOIR` | The plan was not encoded: the reason, in `sqleq-solver`'s spelling where it is the IR reader's (`correlated`, `unsupported-sort`, `aggregate:ARRAY_AGG`), else `unsupported:<what>`. |
 | `timeout` | `HANG`, or anything but a claim cut off at the cap | |
@@ -164,9 +169,12 @@ A proof holds, and a model is a database, under these readings of the IR's types
 * A scalar subquery is read on databases where it returns at most one row.
 * A `NULL` literal the frontend typed by default takes the sort it is wanted at.
 
-These are the readings under which `proved` is a proof. They are also why a `sat` is a `model` and
-not a `counterexample`: it is a database under them, and `sqleq-fuzz`, which runs the pair on
-Postgres, remains the thing that confirms one.
+These are the readings under which `proved` is a proof. They, and the constraints the plan lacks,
+are why a `sat` is a `model` and not a `counterexample`: it is a database under them, and
+`sqleq-fuzz`, which runs the pair on Postgres under its real DDL, remains the thing that confirms
+one. Over the pinned pairs, three `model`s fall on pairs equivalent in Postgres: each is equivalent
+through a unique index the frontend does not carry (`tests/pairs/constraints/`), and cvc5's
+database violates that index.
 
 ## Uninterpreted symbols
 

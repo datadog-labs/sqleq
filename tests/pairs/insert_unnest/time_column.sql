@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather
 -- binding: gather
 -- origin: issue #168: values drawn for a time parameter were strings Postgres cannot read as a time

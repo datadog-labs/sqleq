@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver deduplicated double precision values by identity in DISTINCT, though Postgres deduplicates by = and 0 = -0
 -- witness: t = {(1, 0), (2, -0)}: the inner DISTINCT keeps one of 0 and -0, so A returns one row ('0' or '-0'); B returns two, '0' and '-0'

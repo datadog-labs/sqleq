@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #123: an outer LIMIT with no ORDER BY of its own keeps the rows a sorted subquery puts first,
 --   and the lowering dropped that subquery's ORDER BY, so the two queries lowered to one plan

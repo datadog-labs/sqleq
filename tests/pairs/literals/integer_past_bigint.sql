@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #56: an integer literal past the bigint range was typed INTEGER, and sqleq-solver
 --   saturated it to the largest bigint

@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: sqleq-fuzz compared result cells by DuckDB type, so an identity cast changed the cell (#6)
 -- argument: casting a bigint column to bigint is the identity

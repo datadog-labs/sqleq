@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #167: where uuid-ossp cannot load, sqleq-fuzz dropped a DEFAULT
 --   uuid_generate_v1mc(), so every INSERT that omits the column stored NULL in the key and failed

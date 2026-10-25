@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #57: strip_identical_pagination compared the key A with the alias "A" as text, so it
 --   counted A's key as projected and dropped the pagination; unquoted A is the input column a

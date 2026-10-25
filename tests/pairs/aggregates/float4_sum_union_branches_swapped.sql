@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #85: real (float4) SUM depends on the order its inputs arrive in
 -- witness: t = {(1e10), (1)}, u = {(-1e10)}, rows in that order: A yields 0, B yields 1

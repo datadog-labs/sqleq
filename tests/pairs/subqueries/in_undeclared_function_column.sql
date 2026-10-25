@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #67: the QED prover panicked on x IN (SELECT <undeclared function> ...), because the frontend left the
 --   call's VARBINARY type against the INTEGER operand; the operand is now cast to the column's type

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: DISTINCT ON (1) is lowered as the constant 1 (one group); Postgres reads
 --   it as the first output column, as in ORDER BY 1

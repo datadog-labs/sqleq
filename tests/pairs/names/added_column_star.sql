@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: an ALTER TABLE after the CREATE TABLE was not read, so * read the columns before an ADD
 --   COLUMN

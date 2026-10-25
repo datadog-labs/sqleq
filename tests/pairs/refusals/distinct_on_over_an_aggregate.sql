@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: DISTINCT ON over an aggregate query is refused, not lowered (docs/SOUNDNESS.md); a pin
 --   for each documented refusal (#68)

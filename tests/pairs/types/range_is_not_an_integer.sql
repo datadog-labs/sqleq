@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #58: int4range was mapped to INTEGER, because its name contains INT
 -- witness: t = {('[1,3)')}: A yields empty (the union of r with itself, minus r), B yields [1,3)

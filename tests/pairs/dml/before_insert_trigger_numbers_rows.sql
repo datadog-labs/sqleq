@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #142: the INSERT reduction compared the two statements' rows as written, and a
 --   BEFORE INSERT trigger that numbers them from a sequence stores them by position

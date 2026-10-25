@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: index names were compared lower-cased, so PRIMARY KEY USING INDEX "Ix" took the index ix,
 --   and its column b was read as NOT NULL

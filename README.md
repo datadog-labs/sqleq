@@ -33,9 +33,10 @@ being retired, but it needs a fork that is not published. See
 **`sqleq-cvc5`** encodes the same IR over [cvc5](https://cvc5.github.io/)'s theory of bags of tuples
 (or sets, as an approximation), after the LPAR'24 work on relations and tables in cvc5, and asks
 cvc5 for a model. Asked with `--cvc5`, its `proved` is a proof under that encoding and its `model`
-a database on which the two encodings differ -- a claim that decides a portfolio verdict, though
-not an executed counterexample as `sqleq-fuzz`'s is. It links a cvc5 library you build. See
-[`docs/CVC5.md`](docs/CVC5.md).
+a database on which the two encodings differ -- a refutation of the plan, which is an alarm against
+a proof over the same plan, though not of the pair: the plan lacks the constraints the frontend does
+not carry, and `sqleq-fuzz`'s executed counterexample remains the refutation. It links a cvc5
+library you build. See [`docs/CVC5.md`](docs/CVC5.md).
 
 The **Lean axis** (`sqleq-lean`) covers one class of `INSERT` pair the other axes cannot even state:
 `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a parameter is a scalar on one

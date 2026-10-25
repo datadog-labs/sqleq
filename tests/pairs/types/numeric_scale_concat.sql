@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: || over a numeric converts it to text, whose scale REAL does not carry
 -- witness: t = {(2)}: A yields '2.0x', B yields '2.00x'

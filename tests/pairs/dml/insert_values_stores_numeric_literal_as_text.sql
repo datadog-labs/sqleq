@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #107: an INSERT ... VALUES stored a numeric literal in a text column by its value, and
 --   2.0 = 2.00

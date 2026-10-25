@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: found while fixing issue #61: sqleq-solver read a = b on two numeric columns as identity, but 2.0 = 2.00 holds and the two cast differently
 -- witness: t = {(1, 2.0, 2.00)}: a = b holds, A yields '2.0' and B yields '2.00'

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #56: an integer literal reached the QED prover spelled as written, and QED reads a
 --   constant cast to text as its spelling, so 007::text was '007' where Postgres prints '7'

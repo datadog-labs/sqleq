@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #70: TRY_CAST, which is not Postgres syntax, was lowered as a plain CAST, so the two
 --   sides lowered to one plan

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 6: a grouped query's qualified ORDER BY key was matched to a select item
 --   by how the two are written, so t.a, which is the item a, was refused as not an output column

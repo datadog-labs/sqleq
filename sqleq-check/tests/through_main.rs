@@ -56,18 +56,23 @@ impl Run<'_> {
 const FE_CVC5: &str = "frontend,cvc5";
 
 #[test]
-fn a_cvc5_model_on_an_equivalent_pair_fails_and_is_not_blessed() {
+fn a_cvc5_model_on_an_equivalent_pair_is_pinned_and_a_proof_beside_it_is_an_alarm() {
     let f = Fakes::new();
     let r = Run { f: &f, ss: "NEQ", fuzz: "NO-COUNTEREXAMPLE" };
-    let text = pair(&EQ_OK, &["-- expect frontend: emit"]);
-    std::fs::write(&f.case, &text).unwrap();
+    std::fs::write(&f.case, pair(&EQ_OK, &["-- expect frontend: emit"])).unwrap();
+    // A model refutes the plan, not the pair: the plan may lack a constraint the DDL has. So it
+    // is no invariant failure on an equivalent pair, only an unpinned answer, which --bless takes.
     let ran = r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]);
     assert_eq!(ran.code, 1, "{}{}", ran.out, ran.err);
-    assert!(ran.out.contains("‼ model"), "{}", ran.out);
-    assert_eq!(r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 1);
-    assert_eq!(read(&f.case), text, "bless must not pin a false refutation");
-    // The same answer under uninterpreted symbols is a candidate, not a claim: `no-proof`, which
-    // an equivalent pair may carry.
+    assert!(ran.out.contains("+ model"), "{}", ran.out);
+    assert_eq!(r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+    assert!(read(&f.case).contains("-- expect cvc5: model\n"), "{}", read(&f.case));
+    assert_eq!(r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+    // A proof over the same plan contradicts it, whatever the pins say.
+    let ran = r.main_env(&[], "frontend,cvc5,sqleq-solver", &[("FAKE_CVC5", "NEQ"), ("FAKE_SS", "EQ")]);
+    assert_eq!(ran.code, 1);
+    assert!(ran.out.contains("Alarms"), "{}", ran.out);
+    // The same answer under uninterpreted symbols is a candidate, not a claim: `no-proof`.
     let ran = r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ"), ("FAKE_CVC5_INEXACT", "1")]);
     assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
     assert!(read(&f.case).contains("-- expect cvc5: no-proof\n"), "{}", read(&f.case));
@@ -84,10 +89,6 @@ fn a_cvc5_proof_on_a_non_equivalent_pair_fails_and_an_exact_model_pins() {
     assert_eq!(r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
     assert!(read(&f.case).contains("-- expect cvc5: model\n"), "{}", read(&f.case));
     assert_eq!(r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
-    // A model and a proof on one pair is an alarm whatever the pins say.
-    let ran = r.main_env(&[], "frontend,cvc5,sqleq-solver", &[("FAKE_CVC5", "NEQ"), ("FAKE_SS", "EQ")]);
-    assert_eq!(ran.code, 1);
-    assert!(ran.out.contains("Alarms"), "{}", ran.out);
 }
 
 #[test]

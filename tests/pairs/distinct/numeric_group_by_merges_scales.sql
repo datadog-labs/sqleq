@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver grouped numeric values by identity in GROUP BY, though Postgres groups by = and 2.0 = 2.00
 -- witness: t = {(1, 2.0), (2, 2.00)}: GROUP BY makes one group, so A returns one row (scale 1 or 2); B returns two, 1 and 2

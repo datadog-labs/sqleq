@@ -27,13 +27,12 @@ use crate::axes::{cvc5, fuzz, lean, solver};
 use crate::case::{self, Case, Workdir, ERROR, LOWERED, PANIC, TIMEOUT as CASE_TIMEOUT};
 use crate::discover::{Cvc5Driver, SsDriver};
 use crate::inputs::{first_row_name, CorpusRow, Item};
-use crate::suite::{self, AXES, BINDINGS, GATHER, GATHER_GENERATED, INDEX};
+use crate::suite::{self, ALARM_BINDINGS, AXES, GATHER, GATHER_GENERATED, INDEX};
 use crate::util::tail;
 
 /// A proof and a counterexample under the same binding: one of the two backends is wrong.
 pub const ALARM: &str = "alarm";
-/// sqleq-fuzz found an instance on which the two sides differ, or cvc5 a model of its encoding
-/// on which they do.
+/// sqleq-fuzz found an instance on which the two sides differ.
 pub const NOT_EQUIVALENT: &str = "not-equivalent";
 /// sqleq-fuzz found one under the gather rule, the binding Lean proves under: the arrays of the
 /// `unnest` side built from the values of the `VALUES` side (docs/LEAN.md).
@@ -100,8 +99,10 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
     // An answer can contradict another only under the binding both answer under: a Lean proof and
     // a fuzz counterexample found with `$N` bound alike are about different relations between the
     // two sides' parameters, and a Lean proof and a fuzz counterexample under the gather rule are
-    // not.
-    for b in BINDINGS {
+    // not. A cvc5 model refutes under the plan's own reading, where every prover's proof also
+    // claims, so a proof and a model over one plan are an alarm; a fuzz `no-counterexample` is no
+    // contradiction to it, since Postgres runs the pair under constraints the plan may lack.
+    for b in ALARM_BINDINGS {
         let claims = saying(b, &|a| suite::claims_equivalent(a, b));
         let refuted = saying(b, &|a| suite::refutes(a, b));
         if !claims.is_empty() && !refuted.is_empty() {
@@ -474,9 +475,10 @@ mod tests {
             ("the frontend cut off", vec![("frontend", "timeout"), ("qed", "no-plan"), ("fuzz", "no-counterexample")], TIMEOUT),
             ("a refusal", vec![("frontend", "refuse:unsupported"), ("qed", "no-plan"), ("fuzz", "error")], UNDECIDED),
             ("a proof beats a cut-off", vec![("qed", "proved"), ("sqleq-solver", "timeout")], EQUIVALENT),
-            // cvc5's model refutes under index binding, as a fuzz counterexample does; its proof
-            // proves like any prover's; its no-proof decides nothing.
-            ("a cvc5 model", vec![("qed", "no-proof"), ("cvc5", "model")], NOT_EQUIVALENT),
+            // cvc5's model refutes under the plan's reading only: alone it decides nothing (the
+            // database may be one the DDL forbids), against a proof over the same plan it is an
+            // alarm; its proof proves like any prover's.
+            ("a cvc5 model", vec![("qed", "no-proof"), ("cvc5", "model"), ("fuzz", "no-counterexample")], UNDECIDED),
             ("a cvc5 proof", vec![("qed", "no-proof"), ("cvc5", "proved"), ("fuzz", "no-counterexample")], EQUIVALENT),
             ("a proof and a cvc5 model", vec![("qed", "proved"), ("cvc5", "model")], ALARM),
             ("a cvc5 proof and a counterexample", vec![("cvc5", "proved"), ("fuzz", "counterexample")], ALARM),

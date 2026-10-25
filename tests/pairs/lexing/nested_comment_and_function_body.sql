@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #93 item 3: sqleq-fuzz cut a pair file at the `;` inside a nested block comment,
 --   which Postgres ends only at its second `*/`, and found three queries; the `;` in the function's

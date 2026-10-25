@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: SQL/JSON key/value arguments were dropped, so both calls were nullary
 -- witness: t = {(1, 2)}: A yields {"k" : 1}, B yields {"j" : 2}

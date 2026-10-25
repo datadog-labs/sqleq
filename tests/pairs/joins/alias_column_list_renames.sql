@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: the control beside joins/alias_column_list.sql (#31)
 -- argument: the column list renames t's columns in order, so x.b is t's first column, a

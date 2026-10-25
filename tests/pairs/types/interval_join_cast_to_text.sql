@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: '1 day' = '24 hours' as intervals, but their text differs
 -- witness: t = {('1 day')}, u = {('24 hours')}: A yields '1 day', B yields '24:00:00'

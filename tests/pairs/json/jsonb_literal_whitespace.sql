@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz compared a jsonb literal with the column as text, so whitespace the
 --   generated documents do not have never matched

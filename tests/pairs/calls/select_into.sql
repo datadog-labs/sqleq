@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: SELECT ... INTO was lowered as a plain SELECT
 -- witness: t = {(1)}: A creates table x holding (1) and returns no rows; B returns (1)

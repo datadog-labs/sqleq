@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #168: rows drawn for a time column were strings Postgres rejects, so the table was
 --   empty on every trial and no comparison over it could differ

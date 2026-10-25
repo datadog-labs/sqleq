@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a pair the frontend refuses to lower -- a window function has no counterpart in the
 --   prover's IR -- whose two sides are one query once the DISTINCT under IN is stripped, so it is

@@ -8,6 +8,7 @@
 -- expect fuzz: not-comparable
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather
 -- origin: issue #48: sqleq-lean compared the INSERT targets by their last name only, so a.events and

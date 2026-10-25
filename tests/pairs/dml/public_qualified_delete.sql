@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz created public.t and t as two DuckDB tables and read the final state from one of them
 -- argument: under the default search_path, t is public.t

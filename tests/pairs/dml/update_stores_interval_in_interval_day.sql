@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #107: an interval column's modifier coerces a stored interval by more than its class
 --   under =, and the catalog's type had dropped the modifier

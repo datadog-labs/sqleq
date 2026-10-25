@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #92 item 1 (control): a float is opaque, and a NOT over a comparison of opaque values is not put through, so the pair stays unproved
 -- argument: >= is the negator of < on double precision, NaN included, which Postgres orders above every other float and calls equal to itself: when f is NULL both sides are NULL, and otherwise one is true exactly when the other is false

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #88: Postgres names an unaliased CAST(v + 1 AS TEXT) after its type, "text", which the
 --   frontend left unnamed, so a bare text missed the derived table and resolved to the enclosing u.text

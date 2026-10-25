@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #92: a unique index a later DROP INDEX drops gives no key
 -- witness: t = {(1, 0), (1, 0)}: A yields 1 twice, B once

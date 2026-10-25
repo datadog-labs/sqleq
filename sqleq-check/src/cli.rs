@@ -280,9 +280,10 @@ pub struct Args {
 
     /// Also ask cvc5 (sqleq-cvc5) about every case that lowered: the same Input JSON, encoded as
     /// an SMT problem over cvc5's bags (or sets) of tuples. Its `proved` is a proof under that
-    /// encoding and its `model` a database on which the two encodings differ -- a claim, which
-    /// decides a portfolio verdict and can be half of an alarm. The same as adding `cvc5` to
-    /// --axes. See docs/CVC5.md.
+    /// encoding and its `model` a database on which the two encodings differ: a refutation of the
+    /// plan, which is an alarm against a proof over the same plan but decides no verdict on its
+    /// own, since the plan lacks the constraints the frontend does not carry. The same as adding
+    /// `cvc5` to --axes. See docs/CVC5.md.
     #[arg(long)]
     pub cvc5: bool,
 

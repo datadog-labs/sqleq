@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #108: numrange was read as a type whose = is identity, though its bounds compare as numerics, so 1.0 and 1.00 are equal bounds
 -- witness: t = {(1, '[1.0,2.0)', '[1.00,2.00)')}: a = b holds, A yields [1.0,2.0) and B yields [1.00,2.00)

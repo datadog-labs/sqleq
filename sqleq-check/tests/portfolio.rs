@@ -318,14 +318,14 @@ fn a_refused_pair_whose_sides_are_one_query_is_equivalent() {
 
 
 #[test]
-fn cvc5_decides_a_portfolio_and_contradicts_a_proof() {
+fn a_cvc5_model_is_a_candidate_and_contradicts_a_proof() {
     let f = setup();
     let mut p = Portfolio::new(&f);
     p.set("FAKE_CVC5", "NEQ");
+    // Alone, a model decides nothing: it refutes the plan, which may lack a constraint the DDL has.
     let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
     assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
-    assert_eq!(verdict(&case), "not-equivalent");
-    assert_eq!(strings(&case["portfolio"]["by"]), ["cvc5"]);
+    assert_eq!(verdict(&case), "undecided");
     assert_eq!(case["c_bucket"], "model");
     assert_eq!(case["c_note"], "t=[(0)]");
 

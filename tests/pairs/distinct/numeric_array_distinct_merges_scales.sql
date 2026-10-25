@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #96: an array is opaque, and only an array of a type whose = is identity is listed as such; numeric[] compares its elements with numeric =, so DISTINCT over it stays refused by sqleq-solver (issue #86)
 -- witness: t = {(1, '{2.0}'), (2, '{2.00}')}: the inner DISTINCT keeps one of the two, so A returns one row; B returns two, '{2.0}' and '{2.00}'

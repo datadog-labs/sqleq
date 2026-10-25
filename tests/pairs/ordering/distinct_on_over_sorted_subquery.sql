@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #123: the same for an outer DISTINCT ON with no ORDER BY of its own, which keeps the first row
 --   of each key in the order a sorted subquery hands them on

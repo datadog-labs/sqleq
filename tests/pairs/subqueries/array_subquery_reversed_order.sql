@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #59: ARRAY(SELECT ...) builds the array in the order of its query's rows, and the reflexivity
 --   check stripped that query's ORDER BY

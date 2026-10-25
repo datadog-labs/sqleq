@@ -136,7 +136,7 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
         && !case.f_note.is_empty()
     {
         tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
-    } else if o.verdict == portfolio::NOT_EQUIVALENT && case.c_bucket.as_deref() == Some(cvc5::MODEL) && !case.c_note.is_empty() {
+    } else if case.c_bucket.as_deref() == Some(cvc5::MODEL) && !case.c_note.is_empty() {
         tail += &format!("  {}", c.dim(&format!("— cvc5 model {}", case.c_note)));
     } else if !portfolio::decisive(&o.verdict) {
         let last = suite::splitlines(&case.message).into_iter().map(str::trim).rfind(|l| !l.is_empty());
@@ -592,10 +592,10 @@ pub fn print_cvc5(c: Color, cases: &[Case], stats: &cvc5::Stats, driver: &str) {
         "{}",
         c.dim(
             "  note  `model` is a database on which cvc5's encodings of the two queries differ,\n        checked by cvc5 \
-             against its own assertions. It reads the IR's types its own\n        way (integers unbounded, numerics exact, \
-             opaque values by identity; see\n        docs/CVC5.md), so it is a claim under those readings, not an executed\n        \
-             counterexample as sqleq-fuzz's is. `no-proof` is `unknown`, or two queries\n        whose rows the encoding \
-             cannot compare."
+             against its own assertions: a refutation of the plan, not of\n        the pair -- the plan lacks the constraints \
+             the frontend does not carry, and\n        reads the IR's types its own way (docs/CVC5.md). It contradicts a proof \
+             over\n        the same plan, and decides nothing on its own; sqleq-fuzz remains the\n        disprover. `no-proof` \
+             is `unknown`, or two queries whose rows the encoding\n        cannot compare."
         )
     );
 }

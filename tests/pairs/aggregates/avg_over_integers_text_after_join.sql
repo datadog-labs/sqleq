@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #106: AVG over integers, typed INTEGER, had an identity =, though two equal means can print differently
 -- witness: t = {(19999)}, u = {(39998), (0)}: both means are 19999, A yields '19999.0000000000000000' and B '19999.000000000000'

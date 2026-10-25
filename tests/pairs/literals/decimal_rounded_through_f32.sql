@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #56: a decimal literal reached the QED prover as a REAL constant, which it reads
 --   through f32, where 20000000.5 is 20000000

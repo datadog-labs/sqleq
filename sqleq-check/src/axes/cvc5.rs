@@ -13,10 +13,12 @@
 //!
 //! Unlike the SQLSolver axes, this one can refute, and unlike the fuzz axis its refutation is not
 //! an executed counterexample: it is a database under the encoding's readings of the types, which
-//! cvc5 checked against its own assertions (`check-models`). The bucket is therefore `model`, a
-//! word of its own, so that a reader never confuses it with sqleq-fuzz's `counterexample`; the
-//! suite reads it as a refutation under index binding all the same, which is what lets a portfolio
-//! decide on it and an alarm catch it against a proof.
+//! cvc5 checked against its own assertions (`check-models`), and under the plan's constraints
+//! alone -- the frontend drops those it cannot carry, so the database may be one the DDL forbids.
+//! The bucket is therefore `model`, a word of its own, so that a reader never confuses it with
+//! sqleq-fuzz's `counterexample`; the suite reads it as a refutation under the plan's own binding
+//! (`suite::IR`), where every prover's proof also claims: a model and a proof over one plan are an
+//! alarm, and a model alone decides no verdict.
 //!
 //! The driver is cheap to start and stops on its own at cvc5's time limit, so the axis runs one
 //! process per case, in parallel like sqleq-fuzz, with the case's deadline as the backstop: cvc5

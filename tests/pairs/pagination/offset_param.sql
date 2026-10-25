@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #65: sqleq-fuzz bound a pure OFFSET parameter to 1000000000, so both sides returned no rows
 -- witness: t = {(1, 0)}, $1 = 1, $2 = 0: A yields (1, 0), B yields (1, 1)

@@ -8,6 +8,7 @@
 -- expect fuzz: no-schema
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #112: with "Orders" and orders one synthesized table, the two sides were the

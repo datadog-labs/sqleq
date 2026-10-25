@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #187: a date literal outside the generated dates hid a boundary difference
 -- witness: t = {('2000-01-01')}: B returns it, A returns no row

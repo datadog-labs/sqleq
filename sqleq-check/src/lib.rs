@@ -38,10 +38,11 @@
 //!
 //! `--cvc5` adds the **cvc5 axis** on the same plan: `sqleq-cvc5` encodes it over cvc5's bags (or
 //! sets) of tuples, after the LPAR'24 relations work's Java translator. Its `proved` is a proof
-//! under that encoding, and its `model` -- a database on which the two encodings differ -- a claim
-//! against equivalence, which a portfolio decides on and an alarm weighs against a proof. It is
-//! not sqleq-fuzz's executed counterexample: the encoding reads the IR's types its own way, which
-//! `docs/CVC5.md` lays out, and the report keeps the two words apart.
+//! under that encoding, and its `model` -- a database on which the two encodings differ -- a
+//! refutation of the plan: an alarm against a proof over the same plan, but no verdict on its own,
+//! because the plan lacks the constraints the frontend does not carry and the encoding reads the
+//! IR's types its own way (`docs/CVC5.md`). sqleq-fuzz's executed counterexample remains the
+//! refutation of the pair, and the report keeps the two words apart.
 //!
 //! `--portfolio` asks every backend at once on each case instead, within that case's one deadline,
 //! and reports one combined verdict -- `equivalent`, Lean's weaker `equivalent-gather` and

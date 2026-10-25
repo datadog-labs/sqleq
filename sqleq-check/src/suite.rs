@@ -62,19 +62,30 @@ pub fn canonical_axis(name: &str) -> &str {
 pub const INDEX: &str = "index";
 pub const GATHER: &str = "gather";
 pub const GATHER_GENERATED: &str = "gather-generated";
+/// The bindings a pair may be stated under.
 pub const BINDINGS: [&str; 3] = [INDEX, GATHER, GATHER_GENERATED];
 pub const GATHERS: [&str; 2] = [GATHER, GATHER_GENERATED];
+/// The plan's own reading: the IR as the provers get it, with `$N` bound alike on both sides and
+/// without the constraints the frontend does not carry (an expression or opclass unique index,
+/// `UNIQUE NULLS NOT DISTINCT`, a foreign key). A proof under it is a proof under `index` -- fewer
+/// constraints are more databases -- so every prover claims under both; a refutation under it is
+/// only a refutation under it, since the database found may be one the DDL forbids. No pair is
+/// stated under it: it exists so that a model from cvc5 and a proof over the same plan can be the
+/// contradiction they are.
+pub const IR: &str = "ir";
+/// The bindings under which a claim and a refutation contradict each other.
+pub const ALARM_BINDINGS: [&str; 4] = [INDEX, IR, GATHER, GATHER_GENERATED];
 
 /// The bindings an axis answers under. Lean reads a scalar and an array at the same `$N` only as
 /// the gather rule relates them. sqleq-fuzz answers under `index`, and under `gather` for a pair of
 /// the gather rule's shape, which it runs with the `unnest` side's arrays built from the `VALUES`
 /// side's values; it refuses a generated cell, so it never answers under `gather-generated`. Every
-/// other axis refuses such a pair.
+/// other axis refuses such a pair, and answers under `index` and the plan's own reading, [`IR`].
 pub fn axis_bindings(axis: &str) -> &'static [&'static str] {
     match axis {
         "lean" => &GATHERS,
         "fuzz" => &[INDEX, GATHER],
-        a if AXES.contains(&a) => &[INDEX],
+        a if AXES.contains(&a) => &[INDEX, IR],
         _ => &[],
     }
 }
@@ -117,8 +128,10 @@ pub fn words(axis: &str) -> &'static [&'static str] {
             &["proved", "proved-literal", "no-proof", "unsupported", "no-plan", "error"]
         }
         // `model`: cvc5 found a database on which its encodings of the two queries differ. A
-        // claim against equivalence, under the encoding's readings (docs/CVC5.md), so an
-        // equivalent pair pinned `model` is an invariant failure as `counterexample` is.
+        // refutation under the plan's own reading ([`IR`]), not under `index`: the plan lacks the
+        // constraints the frontend does not carry, so the database may be one the DDL forbids. An
+        // equivalent pair may therefore be pinned `model`; a pair proved over the same plan may
+        // not, which is an alarm.
         "cvc5" => &["proved", "proved-literal", "model", "no-proof", "unsupported", "no-plan", "error"],
         // `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of
         // equivalence.
@@ -172,13 +185,13 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
 
 /// The answers that claim the opposite of equivalence under `binding`: a counterexample found
 /// with `$N` bound alike on both sides, or one found with the `unnest` side's arrays gathered from
-/// the `VALUES` side's values; and cvc5's `model`, a database on which its two encodings differ,
-/// under the index binding its encoding reads.
+/// the `VALUES` side's values; and under the plan's own reading ([`IR`]) cvc5's `model`, a
+/// database on which its two encodings of the plan differ.
 pub fn refutes(axis: &str, binding: &str) -> &'static [&'static str] {
     match (axis, binding) {
         ("fuzz", INDEX) => &["counterexample"],
         ("fuzz", GATHER) => &["counterexample-gather"],
-        ("cvc5", INDEX) => &["model"],
+        ("cvc5", IR) => &["model"],
         _ => &[],
     }
 }

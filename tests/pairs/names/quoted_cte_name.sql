@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #57: inline_ctes folded the CTE name "T" to t, so it replaced the base table t
 -- witness: t = {(1, 2), (2, 1)}: A returns 1 and 2, B returns 2 and 3

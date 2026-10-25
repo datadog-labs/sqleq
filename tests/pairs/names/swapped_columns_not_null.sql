@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #143: sqleq-fuzz drew a table's rows under the names and NOT NULLs its CREATE
 --   TABLE gave, so after three RENAME COLUMNs swapped a and b, the DuckDB engine drew NULLs for b,

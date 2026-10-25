@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz froze now() at 00:00:00 and localtime at 12:00:00
 -- argument: localtime is the time of day of the transaction's start timestamp, which is now()::time

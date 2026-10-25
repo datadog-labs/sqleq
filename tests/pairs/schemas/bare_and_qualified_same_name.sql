@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #125: sqleq-fuzz moved the bare t into schema s, the one schema the DDL named t by,
 --   though that name was the DDL's own create table "s"."t"; the DDL then failed with relation "t"

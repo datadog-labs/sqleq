@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: proved
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #109: the control for MAX over numrange[]; = on integer[] is identity, so MAX binds to an input by identity faithfully and sqleq-solver still proves the pair
 -- argument: x is NOT NULL and integer[]'s order is total, with no two distinct arrays that = calls equal; so on an empty t both sides are empty, and otherwise the inputs with nothing greater are exactly the copies of MAX(x), one value with one text

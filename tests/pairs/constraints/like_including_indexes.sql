@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #143: sqleq-fuzz could not read a CREATE TABLE ... (LIKE ...) the parser rejects,
 --   and found no table t; it now copies the named table's columns, and its keys where the LIKE

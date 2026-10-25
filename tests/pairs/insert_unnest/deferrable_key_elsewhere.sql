@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather
 -- binding: gather
 -- origin: #110: a deferrable key on another column is no arbiter, so it changes nothing here

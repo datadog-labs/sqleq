@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #49: random_normal() was missing from the frontend's volatile list, so the WITH
 --   binding read twice was inlined and lowered, and both sides became the same IR

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #93 item 3: sqleq-fuzz took the `\'` in `E'a\';b'` for the end of the literal,
 --   cut the pair file at the `;` after it, and ran pieces of the two queries as the pair

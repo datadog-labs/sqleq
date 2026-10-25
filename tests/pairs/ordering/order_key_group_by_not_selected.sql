@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #92 item 6: a grouped query whose ORDER BY key is grouped but not selected is
 --   refused, however the key is spelled; the grouped output is not widened with the key

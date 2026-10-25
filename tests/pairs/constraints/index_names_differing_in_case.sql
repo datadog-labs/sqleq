@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: index names were compared lower-cased, so "Ix" and ix were one name: renaming "Ix" renamed
 --   both, and dropping ix then dropped neither, leaving a key on b

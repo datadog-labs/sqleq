@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #154: a literal argument of coalesce beside a column of an opaque type was left as written, so coalesce(a, 16777217) and coalesce(b, 16777217) returned one integer when a and b are NULL
 -- witness: t = {(1, NULL, NULL)}: A yields 16777217::real, which is 1.6777216e+07, and B yields 16777217::double precision, which is 16777217
