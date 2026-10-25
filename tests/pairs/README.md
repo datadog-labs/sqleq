@@ -33,6 +33,9 @@ sqleq-check --expect pinned --axes qed tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
 # The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
 sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
+# The cvc5 axis, which needs sqleq-cvc5 built against a cvc5 library (docs/CVC5.md); its `model`
+# on an equivalent pair is an invariant failure, as a fuzz counterexample is:
+sqleq-check --expect pinned --axes cvc5 tests/pairs examples/*.sql
 ```
 
 The output is one row per pair, with its `truth` and one column per axis that ran. Exit code 0

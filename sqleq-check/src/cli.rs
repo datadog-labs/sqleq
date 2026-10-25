@@ -55,6 +55,24 @@ pub enum Expect {
     Pinned,
 }
 
+/// The semantics the cvc5 axis encodes under (`--cvc5-semantics`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Cvc5Semantics {
+    /// SQL's own: a table is a bag of rows, and a row's multiplicity counts.
+    Bags,
+    /// An approximation under which duplicates collapse, which the solver finds far easier.
+    Sets,
+}
+
+impl Cvc5Semantics {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cvc5Semantics::Bags => "bags",
+            Cvc5Semantics::Sets => "sets",
+        }
+    }
+}
+
 /// A wall-clock budget in seconds, as `-t` and `--retry-timeout` take it: a positive number, or
 /// `inf` for none. A budget too large for a deadline to be set is none as well. NaN, zero and a
 /// negative number are usage errors: no case can run within them, and under --portfolio a NaN
@@ -180,7 +198,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Expect::Equivalent)]
     pub expect: Expect,
 
-    /// Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, lean
+    /// Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, cvc5, lean
     /// (default: frontend,qed). A prover axis brings in frontend; at most one SQLSolver per run.
     /// sqlsolver-rust is the old name of sqleq-solver.
     #[arg(long, value_name = "LIST")]
@@ -260,6 +278,35 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub sqlsolver_tree: Option<String>,
 
+    /// Also ask cvc5 (sqleq-cvc5) about every case that lowered: the same Input JSON, encoded as
+    /// an SMT problem over cvc5's bags (or sets) of tuples. Its `proved` is a proof under that
+    /// encoding and its `model` a database on which the two encodings differ -- a claim, which
+    /// decides a portfolio verdict and can be half of an alarm. The same as adding `cvc5` to
+    /// --axes. See docs/CVC5.md.
+    #[arg(long)]
+    pub cvc5: bool,
+
+    /// The sqleq-cvc5 binary, whenever a run asks it (else --bin-dir / $SQLEQ_CVC5_BIN / PATH / the
+    /// newer of this repo's target/{release,debug} builds).
+    #[arg(long, value_name = "PATH")]
+    pub cvc5_bin: Option<String>,
+
+    /// The semantics sqleq-cvc5 encodes under (default: bags, SQL's own; sets is an approximation
+    /// the solver finds far easier).
+    #[arg(long, value_enum, default_value_t = Cvc5Semantics::Bags)]
+    pub cvc5_semantics: Cvc5Semantics,
+
+    /// A further cvc5 option for sqleq-cvc5, as NAME=VALUE (`bags-to-liastar=true`, say); may be
+    /// repeated.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub cvc5_opt: Vec<String>,
+
+    /// Per-case cap for the cvc5 axis, in ms (default: --timeout): cvc5's own time limit on its
+    /// check, with the process killed at the case's deadline as the backstop. Under --portfolio it
+    /// is also capped by what is left of the case's deadline.
+    #[arg(long, value_name = "MS")]
+    pub cvc5_timeout: Option<u64>,
+
     /// Also run the Lean axis (sqleq-lean) over the .sql cases and corpus rows: INSERT ... VALUES
     /// vs INSERT ... SELECT * FROM unnest(..) pairs, proved under the gather rule. The same as
     /// adding `lean` to --axes; outside --expect pinned it never changes the exit code, and under
@@ -322,6 +369,9 @@ pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
     if let Some(second) = second_opinion(args) {
         axes.push(if second == "sqleq-solver" { "sqleq-solver".into() } else { "sqlsolver-jvm".into() });
     }
+    if args.cvc5 {
+        axes.push("cvc5".into());
+    }
     if args.lean {
         axes.push("lean".into());
     }
@@ -377,6 +427,9 @@ mod tests {
         assert!(axes(&["--axes", "sqleq-solver", "--sqlsolver-jvm"]).is_err());
         assert!(axes(&["--axes", "frontend,qd"]).unwrap_err().contains("unknown axis qd"));
         assert_eq!(axes(&["--axes", "fuzz", "--lean"]).unwrap(), ["fuzz", "lean"]);
+        assert_eq!(axes(&["--cvc5"]).unwrap(), ["frontend", "qed", "cvc5"]);
+        assert_eq!(axes(&["--axes", "cvc5"]).unwrap(), ["frontend", "cvc5"], "a prover brings in the frontend");
+        assert_eq!(axes(&["--axes", "cvc5,sqleq-solver"]).unwrap(), ["frontend", "sqleq-solver", "cvc5"]);
     }
 
     #[test]

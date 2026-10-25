@@ -147,10 +147,28 @@ fi
 printf '{%s}' "$body" > "$out"
 "#;
 
+/// Answers `$FAKE_CVC5` for every job, after `$FAKE_CVC5_SLEEP` seconds when that is set: on `NEQ`
+/// with a model, exact unless `$FAKE_CVC5_INEXACT` is set; appends its arguments to `$FAKE_CVC5_ARGV`
+/// when that is set.
+pub const FAKE_CVC5: &str = r#"[ -n "$FAKE_CVC5_ARGV" ] && printf '%s\n' "$*" >> "$FAKE_CVC5_ARGV"
+[ -n "$FAKE_CVC5_SLEEP" ] && sleep "$FAKE_CVC5_SLEEP"
+jobs=""; out=""
+for a in "$@"; do case "$a" in --*) ;; *) if [ -z "$jobs" ]; then jobs=$a; else out=$a; fi ;; esac; done
+exact=true; [ -n "$FAKE_CVC5_INEXACT" ] && exact=false
+while IFS= read -r line || [ -n "$line" ]; do
+    name=$(printf '%s' "$line" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+    case "$FAKE_CVC5" in
+    NEQ) printf '{"name": "%s", "verdict": "NEQ", "ms": 1, "killed": false, "model": {"tables": [{"name": "t", "rows": [[["0"], 1]]}]}, "model_exact": %s, "counterexample": "t=[(0)]"}\n' "$name" "$exact" >> "$out" ;;
+    *) printf '{"name": "%s", "verdict": "%s", "ms": 1, "killed": false}\n' "$name" "$FAKE_CVC5" >> "$out" ;;
+    esac
+done < "$jobs"
+"#;
+
 pub struct Fakes {
     pub dir: sqleq_check::util::TempDir,
     pub frontend: PathBuf,
     pub solver: PathBuf,
+    pub cvc5: PathBuf,
     pub fuzz: PathBuf,
     pub prover: PathBuf,
     pub lean: PathBuf,
@@ -165,6 +183,7 @@ impl Fakes {
         Fakes {
             frontend: exe(&d.join("fe"), FAKE_FRONTEND),
             solver: exe(&d.join("ss"), FAKE_SOLVER),
+            cvc5: exe(&d.join("cv"), FAKE_CVC5),
             fuzz: exe(&d.join("fz"), FAKE_FUZZ),
             prover: exe(&d.join("qed"), FAKE_PROVER),
             lean: exe(&d.join("ln"), FAKE_LEAN),

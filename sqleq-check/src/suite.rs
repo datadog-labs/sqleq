@@ -44,8 +44,9 @@ pub const NOT_EQUIVALENT: &str = "not-equivalent";
 pub const TRUTHS: [&str; 2] = [EQUIVALENT, NOT_EQUIVALENT];
 
 /// Canonical order: the order `--bless` inserts missing lines in, and the table's column order.
-pub const AXES: [&str; 6] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "lean"];
-pub const PROVERS: [&str; 3] = ["qed", "sqleq-solver", "sqlsolver-jvm"];
+pub const AXES: [&str; 7] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "cvc5", "lean"];
+/// The axes handed the frontend's plan, so asking one asks the frontend.
+pub const PROVERS: [&str; 4] = ["qed", "sqleq-solver", "sqlsolver-jvm", "cvc5"];
 
 /// An axis name as [`AXES`] spells it. `sqlsolver-rust` is sqleq-solver's axis from before the
 /// rename, still read wherever an axis is named -- `--axes` and `expect` lines -- so a pin or a
@@ -115,6 +116,10 @@ pub fn words(axis: &str) -> &'static [&'static str] {
         "sqleq-solver" | "sqlsolver-jvm" => {
             &["proved", "proved-literal", "no-proof", "unsupported", "no-plan", "error"]
         }
+        // `model`: cvc5 found a database on which its encodings of the two queries differ. A
+        // claim against equivalence, under the encoding's readings (docs/CVC5.md), so an
+        // equivalent pair pinned `model` is an invariant failure as `counterexample` is.
+        "cvc5" => &["proved", "proved-literal", "model", "no-proof", "unsupported", "no-plan", "error"],
         // `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of
         // equivalence.
         "lean" => &[
@@ -142,7 +147,7 @@ pub fn claims_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
         };
     }
     match axis {
-        "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
+        "qed" | "sqleq-solver" | "sqlsolver-jvm" | "cvc5" => &PROVED_WORDS,
         "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather", "no-witness"],
         _ => &[],
@@ -158,20 +163,22 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
         };
     }
     match axis {
-        "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
+        "qed" | "sqleq-solver" | "sqlsolver-jvm" | "cvc5" => &PROVED_WORDS,
         "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather"],
         _ => &[],
     }
 }
 
-/// The one answer that claims the opposite of equivalence under `binding`: a counterexample found
+/// The answers that claim the opposite of equivalence under `binding`: a counterexample found
 /// with `$N` bound alike on both sides, or one found with the `unnest` side's arrays gathered from
-/// the `VALUES` side's values.
+/// the `VALUES` side's values; and cvc5's `model`, a database on which its two encodings differ,
+/// under the index binding its encoding reads.
 pub fn refutes(axis: &str, binding: &str) -> &'static [&'static str] {
     match (axis, binding) {
         ("fuzz", INDEX) => &["counterexample"],
         ("fuzz", GATHER) => &["counterexample-gather"],
+        ("cvc5", INDEX) => &["model"],
         _ => &[],
     }
 }

@@ -178,6 +178,57 @@ pub fn discover_sqleq_solver(flag: Option<&str>, bin_dir: Option<&str>) -> Resul
     })
 }
 
+/// How to run the cvc5 axis's driver, `sqleq-cvc5`: the binary, and the arguments every run of it
+/// gets -- the semantics and any further cvc5 option -- which the header line names with it.
+#[derive(Clone, Debug)]
+pub struct Cvc5Driver {
+    pub bin: String,
+    pub semantics: String,
+    /// `--cvc5-opt NAME=VALUE`, each passed on as `--opt=NAME=VALUE`.
+    pub options: Vec<String>,
+}
+
+impl Cvc5Driver {
+    /// The command up to the driver's positional arguments.
+    pub fn cmd(&self) -> Vec<String> {
+        let mut cmd = vec![self.bin.clone(), format!("--semantics={}", self.semantics)];
+        cmd.extend(self.options.iter().map(|o| format!("--opt={o}")));
+        cmd
+    }
+
+    /// What the header line and the report call this configuration: `sqleq-cvc5 (bags)`, with the
+    /// options when there are any.
+    pub fn describe(&self) -> String {
+        if self.options.is_empty() {
+            format!("sqleq-cvc5 ({})", self.semantics)
+        } else {
+            format!("sqleq-cvc5 ({}, {})", self.semantics, self.options.join(" "))
+        }
+    }
+}
+
+/// sqleq-cvc5: explicit override -> `--bin-dir` -> `$SQLEQ_CVC5_BIN` -> PATH -> this repo's own
+/// build. The binary carries the cvc5 library it was built against in its rpath (see
+/// `sqleq-cvc5/build.rs`), so no library path is set here. Each `--cvc5-opt` must be `NAME=VALUE`.
+pub fn discover_cvc5(flag: Option<&str>, bin_dir: Option<&str>, semantics: &str, options: &[String]) -> Result<Cvc5Driver, String> {
+    let bin = match chosen("sqleq-cvc5", flag, bin_dir, "SQLEQ_CVC5_BIN")? {
+        Some(p) => p,
+        None => match which("sqleq-cvc5").or_else(|| newest(&target_builds("sqleq-cvc5"))) {
+            Some(p) => path_str(&abspath(&p)),
+            None => {
+                return Err("error: could not find 'sqleq-cvc5'. Build it with `CVC5_LIB_DIR=<cvc5>/lib cargo build \
+                            --release -p sqleq-cvc5` (it links the cvc5 library that directory holds, see \
+                            docs/CVC5.md), put it on PATH, or pass --cvc5-bin/$SQLEQ_CVC5_BIN."
+                    .to_string())
+            }
+        },
+    };
+    if let Some(bad) = options.iter().find(|o| !o.contains('=') || o.starts_with('=')) {
+        return Err(format!("error: --cvc5-opt takes NAME=VALUE, not `{bad}`"));
+    }
+    Ok(Cvc5Driver { bin, semantics: semantics.to_string(), options: options.to_vec() })
+}
+
 /// The JVM driver (`tools/sqlsolver/IrDriver.java`) over the de-Calcited fork: the original
 /// SQLSolver, kept as a cross-check of sqleq-solver.
 pub fn discover_sqlsolver_jvm(tree_flag: Option<&str>) -> Result<SsDriver, String> {
@@ -272,7 +323,7 @@ fn crate_dir(binary_name: &str) -> Option<PathBuf> {
     let r = repo();
     match binary_name {
         "sqleq-frontend" => Some(r.to_path_buf()),
-        "sqleq-fuzz" | "sqleq-solver" | "sqleq-lean" => Some(r.join(binary_name)),
+        "sqleq-fuzz" | "sqleq-solver" | "sqleq-lean" | "sqleq-cvc5" => Some(r.join(binary_name)),
         _ => None,
     }
 }
