@@ -410,7 +410,10 @@ impl Encoder {
         Ok((a, b))
     }
 
-    /// `table` with each of `columns` replaced by the NULL of the sort given for it.
+    /// `table` with each of `columns` replaced by the NULL of the sort given for it: for column 1
+    /// read as a string,
+    /// `(bag.map (lambda ((t T)) (tuple ((_ tuple.select 0) t) (as nullable.null (Nullable String))))
+    /// table)`.
     fn null_columns(&mut self, table: Term, columns: &[(usize, Sort)]) -> R<Term> {
         if columns.is_empty() {
             return Ok(table);
@@ -675,21 +678,11 @@ impl Encoder {
         Ok(v)
     }
 
-    /// Rewrite a table's constraint as soon as the table is read, before any lambda over its rows is:
-    /// the bags rewriter reads keys and NOT NULL columns off these assertions, and remembers what it
-    /// rewrote, so a lambda body simplified before them would keep a form that does not use them.
-    /// A problem file read by cvc5 rewrites its assertions in order, the constraints first.
-    fn learn(&mut self, constraint: &Term) -> R<()> {
-        self.solver.simplify(constraint.clone(), false)?;
-        Ok(())
-    }
-
-    /// `(lambda vars body)`, with the body rewritten first: the bags solver relates two maps or
-    /// filters by the identity of their functions, and does not rewrite under the binder before
-    /// comparing them, so `(+ x (ite false null (some 5)))` and `(+ x (some 5))` would be two
-    /// functions where Postgres has one expression.
+    /// `(lambda vars body)`. The body is not rewritten here: cvc5 rewrites the assertions, lambda
+    /// bodies included, after its bags-facts pass has read the keys and NOT NULL columns off the
+    /// constraints, and the rewriter keeps what it rewrote, so a body rewritten before would keep a
+    /// form that does not use them.
     fn lambda(&mut self, vars: &[Term], body: Term) -> R<Term> {
-        let body = self.solver.simplify(body, false)?;
         let list = self.tm.mk_term(Kind::VariableList, vars)?;
         Ok(self.tm.mk_term(Kind::Lambda, &[list, body])?)
     }
@@ -752,7 +745,8 @@ impl Encoder {
         self.and(vec![s, v])
     }
 
-    /// A nullable boolean that is `some(false)`: what `NOT` turns into a pass.
+    /// A nullable boolean that is `some(false)`: what `NOT` turns into a pass,
+    /// `(and (nullable.is_some t) (not (nullable.val t)))`.
     fn falsity(&mut self, t: Term) -> R<Term> {
         let s = self.is_some(t.clone())?;
         let v = self.val(t)?;
@@ -765,7 +759,9 @@ impl Encoder {
     /// `a OR b` when one does, `NOT a` when `a` is false. This is the same predicate as the truth
     /// of the three-valued `ite` encoding, but it leaves a conjunction visible as a conjunction,
     /// which lets the solver's rewriter move one conjunct at a time, such as a `HAVING` condition
-    /// on a grouping column below the aggregate.
+    /// on a grouping column below the aggregate. For `a = b AND c`,
+    /// `(and (nullable.is_some a) (= a b) (nullable.is_some c) (nullable.val c))`, up to the
+    /// flattening of `and`.
     fn condition(&mut self, e: &Expr, row: &Row, schemas: &[Schema]) -> R<Term> {
         match e {
             Expr::Call { operator, operand, .. } if operator == "AND" => {
@@ -797,7 +793,9 @@ impl Encoder {
         }
     }
 
-    /// The two-valued reading of `NOT e`: `e` is false, with De Morgan over `AND` and `OR`.
+    /// The two-valued reading of `NOT e`: `e` is false, with De Morgan over `AND` and `OR`; for
+    /// `NOT (a OR b)`, `(and (nullable.is_some a) (not (nullable.val a)) (nullable.is_some b)
+    /// (not (nullable.val b)))`.
     fn negated_condition(&mut self, e: &Expr, row: &Row, schemas: &[Schema]) -> R<Term> {
         match e {
             Expr::Call { operator, operand, .. } if operator == "AND" => {
@@ -940,7 +938,13 @@ impl Encoder {
     /// A row slice, `OFFSET o LIMIT l` under an `ORDER BY` whose keys contain a key of the rows: no
     /// two rows tie, so every row has its place, the number of rows sorted before it, and the slice
     /// keeps the rows placed in [o, o + l). Under ties the slice would depend on the order the rows
-    /// come in, and is refused; so is a slice of a computed size, and one under set semantics.
+    /// come in, and is refused; so is a slice of a computed size, and one under set semantics. For
+    /// `ORDER BY k LIMIT 2` over `rows`, k column 0, ascending and NULLs last,
+    /// `(bag.filter (lambda ((x T)) (and (>= (bag.fold (lambda ((z T) (a Int)) (+ a 1)) 0 E) 0)
+    /// (< (bag.fold (lambda ((z T) (a Int)) (+ a 1)) 0 E) 2))) rows)` with `E`, the rows before x,
+    /// `(bag.filter (lambda ((y T)) (ite (nullable.is_null ((_ tuple.select 0) y)) false (ite
+    /// (nullable.is_null ((_ tuple.select 0) x)) true (< (nullable.val ((_ tuple.select 0) y))
+    /// (nullable.val ((_ tuple.select 0) x)))))) rows)`.
     fn row_slice(
         &mut self,
         source: &Relation,
@@ -1043,7 +1047,6 @@ impl Encoder {
         for (j, nullable) in s.nullable.iter().enumerate().take(s.types.len()) {
             if !nullable {
                 let no_null = self.no_null_in(t.clone(), j, &sorts[j])?;
-                self.learn(&no_null)?;
                 self.constraints.push((format!("{name}: column {j} is NOT NULL"), no_null));
             }
         }
@@ -1059,7 +1062,6 @@ impl Encoder {
                 let projection = self.project(&idx, t.clone())?;
                 let set = self.distinct(projection.clone())?;
                 let distinct = self.tm.mk_term(Kind::Equal, &[set, projection])?;
-                self.learn(&distinct)?;
                 let cols: Vec<String> = key.iter().map(|c| c.to_string()).collect();
                 self.constraints.push((
                     format!("{name}: key ({}): no two rows agree on it, so its values form a set", cols.join(", ")),
@@ -1358,7 +1360,12 @@ impl Encoder {
     /// `DISTINCT` call folds over its own input, the projection onto the keys and its argument with
     /// duplicates removed; the plain calls fold over the rows; the groups of all of them are the
     /// same key values, joined on the keys (equal as values, NULL included, as grouping compares
-    /// them). With no key each part is one row and the join is their product.
+    /// them). With no key each part is one row and the join is their product. For
+    /// `SELECT k, COUNT(DISTINCT c), SUM(a) FROM t GROUP BY k`, the rows of
+    /// `(bag.filter (lambda ((p W)) (= ((_ tuple.select 0) p) ((_ tuple.select 2) p)))
+    /// (table.product A B))` mapped to `(tuple k count sum)`, with `A` the aggregate of `SUM(a)`
+    /// over the rows of `t` by `k`, and `B` that of `COUNT(c)` over
+    /// `(bag.setof (bag.map (lambda ((x T)) (tuple ((_ tuple.select 0) x) ((_ tuple.select 1) x))) t))`.
     #[allow(clippy::too_many_arguments)]
     fn mixed_distinct(
         &mut self,
@@ -1461,7 +1468,13 @@ impl Encoder {
     }
 
     /// `GROUP BY` over `child` by the columns `indices`, the calls folding over every row, each
-    /// reading column `args[j]` (none for `COUNT(*)`).
+    /// reading column `args[j]` (none for `COUNT(*)`), and `extra[j]` the further columns of a
+    /// `COUNT` of several. For `SELECT k, COUNT(*) FROM t GROUP BY k`, k column 0,
+    /// `((_ table.project 0 1) (bag.filter (lambda ((r U)) (>= ((_ tuple.select 2) r) 1))
+    /// ((_ table.aggr 0) (lambda ((x T) (y U)) (tuple ((_ tuple.select 0) x) (nullable.some (+
+    /// (nullable.val ((_ tuple.select 1) y)) 1)) (+ ((_ tuple.select 2) y) 1))) (tuple (as
+    /// nullable.null (Nullable Int)) (nullable.some 0) 0) t)))`: the last column counts the rows of
+    /// the group, and the filter drops the row of initial values `table.aggr` gives an empty `t`.
     fn aggregate_over(
         &mut self,
         child: Term,
@@ -2097,6 +2110,7 @@ impl Encoder {
         Ok(true)
     }
 
+    /// Whether every argument is a nullable integer, `(Nullable Int)`.
     fn all_integers(&self, args: &[Term]) -> R<bool> {
         for a in args {
             if !a.sort().nullable_element_sort()?.is_integer() {
@@ -2371,7 +2385,8 @@ impl Encoder {
     /// `(l1, .., ln) IN (subquery)`: TRUE iff some row equals the operand column by column with no
     /// NULL; UNKNOWN iff not, but some row might -- every column equal or one of the pair NULL;
     /// FALSE otherwise. The rows that might are a filter whose predicate reads the operand, which
-    /// the solver now decorrelates. Where neither side can be NULL it is plain membership.
+    /// the solver now decorrelates. Where neither side can be NULL it is plain membership,
+    /// `(nullable.some (>= (bag.count (tuple l1 l2) inner) 1))`.
     fn in_subquery_tuple(
         &mut self,
         operand: &[Expr],
@@ -2536,7 +2551,6 @@ fn numeric_arith(op: &str) -> Option<(&str, bool)> {
     Some((o, l == "real" || r == "real"))
 }
 
-/// A literal `TRUE`, which a join condition is when the join has none.
 /// Per column of `rel`, whether it is never NULL ([`never_null`]).
 fn never_null_columns(rel: &Relation, base: usize, schemas: &[Schema]) -> Vec<bool> {
     (0..rel.output_types(schemas).len()).map(|c| never_null(rel, c, base, schemas)).collect()
