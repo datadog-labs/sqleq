@@ -1252,7 +1252,12 @@ fn lower_setexpr_ctx(
     ord: OrderCtx,
 ) -> Result<(Value, OutCols, Option<SortScope>)> {
     match body {
-        SetExpr::Select(s) => lower_select_ctx(cat, fns, s, outer, ord),
+        SetExpr::Select(s) => {
+            if let Some(expanded) = expand_grouping_sets(fns, s)? {
+                return lower_setexpr_ctx(cat, fns, &expanded, outer, ord);
+            }
+            lower_select_ctx(cat, fns, s, outer, ord)
+        }
         // A parenthesized query carries its own ORDER BY; `ord` belongs to the enclosing one, and
         // its own `Sort` (if any) is already in place, so there is nothing left to widen.
         SetExpr::Query(q) => lower_query_ctx(cat, fns, q, outer).map(|(v, c)| (v, c, None)),
@@ -1282,13 +1287,12 @@ fn lower_setexpr_ctx(
                     let u = json!({ "union": [lv, rv] });
                     if all { u } else { json!({ "distinct": u }) }
                 }
-                // The prover's Intersect/Except are set-semantics (squash); ALL = bag => refuse.
-                SetOperator::Intersect if all => return Err(unsupported("INTERSECT ALL (bag semantics)")),
+                // The prover's Intersect/Except are set-semantics (squash); the ALL forms keep
+                // multiplicities, their own nodes, which a prover without bags refuses.
+                SetOperator::Intersect if all => json!({ "intersectAll": [lv, rv] }),
                 SetOperator::Intersect => json!({ "intersect": [lv, rv] }),
                 // MINUS is a non-standard synonym for EXCEPT.
-                SetOperator::Except | SetOperator::Minus if all => {
-                    return Err(unsupported("EXCEPT/MINUS ALL (bag semantics)"))
-                }
+                SetOperator::Except | SetOperator::Minus if all => json!({ "exceptAll": [lv, rv] }),
                 SetOperator::Except | SetOperator::Minus => json!({ "except": [lv, rv] }),
             };
             Ok((rel, lcols, None))
@@ -1422,7 +1426,7 @@ fn branch_cells(rel: &Value, j: usize) -> Option<Vec<&Value>> {
         "project" => body["target"].as_array()?.get(j).map(|c| vec![c]),
         "values" => body["content"].as_array()?.iter().map(|row| row.get(j)).collect(),
         "distinct" => branch_cells(body, j),
-        "union" | "intersect" | "except" => {
+        "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
             let mut all = Vec::new();
             for r in body.as_array()? {
                 all.extend(branch_cells(r, j)?);
@@ -1454,7 +1458,7 @@ fn convert_branch_cells(rel: &mut Value, j: usize, ct: &str) {
             }
         }
         "distinct" => convert_branch_cells(body, j, ct),
-        "union" | "intersect" | "except" => {
+        "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
             for r in body.as_array_mut().into_iter().flatten() {
                 convert_branch_cells(r, j, ct);
             }
@@ -2557,6 +2561,192 @@ fn call_or_column_name(e: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `GROUP BY` with `GROUPING SETS`, `ROLLUP` or `CUBE`, written as the `UNION ALL` of one plain
+/// `GROUP BY` per grouping set, which is what SQL defines them as: each grouping set groups the rows
+/// by its own columns, the grouping columns it leaves out are NULL in its rows, and `GROUPING(a, ..)`
+/// is the bit mask of the arguments it leaves out (the last argument the lowest bit). Outside the
+/// aggregates only: an aggregate's arguments read the input rows, where every column has its value.
+/// `None` when the `GROUP BY` has no grouping sets.
+fn expand_grouping_sets(fns: &Fns, s: &Select) -> Result<Option<SetExpr>> {
+    let GroupByExpr::Expressions(items, modifiers) = &s.group_by else { return Ok(None) };
+    // a plain `GROUP BY` is its one grouping set, which `GROUPING(..)` may still read
+    if !items.iter().any(|e| matches!(e, Expr::GroupingSets(_) | Expr::Rollup(_) | Expr::Cube(_)))
+        && (items.is_empty() || !reads_grouping(s))
+    {
+        return Ok(None);
+    }
+    if !modifiers.is_empty() {
+        return Err(unsupported("GROUP BY modifiers beside grouping sets"));
+    }
+    // the grouping sets: one alternative of every item, all combinations
+    let mut sets: Vec<Vec<Expr>> = vec![Vec::new()];
+    for item in items {
+        let alternatives: Vec<Vec<Expr>> = match item {
+            Expr::GroupingSets(gs) => gs.clone(),
+            Expr::Rollup(r) => (0..=r.len()).rev().map(|k| r[..k].concat()).collect(),
+            Expr::Cube(c) => {
+                if c.len() > 6 {
+                    return Err(unsupported("CUBE over more than six columns"));
+                }
+                (0..(1u32 << c.len()))
+                    .rev()
+                    .map(|mask| {
+                        (0..c.len()).filter(|i| mask & (1 << (c.len() - 1 - i)) != 0).flat_map(|i| c[i].clone()).collect()
+                    })
+                    .collect()
+            }
+            Expr::Tuple(t) => vec![t.clone()],
+            other => vec![vec![other.clone()]],
+        };
+        sets = sets
+            .iter()
+            .flat_map(|prefix| {
+                alternatives.iter().map(move |a| {
+                    let mut v = prefix.clone();
+                    v.extend(a.iter().cloned());
+                    v
+                })
+            })
+            .collect();
+    }
+    let key = |e: &Expr| e.to_string().to_lowercase();
+    let mut all: Vec<Expr> = Vec::new();
+    for set in &sets {
+        for e in set {
+            if !all.iter().any(|a| key(a) == key(e)) {
+                all.push(e.clone());
+            }
+        }
+    }
+    let mut branches: Vec<SetExpr> = Vec::new();
+    for set in &sets {
+        let in_set = |e: &Expr| set.iter().any(|g| key(g) == key(e));
+        let mut b = s.clone();
+        b.group_by = GroupByExpr::Expressions(set.clone(), Vec::new());
+        let rewrite = |e: &mut Expr| -> Result<()> {
+            // 1. aggregates aside: their arguments read the rows, not the grouping
+            let mut saved: Vec<Expr> = Vec::new();
+            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+                if is_agg_call(fns, x) {
+                    let n = saved.len();
+                    saved.push(std::mem::replace(x, Expr::Identifier(sqlparser::ast::Ident::new(format!("__sqleq_agg_{n}")))));
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            // 2. GROUPING(..) as its mask, before its arguments change
+            let mut bad = false;
+            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+                if let Expr::Function(f) = x {
+                    if obj_name(&f.name).eq_ignore_ascii_case("grouping") {
+                        let args: Vec<Expr> = match &f.args {
+                            FunctionArguments::List(l) => l
+                                .args
+                                .iter()
+                                .filter_map(|a| match a {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let n = args.len();
+                        let mut mask: u64 = 0;
+                        for (i, a) in args.iter().enumerate() {
+                            if !all.iter().any(|g| key(g) == key(a)) {
+                                bad = true;
+                            }
+                            if !in_set(a) {
+                                mask |= 1 << (n - 1 - i);
+                            }
+                        }
+                        *x = Expr::value(sqlparser::ast::Value::Number(mask.to_string(), false));
+                    }
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            if bad {
+                return Err(unsupported("GROUPING of an expression that is not a grouping column"));
+            }
+            // 3. the grouping columns this set leaves out are NULL
+            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+                if all.iter().any(|g| key(g) == key(x)) && !in_set(x) {
+                    *x = Expr::value(sqlparser::ast::Value::Null);
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            // 4. the aggregates back
+            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+                if let Expr::Identifier(id) = x {
+                    if let Some(n) = id.value.strip_prefix("__sqleq_agg_").and_then(|n| n.parse::<usize>().ok()) {
+                        *x = saved[n].clone();
+                    }
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            Ok(())
+        };
+        for item in b.projection.iter_mut() {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    // a column the set leaves out keeps its name: an enclosing query reads it by name
+                    let name = match e {
+                        Expr::Identifier(id) => Some(id.clone()),
+                        Expr::CompoundIdentifier(ids) => ids.last().cloned(),
+                        _ => None,
+                    };
+                    let before = e.clone();
+                    rewrite(e)?;
+                    if let (Some(alias), true) = (name, *e != before) {
+                        *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, .. } => rewrite(expr)?,
+                _ => return Err(unsupported("a wildcard beside grouping sets")),
+            }
+        }
+        if let Some(h) = b.having.as_mut() {
+            rewrite(h)?;
+        }
+        branches.push(SetExpr::Select(Box::new(b)));
+    }
+    let mut it = branches.into_iter();
+    let mut out = it.next().expect("one grouping set at least");
+    for b in it {
+        out = SetExpr::SetOperation {
+            left: Box::new(out),
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            right: Box::new(b),
+        };
+    }
+    Ok(Some(out))
+}
+
+/// Whether the projection or the `HAVING` of `s` calls `GROUPING(..)`.
+fn reads_grouping(s: &Select) -> bool {
+    let mut found = false;
+    let mut look = |e: &Expr| {
+        let _ = sqlparser::ast::visit_expressions(e, |x: &Expr| {
+            if let Expr::Function(f) = x {
+                if obj_name(&f.name).eq_ignore_ascii_case("grouping") {
+                    found = true;
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    };
+    for item in &s.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => look(e),
+            _ => {}
+        }
+    }
+    if let Some(h) = &s.having {
+        look(h);
+    }
+    found
 }
 
 fn group_by_empty(s: &Select) -> bool {
@@ -3800,6 +3990,37 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 operand.push(lower_expr(cat, scope, fns, i)?);
             }
             Ok(subscript_call(operand))
+        }
+        // `SUBSTRING(x FROM a FOR b)` and `TRIM(BOTH c FROM x)` have syntax of their own; they are
+        // the strict functions `SUBSTRING` and `TRIM_BOTH`/`TRIM_LEADING`/`TRIM_TRAILING` over
+        // their arguments, which the provers do not interpret.
+        Expr::Substring { expr, substring_from, substring_for, .. } => {
+            let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
+            operand.push(match substring_from {
+                Some(f) => lower_expr(cat, scope, fns, f)?,
+                // `SUBSTRING(x FOR n)` starts at the first character
+                None => json!({ "operator": "1", "operand": [], "type": "INTEGER" }),
+            });
+            if let Some(n) = substring_for {
+                operand.push(lower_expr(cat, scope, fns, n)?);
+            }
+            Ok(json!({ "operator": "SUBSTRING", "operand": operand, "type": "VARCHAR" }))
+        }
+        Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
+            if trim_characters.is_some() {
+                return Err(unsupported("TRIM with a list of characters"));
+            }
+            let side = match trim_where {
+                Some(sqlparser::ast::TrimWhereField::Leading) => "LEADING",
+                Some(sqlparser::ast::TrimWhereField::Trailing) => "TRAILING",
+                _ => "BOTH",
+            };
+            let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
+            operand.push(match trim_what {
+                Some(w) => lower_expr(cat, scope, fns, w)?,
+                None => string_literal(" "),
+            });
+            Ok(json!({ "operator": format!("TRIM_{side}"), "operand": operand, "type": "VARCHAR" }))
         }
         other => Err(unsupported(format!("expr: {other:?}"))),
     }

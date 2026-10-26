@@ -199,11 +199,13 @@ fn rows_of_different_shapes_are_incomparable_not_refuted() {
 }
 
 #[test]
-fn a_correlated_subquery_is_refused() {
+fn a_correlated_subquery_is_encoded() {
+    // the inner query reads the outer row's column 0 as column 2 of its scope: encoded, its filter
+    // reading the enclosing lambda's variable, and not refused
     let inner = filter(scan(0), pred("=", vec![col(2, "INTEGER"), col(0, "INTEGER")]));
     let exists = json!({ "operator": "EXISTS", "type": "BOOLEAN", "operand": [], "query": inner });
     for r in both(t(), filter(scan(0), exists), scan(0)) {
-        assert_eq!(r, Err(Failure::Refused(Refusal::Ir(TranslateError::Correlated))));
+        assert!(!matches!(r, Err(Failure::Refused(_))), "{r:?}");
     }
 }
 

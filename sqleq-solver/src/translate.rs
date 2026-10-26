@@ -416,6 +416,7 @@ impl<'s> Translator<'s> {
             Relation::Union(sides) => self.set_op(SetOpKind::Union, sides, base),
             Relation::Except(sides) => self.set_op(SetOpKind::Except, sides, base),
             Relation::Intersect(sides) => self.set_op(SetOpKind::Intersect, sides, base),
+            Relation::IntersectAll(_) | Relation::ExceptAll(_) => Err(TranslateError::UnsupportedBagSetOp),
         }
     }
 

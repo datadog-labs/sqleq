@@ -146,6 +146,18 @@ pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
         Some(crate::infer::Ty::Bool) => return "BOOLEAN".to_string(),
         _ => {}
     }
+    if SELECTS.contains(&name) {
+        // Postgres resolves these as it resolves a CASE: one common type for the arguments, a bare
+        // NULL taking the others' (NULLIF: its first argument's). Over builtin types that is a
+        // builtin type, and the value is one of the arguments, so it is that type here too.
+        let typed: Vec<String> = operand.iter().filter(|v| !crate::types::is_null_lit(v)).map(ty_of).collect();
+        let considered: Vec<String> = if name == "NULLIF" { typed.into_iter().take(1).collect() } else { typed };
+        if !considered.is_empty() && considered.iter().all(|t| crate::types::is_builtin(t)) {
+            if let Some(t) = considered.into_iter().reduce(|a, b| crate::types::common_type(&a, &b)) {
+                return t;
+            }
+        }
+    }
     if PASS_THROUGH.contains(&name) {
         let types: Vec<String> = operand.iter().map(ty_of).collect();
         let classes = || types.iter().filter_map(|t| coarse_class(t));

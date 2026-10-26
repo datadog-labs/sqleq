@@ -1362,9 +1362,12 @@ pub fn make_case(mut ops: Vec<Value>) -> Value {
         res.push(n - 1);
     }
     // A string literal branch takes the type of the others, as in a comparison ([`common_type_of`]),
-    // unless every other branch is a literal or a NULL, where Postgres makes the CASE text.
-    let voters: Vec<usize> = res.iter().copied().filter(|&i| !is_string_literal(&ops[i])).collect();
-    let voters = if voters.iter().all(|&i| is_null_lit(&ops[i])) { res.clone() } else { voters };
+    // unless every other branch is a literal or a NULL, where Postgres makes the CASE text. A bare
+    // NULL has no type of its own in Postgres either (the lowering spells it INTEGER): it takes the
+    // others', so `CASE WHEN c THEN FALSE ELSE NULL END` is a boolean.
+    let typed: Vec<usize> =
+        res.iter().copied().filter(|&i| !is_string_literal(&ops[i]) && !is_null_lit(&ops[i])).collect();
+    let voters = if typed.is_empty() { res.clone() } else { typed };
     let ct = voters
         .iter()
         .map(|&i| ty_of(&ops[i]))

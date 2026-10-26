@@ -40,11 +40,11 @@
 //! database under them, and may use a value Postgres has not got (a 40-digit integer, say). The
 //! harness therefore calls a `sat` answer a `model`, not a `counterexample`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use cvc5::{Kind, Solver, Sort, Term, TermManager};
-use sqleq_solver::ir::{AggCall, Expr, Input, JoinKind, Relation, Schema, TranslateError, Type};
+use sqleq_solver::ir::{AggCall, Expr, Input, JoinKind, Relation, Schema, SortKey, TranslateError, Type};
 
 /// Bag semantics, SQL's own, where a row's multiplicity is how often it occurs; or set semantics,
 /// an approximation under which `UNION ALL`, `EXCEPT ALL` and duplicates in general collapse, which
@@ -223,9 +223,13 @@ fn kind_name(ty: Type) -> &'static str {
 }
 
 /// A row in scope: the bound tuple variable, and the logical column its first field is.
+#[derive(Clone)]
 struct Row {
     var: Term,
     base: usize,
+    /// Per column of `var`, whether it is never NULL (see [`never_null`]); shorter or empty where
+    /// nothing is known.
+    nonnull: Vec<bool>,
 }
 
 /// A translated relation: its collection term. Everything else about it -- its arity, its column
@@ -250,11 +254,17 @@ struct Encoder {
     /// Declarations in order, as SMT-LIB text.
     declarations: Vec<String>,
     /// The bound variables, one per sort and role (see [`Encoder::var`]).
-    vars: Vec<(Sort, &'static str, Term)>,
+    vars: Vec<(Sort, &'static str, usize, Term)>,
     /// The two sides, once encoded, and the disequality asserted between them.
     sides: Option<(Term, Term)>,
     /// Whether no uninterpreted symbol has been declared: see [`Outcome::Different`].
     exact: bool,
+    /// The rows of the queries enclosing the subquery being translated, innermost last: a column
+    /// below the subquery's base is one of theirs (a correlated subquery).
+    outer: Vec<Row>,
+    /// How many subqueries enclose the one being translated: its variables are named apart from
+    /// the enclosing rows', which its lambdas would otherwise capture.
+    depth: usize,
 }
 
 const LOGIC: &str = "HO_ALL";
@@ -294,6 +304,8 @@ impl Encoder {
             vars: Vec::new(),
             sides: None,
             exact: true,
+            outer: Vec::new(),
+            depth: 0,
         })
     }
 
@@ -305,7 +317,9 @@ impl Encoder {
         self.tables = vec![None; input.schemas.len()];
         let q1 = self.rel(&input.queries[0], 0, &input.schemas)?;
         let q2 = self.rel(&input.queries[1], 0, &input.schemas)?;
-        let (q1, q2) = self.widen(q1.term, q2.term)?;
+        let (q1, q2) =
+            self.coerce_null_columns(q1.term, &input.queries[0], q2.term, &input.queries[1], &input.schemas)?;
+        let (q1, q2) = self.widen(q1, q2)?;
         let (s1, s2) = (q1.sort(), q2.sort());
         if s1 != s2 {
             let (w1, w2) = (self.width(&s1)?, self.width(&s2)?);
@@ -360,6 +374,60 @@ impl Encoder {
         out.push("(check-sat)".into());
         out.push("(get-model)".into());
         out.join("\n") + "\n"
+    }
+
+    /// The two sides over one row sort where one side's column is NULL in every row and the other's
+    /// is of another sort: that side's column is read as the other sort's NULL. Calcite writes an
+    /// empty relation of any type as `SELECT NULL AS a, .. WHERE 1 = 0`, whose NULLs the IR types as
+    /// integers, and a NULL of one type and a NULL of another are the same cell to a comparison of
+    /// rows. Columns differing any other way are left for [`Self::widen`] or the caller.
+    fn coerce_null_columns(
+        &mut self,
+        a: Term,
+        ra: &Relation,
+        b: Term,
+        rb: &Relation,
+        schemas: &[Schema],
+    ) -> R<(Term, Term)> {
+        let (sa, sb) = (self.column_sorts(&a)?, self.column_sorts(&b)?);
+        if sa.len() != sb.len() || sa == sb {
+            return Ok((a, b));
+        }
+        let mut fix_a: Vec<(usize, Sort)> = Vec::new();
+        let mut fix_b: Vec<(usize, Sort)> = Vec::new();
+        for (i, (x, y)) in sa.iter().zip(&sb).enumerate() {
+            if x == y {
+                continue;
+            }
+            if always_null(ra, i, schemas) {
+                fix_a.push((i, y.clone()));
+            } else if always_null(rb, i, schemas) {
+                fix_b.push((i, x.clone()));
+            }
+        }
+        let a = self.null_columns(a, &fix_a)?;
+        let b = self.null_columns(b, &fix_b)?;
+        Ok((a, b))
+    }
+
+    /// `table` with each of `columns` replaced by the NULL of the sort given for it.
+    fn null_columns(&mut self, table: Term, columns: &[(usize, Sort)]) -> R<Term> {
+        if columns.is_empty() {
+            return Ok(table);
+        }
+        let elem = self.elem_of(&table)?;
+        let n = elem.tuple_length()?;
+        let t = self.var(elem, "t")?;
+        let mut cells = Vec::with_capacity(n);
+        for i in 0..n {
+            match columns.iter().find(|(c, _)| *c == i) {
+                Some((_, sort)) => cells.push(self.null(sort.clone())?),
+                None => cells.push(self.select(t.clone(), i)?),
+            }
+        }
+        let body = self.tm.mk_tuple(&cells)?;
+        let f = self.lambda(&[t], body)?;
+        Ok(self.tm.mk_term(self.map_kind(), &[f, table])?)
     }
 
     /// The two sides over one row sort where they differ only in an integer column against a real
@@ -595,12 +663,25 @@ impl Encoder {
     /// compute the same thing are one term: the two sides of a pair share most of their plan, and
     /// cvc5 does not identify lambdas up to the names of their variables on its own.
     fn var(&mut self, sort: Sort, prefix: &'static str) -> R<Term> {
-        if let Some((_, _, v)) = self.vars.iter().find(|(s, p, _)| *s == sort && *p == prefix) {
+        let depth = self.depth;
+        if let Some((_, _, _, v)) = self.vars.iter().find(|(s, p, d, _)| *s == sort && *p == prefix && *d == depth) {
             return Ok(v.clone());
         }
-        let v = self.tm.mk_var(sort.clone(), prefix)?;
-        self.vars.push((sort, prefix, v.clone()));
+        // `t__0`: not a table's name (a table `t` and a row variable `t` would be one symbol to a
+        // reader of the printed problem, which binds by name), and apart per nesting level
+        let name = format!("{prefix}__{depth}");
+        let v = self.tm.mk_var(sort.clone(), &name)?;
+        self.vars.push((sort, prefix, depth, v.clone()));
         Ok(v)
+    }
+
+    /// Rewrite a table's constraint as soon as the table is read, before any lambda over its rows is:
+    /// the bags rewriter reads keys and NOT NULL columns off these assertions, and remembers what it
+    /// rewrote, so a lambda body simplified before them would keep a form that does not use them.
+    /// A problem file read by cvc5 rewrites its assertions in order, the constraints first.
+    fn learn(&mut self, constraint: &Term) -> R<()> {
+        self.solver.simplify(constraint.clone(), false)?;
+        Ok(())
     }
 
     /// `(lambda vars body)`, with the body rewritten first: the bags solver relates two maps or
@@ -671,6 +752,74 @@ impl Encoder {
         self.and(vec![s, v])
     }
 
+    /// A nullable boolean that is `some(false)`: what `NOT` turns into a pass.
+    fn falsity(&mut self, t: Term) -> R<Term> {
+        let s = self.is_some(t.clone())?;
+        let v = self.val(t)?;
+        let nv = self.not(v)?;
+        self.and(vec![s, nv])
+    }
+
+    /// The two-valued reading of a condition, with SQL's `AND`, `OR` and `NOT` read as the Boolean
+    /// connectives over the truth values of their operands: `a AND b` passes exactly when both do,
+    /// `a OR b` when one does, `NOT a` when `a` is false. This is the same predicate as the truth
+    /// of the three-valued `ite` encoding, but it leaves a conjunction visible as a conjunction,
+    /// which lets the solver's rewriter move one conjunct at a time, such as a `HAVING` condition
+    /// on a grouping column below the aggregate.
+    fn condition(&mut self, e: &Expr, row: &Row, schemas: &[Schema]) -> R<Term> {
+        match e {
+            Expr::Call { operator, operand, .. } if operator == "AND" => {
+                let ts = operand.iter().map(|a| self.condition(a, row, schemas)).collect::<R<Vec<_>>>()?;
+                self.and(ts)
+            }
+            Expr::Call { operator, operand, .. } if operator == "OR" => {
+                let ts = operand.iter().map(|a| self.condition(a, row, schemas)).collect::<R<Vec<_>>>()?;
+                self.or(ts)
+            }
+            Expr::Call { operator, operand, .. } if operator == "NOT" && operand.len() == 1 => {
+                self.negated_condition(&operand[0], row, schemas)
+            }
+            Expr::Call { operator, operand, .. } if operator == "=" && operand.len() == 2 => {
+                // `a = b` holds exactly when `a` is not NULL and equals `b`: the truth of the
+                // three-valued comparison, without the `ite` over NULLs, so a join on a column is an
+                // equation between the two columns the solver's rewriter can read.
+                let a = self.expr(&operand[0], row, schemas)?;
+                let b = self.expr(&operand[1], row, schemas)?;
+                let (a, b) = self.unify("=", a, b)?;
+                let some = self.is_some(a.clone())?;
+                let eq = self.tm.mk_term(Kind::Equal, &[a, b])?;
+                self.and(vec![some, eq])
+            }
+            _ => {
+                let t = self.expr(e, row, schemas)?;
+                self.truth(t)
+            }
+        }
+    }
+
+    /// The two-valued reading of `NOT e`: `e` is false, with De Morgan over `AND` and `OR`.
+    fn negated_condition(&mut self, e: &Expr, row: &Row, schemas: &[Schema]) -> R<Term> {
+        match e {
+            Expr::Call { operator, operand, .. } if operator == "AND" => {
+                let ts =
+                    operand.iter().map(|a| self.negated_condition(a, row, schemas)).collect::<R<Vec<_>>>()?;
+                self.or(ts)
+            }
+            Expr::Call { operator, operand, .. } if operator == "OR" => {
+                let ts =
+                    operand.iter().map(|a| self.negated_condition(a, row, schemas)).collect::<R<Vec<_>>>()?;
+                self.and(ts)
+            }
+            Expr::Call { operator, operand, .. } if operator == "NOT" && operand.len() == 1 => {
+                self.condition(&operand[0], row, schemas)
+            }
+            _ => {
+                let t = self.expr(e, row, schemas)?;
+                self.falsity(t)
+            }
+        }
+    }
+
     /// `op` over the values of nullable `args`, null when any of them is. Not cvc5's own
     /// `nullable.lift`: that wraps `op` in a lambda with fresh bound variables every time, so two
     /// occurrences of one expression are two functions to the bags solver, which relates maps and
@@ -734,15 +883,22 @@ impl Encoder {
             }
             Relation::Filter { source, condition } => {
                 let src = self.rel(source, base, schemas)?;
-                self.filter(condition, src.term, base, schemas)
+                let nonnull = never_null_columns(source, base, schemas);
+                self.filter(condition, src.term, base, nonnull, schemas)
             }
             Relation::Project { source, target } => self.projection(source, target, base, schemas),
             Relation::Join { left, right, kind, condition } => self.join(left, right, *kind, condition, base, schemas),
             Relation::Group { source, keys, function } => self.group(source, keys, function, base, schemas),
             // Bare ORDER BY changes no multiplicity; a row slice does, and has no encoding here.
-            Relation::Sort { source, offset, limit } => {
+            Relation::Sort { source, offset, limit, keys } => {
+                // `LIMIT 0` (or `FETCH NEXT 0 ROWS`) keeps no row, whatever the order
+                if matches!(limit, Some(Expr::Literal { value, .. }) if value.trim() == "0") {
+                    let src = self.rel(source, base, schemas)?;
+                    let sort = src.term.sort();
+                    return Ok(Rel { term: self.empty_table(sort)? });
+                }
                 if offset.is_some() || limit.is_some() {
-                    return Err(TranslateError::UnsupportedSort.into());
+                    return self.row_slice(source, offset.as_ref(), limit.as_ref(), keys, base, schemas);
                 }
                 self.rel(source, base, schemas)
             }
@@ -762,7 +918,97 @@ impl Encoder {
                 let rest = self.tm.mk_term(self.difference_remove_kind(), &[l, r])?;
                 Ok(Rel { term: self.distinct(rest)? })
             }
+            // `INTERSECT ALL` keeps the fewer copies of a row, `EXCEPT ALL` the copies the first
+            // branch has beyond the second's: multiplicities, which only bags have.
+            Relation::IntersectAll(sides) => {
+                if self.sem != Semantics::Bags {
+                    return Err(unsupported("INTERSECT ALL under set semantics"));
+                }
+                let (l, r) = self.sides(sides, base, schemas)?;
+                Ok(Rel { term: self.tm.mk_term(Kind::BagInterMin, &[l, r])? })
+            }
+            Relation::ExceptAll(sides) => {
+                if self.sem != Semantics::Bags {
+                    return Err(unsupported("EXCEPT ALL under set semantics"));
+                }
+                let (l, r) = self.sides(sides, base, schemas)?;
+                Ok(Rel { term: self.tm.mk_term(Kind::BagDifferenceSubtract, &[l, r])? })
+            }
         }
+    }
+
+    /// A row slice, `OFFSET o LIMIT l` under an `ORDER BY` whose keys contain a key of the rows: no
+    /// two rows tie, so every row has its place, the number of rows sorted before it, and the slice
+    /// keeps the rows placed in [o, o + l). Under ties the slice would depend on the order the rows
+    /// come in, and is refused; so is a slice of a computed size, and one under set semantics.
+    fn row_slice(
+        &mut self,
+        source: &Relation,
+        offset: Option<&Expr>,
+        limit: Option<&Expr>,
+        keys: &[SortKey],
+        base: usize,
+        schemas: &[Schema],
+    ) -> R<Rel> {
+        let constant = |e: Option<&Expr>| -> R<Option<i64>> {
+            match e {
+                None => Ok(None),
+                Some(Expr::Literal { value, .. }) => {
+                    value.trim().parse::<i64>().map(Some).map_err(|_| TranslateError::UnsupportedSort.into())
+                }
+                Some(_) => Err(TranslateError::UnsupportedSort.into()),
+            }
+        };
+        let off = constant(offset)?.unwrap_or(0);
+        let lim = constant(limit)?;
+        let sorted: BTreeSet<usize> = keys.iter().map(|k| k.column as usize).collect();
+        let unique = relation_keys(source, base, schemas).iter().any(|k| k.iter().all(|c| sorted.contains(c)));
+        if self.sem != Semantics::Bags || !unique {
+            return Err(TranslateError::UnsupportedSort.into());
+        }
+        let rows = self.rel(source, base, schemas)?.term;
+        let elem = self.elem_of(&rows)?;
+        let x = self.var(elem.clone(), "x")?;
+        let y = self.var(elem, "y")?;
+        // y sorts before x: lexicographically by the keys, each in its direction and nulls order
+        let mut before = self.tm.mk_false();
+        for key in keys.iter().rev() {
+            let c = key.column as usize;
+            let a = self.select(y.clone(), c)?;
+            let b = self.select(x.clone(), c)?;
+            let a_null = self.is_null(a.clone())?;
+            let b_null = self.is_null(b.clone())?;
+            let (va, vb) = (self.val(a.clone())?, self.val(b.clone())?);
+            let values = if key.descending { self.less(vb, va)? } else { self.less(va, vb)? };
+            let b_some = self.not(b_null.clone())?;
+            let null_first = if key.nulls_first { b_some } else { self.tm.mk_false() };
+            let some_first = if key.nulls_first { self.tm.mk_false() } else { self.tm.mk_true() };
+            let rest = self.ite(b_null, some_first, values)?;
+            let less = self.ite(a_null, null_first, rest)?;
+            let same = self.tm.mk_term(Kind::Equal, &[a, b])?;
+            let tie = self.and(vec![same, before])?;
+            before = self.or(vec![less, tie])?;
+        }
+        let p = self.lambda(&[y.clone()], before)?;
+        let earlier = self.tm.mk_term(self.filter_kind(), &[p, rows.clone()])?;
+        // the place: a fold counting the rows before x
+        let int = self.tm.integer_sort();
+        let z = self.var(self.elem_of(&rows)?, "z")?;
+        let a = self.var(int, "a")?;
+        let one = self.tm.mk_integer(1);
+        let step = self.tm.mk_term(Kind::Add, &[a.clone(), one])?;
+        let count = self.lambda(&[z, a], step)?;
+        let zero = self.tm.mk_integer(0);
+        let place = self.tm.mk_term(Kind::BagFold, &[count, zero, earlier])?;
+        let first = self.tm.mk_integer(off);
+        let mut kept = vec![self.tm.mk_term(Kind::Geq, &[place.clone(), first])?];
+        if let Some(l) = lim {
+            let end = self.tm.mk_integer(off + l);
+            kept.push(self.tm.mk_term(Kind::Lt, &[place, end])?);
+        }
+        let body = self.and(kept)?;
+        let q = self.lambda(&[x], body)?;
+        Ok(Rel { term: self.tm.mk_term(self.filter_kind(), &[q, rows])? })
     }
 
     /// The two branches of a set operation, which cvc5 needs over one tuple sort.
@@ -797,6 +1043,7 @@ impl Encoder {
         for (j, nullable) in s.nullable.iter().enumerate().take(s.types.len()) {
             if !nullable {
                 let no_null = self.no_null_in(t.clone(), j, &sorts[j])?;
+                self.learn(&no_null)?;
                 self.constraints.push((format!("{name}: column {j} is NOT NULL"), no_null));
             }
         }
@@ -812,6 +1059,7 @@ impl Encoder {
                 let projection = self.project(&idx, t.clone())?;
                 let set = self.distinct(projection.clone())?;
                 let distinct = self.tm.mk_term(Kind::Equal, &[set, projection])?;
+                self.learn(&distinct)?;
                 let cols: Vec<String> = key.iter().map(|c| c.to_string()).collect();
                 self.constraints.push((
                     format!("{name}: key ({}): no two rows agree on it, so its values form a set", cols.join(", ")),
@@ -825,28 +1073,34 @@ impl Encoder {
     /// `(= (bag.count (tuple null) ((_ table.project j) T)) 0)`, or under sets that the null tuple
     /// is not a member of the projection.
     fn no_null_in(&mut self, table: Term, j: usize, col_sort: &Sort) -> R<Term> {
-        let column = self.project(&[j as u32], table)?;
         let null = self.null(col_sort.clone())?;
-        let null_row = self.tm.mk_tuple(&[null])?;
         Ok(match self.sem {
             Semantics::Bags => {
-                let count = self.tm.mk_term(Kind::BagCount, &[null_row, column])?;
-                let zero = self.tm.mk_integer(0);
-                self.tm.mk_term(Kind::Equal, &[count, zero])?
+                // `(= (bag.filter (lambda t. (= t.j null)) T) empty)`: an emptiness the solver
+                // decides with one lemma per row it knows, where a count of a projection would
+                // bring the whole map machinery (preimage sums) to every table column
+                let elem = self.elem_of(&table)?;
+                let t = self.var(elem, "n")?;
+                let cell = self.select(t.clone(), j)?;
+                let is_null = self.tm.mk_term(Kind::Equal, &[cell, null])?;
+                let p = self.lambda(&[t], is_null)?;
+                let nulls = self.tm.mk_term(self.filter_kind(), &[p, table])?;
+                self.is_empty(nulls)?
             }
             Semantics::Sets => {
+                let column = self.project(&[j as u32], table)?;
+                let null_row = self.tm.mk_tuple(&[null])?;
                 let member = self.member(null_row, column)?;
                 self.not(member)?
             }
         })
     }
 
-    fn filter(&mut self, condition: &Expr, table: Term, base: usize, schemas: &[Schema]) -> R<Rel> {
+    fn filter(&mut self, condition: &Expr, table: Term, base: usize, nonnull: Vec<bool>, schemas: &[Schema]) -> R<Rel> {
         let elem = self.elem_of(&table)?;
         let t = self.var(elem, "t")?;
-        let row = Row { var: t.clone(), base };
-        let cond = self.expr(condition, &row, schemas)?;
-        let body = self.truth(cond)?;
+        let row = Row { var: t.clone(), base, nonnull };
+        let body = self.condition(condition, &row, schemas)?;
         let p = self.lambda(&[t], body)?;
         Ok(Rel { term: self.tm.mk_term(self.filter_kind(), &[p, table])? })
     }
@@ -858,16 +1112,14 @@ impl Encoder {
         let mut indices = Vec::with_capacity(target.len());
         for e in target {
             match e {
-                Expr::Column { index, .. } => {
+                Expr::Column { index, .. } if (*index as usize) >= base => {
                     let i = *index as usize;
-                    if i < base {
-                        return Err(TranslateError::Correlated.into());
-                    }
                     if i - base >= width {
                         return Err(TranslateError::ColumnOutOfRange.into());
                     }
                     indices.push((i - base) as u32);
                 }
+                // an expression, or a column of an enclosing row: a map over the rows
                 _ => {
                     indices.clear();
                     break;
@@ -879,7 +1131,7 @@ impl Encoder {
         }
         let elem = self.elem_of(&src.term)?;
         let t = self.var(elem, "t")?;
-        let row = Row { var: t.clone(), base };
+        let row = Row { var: t.clone(), base, nonnull: never_null_columns(source, base, schemas) };
         let cells: Vec<Term> = target.iter().map(|e| self.expr(e, &row, schemas)).collect::<R<_>>()?;
         let body = self.tm.mk_tuple(&cells)?;
         let f = self.lambda(&[t], body)?;
@@ -894,7 +1146,7 @@ impl Encoder {
         }
         // A literal row needs no row in scope; the dummy is never read.
         let dummy = self.var(row_sort, "v")?;
-        let row = Row { var: dummy, base };
+        let row = Row { var: dummy, base, nonnull: Vec::new() };
         let mut rows = Vec::with_capacity(content.len());
         for cells in content {
             if cells.len() != schema.len() {
@@ -927,23 +1179,25 @@ impl Encoder {
         let a = self.rel(left, base, schemas)?.term;
         let b = self.rel(right, base, schemas)?.term;
         let mut product = self.tm.mk_term(self.product_kind(), &[a.clone(), b.clone()])?;
+        let mut nonnull = never_null_columns(left, base, schemas);
+        nonnull.extend(never_null_columns(right, base, schemas));
         if !is_true(condition) {
-            product = self.filter(condition, product, base, schemas)?.term;
+            product = self.filter(condition, product, base, nonnull.clone(), schemas)?.term;
         }
         Ok(Rel {
             term: match kind {
                 JoinKind::Inner => product,
                 JoinKind::Left => {
-                    let padded = self.unmatched(&a, &product, Side::Left)?;
+                    let padded = self.unmatched(&a, &b, condition, Side::Left, base, &nonnull, schemas)?;
                     self.tm.mk_term(self.union_all_kind(), &[padded, product])?
                 }
                 JoinKind::Right => {
-                    let padded = self.unmatched(&b, &product, Side::Right)?;
+                    let padded = self.unmatched(&a, &b, condition, Side::Right, base, &nonnull, schemas)?;
                     self.tm.mk_term(self.union_all_kind(), &[padded, product])?
                 }
                 JoinKind::Full => {
-                    let l = self.unmatched(&a, &product, Side::Left)?;
-                    let r = self.unmatched(&b, &product, Side::Right)?;
+                    let l = self.unmatched(&a, &b, condition, Side::Left, base, &nonnull, schemas)?;
+                    let r = self.unmatched(&a, &b, condition, Side::Right, base, &nonnull, schemas)?;
                     let both = self.tm.mk_term(self.union_all_kind(), &[l, r])?;
                     self.tm.mk_term(self.union_all_kind(), &[both, product])?
                 }
@@ -951,40 +1205,81 @@ impl Encoder {
         })
     }
 
-    /// The rows of `side` that no product row projects back onto, each padded with nulls on the
-    /// other side (`Cvc5AbstractTranslator.mkLeft`/`mkRight`). The difference drops a row entirely
-    /// once it matches anything, so a row matching `k` rows contributes no padded row while an
-    /// unmatched one keeps every copy.
-    fn unmatched(&mut self, side_table: &Term, product: &Term, side: Side) -> R<Term> {
-        let side_sorts = self.column_sorts(side_table)?;
-        let product_sorts = self.column_sorts(product)?;
-        let (n, m) = (side_sorts.len(), product_sorts.len());
+    /// The rows of one side that no row of the other joins with, each padded with nulls on the
+    /// other side: `(bag.filter (lambda u. (= (bag.filter (lambda v. cond(u, v)) other) empty)) side)`,
+    /// mapped onto the padded row. A row matching `k` rows contributes no padded row while an
+    /// unmatched one keeps every copy, as with the difference `side - project(matched)`, but the
+    /// anti-join is a filter whose predicate the solver can compare with another side's predicate
+    /// pointwise, where a difference of two projections asks for the multiplicities of both.
+    #[allow(clippy::too_many_arguments)]
+    fn unmatched(
+        &mut self,
+        a: &Term,
+        b: &Term,
+        condition: &Expr,
+        side: Side,
+        base: usize,
+        nonnull: &[bool],
+        schemas: &[Schema],
+    ) -> R<Term> {
+        let (side_table, other) = match side {
+            Side::Left => (a, b),
+            Side::Right => (b, a),
+        };
+        let s_elem = self.elem_of(side_table)?;
+        let o_elem = self.elem_of(other)?;
+        let n = s_elem.tuple_length()?;
+        let m = o_elem.tuple_length()?;
+        let u = self.var(s_elem.clone(), "u")?;
+        let v = self.var(o_elem.clone(), "v")?;
+        // the product row, left columns then right columns, from the two candidates
+        let (left_var, left_n, right_var, right_n) = match side {
+            Side::Left => (u.clone(), n, v.clone(), m),
+            Side::Right => (v.clone(), m, u.clone(), n),
+        };
+        let mut cells = Vec::with_capacity(left_n + right_n);
+        for i in 0..left_n {
+            cells.push(self.select(left_var.clone(), i)?);
+        }
+        for i in 0..right_n {
+            cells.push(self.select(right_var.clone(), i)?);
+        }
+        let row = self.tm.mk_tuple(&cells)?;
+        let matches = if is_true(condition) {
+            other.clone()
+        } else {
+            let body = self.condition(condition, &Row { var: row, base, nonnull: nonnull.to_vec() }, schemas)?;
+            let p = self.lambda(&[v], body)?;
+            self.tm.mk_term(self.filter_kind(), &[p, other.clone()])?
+        };
+        let none = self.is_empty(matches)?;
+        let anti = self.lambda(&[u], none)?;
+        let unmatched = self.tm.mk_term(self.filter_kind(), &[anti, side_table.clone()])?;
+        // pad: the side's columns in place, nulls for the other side's
+        let a_sorts = self.column_sorts(a)?;
+        let b_sorts = self.column_sorts(b)?;
         let offset = match side {
             Side::Left => 0,
-            Side::Right => m - n,
+            Side::Right => a_sorts.len(),
         };
-        let indices: Vec<u32> = (offset..offset + n).map(|i| i as u32).collect();
-        let projection = self.project(&indices, product.clone())?;
-        let difference = self.tm.mk_term(self.difference_remove_kind(), &[side_table.clone(), projection])?;
-        let elem = self.elem_of(side_table)?;
-        let t = self.var(elem, "t")?;
-        let mut cells = Vec::with_capacity(m);
-        for (i, sort) in product_sorts.iter().enumerate() {
+        let t = self.var(s_elem, "t")?;
+        let mut padded = Vec::with_capacity(a_sorts.len() + b_sorts.len());
+        for (i, sort) in a_sorts.iter().chain(b_sorts.iter()).enumerate() {
             if i >= offset && i < offset + n {
-                cells.push(self.select(t.clone(), i - offset)?);
+                padded.push(self.select(t.clone(), i - offset)?);
             } else {
-                cells.push(self.null(sort.clone())?);
+                padded.push(self.null(sort.clone())?);
             }
         }
-        let body = self.tm.mk_tuple(&cells)?;
+        let body = self.tm.mk_tuple(&padded)?;
         let f = self.lambda(&[t], body)?;
-        Ok(self.tm.mk_term(self.map_kind(), &[f, difference])?)
+        Ok(self.tm.mk_term(self.map_kind(), &[f, unmatched])?)
     }
 
     // ── Aggregation (Cvc5AbstractTranslator.translate(LogicalAggregate)) ────────────────────────
 
     fn group(&mut self, source: &Relation, keys: &[Expr], calls: &[AggCall], base: usize, schemas: &[Schema]) -> R<Rel> {
-        let mut child = self.rel(source, base, schemas)?.term;
+        let child = self.rel(source, base, schemas)?.term;
         let width = self.width(&child.sort())?;
         let column = |e: &Expr, err: TranslateError| -> R<u32> {
             match e {
@@ -1001,45 +1296,199 @@ impl Encoder {
                 _ => Err(err.into()),
             }
         };
-        let mut indices: Vec<u32> = keys.iter().map(|k| column(k, TranslateError::GroupKeyNonRef)).collect::<R<_>>()?;
+        let indices: Vec<u32> = keys.iter().map(|k| column(k, TranslateError::GroupKeyNonRef)).collect::<R<_>>()?;
         if calls.is_empty() {
             // SELECT DISTINCT, or GROUP BY with no aggregate: duplicate removal of a projection.
             let projection = self.project(&indices, child)?;
             return Ok(Rel { term: self.distinct(projection)? });
         }
-        // The argument column of each call, or none for COUNT(*).
+        // The argument column of each call, or none for COUNT(*). A COUNT of a column that is never
+        // NULL counts every row, so it is COUNT(*), one fold for both.
         let mut args: Vec<Option<u32>> = Vec::with_capacity(calls.len());
+        // the other columns of a COUNT of several, which counts the rows where none is NULL
+        let mut extra: Vec<Vec<u32>> = Vec::with_capacity(calls.len());
         for call in calls {
-            if call.operand.len() > 1 {
+            if call.operand.len() > 1 && call.operator != "COUNT" {
                 return Err(unsupported(format!("multi-argument aggregate {}", call.operator)));
             }
-            args.push(match call.operand.first() {
-                None => None,
-                Some(e) => Some(column(e, TranslateError::AggArgNonRef)?),
-            });
+            let cols: Vec<u32> =
+                call.operand.iter().map(|e| column(e, TranslateError::AggArgNonRef)).collect::<R<_>>()?;
+            let never = cols.iter().all(|c| never_null(source, *c as usize, base, schemas));
+            if cols.is_empty() || (call.operator == "COUNT" && !call.distinct && never) {
+                args.push(None);
+                extra.push(Vec::new());
+            } else {
+                args.push(Some(cols[0]));
+                extra.push(cols[1..].to_vec());
+            }
         }
         if calls.iter().any(|c| c.distinct) {
-            // table.aggr folds over every copy, so a DISTINCT aggregate needs its duplicates
-            // removed first: project onto (keys, argument) and deduplicate. That serves one call;
-            // a second would need its own, differently deduplicated, input.
-            if calls.len() != 1 || args[0].is_none() {
+            if args.iter().zip(calls).any(|(a, c)| c.distinct && a.is_none()) {
                 return Err(TranslateError::DistinctAggregateUnsupported.into());
             }
+            if calls.len() > 1 {
+                return self.mixed_distinct(child, &indices, calls, &args, &extra, source, base, schemas);
+            }
+            // one DISTINCT call: fold over the projection onto (keys, arguments) with duplicates
+            // removed, grouped by the keys, which is the plan Calcite writes for it
+            let argument = args[0].expect("checked");
             let mut keep = indices.clone();
-            keep.push(args[0].expect("checked"));
+            keep.push(argument);
+            keep.extend(extra[0].iter().copied());
             let projection = self.project(&keep, child)?;
-            child = self.distinct(projection)?;
-            indices = (0..keys.len() as u32).collect();
-            args[0] = Some(keys.len() as u32);
+            let dedup = self.distinct(projection)?;
+            let nk = indices.len() as u32;
+            let mut call = calls[0].clone();
+            call.distinct = false;
+            let operands: Vec<u32> = std::iter::once(argument).chain(extra[0].iter().copied()).collect();
+            let never = operands.iter().all(|c| never_null(source, *c as usize, base, schemas));
+            let (arg, ex) = if call.operator == "COUNT" && never {
+                (None, Vec::new())
+            } else {
+                (Some(nk), (nk + 1..nk + operands.len() as u32).collect())
+            };
+            return Ok(Rel {
+                term: self.aggregate_over(dedup, (0..nk).collect(), std::slice::from_ref(&call), vec![arg], &[ex])?,
+            });
         }
+        Ok(Rel { term: self.aggregate_over(child, indices, calls, args, &extra)? })
+    }
+
+    /// A `GROUP BY` with `DISTINCT` calls: `table.aggr` folds over every copy of a row, so each
+    /// `DISTINCT` call folds over its own input, the projection onto the keys and its argument with
+    /// duplicates removed; the plain calls fold over the rows; the groups of all of them are the
+    /// same key values, joined on the keys (equal as values, NULL included, as grouping compares
+    /// them). With no key each part is one row and the join is their product.
+    #[allow(clippy::too_many_arguments)]
+    fn mixed_distinct(
+        &mut self,
+        child: Term,
+        indices: &[u32],
+        calls: &[AggCall],
+        args: &[Option<u32>],
+        extra: &[Vec<u32>],
+        source: &Relation,
+        base: usize,
+        schemas: &[Schema],
+    ) -> R<Rel> {
+        let nk = indices.len();
+        let plain: Vec<usize> = (0..calls.len()).filter(|&j| !calls[j].distinct).collect();
+        // the first part: the plain calls over the rows, or the distinct keys when there are none
+        let first = if plain.is_empty() {
+            let projection = self.project(indices, child.clone())?;
+            self.distinct(projection)?
+        } else {
+            let pc: Vec<AggCall> = plain.iter().map(|&j| calls[j].clone()).collect();
+            let pa: Vec<Option<u32>> = plain.iter().map(|&j| args[j]).collect();
+            let pe: Vec<Vec<u32>> = plain.iter().map(|&j| extra[j].clone()).collect();
+            self.aggregate_over(child.clone(), indices.to_vec(), &pc, pa, &pe)?
+        };
+        // Without GROUP BY the query has its one row even over no rows, and the distinct keys of
+        // no columns are no row then: the parts below, folds without keys, are one row each.
+        let mut parts = if plain.is_empty() && nk == 0 { Vec::new() } else { vec![first] };
+        // where each call's value is: (part, column)
+        let mut place: Vec<(usize, usize)> = vec![(0, 0); calls.len()];
+        for (n, &j) in plain.iter().enumerate() {
+            place[j] = (0, nk + n);
+        }
+        for j in 0..calls.len() {
+            if !calls[j].distinct {
+                continue;
+            }
+            let argument = args[j].expect("checked");
+            let mut keep = indices.to_vec();
+            keep.push(argument);
+            keep.extend(extra[j].iter().copied());
+            let projection = self.project(&keep, child.clone())?;
+            let dedup = self.distinct(projection)?;
+            let mut call = calls[j].clone();
+            call.distinct = false;
+            // over the deduplicated rows a COUNT of columns that are never NULL counts them all
+            let operands: Vec<u32> = std::iter::once(argument).chain(extra[j].iter().copied()).collect();
+            let never = operands.iter().all(|c| never_null(source, *c as usize, base, schemas));
+            let (arg, ex) = if call.operator == "COUNT" && never {
+                (None, Vec::new())
+            } else {
+                (Some(nk as u32), (nk as u32 + 1..(nk + operands.len()) as u32).collect())
+            };
+            let part =
+                self.aggregate_over(dedup, (0..nk as u32).collect(), std::slice::from_ref(&call), vec![arg], &[ex])?;
+            place[j] = (parts.len(), nk);
+            parts.push(part);
+        }
+        // the product of the parts, right-nested, and where each part's columns start in its rows
+        let mut widths = Vec::with_capacity(parts.len());
+        for p in &parts {
+            widths.push(self.width(&p.sort())?);
+        }
+        let mut product = parts.last().expect("one part").clone();
+        for p in parts.iter().rev().skip(1) {
+            product = self.tm.mk_term(self.product_kind(), &[p.clone(), product])?;
+        }
+        let mut offsets = Vec::with_capacity(parts.len());
+        let mut at = 0;
+        for w in &widths {
+            offsets.push(at);
+            at += w;
+        }
+        let elem = self.elem_of(&product)?;
+        let t = self.var(elem, "t")?;
+        let mut equal = Vec::new();
+        for p in 1..parts.len() {
+            for k in 0..nk {
+                let a = self.select(t.clone(), k)?;
+                let b = self.select(t.clone(), offsets[p] + k)?;
+                equal.push(self.tm.mk_term(Kind::Equal, &[a, b])?);
+            }
+        }
+        let joined = if equal.is_empty() {
+            product
+        } else {
+            let body = self.and(equal)?;
+            let p = self.lambda(&[t.clone()], body)?;
+            self.tm.mk_term(self.filter_kind(), &[p, product])?
+        };
+        let mut cells = Vec::with_capacity(nk + calls.len());
+        for k in 0..nk {
+            cells.push(self.select(t.clone(), k)?);
+        }
+        for &(p, c) in &place {
+            cells.push(self.select(t.clone(), offsets[p] + c)?);
+        }
+        let body = self.tm.mk_tuple(&cells)?;
+        let f = self.lambda(&[t], body)?;
+        Ok(Rel { term: self.tm.mk_term(self.map_kind(), &[f, joined])? })
+    }
+
+    /// `GROUP BY` over `child` by the columns `indices`, the calls folding over every row, each
+    /// reading column `args[j]` (none for `COUNT(*)`).
+    fn aggregate_over(
+        &mut self,
+        child: Term,
+        indices: Vec<u32>,
+        calls: &[AggCall],
+        args: Vec<Option<u32>>,
+        extra: &[Vec<u32>],
+    ) -> R<Term> {
         let x_sort = self.elem_of(&child)?;
         let x_sorts = x_sort.tuple_element_sorts()?;
         // The accumulator: one slot per key, then the slots of each call (AVG keeps a sum and a
         // count, and is finished off by a map below).
         let mut slot_sorts: Vec<Sort> = indices.iter().map(|i| x_sorts[*i as usize].clone()).collect();
         let mut slots: Vec<Vec<Sort>> = Vec::with_capacity(calls.len());
-        for call in calls {
-            let out = self.col_sort(call.ty)?;
+        // A SUM of integers the IR types as REAL (see the frontend's `numeric` guard) adds them as
+        // integers, read as a real once at the end: the same value, which stays visibly an integer.
+        let int = self.col_sort(Type::Integer)?;
+        let mut int_sums = vec![false; calls.len()];
+        for (j, call) in calls.iter().enumerate() {
+            if call.operator == "SUM" && call.ty == Type::Real {
+                if let Some(i) = args[j] {
+                    int_sums[j] = x_sorts[i as usize] == int;
+                }
+            }
+        }
+        for (j, call) in calls.iter().enumerate() {
+            let out = if int_sums[j] { int.clone() } else { self.col_sort(call.ty)? };
             let s = match call.operator.as_str() {
                 "AVG" => {
                     let int = self.col_sort(Type::Integer)?;
@@ -1049,6 +1498,15 @@ impl Encoder {
             };
             slot_sorts.extend(s.iter().cloned());
             slots.push(s);
+        }
+        // GROUP BY over an empty table has no groups, so SQL answers with no rows, while
+        // table.aggr gives the empty table one empty part folded to a row of initial values. A
+        // hidden counter tells that row apart: it is the one with count 0, filtered out below and
+        // projected away again. (An ite over the whole table would hide the aggregate from the
+        // solver behind a fresh constant.)
+        let counted = !indices.is_empty();
+        if counted {
+            slot_sorts.push(self.tm.integer_sort());
         }
         let y_sort = self.tm.mk_tuple_sort(&slot_sorts)?;
         let x = self.var(x_sort.clone(), "x")?;
@@ -1072,30 +1530,60 @@ impl Encoder {
                 }
             };
             let accs: Vec<Term> = (0..slots[j].len()).map(|s| self.select(y.clone(), at + s)).collect::<R<_>>()?;
+            if let (Some(first), Some(more)) = (arg.clone(), extra.get(j).filter(|e| !e.is_empty())) {
+                // COUNT of several columns: the rows where none of them is NULL
+                let mut nulls = vec![self.is_null(first)?];
+                for c in more {
+                    let a = self.select(x.clone(), *c as usize)?;
+                    nulls.push(self.is_null(a)?);
+                }
+                let any = self.or(nulls)?;
+                let acc = accs[0].clone();
+                let v = self.val(acc.clone())?;
+                let one = self.tm.mk_integer(1);
+                let next = self.tm.mk_term(Kind::Add, &[v, one])?;
+                let next = self.some(next)?;
+                elements.push(self.ite(any, acc, next)?);
+                let zero = self.tm.mk_integer(0);
+                initial.push(self.some(zero)?);
+                at += slots[j].len();
+                continue;
+            }
             let (e, i) = self.aggregate_step(call, arg, &accs, &slots[j])?;
             elements.extend(e);
             initial.extend(i);
             at += slots[j].len();
+        }
+        if counted {
+            let last = slot_sorts.len() - 1;
+            let acc = self.select(y.clone(), last)?;
+            let one = self.tm.mk_integer(1);
+            elements.push(self.tm.mk_term(Kind::Add, &[acc, one])?);
+            initial.push(self.tm.mk_integer(0));
         }
         let body = self.tm.mk_tuple(&elements)?;
         let init = self.tm.mk_tuple(&initial)?;
         let f = self.lambda(&[x, y], body)?;
         let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
         let mut aggregated = self.tm.mk_term_from_op(op, &[f, init, child.clone()])?;
-        if slots.iter().any(|s| s.len() > 1) {
-            aggregated = self.finish_aggregates(aggregated, indices.len(), calls, &slots)?;
+        if counted {
+            // keep the groups a row reached, then drop the counter
+            let last = slot_sorts.len() - 1;
+            let r = self.var(y_sort.clone(), "r")?;
+            let cnt = self.select(r.clone(), last)?;
+            let one = self.tm.mk_integer(1);
+            let reached = self.tm.mk_term(Kind::Geq, &[cnt, one])?;
+            let p = self.lambda(&[r], reached)?;
+            aggregated = self.tm.mk_term(self.filter_kind(), &[p, aggregated])?;
+            let keep: Vec<u32> = (0..last as u32).collect();
+            aggregated = self.project(&keep, aggregated)?;
         }
-        if indices.is_empty() {
-            // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*) FROM
-            // empty is 0 -- which is what the fold of a single empty group gives.
-            return Ok(Rel { term: aggregated });
+        if slots.iter().any(|s| s.len() > 1) || int_sums.iter().any(|b| *b) {
+            aggregated = self.finish_aggregates(aggregated, indices.len(), calls, &slots, &int_sums)?;
         }
-        // GROUP BY over an empty table has no groups, so SQL answers with no rows. table.aggr gives
-        // the empty table one empty part and folds it to a row of initial values; guard that one
-        // case, the only one in which a part can be missing.
-        let empty = self.is_empty(child)?;
-        let none = self.empty_table(aggregated.sort())?;
-        Ok(Rel { term: self.ite(empty, none, aggregated)? })
+        // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*) FROM
+        // empty is 0 -- which is what the fold of a single empty group gives.
+        Ok(aggregated)
     }
 
     /// One call's step of the fold and its seed: how the slots change on a row whose argument is
@@ -1126,6 +1614,14 @@ impl Encoder {
                 let step = self.fold_step(&call.operator, a, acc)?;
                 let seed = self.null(sorts[0].clone())?;
                 Ok((vec![step], vec![seed]))
+            }
+            "SINGLE_VALUE" => {
+                // Calcite's: the value of the group's only row, an error on two or more. A run
+                // that answers reads one row, which a fold keeping the last value read returns;
+                // NULL over no rows, as a scalar subquery over none is.
+                let a = arg.ok_or_else(|| unsupported("SINGLE_VALUE without an argument"))?;
+                let seed = self.null(sorts[0].clone())?;
+                Ok((vec![a], vec![seed]))
             }
             "AVG" => {
                 let a = arg.ok_or_else(|| unsupported("AVG without an argument"))?;
@@ -1188,7 +1684,14 @@ impl Encoder {
 
     /// The row of a `GROUP BY` from its accumulator, where a call kept more than one slot: `AVG`
     /// becomes `avg(sum, count)`, null when the count is zero.
-    fn finish_aggregates(&mut self, aggregated: Term, nkeys: usize, calls: &[AggCall], slots: &[Vec<Sort>]) -> R<Term> {
+    fn finish_aggregates(
+        &mut self,
+        aggregated: Term,
+        nkeys: usize,
+        calls: &[AggCall],
+        slots: &[Vec<Sort>],
+        int_sums: &[bool],
+    ) -> R<Term> {
         let y_sort = self.elem_of(&aggregated)?;
         let y = self.var(y_sort, "y")?;
         let mut cells = Vec::with_capacity(nkeys + calls.len());
@@ -1196,9 +1699,11 @@ impl Encoder {
             cells.push(self.select(y.clone(), k)?);
         }
         let mut at = nkeys;
-        for call_slots in slots.iter().take(calls.len()) {
+        for (j, call_slots) in slots.iter().take(calls.len()).enumerate() {
             let first = self.select(y.clone(), at)?;
-            if call_slots.len() == 1 {
+            if int_sums[j] {
+                cells.push(self.lift(Kind::ToReal, &[first])?);
+            } else if call_slots.len() == 1 {
                 cells.push(first);
             } else {
                 let count = self.select(y.clone(), at + 1)?;
@@ -1230,6 +1735,14 @@ impl Encoder {
             Expr::Column { index, .. } => {
                 let i = *index as usize;
                 if i < row.base {
+                    // a column of an enclosing query: a correlated subquery
+                    for r in self.outer.iter().rev() {
+                        let w = r.var.sort().tuple_length()?;
+                        if i >= r.base && i - r.base < w {
+                            let (var, at) = (r.var.clone(), i - r.base);
+                            return self.select(var, at);
+                        }
+                    }
                     return Err(TranslateError::Correlated.into());
                 }
                 let width = row.var.sort().tuple_length()?;
@@ -1241,10 +1754,35 @@ impl Encoder {
             Expr::Literal { value, ty } => self.literal(value, *ty)?,
             Expr::Cast { ty, operand } => {
                 let v = self.expr(operand, row, schemas)?;
+                if operand.ty() == *ty && matches!(ty, Type::Integer | Type::Boolean | Type::Varchar) {
+                    // A cast to the type the value already has changes no value: an integer read as
+                    // an integer (an overflow raises, and a run that answers has none), a boolean as
+                    // a boolean, text as unbounded text. Calcite writes these around nullable
+                    // columns. A length-limited VARCHAR is `q_cast_varchar_N`, never this node.
+                    return self.as_type(v, e.ty());
+                }
                 let name = format!("cast:{}->{}", kind_name(operand.ty()), kind_name(*ty));
                 let out = self.base_sort(*ty);
-                let f = self.fun(&name, &[v.sort().nullable_element_sort()?], out)?;
-                self.strict(&[v], |enc, vals| enc.apply(f, &vals))?
+                let base = v.sort().nullable_element_sort()?;
+                if base.is_integer() && out.is_real() {
+                    // an integer read as a `numeric`: the same value
+                    let r = self.lift(Kind::ToReal, &[v])?;
+                    return self.as_type(r, e.ty());
+                }
+                let f = self.fun(&name, &[base.clone()], out.clone())?;
+                if base.is_real() && out.is_integer() {
+                    // `numeric` to an integer rounds, which only a value with a fraction shows: an
+                    // integral value is itself, the rest is the uninterpreted cast
+                    self.strict(&[v], |enc, vals| {
+                        let x = vals[0].clone();
+                        let integral = enc.tm.mk_term(Kind::IsInteger, &[x.clone()])?;
+                        let exact = enc.tm.mk_term(Kind::ToInteger, &[x.clone()])?;
+                        let other = enc.apply(f, &vals)?;
+                        enc.ite(integral, exact, other)
+                    })?
+                } else {
+                    self.strict(&[v], |enc, vals| enc.apply(f, &vals))?
+                }
             }
             Expr::Call { operator, ty, operand } => self.call(operator, *ty, operand, row, schemas)?,
             Expr::Subquery { operator, ty: _, operand, query } => self.subquery(operator, operand, query, row, schemas)?,
@@ -1516,6 +2054,25 @@ impl Encoder {
             // VARBINARY is a function it does not know, and so stays uninterpreted here, named
             // alike on both sides.
             ("||", 2) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringConcat, &args),
+            ("SUBSTRING", 2 | 3) if ty == Type::Varchar && self.all_strings(&args[..1])? && self.all_integers(&args[1..])? => {
+                // Postgres counts from 1 and clips: characters a .. a + n - 1 that exist, none for a
+                // negative end. cvc5's str.substr counts from 0 and clips the length to the end, so
+                // the start is max(a, 1) - 1 and the length (a + n) - max(a, 1); without FOR, the
+                // rest of the string.
+                self.strict(&args, |enc, v| {
+                    let one = enc.tm.mk_integer(1);
+                    let below = enc.tm.mk_term(Kind::Lt, &[v[1].clone(), one.clone()])?;
+                    let first = enc.tm.mk_term(Kind::Ite, &[below, one.clone(), v[1].clone()])?;
+                    let start = enc.tm.mk_term(Kind::Sub, &[first.clone(), one])?;
+                    let length = if v.len() == 3 {
+                        let end = enc.tm.mk_term(Kind::Add, &[v[1].clone(), v[2].clone()])?;
+                        enc.tm.mk_term(Kind::Sub, &[end, first])?
+                    } else {
+                        enc.tm.mk_term(Kind::StringLength, &[v[0].clone()])?
+                    };
+                    Ok(enc.tm.mk_term(Kind::StringSubstr, &[v[0].clone(), start, length])?)
+                })
+            }
             ("UPPER", 1) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringToUpper, &args),
             ("LOWER", 1) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringToLower, &args),
             ("ABS", 1) if matches!(ty, Type::Integer | Type::Real) && self.numeric(&args[0])? => self.lift(Kind::Abs, &args),
@@ -1534,6 +2091,15 @@ impl Encoder {
     fn all_strings(&self, args: &[Term]) -> R<bool> {
         for a in args {
             if !a.sort().nullable_element_sort()?.is_string() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn all_integers(&self, args: &[Term]) -> R<bool> {
+        for a in args {
+            if !a.sort().nullable_element_sort()?.is_integer() {
                 return Ok(false);
             }
         }
@@ -1696,14 +2262,19 @@ impl Encoder {
 
     fn subquery(&mut self, op: &str, operand: &[Expr], query: &Relation, row: &Row, schemas: &[Schema]) -> R<Term> {
         let inner_base = row.base + row.var.sort().tuple_length()?;
-        let inner = self.rel(query, inner_base, schemas)?.term;
+        self.outer.push(row.clone());
+        self.depth += 1;
+        let inner = self.rel(query, inner_base, schemas);
+        self.depth -= 1;
+        self.outer.pop();
+        let inner = inner?.term;
         match op {
             "EXISTS" => {
                 let empty = self.is_empty(inner)?;
                 let some_row = self.not(empty)?;
                 self.some(some_row)
             }
-            "IN" => self.in_subquery(operand, inner, row, schemas),
+            "IN" => self.in_subquery(operand, inner, query, inner_base, row, schemas),
             "$SCALAR_QUERY" => {
                 let sorts = self.column_sorts(&inner)?;
                 if sorts.len() != 1 {
@@ -1715,6 +2286,19 @@ impl Encoder {
                 let one = self.tm.mk_integer(1);
                 let at_most_one = self.tm.mk_term(Kind::Leq, &[card, one])?;
                 self.constraints.push(("a scalar subquery returns at most one row".into(), at_most_one));
+                if self.sem == Semantics::Bags {
+                    // The column of the row, or NULL where there is none: a fold that keeps the
+                    // value of the row it reads, seeded with NULL. `SINGLE_VALUE`, which Calcite
+                    // decorrelates a scalar subquery into, folds its group the same way, so the
+                    // two are one term once the solver rewrites the fold over the projection.
+                    let elem = self.elem_of(&inner)?;
+                    let x = self.var(elem, "x")?;
+                    let acc = self.var(sorts[0].clone(), "acc")?;
+                    let body = self.select(x.clone(), 0)?;
+                    let f = self.lambda(&[x, acc], body)?;
+                    let null = self.null(sorts[0].clone())?;
+                    return Ok(self.tm.mk_term(Kind::BagFold, &[f, null, inner])?);
+                }
                 let empty = self.is_empty(inner.clone())?;
                 let chosen = self.choose(inner)?;
                 let value = self.select(chosen, 0)?;
@@ -1732,26 +2316,117 @@ impl Encoder {
     /// One column only. For `(l1, l2) IN (...)` the rows that might match are those equal to the
     /// operand wherever both are non-null, a filter whose predicate reads the enclosing row: a bag
     /// term under a binder, which the bags solver does not decide. Such a pair is refused.
-    fn in_subquery(&mut self, operand: &[Expr], inner: Term, row: &Row, schemas: &[Schema]) -> R<Term> {
+    fn in_subquery(
+        &mut self,
+        operand: &[Expr],
+        inner: Term,
+        query: &Relation,
+        inner_base: usize,
+        row: &Row,
+        schemas: &[Schema],
+    ) -> R<Term> {
         let sorts = self.column_sorts(&inner)?;
         if sorts.len() != operand.len() {
             return Err(TranslateError::MalformedShape("IN operand arity does not match subquery width".into()).into());
         }
         if operand.len() != 1 {
-            return Err(unsupported("IN over more than one column"));
+            return self.in_subquery_tuple(operand, inner, query, inner_base, row, schemas);
         }
         let l = self.expr(&operand[0], row, schemas)?;
         let l = self.as_sort(l, &sorts[0])?;
         let tuple = self.tm.mk_tuple(std::slice::from_ref(&l))?;
-        let matches = self.member(tuple, inner.clone())?;
+        let operand_never_null = match &operand[0] {
+            Expr::Column { index, .. } => {
+                (*index as usize).checked_sub(row.base).and_then(|i| row.nonnull.get(i).copied()).unwrap_or(false)
+            }
+            Expr::Literal { value, .. } => value != "NULL",
+            _ => false,
+        };
+        if operand_never_null && never_null(query, 0, inner_base, schemas) {
+            // Neither the operand nor a row of the subquery is NULL: IN is TRUE or FALSE.
+            let member = self.member(tuple, inner)?;
+            return self.some(member);
+        }
+        // A NULL operand equals no row, not even a NULL one: `NULL IN (SELECT NULL)` is UNKNOWN.
+        let member = self.member(tuple, inner.clone())?;
+        let l_null = self.is_null(l)?;
+        let l_some = self.not(l_null.clone())?;
+        let matches = self.and(vec![l_some, member])?;
         let null = self.null(sorts[0].clone())?;
         let null_row = self.tm.mk_tuple(&[null])?;
         let inner_has_null = self.member(null_row, inner.clone())?;
-        let l_null = self.is_null(l)?;
         let empty = self.is_empty(inner)?;
         let some_row = self.not(empty)?;
         let l_null_and_rows = self.and(vec![l_null, some_row])?;
         let possible = self.or(vec![l_null_and_rows, inner_has_null])?;
+        let t = self.tm.mk_true();
+        let some_true = self.some(t)?;
+        let unknown = self.null(some_true.sort())?;
+        let f = self.tm.mk_false();
+        let some_false = self.some(f)?;
+        let rest = self.ite(possible, unknown, some_false)?;
+        self.ite(matches, some_true, rest)
+    }
+
+    /// `(l1, .., ln) IN (subquery)`: TRUE iff some row equals the operand column by column with no
+    /// NULL; UNKNOWN iff not, but some row might -- every column equal or one of the pair NULL;
+    /// FALSE otherwise. The rows that might are a filter whose predicate reads the operand, which
+    /// the solver now decorrelates. Where neither side can be NULL it is plain membership.
+    fn in_subquery_tuple(
+        &mut self,
+        operand: &[Expr],
+        inner: Term,
+        query: &Relation,
+        inner_base: usize,
+        row: &Row,
+        schemas: &[Schema],
+    ) -> R<Term> {
+        let sorts = self.column_sorts(&inner)?;
+        let mut ls = Vec::with_capacity(operand.len());
+        for (e, sort) in operand.iter().zip(&sorts) {
+            let l = self.expr(e, row, schemas)?;
+            ls.push(self.as_sort(l, sort)?);
+        }
+        let tuple = self.tm.mk_tuple(&ls)?;
+        let member = self.member(tuple, inner.clone())?;
+        let never = operand.iter().enumerate().all(|(c, e)| {
+            let op_never = match e {
+                Expr::Column { index, .. } => {
+                    (*index as usize).checked_sub(row.base).and_then(|i| row.nonnull.get(i).copied()).unwrap_or(false)
+                }
+                Expr::Literal { value, .. } => value != "NULL",
+                _ => false,
+            };
+            op_never && never_null(query, c, inner_base, schemas)
+        });
+        if never {
+            return self.some(member);
+        }
+        let mut somes = Vec::with_capacity(ls.len());
+        for l in &ls {
+            let n = self.is_null(l.clone())?;
+            somes.push(self.not(n)?);
+        }
+        let all_some = self.and(somes)?;
+        let matches = self.and(vec![all_some, member])?;
+        // rows that might match
+        let elem = self.elem_of(&inner)?;
+        self.depth += 1;
+        let v = self.var(elem, "w")?;
+        self.depth -= 1;
+        let mut cols = Vec::with_capacity(ls.len());
+        for (k, l) in ls.iter().enumerate() {
+            let c = self.select(v.clone(), k)?;
+            let ln = self.is_null(l.clone())?;
+            let cn = self.is_null(c.clone())?;
+            let eq = self.tm.mk_term(Kind::Equal, &[l.clone(), c])?;
+            cols.push(self.or(vec![ln, cn, eq])?);
+        }
+        let body = self.and(cols)?;
+        let p = self.lambda(&[v], body)?;
+        let maybe = self.tm.mk_term(self.filter_kind(), &[p, inner])?;
+        let none = self.is_empty(maybe)?;
+        let possible = self.not(none)?;
         let t = self.tm.mk_true();
         let some_true = self.some(t)?;
         let unknown = self.null(some_true.sort())?;
@@ -1862,6 +2537,147 @@ fn numeric_arith(op: &str) -> Option<(&str, bool)> {
 }
 
 /// A literal `TRUE`, which a join condition is when the join has none.
+/// Per column of `rel`, whether it is never NULL ([`never_null`]).
+fn never_null_columns(rel: &Relation, base: usize, schemas: &[Schema]) -> Vec<bool> {
+    (0..rel.output_types(schemas).len()).map(|c| never_null(rel, c, base, schemas)).collect()
+}
+
+/// Whether column `c` of `rel` is never NULL: a NOT NULL column of a table, carried through the
+/// operators that copy it (not the padded side of an outer join), a literal other than NULL, or a
+/// `COUNT`. `base` is the number of `rel`'s first column in the numbering its expressions use (an
+/// enclosing query's columns come first in a subquery). Conservative: anything else may be.
+fn never_null(rel: &Relation, c: usize, base: usize, schemas: &[Schema]) -> bool {
+    fn expr_never_null(e: &Expr, source: &Relation, base: usize, schemas: &[Schema]) -> bool {
+        match e {
+            Expr::Column { index, .. } => {
+                (*index as usize).checked_sub(base).is_some_and(|i| never_null(source, i, base, schemas))
+            }
+            Expr::Literal { value, .. } => value != "NULL",
+            Expr::Cast { operand, .. } => expr_never_null(operand, source, base, schemas),
+            Expr::Call { operator, operand, .. } if operator == "CAST" && operand.len() == 1 => {
+                expr_never_null(&operand[0], source, base, schemas)
+            }
+            // `CASE WHEN TRUE THEN x ..`, which Calcite writes for a column it marks nullable
+            Expr::Call { operator, operand, .. } if operator == "CASE" && operand.len() >= 3 && operand.len() % 2 == 1 => {
+                is_true(&operand[0]) && expr_never_null(&operand[1], source, base, schemas)
+            }
+            _ => false,
+        }
+    }
+    match rel {
+        Relation::Scan(i) => schemas.get(*i).and_then(|s| s.nullable.get(c)).is_some_and(|n| !*n),
+        Relation::Filter { source, .. } | Relation::Sort { source, .. } | Relation::Distinct(source) => {
+            never_null(source, c, base, schemas)
+        }
+        Relation::Project { source, target } => target.get(c).is_some_and(|e| expr_never_null(e, source, base, schemas)),
+        Relation::Join { left, right, kind, .. } => {
+            let w = left.output_types(schemas).len();
+            if c < w {
+                matches!(kind, JoinKind::Inner | JoinKind::Left) && never_null(left, c, base, schemas)
+            } else {
+                matches!(kind, JoinKind::Inner | JoinKind::Right) && never_null(right, c - w, base, schemas)
+            }
+        }
+        Relation::Group { source, keys, function } => {
+            if c < keys.len() {
+                expr_never_null(&keys[c], source, base, schemas)
+            } else {
+                function.get(c - keys.len()).is_some_and(|f| f.operator == "COUNT")
+            }
+        }
+        Relation::Values { content, .. } => content
+            .iter()
+            .all(|row| row.get(c).is_some_and(|e| matches!(e, Expr::Literal { value, .. } if value != "NULL"))),
+        Relation::Union(sides) | Relation::Intersect(sides) | Relation::IntersectAll(sides) => {
+            never_null(&sides[0], c, base, schemas) && never_null(&sides[1], c, base, schemas)
+        }
+        Relation::Except(sides) | Relation::ExceptAll(sides) => never_null(&sides[0], c, base, schemas),
+    }
+}
+
+/// Keys of `rel`'s rows, as sets of its columns no two rows agree on: a table's declared keys, kept by
+/// filters and sorts and by a projection that copies their columns, every column after duplicate
+/// removal, and a `GROUP BY`'s keys. Conservative: anything else has none known.
+fn relation_keys(rel: &Relation, base: usize, schemas: &[Schema]) -> Vec<Vec<usize>> {
+    match rel {
+        Relation::Scan(i) => schemas.get(*i).map(|s| s.key.clone()).unwrap_or_default(),
+        Relation::Filter { source, .. } | Relation::Sort { source, .. } => relation_keys(source, base, schemas),
+        Relation::Distinct(source) => {
+            let mut keys = relation_keys(source, base, schemas);
+            keys.push((0..source.output_types(schemas).len()).collect());
+            keys
+        }
+        Relation::Project { source, target } => {
+            let mut keys = Vec::new();
+            for key in relation_keys(source, base, schemas) {
+                let mut cols = Vec::new();
+                for c in &key {
+                    let at = target.iter().position(
+                        |e| matches!(e, Expr::Column { index, .. } if (*index as usize).checked_sub(base) == Some(*c)),
+                    );
+                    match at {
+                        Some(p) => cols.push(p),
+                        None => break,
+                    }
+                }
+                if cols.len() == key.len() {
+                    keys.push(cols);
+                }
+            }
+            keys
+        }
+        Relation::Group { keys, .. } if !keys.is_empty() => vec![(0..keys.len()).collect()],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether column `c` of `rel` is NULL in every row: a NULL literal (or a cast of one) in a VALUES
+/// or a projection, carried through filters, sorts, duplicate removal, projections that copy it,
+/// joins and set operations. Conservative: anything else is not known to be.
+fn always_null(rel: &Relation, c: usize, schemas: &[Schema]) -> bool {
+    fn null_literal(e: &Expr) -> bool {
+        match e {
+            Expr::Literal { value, .. } => value == "NULL",
+            Expr::Cast { operand, .. } => null_literal(operand),
+            Expr::Call { operator, operand, .. } if operator == "CAST" && operand.len() == 1 => {
+                null_literal(&operand[0])
+            }
+            // A strict function is NULL as soon as an argument is: `q_cast_varchar_20(NULL)`.
+            Expr::Call { operator, operand, .. } if strict_function(operator) => operand.iter().any(null_literal),
+            _ => false,
+        }
+    }
+    match rel {
+        Relation::Values { content, .. } => content.iter().all(|row| row.get(c).is_some_and(null_literal)),
+        Relation::Filter { source, .. } | Relation::Sort { source, .. } | Relation::Distinct(source) => {
+            always_null(source, c, schemas)
+        }
+        Relation::Project { source, target } => match target.get(c) {
+            Some(e) if null_literal(e) => true,
+            Some(Expr::Column { index, .. }) => always_null(source, *index as usize, schemas),
+            _ => false,
+        },
+        Relation::Join { left, right, .. } => {
+            let w = left.output_types(schemas).len();
+            if c < w {
+                always_null(left, c, schemas)
+            } else {
+                always_null(right, c - w, schemas)
+            }
+        }
+        Relation::Union(sides) | Relation::Intersect(sides) | Relation::IntersectAll(sides) => {
+            always_null(&sides[0], c, schemas) && always_null(&sides[1], c, schemas)
+        }
+        Relation::Except(sides) | Relation::ExceptAll(sides) => always_null(&sides[0], c, schemas),
+        Relation::Group { source, keys, .. } => match keys.get(c) {
+            Some(e) if null_literal(e) => true,
+            Some(Expr::Column { index, .. }) => always_null(source, *index as usize, schemas),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn is_true(e: &Expr) -> bool {
     matches!(e, Expr::Literal { value, ty: Type::Boolean } if value.eq_ignore_ascii_case("true"))
 }
@@ -1872,7 +2688,8 @@ fn is_true(e: &Expr) -> bool {
 fn strict_function(op: &str) -> bool {
     matches!(
         op,
-        "UPPER" | "LOWER" | "ABS" | "SUBSTRING" | "DATE" | "DATE_TRUNC" | "TO_CHAR" | "TO_TIMESTAMP" | "CARDINALITY" | "NLEVEL" | "LIKE" | "||"
+        "UPPER" | "LOWER" | "ABS" | "SUBSTRING" | "TRIM_BOTH" | "TRIM_LEADING" | "TRIM_TRAILING" | "DATE" | "DATE_TRUNC"
+            | "TO_CHAR" | "TO_TIMESTAMP" | "CARDINALITY" | "NLEVEL" | "LIKE" | "||"
     ) || op.strip_prefix("QCAST").is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
         || op.starts_with("q_conv_")
         || op.starts_with("q_arith_")

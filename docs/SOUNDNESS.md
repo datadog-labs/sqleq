@@ -27,13 +27,18 @@ The provers are taken to be sound: each proves only genuinely equivalent pairs *
 (the JVM SQLSolver has known exceptions, listed in [SQLSOLVER.md](SQLSOLVER.md)). So, short of the
 two assumptions below, a false positive can only come from unfaithful lowering. The frontend
 therefore **refuses** (returns an error) any construct it cannot lower faithfully — window
-functions, `HAVING` it can't express, correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`,
+functions, `HAVING` it can't express, correlated columns it can't resolve,
 `LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
 a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
 TIES`, a `WITH` it cannot inline (`RECURSIVE`, or one with a data-modifying binding, at any level),
 etc. — rather than emitting best-effort IR. It never panics or exits on bad input: a statement whose
 expressions or set operations nest more than 1,024 levels deep, which the parser builds with a loop
 from a long chain such as `a + a + … + a`, is refused before any pass recurses on it.
+
+`INTERSECT ALL` and `EXCEPT ALL` keep multiplicities, so they have IR nodes of their own,
+`intersectAll` and `exceptAll`, apart from the set operations `intersect` and `except`: a prover over
+sets refuses them (`sqleq-solver` answers unsupported), and the cvc5 axis states them over bags as
+`bag.inter_min` and `bag.difference_subtract`.
 
 Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
 `OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause
