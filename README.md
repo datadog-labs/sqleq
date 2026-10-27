@@ -261,11 +261,14 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and
   builds the [`lean/`](lean/) package on first use; that package pins its own Lean version and
   needs no Mathlib.
-* **`sqleq-cvc5`** — `CVC5_LIB_DIR=<cvc5 prefix>/lib cargo build --release -p sqleq-cvc5`. It links
-  the cvc5 library that directory holds (1.4.0 or later, built with its C API; the axis was
-  measured against the `map-row-equations` branch), reads its headers from
-  `$CVC5_LIB_DIR/../include` or `$CVC5_INCLUDE_DIR`, needs `libclang` for the bindings, and
-  compiles Z3 too, since it reads the IR through `sqleq-solver`. See [`docs/CVC5.md`](docs/CVC5.md).
+* **`sqleq-cvc5`** — `sh tools/build_cvc5.sh`, once. It needs the bag reasoning of a cvc5 branch
+  that no release has yet ([`bags-algebra`](https://github.com/mudathirmahgoub/cvc5/pull/27)), so
+  the script fetches that branch at a pinned commit, builds and installs it under `target/cvc5/`
+  (5 to 15 minutes the first time, by the cores; git, cmake, a C++17 compiler and Python 3), and then runs
+  `cargo build --release -p sqleq-cvc5`. After that, `cargo build -p sqleq-cvc5` and `cargo test
+  -p sqleq-cvc5` work like the other crates': `.cargo/config.toml` points `CVC5_LIB_DIR` at the
+  install. The bindings need `libclang`, and the first build compiles Z3 too, since the crate reads
+  the IR through `sqleq-solver`. See [`docs/CVC5.md`](docs/CVC5.md).
 
 The QED prover is external (the upstream [`qed-solver`](https://github.com/qed-solver/prover)
 project) and is not vendored here. It needs the native `z3` and `cvc5` solvers, and its Nix flake

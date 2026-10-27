@@ -25,8 +25,10 @@ path = "src/main.rs"
 # The cvc5 bindings (https://github.com/cvc5/cvc5-rs). Without their `static` feature they link the
 # cvc5 library that `CVC5_LIB_DIR` names and read its headers from `CVC5_INCLUDE_DIR` or
 # `$CVC5_LIB_DIR/../include`; build.rs adds that directory to the binary's rpath. The library must
-# be 1.4.0 or later, and this axis is written against the `map-row-equations` branch
-# (https://github.com/mudathirmahgoub/cvc5/pull/26), whose bag reasoning it exercises.
+# be 1.4.0 or later, and this axis is written against the `bags-algebra` branch
+# (https://github.com/mudathirmahgoub/cvc5/pull/27), whose bag reasoning it exercises:
+# `sh tools/build_cvc5.sh` builds it under target/cvc5/, where .cargo/config.toml points
+# CVC5_LIB_DIR.
 cvc5 = "0.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true, features = ["unbounded_depth"] }

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #107: the control for the assignment cast, which is not refused where it converts by
 --   value

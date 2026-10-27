@@ -212,8 +212,21 @@ fn a_correlated_subquery_is_encoded() {
 #[test]
 fn the_smt2_text_names_the_table_and_the_option() {
     let input = Input::parse(&json!({ "schemas": t(), "queries": [scan(0), scan(0)] })).unwrap();
-    let text = smt2(&input, &Options { cvc5_options: vec![("bags-to-liastar".into(), "true".into())], ..opts(Semantics::Bags) }).unwrap();
-    assert!(text.contains("(set-option :bags-to-liastar true)"), "{text}");
+    let text = smt2(&input, &Options { cvc5_options: vec![("dag-thresh".into(), "0".into())], ..opts(Semantics::Bags) }).unwrap();
+    assert!(text.contains("(set-option :dag-thresh 0)"), "{text}");
     assert!(text.contains("(declare-const t (Bag (Tuple (Nullable Int) (Nullable String))))"), "{text}");
     assert!(text.trim_end().ends_with("(get-model)"), "{text}");
+}
+
+#[test]
+fn a_string_literal_beyond_ascii_is_one_string() {
+    // `c = 'é'` against `c = 'é' AND c = 'é'`: the literal is one character, written as an escape
+    // for cvc5, and the two filters are one.
+    let schemas = vec![table("s", &["VARCHAR"], &[true], &[])];
+    let e = || pred("=", vec![col(0, "VARCHAR"), lit("é", "VARCHAR")]);
+    let a = filter(scan(0), e());
+    let b = filter(scan(0), pred("AND", vec![e(), e()]));
+    for r in both(schemas, a, b) {
+        assert!(matches!(r, Ok(Outcome::Equivalent)), "{r:?}");
+    }
 }

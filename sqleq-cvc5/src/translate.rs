@@ -78,8 +78,8 @@ pub struct Options {
     pub semantics: Semantics,
     /// cvc5's `tlimit-per`, in milliseconds: the budget of the one `check-sat`.
     pub timeout_ms: Option<u64>,
-    /// Further `set-option`s, applied after the defaults, so they can override them: `("bags-to-liastar",
-    /// "true")`, say.
+    /// Further `set-option`s, applied after the defaults, so they can override them:
+    /// `("bags-deq-decompose", "false")`, say.
     pub cvc5_options: Vec<(String, String)>,
     /// `check-models`: have cvc5 verify every model against the assertions before it is reported.
     /// On by default, because a model is a claim the harness acts on.
@@ -1819,7 +1819,7 @@ impl Encoder {
                 "false" => self.tm.mk_false(),
                 _ => return Err(refuse()),
             },
-            Type::Varchar => self.tm.mk_string(value, false),
+            Type::Varchar => self.string(value),
             // An opaque literal is a constant of the opaque sort: two spellings may or may not be
             // one value (`'{"a":1}'` and `'{"a": 1}'` as jsonb are), so nothing relates them.
             Type::Varbinary | Type::Interval => {
@@ -2207,6 +2207,21 @@ impl Encoder {
         self.ite(is_dominant, d, lifted)
     }
 
+    /// `s` as a cvc5 string. cvc5 refuses a character beyond printable ASCII in a plain string, so
+    /// every other character, and the backslash, is written as its SMT-LIB escape: `é` as `\u{e9}`.
+    /// (`Cvc5AbstractTranslator.mkString` does the same.)
+    fn string(&mut self, s: &str) -> Term {
+        let mut escaped = String::with_capacity(s.len());
+        for c in s.chars() {
+            if (' '..='~').contains(&c) && c != '\\' {
+                escaped.push(c);
+            } else {
+                escaped.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+        }
+        self.tm.mk_string(&escaped, true)
+    }
+
     /// `pattern` as a regular expression: `%` any string, `_` any character, a backslash escaping
     /// the next character, as Postgres reads `LIKE` without an `ESCAPE` clause.
     fn like_regex(&mut self, pattern: &str) -> R<Term> {
@@ -2215,7 +2230,7 @@ impl Encoder {
         let mut chars = pattern.chars();
         let flush = |enc: &mut Encoder, literal: &mut String, parts: &mut Vec<Term>| -> R<()> {
             if !literal.is_empty() {
-                let s = enc.tm.mk_string(literal, false);
+                let s = enc.string(literal);
                 parts.push(enc.tm.mk_term(Kind::StringToRegexp, &[s])?);
                 literal.clear();
             }

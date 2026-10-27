@@ -110,7 +110,7 @@ sqleq-check --keep ./work rewrites/
 | `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding and its `model` a refutation of the plan, which is half of an [alarm](#alarms) against a proof over the same plan but decides no verdict on its own. The same as adding `cvc5` to `--axes`. |
 | `--cvc5-bin PATH` | The `sqleq-cvc5` binary ([lookup order](#requirements)). |
 | `--cvc5-semantics bags\|sets` | The semantics it encodes under (default `bags`, SQL's own; `sets` collapses duplicates and is far easier for the solver). |
-| `--cvc5-opt NAME=VALUE` | A further cvc5 option, repeatable: `bags-to-liastar=true`, say. |
+| `--cvc5-opt NAME=VALUE` | A further cvc5 option, repeatable: `bags-deq-decompose=false`, say. |
 | `--cvc5-timeout MS` | cvc5's own cap on each case's check (default: `-t` in ms); the process is killed at the case's deadline regardless. |
 | `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases and corpus rows: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary ([lookup order](#requirements)). It needs `lake` on `PATH`. |

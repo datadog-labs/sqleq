@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: the equivalent shape beside the two temporal casts above, which must still lower and prove
 -- argument: = is symmetric, and both sides apply the same cast to the same column

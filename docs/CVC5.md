@@ -30,17 +30,30 @@ first build also compiles Z3. The library is the one `CVC5_LIB_DIR` names, with 
 `CVC5_INCLUDE_DIR` or `$CVC5_LIB_DIR/../include`, and `build.rs` puts that directory in the
 binary's rpath. The bindings need `libclang` to generate their FFI.
 
+The axis is written against the `bags-algebra` branch of cvc5
+([mudathirmahgoub/cvc5#27](https://github.com/mudathirmahgoub/cvc5/pull/27)), whose bag reasoning it
+exercises: normal forms for the relational terms the encoding builds, the keys and `NOT NULL`
+columns of the tables read off their constraints (a preprocessing pass, `bags-facts`), and lemmas
+for folds, maps and disequalities. No cvc5 release has it yet, so one script fetches that branch at
+a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the crate against
+it:
+
 ```sh
-# A cvc5 built with its C API, installed under <prefix>: `cmake --install build --prefix <prefix>`.
-CVC5_LIB_DIR=<prefix>/lib cargo build --release -p sqleq-cvc5
-CVC5_LIB_DIR=<prefix>/lib cargo test --release -p sqleq-cvc5
+sh tools/build_cvc5.sh            # once; then, like the other crates:
+cargo build --release -p sqleq-cvc5
+cargo test -p sqleq-cvc5
 ```
 
-The axis was written and measured against the `map-row-equations` branch of cvc5
-([mudathirmahgoub/cvc5#26](https://github.com/mudathirmahgoub/cvc5/pull/26)), which adds row
-equations for `bag.map` to the LIA\* translation (`--cvc5-opt bags-to-liastar=true`); any cvc5 from
-1.4.0 on runs the default encoding. It is opt-in like `sqleq-fuzz` and `sqleq-solver` (not a default
-workspace member), and CI does not build it.
+The first run compiles cvc5 for 5 to 15 minutes, by the cores, and needs git, cmake 3.16 or later,
+a C++17 compiler and Python 3; cvc5 downloads and builds CaDiCaL, SymFPU, LibPoly, MPFR and, where
+the system has none, GMP, and installs the shared ones beside itself.
+A second run with the same commit only rebuilds the crate. `.cargo/config.toml` points
+`CVC5_LIB_DIR` at the install, so cargo needs no environment; to build against a cvc5 of your own,
+set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../include` or
+`$CVC5_INCLUDE_DIR`), or `SQLEQ_CVC5_REPO` and `SQLEQ_CVC5_COMMIT` to have the script build another
+commit. Any cvc5 from 1.4.0 on runs the encoding, but proves far fewer pairs without the branch.
+The crate is opt-in like `sqleq-fuzz` and `sqleq-solver` (not a default workspace member), and CI
+does not build it.
 
 ## Running it
 
@@ -49,7 +62,7 @@ workspace member), and CI does not build it.
 sqleq-check --axes frontend,cvc5 --expect report-only -t 10 -j 6 pairs/
 # Set semantics, and a cvc5 option:
 sqleq-check --cvc5 --cvc5-semantics sets --expect report-only pairs/
-sqleq-check --cvc5 --cvc5-opt bags-to-liastar=true --expect report-only pairs/
+sqleq-check --cvc5 --cvc5-opt bags-deq-decompose=false --expect report-only pairs/
 # In a portfolio, where a cvc5 proof decides `equivalent`, and a cvc5 model against a QED proof
 # is an alarm:
 sqleq-check --portfolio --axes qed,cvc5,fuzz --expect report-only -v pairs/

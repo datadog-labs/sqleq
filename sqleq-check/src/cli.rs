@@ -297,7 +297,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Cvc5Semantics::Bags)]
     pub cvc5_semantics: Cvc5Semantics,
 
-    /// A further cvc5 option for sqleq-cvc5, as NAME=VALUE (`bags-to-liastar=true`, say); may be
+    /// A further cvc5 option for sqleq-cvc5, as NAME=VALUE (`bags-deq-decompose=false`, say); may be
     /// repeated.
     #[arg(long, value_name = "NAME=VALUE")]
     pub cvc5_opt: Vec<String>,

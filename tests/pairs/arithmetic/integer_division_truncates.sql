@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #62: sqleq-fuzz ran integer `/` as floating-point division (DuckDB's default)
 -- argument: Postgres integer division truncates toward zero and `%` takes the dividend's sign, so a - a % 2 is the even integer 2 * (a / 2) and halving it is exact

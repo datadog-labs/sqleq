@@ -28,7 +28,7 @@
 //! itself. A row still running `--grace-ms` after it is written as `HANG` and the process exits
 //! with status 3 -- `IrDriver`'s self-halt, which a caller answers by resuming on a fresh process
 //! over the rows not yet written. `--semantics` picks bags (the default: SQL's own) or sets; each
-//! `--opt` is a further cvc5 `set-option`, `--opt=bags-to-liastar=true` say; `--smt2=DIR` also
+//! `--opt` is a further cvc5 `set-option`, `--opt=bags-deq-decompose=false` say; `--smt2=DIR` also
 //! writes each row's problem as `DIR/<name>.smt2`, for re-checking with the `cvc5` binary.
 //!
 //! `--plan` takes one `Input` JSON instead of a jobs file and prints the row to stdout.

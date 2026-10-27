@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: integer reasoning across a half-open range, which is sound over integers and not
 --   over dates (temporal/date_eq_param_vs_half_open.sql)

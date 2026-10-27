@@ -97,10 +97,10 @@ in. What it rewrites, and where it deliberately differs from the original, is in
 ## The cvc5 axis (`sqleq-cvc5/`)
 
 The lowered IR as an SMT problem over cvc5's theory of bags (or sets) of tuples, after the LPAR'24
-Java translator, opt-in because it links a cvc5 library: `CVC5_LIB_DIR=... cargo build -p
-sqleq-cvc5`. It reads the IR through `sqleq-solver`'s `ir` module, so the two axes read one plan one
-way, and answers in `IrDriver`'s row format with a `model` on `NEQ`. [CVC5.md](CVC5.md) has the
-encoding and its readings of the types.
+Java translator, opt-in because it links a cvc5 library: `sh tools/build_cvc5.sh` builds the cvc5
+branch it needs and the crate. It reads the IR through `sqleq-solver`'s `ir` module, so the two
+axes read one plan one way, and answers in `IrDriver`'s row format with a `model` on `NEQ`.
+[CVC5.md](CVC5.md) has the encoding and its readings of the types.
 
 | path | what |
 |---|---|

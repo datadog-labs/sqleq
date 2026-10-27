@@ -99,14 +99,14 @@ fn the_cvc5_driver_gets_the_plan_under_the_case_name() {
     let argv_log = f.path().join("cvc5.argv");
     let log = argv_log.to_string_lossy().into_owned();
     let ran = r.main_env(
-        &["--cvc5-semantics", "sets", "--cvc5-opt", "bags-to-liastar=true", "--cvc5-timeout", "1500"],
+        &["--cvc5-semantics", "sets", "--cvc5-opt", "bags-deq-decompose=false", "--cvc5-timeout", "1500"],
         FE_CVC5,
         &[("FAKE_CVC5", "EQ"), ("FAKE_CVC5_ARGV", &log)],
     );
     assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
     let argv = std::fs::read_to_string(&argv_log).unwrap();
     assert!(argv.contains("--semantics=sets"), "{argv}");
-    assert!(argv.contains("--opt=bags-to-liastar=true"), "{argv}");
+    assert!(argv.contains("--opt=bags-deq-decompose=false"), "{argv}");
     assert!(argv.contains("--timeout-ms="), "{argv}");
     let job: String = argv.split_whitespace().find(|a| a.ends_with(".job.jsonl")).unwrap().to_string();
     let line = std::fs::read_to_string(&job).unwrap_or_default();

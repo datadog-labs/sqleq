@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #108: the result of a function nobody declared is now a value whose = is not identity, and a cast to text over it computed in place from integers has to stay provable
 -- argument: i = j makes round(i, 1) and round(j, 1) one numeric spelled one way, so the two casts are one
