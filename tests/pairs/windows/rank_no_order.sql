@@ -5,7 +5,11 @@
 
 -- truth: equivalent
 -- expect frontend: emit-reflexive
+-- expect fuzz: no-counterexample
+-- expect qed: proved-literal
+-- expect sqleq-solver: proved-literal
 -- expect cvc5: proved-literal
+-- expect lean: unsupported
 -- origin: RANK() over one table is lowered as one more than the rows of its partition sorting
 --   strictly before the row (no ORDER BY: every row its partition's peer); checked on
 --   Postgres 17 by sqleq-fuzz
