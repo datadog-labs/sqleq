@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #154: the control for literal_read_as_two_float_types, whose fix reads a literal at each column's declared type: two columns of one type read it as one value, so the proof stays
 -- argument: '1.5' is one double precision value, so a = '1.5' AND b = '1.5' makes a and b equal, and the two queries return the same bag

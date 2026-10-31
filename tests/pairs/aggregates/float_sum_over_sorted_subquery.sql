@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #85: a double precision SUM over a sorted subquery depends on the sort, and the frontend drops both ORDER BYs
 -- witness: t = {(1, 1e20), (2, -1e20), (3, 1)}: A sums 1e20, -1e20, 1 and yields 1; B sums 1, -1e20, 1e20 and yields 0

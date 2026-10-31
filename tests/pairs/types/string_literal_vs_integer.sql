@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #58: a string literal compared with an INTEGER column cast the column to text, where Postgres reads the literal as an integer
 -- witness: t = {(1)}: A yields no rows ('1' and '01' both read as the integer 1), B yields (1)

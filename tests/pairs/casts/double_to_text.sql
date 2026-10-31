@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz let DuckDB print a double precision as 2.0, where Postgres prints 2
 -- argument: every INTEGER value is exactly a double, and Postgres prints a double below 1e15 in magnitude

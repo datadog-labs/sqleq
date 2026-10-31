@@ -10,6 +10,7 @@ cargo test                 # the frontend: 219 + 9 + 3 + 7 + 13 + 10 + 6 + 24 + 
 cargo test -p sqleq-fuzz   # the disprover: 62 + 2 + 5 + 5 + 15 + 8 + 40 + 3 + 7 + 60
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 3 + 4 + 4 + 11 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 51 + 1 + 7 (needs Lean, see below)
+cargo test -p sqleq-cvc5   # the cvc5 axis: 5 + 11 (after `sh tools/build_cvc5.sh`, see docs/CVC5.md)
 cargo build -p sqleq-fuzz -p sqleq-solver
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```

@@ -10,5 +10,10 @@
 #
 # To build against a libduckdb you already have, set DUCKDB_LIB_DIR; the build script checks it
 # before it considers downloading anything.
+#
+# sqleq-cvc5 links the cvc5 library that `sh tools/build_cvc5.sh` installs under target/cvc5/, so
+# `cargo build -p sqleq-cvc5` and `cargo test -p sqleq-cvc5` find it without further setup. A
+# CVC5_LIB_DIR in the environment takes precedence, for a cvc5 built elsewhere.
 [env]
 DUCKDB_DOWNLOAD_LIB = "1"
+CVC5_LIB_DIR = { value = "target/cvc5/install/lib", relative = true }

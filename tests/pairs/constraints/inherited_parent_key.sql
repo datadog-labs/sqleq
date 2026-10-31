@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: a primary key was read on a table another inherits from, though a scan of it reads the
 --   inheriting table's rows, which the key does not bind

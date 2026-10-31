@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: unsupported
 -- expect sqlsolver-jvm: unsupported
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a parameter that is only an EXISTS subquery's select-list item counted toward arity, so the

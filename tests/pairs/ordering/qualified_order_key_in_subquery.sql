@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: the qualified ORDER BY key mismatch, inside IN (SELECT ... LIMIT)
 -- witness: t = {(1, 1), (2, 2)}, u = {(1, 5), (2, 3)}, w = {(1, 5), (2, 3)}: A returns 1, B returns 2

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a second cast to the type a cast had just given ($2::uuid::uuid) was read through

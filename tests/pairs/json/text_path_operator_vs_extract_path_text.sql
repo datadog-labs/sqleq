@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 5: #>> and jsonb_extract_path_text got two symbols, so the pair lowered to
 --   two plans and was refused for reading a jsonb as text

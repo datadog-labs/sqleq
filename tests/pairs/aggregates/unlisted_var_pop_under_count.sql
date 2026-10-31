@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #51: var_pop, an aggregate on no list, was lowered as a per-row scalar
 -- witness: t = {}: A yields 1 (an aggregate without GROUP BY returns one row), B yields 0

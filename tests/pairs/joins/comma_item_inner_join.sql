@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #47: the control beside joins/comma_item_right_join.sql; each comma item is now its
 --   own join tree, which for an inner join is only a regrouping

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: ->> and #>> were lowered to one symbol, though ->> looks up one key and #>> follows a path
 -- witness: t = {('{"a": "x"}')}: A yields NULL (there is no key named {a}), B yields x (the path [a])

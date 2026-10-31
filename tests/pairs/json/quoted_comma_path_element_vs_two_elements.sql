@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #92 item 5: a literal path under #> is read into its elements, and a comma inside a
 --   double-quoted element is a character of it, not a delimiter

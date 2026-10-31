@@ -44,8 +44,9 @@ pub const NOT_EQUIVALENT: &str = "not-equivalent";
 pub const TRUTHS: [&str; 2] = [EQUIVALENT, NOT_EQUIVALENT];
 
 /// Canonical order: the order `--bless` inserts missing lines in, and the table's column order.
-pub const AXES: [&str; 6] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "lean"];
-pub const PROVERS: [&str; 3] = ["qed", "sqleq-solver", "sqlsolver-jvm"];
+pub const AXES: [&str; 7] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "cvc5", "lean"];
+/// The axes handed the frontend's plan, so asking one asks the frontend.
+pub const PROVERS: [&str; 4] = ["qed", "sqleq-solver", "sqlsolver-jvm", "cvc5"];
 
 /// An axis name as [`AXES`] spells it. `sqlsolver-rust` is sqleq-solver's axis from before the
 /// rename, still read wherever an axis is named -- `--axes` and `expect` lines -- so a pin or a
@@ -61,19 +62,30 @@ pub fn canonical_axis(name: &str) -> &str {
 pub const INDEX: &str = "index";
 pub const GATHER: &str = "gather";
 pub const GATHER_GENERATED: &str = "gather-generated";
+/// The bindings a pair may be stated under.
 pub const BINDINGS: [&str; 3] = [INDEX, GATHER, GATHER_GENERATED];
 pub const GATHERS: [&str; 2] = [GATHER, GATHER_GENERATED];
+/// The plan's own reading: the IR as the provers get it, with `$N` bound alike on both sides and
+/// without the constraints the frontend does not carry (an expression or opclass unique index,
+/// `UNIQUE NULLS NOT DISTINCT`, a foreign key). A proof under it is a proof under `index` -- fewer
+/// constraints are more databases -- so every prover claims under both; a refutation under it is
+/// only a refutation under it, since the database found may be one the DDL forbids. No pair is
+/// stated under it: it exists so that a model from cvc5 and a proof over the same plan can be the
+/// contradiction they are.
+pub const IR: &str = "ir";
+/// The bindings under which a claim and a refutation contradict each other.
+pub const ALARM_BINDINGS: [&str; 4] = [INDEX, IR, GATHER, GATHER_GENERATED];
 
 /// The bindings an axis answers under. Lean reads a scalar and an array at the same `$N` only as
 /// the gather rule relates them. sqleq-fuzz answers under `index`, and under `gather` for a pair of
 /// the gather rule's shape, which it runs with the `unnest` side's arrays built from the `VALUES`
 /// side's values; it refuses a generated cell, so it never answers under `gather-generated`. Every
-/// other axis refuses such a pair.
+/// other axis refuses such a pair, and answers under `index` and the plan's own reading, [`IR`].
 pub fn axis_bindings(axis: &str) -> &'static [&'static str] {
     match axis {
         "lean" => &GATHERS,
         "fuzz" => &[INDEX, GATHER],
-        a if AXES.contains(&a) => &[INDEX],
+        a if AXES.contains(&a) => &[INDEX, IR],
         _ => &[],
     }
 }
@@ -115,6 +127,24 @@ pub fn words(axis: &str) -> &'static [&'static str] {
         "sqleq-solver" | "sqlsolver-jvm" => {
             &["proved", "proved-literal", "no-proof", "unsupported", "no-plan", "error"]
         }
+        // `model`: cvc5 found a database on which its encodings of the two queries differ. A
+        // refutation under the plan's own reading ([`IR`]), not under `index`: the plan lacks the
+        // constraints the frontend does not carry, so the database may be one the DDL forbids. An
+        // equivalent pair may therefore be pinned `model`; a pair proved over the same plan may
+        // not, which is an alarm.
+        // `proved-sets` and `model-sets` are the same two answers under `--cvc5-semantics sets`, an
+        // approximation under which duplicates collapse, so neither claims nor refutes anything.
+        "cvc5" => &[
+            "proved",
+            "proved-literal",
+            "model",
+            "proved-sets",
+            "model-sets",
+            "no-proof",
+            "unsupported",
+            "no-plan",
+            "error",
+        ],
         // `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of
         // equivalence.
         "lean" => &[
@@ -142,14 +172,19 @@ pub fn claims_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
         };
     }
     match axis {
-        "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
+        "qed" | "sqleq-solver" | "sqlsolver-jvm" | "cvc5" => &PROVED_WORDS,
         "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather", "no-witness"],
         _ => &[],
     }
 }
 
-/// Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is.
+/// Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is,
+/// and not experimental, which cvc5's is. The cvc5 axis is experimental: its bag reasoning lives in
+/// an unreleased branch of cvc5 and its proofs are not checked, so its `proved` is reported and is
+/// an alarm against a refutation ([`claims_equivalent`]), but it decides no portfolio verdict and
+/// stands for no pair's truth, until the bag work is in a cvc5 release and the axis has been
+/// cross-checked against sqleq-fuzz.
 pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
     if binding == GATHER_GENERATED {
         return match axis {
@@ -165,13 +200,15 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
     }
 }
 
-/// The one answer that claims the opposite of equivalence under `binding`: a counterexample found
+/// The answers that claim the opposite of equivalence under `binding`: a counterexample found
 /// with `$N` bound alike on both sides, or one found with the `unnest` side's arrays gathered from
-/// the `VALUES` side's values.
+/// the `VALUES` side's values; and under the plan's own reading ([`IR`]) cvc5's `model`, a
+/// database on which its two encodings of the plan differ.
 pub fn refutes(axis: &str, binding: &str) -> &'static [&'static str] {
     match (axis, binding) {
         ("fuzz", INDEX) => &["counterexample"],
         ("fuzz", GATHER) => &["counterexample-gather"],
+        ("cvc5", IR) => &["model"],
         _ => &[],
     }
 }

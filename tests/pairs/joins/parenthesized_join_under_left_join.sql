@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: a parenthesized join is lowered on its own, and under an outer join its parentheses must
 --   survive, since the grouping changes the result (#31)

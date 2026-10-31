@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #47: the ON condition of a join after a comma item is resolved against the
 --   earlier comma items too, so the bare x binds to a.x; Postgres hides a there and binds x to o.x

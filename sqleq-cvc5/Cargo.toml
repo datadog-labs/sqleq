@@ -1,0 +1,38 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+[package]
+name = "sqleq-cvc5"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "The lowered IR as a cvc5 problem over bags or sets of tuples: a proof, or a model"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sqleq_cvc5"
+path = "src/lib.rs"
+
+# IrDriver's command line and JSONL contract, so a harness drives it like sqleq-solver; see src/main.rs.
+[[bin]]
+name = "sqleq-cvc5"
+path = "src/main.rs"
+
+[dependencies]
+# The cvc5 bindings (https://github.com/cvc5/cvc5-rs). Without their `static` feature they link the
+# cvc5 library that `CVC5_LIB_DIR` names and read its headers from `CVC5_INCLUDE_DIR` or
+# `$CVC5_LIB_DIR/../include`; build.rs adds that directory to the binary's rpath. The library must
+# be 1.4.0 or later, and this axis is written against the `bags-algebra` branch
+# (https://github.com/mudathirmahgoub/cvc5/pull/27), whose bag reasoning it exercises:
+# `sh tools/build_cvc5.sh` builds it under target/cvc5/, where .cargo/config.toml points
+# CVC5_LIB_DIR.
+cvc5 = "0.6.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+# The `Input` IR as typed Rust (`ir`) and the tier-0 identity check (`prove::identical_sides`): the
+# same reader sqleq-solver proves from, so the two axes read one plan one way. It brings Z3 along,
+# which sqleq-solver links; the first build compiles it.
+sqleq-solver = { path = "../sqleq-solver" }

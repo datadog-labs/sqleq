@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #94: sqleq-fuzz read an identity column as a nullable integer and drew NULLs into it
 -- argument: an identity column is implicitly NOT NULL in Postgres, so no instance it accepts has a NULL

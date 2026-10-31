@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 1: under COLLATE "C" an order comparison of strings stays native, so NOT (s <= 'b') is lowered as s > 'b'
 -- argument: under C strings are ordered by their bytes, a total order, and > is the negator of <=: when s is NULL both sides are NULL, and otherwise one is true exactly when the other is false

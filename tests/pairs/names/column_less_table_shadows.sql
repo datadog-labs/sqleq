@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a table created without a column list (LIKE) was dropped from the catalog, so a bare
 --   reference to it resolved to the one table of its name in another schema

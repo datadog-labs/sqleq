@@ -12,14 +12,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
-use crate::axes::{fuzz, lean, solver};
+use crate::axes::{cvc5, fuzz, lean, solver};
 use crate::case::{run_case, status_rank, Case, Stage, ERROR, LOWERED, PANIC, PROVABLE, TIMEOUT};
 use crate::cli::{resolve_axes, Args, Expect};
-use crate::discover::{self, SsDriver};
+use crate::discover::{self, Cvc5Driver, SsDriver};
 use crate::inputs::{collect_inputs, common_root, corpus_items, display_name, read_names, suffix, Item};
 use crate::pinned;
 use crate::portfolio;
-use crate::report::{self, Color, Finding, FuzzMeta, LeanMeta, Meta, PinnedMeta, PortfolioMeta, SsMeta};
+use crate::report::{self, Color, Cvc5Meta, Finding, FuzzMeta, LeanMeta, Meta, PinnedMeta, PortfolioMeta, SsMeta};
 use crate::util::round;
 
 /// Everything resolved before a single case runs.
@@ -28,6 +28,7 @@ pub struct Env {
     pub frontend: Option<String>,
     pub prover: Option<String>,
     pub ss: Option<SsDriver>,
+    pub cvc5: Option<Cvc5Driver>,
     pub fuzz: Option<String>,
     pub lean: Option<String>,
     pub items: Vec<Item>,
@@ -51,8 +52,8 @@ pub fn setup(args: &Args) -> Result<Env, String> {
                         than the case; ask --sqleq-solver, or the JVM fork without --portfolio"
                 .into());
         }
-        if !axes.iter().any(|a| ["qed", "sqleq-solver", "fuzz", "lean"].contains(a)) {
-            return Err("error: --portfolio needs a backend that can decide: qed, sqleq-solver, fuzz or lean".into());
+        if !axes.iter().any(|a| ["qed", "sqleq-solver", "cvc5", "fuzz", "lean"].contains(a)) {
+            return Err("error: --portfolio needs a backend that can decide: qed, sqleq-solver, cvc5, fuzz or lean".into());
         }
     }
     if args.bless && !pinned {
@@ -77,6 +78,11 @@ pub fn setup(args: &Args) -> Result<Env, String> {
         Some(discover::discover_sqleq_solver(args.sqleq_solver_bin.as_deref(), bin_dir)?)
     } else if has("sqlsolver-jvm") {
         Some(discover::discover_sqlsolver_jvm(args.sqlsolver_tree.as_deref())?)
+    } else {
+        None
+    };
+    let cvc5 = if has("cvc5") {
+        Some(discover::discover_cvc5(args.cvc5_bin.as_deref(), bin_dir, args.cvc5_semantics.name(), &args.cvc5_opt)?)
     } else {
         None
     };
@@ -130,6 +136,9 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     if let Some(d) = ss.as_ref().filter(|d| d.imp == "sqleq-solver") {
         bins.push(&d.location);
     }
+    if let Some(d) = &cvc5 {
+        bins.push(&d.bin);
+    }
     for b in bins {
         if let Some(why) = discover::stale_build(b) {
             if args.bless {
@@ -140,7 +149,7 @@ pub fn setup(args: &Args) -> Result<Env, String> {
             eprintln!("warning: {why}; its answers may not be this tree's");
         }
     }
-    Ok(Env { axes, frontend, prover, ss, fuzz, lean, items })
+    Ok(Env { axes, frontend, prover, ss, cvc5, fuzz, lean, items })
 }
 
 /// GiB as bytes, for an address-space cap.
@@ -269,6 +278,9 @@ pub fn main(args: Args) -> i32 {
         }
     };
     let ss_timeout_ms = args.sqleq_solver_timeout.filter(|t| *t > 0).unwrap_or((args.timeout * 1000.0) as u64);
+    let cvc5_cap_ms = args.cvc5_timeout.filter(|t| *t > 0);
+    // The cvc5 axis's budget per case: its cap, within the case's own.
+    let cvc5_timeout_s = cvc5_cap_ms.map_or(args.timeout, |ms| (ms as f64 / 1000.0).min(args.timeout));
 
     // Absolute: a case's directory under it is also the working directory its backends run in, so
     // a path relative to ours would name somewhere else to them -- the sqleq-solver job a portfolio
@@ -341,6 +353,38 @@ pub fn main(args: Args) -> i32 {
         }
     };
 
+    // One directory for the cvc5 axis's jobs, likewise: a plan per case, and the driver's row.
+    let mut cvc5_tmp: Option<crate::util::TempDir> = None;
+    let cvc5_dir: Option<PathBuf> = match &env.cvc5 {
+        None => None,
+        Some(_) if args.portfolio => None,
+        Some(_) => {
+            let dir = match &keep_dir {
+                Some(k) => {
+                    let d = k.join("cvc5");
+                    let _ = std::fs::remove_dir_all(&d);
+                    d
+                }
+                None => match crate::util::TempDir::new("sqleq-cvc5-") {
+                    Ok(t) => {
+                        let p = t.path().to_path_buf();
+                        cvc5_tmp = Some(t);
+                        p
+                    }
+                    Err(e) => {
+                        eprintln!("error: cannot create a temporary directory: {e}");
+                        return 2;
+                    }
+                },
+            };
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("error: {}: {e}", dir.display());
+                return 2;
+            }
+            Some(dir)
+        }
+    };
+
     if !args.quiet {
         if let Some(f) = &env.frontend {
             println!("{}", c.dim(&format!("sqleq-frontend: {f}")));
@@ -351,6 +395,9 @@ pub fn main(args: Args) -> i32 {
         if let Some(d) = &env.ss {
             let label = if d.imp == "sqleq-solver" { "sqleq-solver:" } else { "JVM fork:" };
             println!("{}", c.dim(&format!("{label:<14}{}", d.location)));
+        }
+        if let Some(d) = &env.cvc5 {
+            println!("{}", c.dim(&format!("{:<14}{}", format!("{}:", d.describe()), d.bin)));
         }
         if let Some(f) = &env.fuzz {
             println!("{}", c.dim(&format!("sqleq-fuzz:   {f}")));
@@ -387,6 +434,7 @@ pub fn main(args: Args) -> i32 {
         smt_timeout_ms: args.smt_timeout,
         keep_dir: keep_dir.clone(),
         ss_dir: ss_dir.clone(),
+        cvc5_dir: cvc5_dir.clone(),
         catalog: args.catalog.map(|c| c.name().to_string()),
         qed_mem: gib(args.qed_mem_gib),
     };
@@ -403,6 +451,8 @@ pub fn main(args: Args) -> i32 {
         "lean"
     } else if env.fuzz.is_some() {
         "fuzz"
+    } else if env.cvc5.is_some() {
+        "cvc5"
     } else if env.ss.is_some() {
         "solver"
     } else {
@@ -414,6 +464,8 @@ pub fn main(args: Args) -> i32 {
         prover: env.prover.as_deref(),
         ss: env.ss.as_ref(),
         ss_cap_ms: args.sqleq_solver_timeout.filter(|t| *t > 0),
+        cvc5: env.cvc5.as_ref(),
+        cvc5_cap_ms,
         fuzz: env.fuzz.as_deref(),
         lean: env.lean.as_deref(),
         timeout: args.timeout,
@@ -569,6 +621,38 @@ pub fn main(args: Args) -> i32 {
         }
     }
 
+    // The cvc5 axis, over the plans packaged for it: one driver per case, in parallel, each within
+    // its own budget -- timed apart from the passes above for the same reason.
+    let mut cvc5_stats = None;
+    if args.portfolio {
+        cvc5_stats = env.cvc5.as_ref().map(|_| cvc5::Stats { rows: cases.iter().filter(|x| x.c_bucket.is_some()).count(), wall_s: None });
+    } else if let (Some(driver), Some(dir)) = (&env.cvc5, &cvc5_dir) {
+        if !args.quiet {
+            if live {
+                progress(&" ".repeat(30));
+            }
+            let n = cases.iter().filter(|x| x.c_bucket.is_none() && x.lowered).count();
+            println!(
+                "{}",
+                c.dim(&format!("  asking {} about {n} case(s), {} at a time, {}s each…", driver.describe(), args.jobs, report::fmt_secs(cvc5_timeout_s)))
+            );
+        }
+        let emitted: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+        let done = |x: &Case| {
+            if last_pass == "cvc5" {
+                stream.emit(x);
+                emitted.lock().unwrap_or_else(|e| e.into_inner()).insert(x.name.clone());
+            }
+        };
+        cvc5_stats = Some(cvc5::run_cvc5(&mut cases, dir, driver, args.jobs, cvc5_cap_ms, cvc5_timeout_s, &done));
+        // A case with no cvc5 job -- never lowered, or one whose job could not be written -- has
+        // nothing more to say either, and is written now, so that `--resume` does not run it again.
+        if last_pass == "cvc5" {
+            let emitted = emitted.into_inner().unwrap_or_else(|e| e.into_inner());
+            cases.iter().filter(|x| !emitted.contains(&x.name)).for_each(|x| stream.emit(x));
+        }
+    }
+
     // The fuzz axis reads the pair files itself, so it is independent of the passes above --
     // though not of the pair, which is the point.
     let mut fuzz_stats = None;
@@ -673,6 +757,9 @@ pub fn main(args: Args) -> i32 {
         }
         let imp = env.ss.as_ref().map_or("sqleq-solver", |d| d.imp.as_str());
         report::print_second_opinion(c, &cases, &ss_stats, imp, axes.contains(&"qed"));
+        if let (Some(st), Some(d)) = (&cvc5_stats, &env.cvc5) {
+            report::print_cvc5(c, &cases, st, &d.describe());
+        }
         if let Some(st) = &fuzz_stats {
             report::print_fuzz(c, &cases, st);
         }
@@ -707,6 +794,13 @@ pub fn main(args: Args) -> i32 {
             bin: b.clone(),
             args: fuzz::FUZZ_ARGS.iter().map(|s| s.to_string()).collect(),
         }),
+        cvc5: env.cvc5.as_ref().map(|d| Cvc5Meta {
+            stats: cvc5_stats.clone().unwrap_or_default(),
+            bin: d.bin.clone(),
+            semantics: d.semantics.clone(),
+            options: d.options.clone(),
+            timeout_ms: cvc5_cap_ms,
+        }),
         lean: env.lean.as_ref().map(|b| LeanMeta { stats: lean_stats.clone().unwrap_or_default(), bin: b.clone() }),
         pinned: pinned_mode.then(|| PinnedMeta {
             held: pinned.iter().filter(|p| p.passed()).count(),
@@ -738,6 +832,7 @@ pub fn main(args: Args) -> i32 {
         alarms: alarms.iter().filter(|a| !a.known).map(|a| cases[a.case].name.clone()).collect(),
     };
     drop(ss_tmp);
+    drop(cvc5_tmp);
     if let Some(path) = &args.json {
         if let Err(e) = report::write_json(path, &cases, &meta) {
             eprintln!("error: {path}: {e}");

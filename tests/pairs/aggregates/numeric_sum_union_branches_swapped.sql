@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #85 (control): numeric addition is exact, so SUM over numeric is a function of the bag and stays lowered
 -- argument: numeric + is exact and commutative and associative, so the sum does not depend on the order of its inputs

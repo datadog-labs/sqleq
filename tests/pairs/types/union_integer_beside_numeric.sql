@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #177: a UNION ALL column took its first branch's type, so the integer branch reached
 --   the prover under a numeric column and QED panicked

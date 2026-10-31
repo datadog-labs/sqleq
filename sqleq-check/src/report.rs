@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Serialize;
 
-use crate::axes::{fuzz, lean, solver};
+use crate::axes::{cvc5, fuzz, lean, solver};
 use crate::portfolio;
 use crate::case::{Case, LOWERED, PANIC, PROVABLE, REFUSED, STATUS_ORDER, TIMEOUT, UNPROVABLE};
 use crate::pinned::Pinned;
@@ -136,6 +136,8 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
         && !case.f_note.is_empty()
     {
         tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
+    } else if case.c_bucket.as_deref() == Some(cvc5::MODEL) && !case.c_note.is_empty() {
+        tail += &format!("  {}", c.dim(&format!("— cvc5 model {}", case.c_note)));
     } else if !portfolio::decisive(&o.verdict) {
         let last = suite::splitlines(&case.message).into_iter().map(str::trim).rfind(|l| !l.is_empty());
         if let Some(l) = last {
@@ -271,8 +273,12 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
             (false, true) => parts.push(format!("sqleq-solver {}", n(&|o| has(o, "sqleq-solver")))),
             (false, false) => {}
         }
+        if backends.contains(&"cvc5") {
+            let alone = n(&|o| has(o, "cvc5") && !has(o, "qed") && !has(o, "sqleq-solver"));
+            parts.push(format!("cvc5 {} (alone {alone})", n(&|o| has(o, "cvc5"))));
+        }
         // Settled with no prover: the frontend found the two sides one query.
-        let refl = n(&|o| !has(o, "qed") && !has(o, "sqleq-solver"));
+        let refl = n(&|o| !has(o, "qed") && !has(o, "sqleq-solver") && !has(o, "cvc5"));
         if refl > 0 {
             parts.push(format!("reflexivity alone {refl}"));
         }
@@ -550,6 +556,50 @@ pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
     );
 }
 
+pub fn print_cvc5(c: Color, cases: &[Case], stats: &cvc5::Stats, driver: &str) {
+    let scored: Vec<&Case> = cases.iter().filter(|x| x.c_bucket.is_some()).collect();
+    if scored.is_empty() {
+        return;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for x in &scored {
+        *counts.entry(x.c_bucket.as_deref().unwrap_or("")).or_default() += 1;
+    }
+    println!();
+    println!("{}{}", c.bold("  cvc5 axis"), c.dim(&format!("  — {driver}, over the lowered IR")));
+    println!("{}", rule(c));
+    for b in cvc5::ORDER {
+        if let Some(n) = counts.get(b).filter(|n| **n > 0) {
+            println!("  {b:<22} {n:>5}");
+        }
+    }
+    println!("{}", rule(c));
+    // Capability on the same footing as the other provers': pairs whose two queries differ.
+    let diff: Vec<&&Case> = scored.iter().filter(|x| x.trivial == Some(false)).collect();
+    if !diff.is_empty() {
+        let n = diff.iter().filter(|x| x.c_bucket.as_deref() == Some(cvc5::PROVED)).count();
+        let pct = 100.0 * n as f64 / diff.len() as f64;
+        println!("  {:<13} {n}/{}  ({pct:.1}%)   {}", c.bold("proved"), diff.len(), c.dim("pairs whose two queries differ"));
+    }
+    for x in scored.iter().filter(|x| x.c_bucket.as_deref() == Some(cvc5::MODEL)) {
+        let note = if x.c_note.is_empty() { String::new() } else { format!("  — {}", x.c_note) };
+        println!("{}", c.dim(&format!("  {:<22}       {}{note}", "model", x.name)));
+    }
+    if let Some(w) = stats.wall_s {
+        println!("{}", c.dim(&format!("  {:<22} {w:.2}s over {} row(s)", "wall time", stats.rows)));
+    }
+    println!(
+        "{}",
+        c.dim(
+            "  note  `model` is a database on which cvc5's encodings of the two queries differ,\n        checked by cvc5 \
+             against its own assertions: a refutation of the plan, not of\n        the pair -- the plan lacks the constraints \
+             the frontend does not carry, and\n        reads the IR's types its own way (docs/CVC5.md). It contradicts a proof \
+             over\n        the same plan, and decides nothing on its own; sqleq-fuzz remains the\n        disprover. `no-proof` \
+             is `unknown`, or two queries whose rows the encoding\n        cannot compare."
+        )
+    );
+}
+
 pub fn print_lean(c: Color, cases: &[Case], stats: &lean::Stats) {
     let scored: Vec<&Case> = cases.iter().filter(|x| x.l_verdict.is_some()).collect();
     if scored.is_empty() {
@@ -683,6 +733,16 @@ pub struct FuzzMeta {
 }
 
 #[derive(Serialize)]
+pub struct Cvc5Meta {
+    #[serde(flatten)]
+    pub stats: cvc5::Stats,
+    pub bin: String,
+    pub semantics: String,
+    pub options: Vec<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
 pub struct LeanMeta {
     #[serde(flatten)]
     pub stats: lean::Stats,
@@ -768,6 +828,8 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzz: Option<FuzzMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvc5: Option<Cvc5Meta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lean: Option<LeanMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<PortfolioMeta>,
@@ -818,10 +880,12 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result
         "f_note",
         "f_ms",
     ];
-    // Appended, so a reader of the batch columns finds them where they always were.
+    // Appended, so a reader of the batch columns finds them where they always were; the cvc5
+    // axis's columns after the portfolio's, which were there first.
     if portfolio {
         cols.extend(["p_verdict", "p_by", "p_pending", "p_first_s", "p_retried"]);
     }
+    cols.extend(["c_bucket", "c_verdict", "c_ms", "c_note"]);
     let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_path(path)?;
     w.write_record(&cols)?;
     let opt = |v: &Option<String>| v.clone().unwrap_or_default();
@@ -862,6 +926,7 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result
                 o.retried.to_string(),
             ]);
         }
+        row.extend([opt(&x.c_bucket), opt(&x.c_verdict), num(&x.c_ms), x.c_note.clone()]);
         w.write_record(&row)?;
     }
     w.flush()

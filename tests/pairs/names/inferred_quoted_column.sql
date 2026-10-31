@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #112: type inference lower-cased the quoted column "createdAt", so the

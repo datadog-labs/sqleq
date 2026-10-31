@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #56: an exponent literal with no . was typed INTEGER, and sqleq-solver truncated
 --   1e-5 to 0

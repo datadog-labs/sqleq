@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #92: CREATE UNIQUE INDEX IF NOT EXISTS creates nothing when the name is taken, so it
 --   gives no key

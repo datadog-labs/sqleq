@@ -63,6 +63,11 @@ pub struct Case {
     pub stats: Value,
     /// Error detail when not provable/unprovable.
     pub message: String,
+    /// Why QED was not handed the plan although there is one: a node its IR has no reading of
+    /// (`intersectAll`, `exceptAll`), on which it would fail to deserialize the plan. Its answer is
+    /// then `no-plan`, as for a pair that never lowered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qed_unasked: Option<String>,
     // The second opinion, only when one was asked for. `s_verdict` is that prover's raw label, kept
     // beside the bucket purely for audit: nothing may branch on it, because `NEQ` is not a
     // refutation.
@@ -70,6 +75,12 @@ pub struct Case {
     pub s_verdict: Option<String>,
     pub s_ms: Option<Value>,
     pub s_note: String,
+    // The cvc5 axis, only when it is asked: its bucket, cvc5's raw verdict kept for audit, its wall
+    // time and a note -- the model's tables on `model`, the reason on anything else.
+    pub c_bucket: Option<String>,
+    pub c_verdict: Option<String>,
+    pub c_ms: Option<Value>,
+    pub c_note: String,
     // The Lean axis, only when it is asked: sqleq-lean's own verdict on the pair file (it reads the
     // .sql itself, so it answers whatever the frontend did).
     pub l_verdict: Option<String>,
@@ -95,6 +106,8 @@ pub struct Case {
     pub f_raw: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s_raw: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c_raw: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l_raw: Option<Value>,
     /// The end of the prover's stdout and stderr when it crashed: the signature a crash is told
@@ -132,6 +145,10 @@ impl Case {
             s_verdict: None,
             s_ms: None,
             s_note: String::new(),
+            c_bucket: None,
+            c_verdict: None,
+            c_ms: None,
+            c_note: String::new(),
             l_verdict: None,
             l_reason: String::new(),
             l_shape: String::new(),
@@ -143,9 +160,11 @@ impl Case {
             reflexive: false,
             f_raw: None,
             s_raw: None,
+            c_raw: None,
             l_raw: None,
             q_tail: String::new(),
             q_rc: None,
+            qed_unasked: None,
             row: None,
         }
     }
@@ -343,6 +362,8 @@ pub struct Stage {
     pub smt_timeout_ms: Option<u64>,
     pub keep_dir: Option<PathBuf>,
     pub ss_dir: Option<PathBuf>,
+    /// The directory the cvc5 axis's jobs are kept in, when that axis is asked.
+    pub cvc5_dir: Option<PathBuf>,
     /// `--catalog`: the catalog a case is lowered against when its header names none.
     pub catalog: Option<String>,
     /// `--qed-mem-gib`, in bytes.
@@ -372,10 +393,23 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
     if let Some(job) = &job {
         let _ = std::fs::remove_file(job);
     }
+    // Likewise the cvc5 axis's job, for the same reason.
+    let cvc5_job = st.cvc5_dir.as_ref().map(|d| d.join(format!("{}.job.jsonl", ss_slug(name))));
+    if let Some(job) = &cvc5_job {
+        let _ = std::fs::remove_file(job);
+    }
     let Some(json_name) = lower(&mut case, src, &wd.path, &st.frontend, st.catalog.as_deref(), st.timeout) else {
         case.wall = t0.elapsed().as_secs_f64();
         return case;
     };
+    // The cvc5 axis's job: the plan itself under the case's name, no frontend needed. Written
+    // before the prover runs, like the second opinion's, so a prover timeout costs it nothing.
+    if let Some(job) = &cvc5_job {
+        if let Err(e) = crate::axes::cvc5::write_job(name, &wd.path.join(&json_name), job) {
+            case.c_bucket = Some(s(crate::axes::cvc5::ERROR));
+            case.c_note = format!("could not write the cvc5 job: {e}");
+        }
+    }
 
     // 1b) Package the plan for the second opinion, while the workdir still exists. Built before the
     // prover runs, so a prover timeout does not also cost the second opinion; its own cost is
@@ -603,6 +637,14 @@ pub fn prove(
     smt_timeout_ms: Option<u64>,
     mem_bytes: Option<u64>,
 ) {
+    // A plan with a node QED's IR has no reading of is not handed to it: it would panic on the
+    // deserialization, and a panic says nothing about the pair. The bag set operations are nodes of
+    // this frontend's own (docs/SOUNDNESS.md), which a set-semantics prover has no answer to.
+    if let Some(node) = bag_set_op(&workdir.join(json_name)) {
+        case.status = s(LOWERED);
+        case.qed_unasked = Some(format!("the plan has an {node} node, which QED's IR cannot read"));
+        return;
+    }
     let env: Vec<(String, String)> =
         smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
     let argv = [prover.to_string(), json_name.to_string()];
@@ -615,6 +657,14 @@ pub fn prove(
     }
     let stem = json_name.strip_suffix(".json").unwrap_or(json_name);
     read_result(case, &workdir.join(format!("{stem}.result")), &qr);
+}
+
+/// The first of the plan's `intersectAll` and `exceptAll` nodes, read off the plan's text at `path`:
+/// a node is an object key, `"exceptAll"`, and a string value spelling the same is escaped
+/// (`\"exceptAll\"`), so the quoted name alone is the key.
+fn bag_set_op(path: &Path) -> Option<&'static str> {
+    let text = std::fs::read_to_string(path).ok()?;
+    ["intersectAll", "exceptAll"].into_iter().find(|node| text.contains(&format!("\"{node}\"")))
 }
 
 /// The last 600 characters of the prover's stdout and of its stderr: what tells one crash from

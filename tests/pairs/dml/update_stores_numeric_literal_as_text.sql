@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #107: an UPDATE stored a numeric literal in a text column by its value, and 2.0 = 2.00
 -- witness: t = {(1, NULL)}: A stores '2.0' in s, B stores '2.00'

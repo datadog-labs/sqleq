@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: jsonb_extract_path_text was lowered to the symbol of ->>, though it follows a path and ->> looks up a key
 -- witness: t = {('[5]')}: A yields 5 (the path [0] reaches the first element), B yields NULL (an array has no key named 0)

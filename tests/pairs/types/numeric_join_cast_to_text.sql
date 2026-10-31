@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: 2.0 = 2.00 as numerics, but their text shows the scale
 -- witness: t = {(2.0)}, u = {(2.00)}: A yields '2.0', B yields '2.00'

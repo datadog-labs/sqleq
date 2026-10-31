@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #122: the avg rewrite under the inferring catalog, whose own schema types a as an integer too

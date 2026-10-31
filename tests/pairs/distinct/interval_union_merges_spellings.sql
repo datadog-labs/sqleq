@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver deduplicated interval values by identity in UNION, though Postgres deduplicates by = and '1 day' = '24 hours'
 -- witness: t = {(1, '1 day'), (2, '24 hours')}: UNION keeps one of the two, so A returns one row; B returns two, '1 day' and '24:00:00'

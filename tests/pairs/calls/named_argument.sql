@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: named function arguments were dropped, so both calls were nullary
 -- witness: t = {(1)}: A yields 1 day, B yields 01:00:00

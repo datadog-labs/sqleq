@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #187's control: a literal and its neighbours drawn into a column must not refute an
 --   exact rewrite of the boundary

@@ -132,7 +132,7 @@ impl Verifier<'_> {
                 }
                 s
             }
-            "union" | "intersect" | "except" => {
+            "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
                 let rels = v.as_array().ok_or_else(|| ir("set op without branches"))?;
                 self.scope(rels.first().ok_or_else(|| ir("set op with no branches"))?)?
             }
@@ -233,7 +233,7 @@ impl Verifier<'_> {
                     }
                 }
             }
-            "union" | "intersect" | "except" => {
+            "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
                 let rels = v.as_array().ok_or_else(|| ir("set op without branches"))?;
                 // The prover takes the first branch's scope for the operation and asserts every
                 // other branch holds it: the same width, and in each column the same sort.

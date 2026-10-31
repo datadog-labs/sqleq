@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: citext was mapped to VARCHAR, whose equality is case-sensitive; a citext value is now refused
 -- witness: t = {('A')} (with the citext extension): A yields no rows (citext compares case-insensitively), B yields ('A')

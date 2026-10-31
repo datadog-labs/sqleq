@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #67: a declare line with non-ASCII letters in it panicked the frontend, which sliced the line with offsets
 --   taken from its Unicode-lowercased copy (İ grows by a byte when lowercased)

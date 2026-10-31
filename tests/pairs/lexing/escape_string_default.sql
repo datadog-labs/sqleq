@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #166: sqleq-fuzz unescaped every `\'` in the DDL, so the `E'x\';y'` default ended
 --   at its `\'` and no table was read (NO-SCHEMA)

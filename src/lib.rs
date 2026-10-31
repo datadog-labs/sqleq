@@ -609,10 +609,11 @@ impl Rewrites {
     pub const STRIP_IDENTICAL_LOCKS: Rewrites = Rewrites(1 << 9);
     pub const DESUGAR_SPECIAL_FORMS: Rewrites = Rewrites(1 << 10);
     pub const COLLAPSE_REPEATED_CASTS: Rewrites = Rewrites(1 << 11);
-    /// The twelve bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
+    pub const CANONICAL_ALIASES: Rewrites = Rewrites(1 << 12);
+    /// The thirteen bits above and exactly those. Not `u16::MAX`: a bit [`Rewrites::EACH`] does not name
     /// is a rewrite an attribution pass reports as "no rewrite was necessary" for every row it
     /// closes, so the two are pinned equal by a test and this mask is what makes that pin possible.
-    pub const ALL: Rewrites = Rewrites((1 << 12) - 1);
+    pub const ALL: Rewrites = Rewrites((1 << 13) - 1);
     /// Every rewrite except one — the single-subtraction counterfactual.
     pub const NONE: Rewrites = Rewrites(0);
 
@@ -630,7 +631,7 @@ impl Rewrites {
 
     /// The individual rewrites, in the order [`reflexive_with`] runs them, each with the stable name
     /// an attribution pass reports it under.
-    pub const EACH: [(&'static str, Rewrites); 12] = [
+    pub const EACH: [(&'static str, Rewrites); 13] = [
         ("fix_precedence", Rewrites::FIX_PRECEDENCE),
         ("desugar_special_forms", Rewrites::DESUGAR_SPECIAL_FORMS),
         ("demote_operators", Rewrites::DEMOTE_OPERATORS),
@@ -643,6 +644,7 @@ impl Rewrites {
         ("strip_identical_pagination", Rewrites::STRIP_IDENTICAL_PAGINATION),
         ("strip_dead_order_by", Rewrites::STRIP_DEAD_ORDER_BY),
         ("strip_schema", Rewrites::STRIP_SCHEMA),
+        ("canonical_aliases", Rewrites::CANONICAL_ALIASES),
     ];
 }
 
@@ -734,6 +736,11 @@ fn normalized_pair(
     let Ok((_, mut statements)) = parse_statements(src) else {
         return None;
     };
+    // As in `parse_input`: an identifier spelled like one of the rewrites' own could be read as it,
+    // so such a pair is not compared.
+    if statements.iter().any(|st| !matches!(lower::reserved_identifier(&st.to_string()), Ok(None))) {
+        return None;
+    }
     // A repair of a parser bug rather than a rewrite, so it runs here for the same reason it runs
     // first in `parse_input`: everything below reads the tree it produces.
     if rewrites.has(Rewrites::FIX_PRECEDENCE)
@@ -801,6 +808,9 @@ fn normalized_pair(
     }
     if rewrites.has(Rewrites::STRIP_SCHEMA) {
         normalize::strip_schema(&mut queries);
+    }
+    if rewrites.has(Rewrites::CANONICAL_ALIASES) {
+        normalize::canonical_aliases(&mut queries);
     }
     let mut it = queries.into_iter().map(|q| sqlparser::ast::Statement::Query(Box::new(q)));
     Some((it.next()?, it.next()?))
@@ -954,6 +964,9 @@ fn parse_input(
     casts::refuse_foreign_kinds(&statements)?;
     // Also before any rewrite, which writes calls of its own under names this refuses.
     lower::refuse_reserved_call_names(&statements)?;
+    // Also before any rewrite: the aliases, placeholders and markers the rewrites write all begin
+    // with `__sqleq_`, and an identifier of the input spelled so would be read as one of them.
+    lower::refuse_reserved_identifiers(&statements)?;
     // Before the shape check and the placeholder passes, which see a `$N` only in an expression
     // position, and a typed literal's `DATE $1` is not one.
     normalize::desugar_special_forms(&mut statements);
@@ -994,6 +1007,8 @@ fn parse_input(
     // Before `strip_schema`, which would otherwise turn `part_16.c` into something a CTE named `c`
     // captures.
     normalize::inline_ctes(&mut queries);
+    // After `inline_ctes`, so a window over a binding's rows sees the derived table that replaced it.
+    normalize::lower_rank_windows(&mut queries);
     // After `inline_ctes`, so a lock clause inside a `WITH` binding sits on the derived table that
     // replaced it and is compared in the position lowering will see it.
     normalize::strip_identical_locks(&mut queries);

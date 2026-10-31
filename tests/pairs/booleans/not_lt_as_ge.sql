@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 1: the order comparisons beside booleans/not_eq_as_ne.sql; NOT (a < 1) is now lowered as a >= 1
 -- argument: >= is the negator of < on integers: when a is NULL both sides are NULL, and otherwise one is true exactly when the other is false

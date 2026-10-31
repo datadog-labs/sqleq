@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: a table alias's column list was ignored, so `x.a` resolved to the table's own `a` (#31)
 -- witness: t = {(1, 2)}: the column list renames t's columns in order, so A yields 2 and B 1

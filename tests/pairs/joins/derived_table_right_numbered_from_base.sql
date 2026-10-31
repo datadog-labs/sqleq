@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #22: both SQLSolver bridges numbered a join's right input from after its left, so
 --   `t.c` on the right read as `t.id` and this pair was proved (#29)

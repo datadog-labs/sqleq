@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #108: a subscript of an opaque value was read as a value whose = is identity, though p[0] over a point is a double precision
 -- witness: t = {(1, '(-0,0)', '(0,0)')}: x = -0 and y = 0, so x = y holds; A yields -0 and B yields 0

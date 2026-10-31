@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz compared STRUCT cells by their Debug rendering, which includes the DuckDB type of each field
 -- argument: b is already bigint, so the cast changes nothing

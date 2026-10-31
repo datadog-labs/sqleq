@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #108: the result of sqrt(integer), a double precision, was typed VARBINARY and read as a type whose = is identity
 -- witness: t = {(1, 0, 0)}: x = -0 and y = 0, so x = y holds; A yields -0 and B yields 0

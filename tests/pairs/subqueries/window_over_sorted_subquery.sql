@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #59: a window function numbers the rows in the order a sorted subquery hands them on, and the
 --   reflexivity check stripped that ORDER BY too

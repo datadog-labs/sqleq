@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: the qualified ORDER BY key mismatch, inside a derived table
 -- witness: t = {(1, 1), (2, 2)}, u = {(1, 5), (2, 3)}: A returns 5, B returns 3

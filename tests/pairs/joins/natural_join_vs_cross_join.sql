@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: NATURAL JOIN is refused (`join_op`); read as a join with no constraint, it would be the
 --   CROSS JOIN beside it. No test reached that refusal until this pair

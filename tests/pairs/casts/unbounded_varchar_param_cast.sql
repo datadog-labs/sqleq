@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: the control beside the typmod fixes: a cast with no length must still be the identity

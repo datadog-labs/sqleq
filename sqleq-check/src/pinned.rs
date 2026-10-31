@@ -49,6 +49,8 @@ pub fn observe(case: &Case, axes: &[&str]) -> HashMap<String, (String, String)> 
     if axes.contains(&"qed") {
         if no_plan {
             put("qed", "no-plan", "");
+        } else if let Some(why) = &case.qed_unasked {
+            put("qed", "no-plan", why);
         } else {
             let mut word = qed_word(&case.status);
             if word == "proved" && case.trivial == Some(true) {
@@ -64,6 +66,13 @@ pub fn observe(case: &Case, axes: &[&str]) -> HashMap<String, (String, String)> 
             } else {
                 put(axis, case.s_bucket.as_deref().unwrap_or(crate::axes::solver::MISSING), &case.s_note);
             }
+        }
+    }
+    if axes.contains(&"cvc5") {
+        if no_plan {
+            put("cvc5", "no-plan", "");
+        } else {
+            put("cvc5", case.c_bucket.as_deref().unwrap_or(crate::axes::cvc5::MISSING), &case.c_note);
         }
     }
     if axes.contains(&"fuzz") {

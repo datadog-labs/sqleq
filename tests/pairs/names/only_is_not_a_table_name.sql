@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #190: sqlparser read ONLY "t" as a table named ONLY, which resolved to the table "only"
 -- witness: t = {(1, 1)}, "only" = {}: A reads t (with no children) and yields 1; B yields nothing

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a cast over a parameter was dropped as its type whatever type inference gave it; $1 is a numeric here (its first use is n = $1) and $1::int rounds it

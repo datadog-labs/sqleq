@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #62: sqleq-fuzz materialized CHAR(n) as VARCHAR, so trailing blanks became significant
 -- argument: comparing a character(n) value ignores trailing blanks, and the untyped literal is read as character, so 'a' and 'a  ' compare the same

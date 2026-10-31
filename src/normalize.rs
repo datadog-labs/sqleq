@@ -3111,3 +3111,317 @@ mod tests {
         assert_eq!(distributed(&once), once);
     }
 }
+
+/// Every table alias a query declares renamed to `__sqleq_alias_N`, N counting the aliases in the
+/// order they are declared, and every qualifier that names one with it: two queries that differ only
+/// in what they call their aliases (`FROM emp AS e` and `FROM emp AS e0`, each read as `e.x` and
+/// `e0.x`) become one tree, for [`crate::reflexive`] alone.
+///
+/// SOUNDNESS GUARD. The renaming is by name, not by scope, so it must be a consistent renaming of the
+/// query to keep its meaning: it is skipped for a query that declares one alias name twice, or one
+/// that is also a table it reads without an alias (whose implicit qualifier it would rename too), or
+/// one that is already of the canonical form. Canonical names are distinct, so the renaming is
+/// injective, and two queries renamed to one tree differ by a renaming of their aliases only -- as
+/// long as every way the query names an alias was renamed. The renaming reaches a declaration, a
+/// qualifier `a.x` and a qualified wildcard `a.*` in a select list, and nothing else that can name
+/// one: not a whole-row reference (`row_to_json(e)`, `(e).x`, `e.*` as an argument), not the alias
+/// of an `UNNEST`, a function or a parenthesized join (which the collection does not see either, so
+/// a duplicate of one escapes the clash check), not a three-part name. Each would leave the name in
+/// place while its declaration, or another alias's, was renamed, and two queries Postgres tells
+/// apart could become one tree. So a query in whose text an alias's name is still an identifier
+/// after the renaming is put back as it was ([`names_remain`]).
+pub fn canonical_aliases(queries: &mut [Query]) {
+    for q in queries {
+        let mut seen = CollectAliases::default();
+        let _ = Visit::visit(&*q, &mut seen);
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut clash = false;
+        for a in &seen.aliases {
+            let n = map.len();
+            match map.entry(a.clone()) {
+                Entry::Occupied(_) => clash = true,
+                Entry::Vacant(v) => {
+                    v.insert(format!("__sqleq_alias_{n}"));
+                }
+            }
+        }
+        clash = clash
+            || seen.aliases.iter().any(|a| a.starts_with("__sqleq_alias_"))
+            || seen.unaliased.iter().any(|t| map.contains_key(t));
+        if map.is_empty() || clash {
+            continue;
+        }
+        let before = q.clone();
+        let _ = VisitMut::visit(q, &mut RenameAliases { map: &map });
+        if names_remain(q, &map) {
+            *q = before;
+        }
+    }
+}
+
+/// Whether an identifier token of `q`'s text, folded as [`crate::dml::fold_ident`] folds one, is a
+/// key of `map`: an alias name the renaming left in place. `true` as well when the text does not
+/// tokenize, which keeps the renaming out.
+fn names_remain(q: &Query, map: &HashMap<String, String>) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, &q.to_string()).tokenize() else {
+        return true;
+    };
+    tokens.iter().any(|t| match t {
+        Token::Word(w) => map.contains_key(&match w.quote_style {
+            Some(_) => w.value.clone(),
+            None => w.value.to_ascii_lowercase(),
+        }),
+        _ => false,
+    })
+}
+
+/// Whether `e` has a subquery anywhere in it.
+pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    struct Subquery;
+    impl Visitor for Subquery {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+    }
+    Visit::visit(e, &mut Subquery).is_break()
+}
+
+/// The aliases a query declares, folded, in order, and the bare names of the tables it reads without
+/// one, for [`canonical_aliases`].
+#[derive(Default)]
+struct CollectAliases {
+    aliases: Vec<String>,
+    unaliased: Vec<String>,
+}
+
+impl Visitor for CollectAliases {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<Self::Break> {
+        match t {
+            TableFactor::Table { name, alias, .. } => match alias {
+                Some(a) => self.aliases.push(crate::dml::fold_ident(&a.name)),
+                None => {
+                    if let Some(id) = name.0.last().and_then(|p| p.as_ident()) {
+                        self.unaliased.push(crate::dml::fold_ident(id));
+                    }
+                }
+            },
+            TableFactor::Derived { alias: Some(a), .. } => self.aliases.push(crate::dml::fold_ident(&a.name)),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+struct RenameAliases<'a> {
+    map: &'a HashMap<String, String>,
+}
+
+impl RenameAliases<'_> {
+    fn rename(&self, id: &mut Ident) {
+        if let Some(n) = self.map.get(&crate::dml::fold_ident(id)) {
+            *id = Ident::new(n.clone());
+        }
+    }
+}
+
+impl VisitorMut for RenameAliases<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
+        match t {
+            TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => {
+                self.rename(&mut a.name)
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::CompoundIdentifier(ids) = e {
+            if ids.len() >= 2 {
+                self.rename(&mut ids[0]);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<Self::Break> {
+        // `t.*` is a select item, not an expression
+        fn items(body: &mut SetExpr, this: &RenameAliases<'_>) {
+            match body {
+                SetExpr::Select(s) => {
+                    for item in s.projection.iter_mut() {
+                        if let SelectItem::QualifiedWildcard(sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n), _) = item {
+                            if n.0.len() == 1 {
+                                if let ObjectNamePart::Identifier(id) = &mut n.0[0] {
+                                    this.rename(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                SetExpr::SetOperation { left, right, .. } => {
+                    items(left, this);
+                    items(right, this);
+                }
+                _ => {}
+            }
+        }
+        items(&mut q.body, self);
+        ControlFlow::Continue(())
+    }
+}
+
+/// `RANK() OVER (PARTITION BY p.. ORDER BY o..)` in the select list of a query that reads one table
+/// and nothing else, as what it is: one more than the number of the table's rows in the row's
+/// partition that sort strictly before it,
+///
+/// ```sql
+/// 1 + (SELECT COUNT(*) FROM t AS __sqleq_window
+///      WHERE __sqleq_window.p IS NOT DISTINCT FROM a.p AND <__sqleq_window sorts before a by o..>)
+/// ```
+///
+/// with `a` the table's alias (or its name), each key in its direction and with its nulls where the
+/// clause puts them (Postgres's default: last ascending, first descending). Rows that tie on every
+/// key are peers and share a rank, which the strict comparison gives them; a frame clause does not
+/// change a rank.
+///
+/// SOUNDNESS GUARD. Only where the window sees exactly the table's rows: one table in `FROM`, with no
+/// join, and no `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `QUALIFY` or named window; partition and
+/// order keys that are columns of that table; `RANK()` with no argument and no `FILTER`; and only in
+/// a select item with no subquery in it, since the walk over an item enters every expression of it,
+/// and a `RANK()` inside a subquery is over that subquery's rows, not this table's. Any other window
+/// call is left alone, and lowering refuses it as before. The alias the rewrite writes,
+/// `__sqleq_window`, is a name no input spells ([`crate::lower::refuse_reserved_identifiers`]), so a
+/// table the input aliases so cannot be taken for it.
+pub fn lower_rank_windows(queries: &mut [Query]) {
+    for q in queries {
+        let _ = VisitMut::visit(q, &mut RankWindows);
+    }
+}
+
+struct RankWindows;
+
+impl VisitorMut for RankWindows {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<Self::Break> {
+        if let SetExpr::Select(s) = q.body.as_mut() {
+            rank_windows_in(s);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn rank_windows_in(s: &mut sqlparser::ast::Select) {
+    use sqlparser::ast::{OrderBySort, WindowType};
+    if s.from.len() != 1
+        || !s.from[0].joins.is_empty()
+        || s.selection.is_some()
+        || s.having.is_some()
+        || s.qualify.is_some()
+        || s.distinct.is_some()
+        || !s.named_window.is_empty()
+        || !matches!(&s.group_by, GroupByExpr::Expressions(v, m) if v.is_empty() && m.is_empty())
+    {
+        return;
+    }
+    let TableFactor::Table { name, alias, args: None, .. } = &s.from[0].relation else { return };
+    if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+        return;
+    }
+    let Some(outer) = alias.as_ref().map(|a| a.name.clone()).or_else(|| name.0.last().and_then(|p| p.as_ident()).cloned())
+    else {
+        return;
+    };
+    let table = name.to_string();
+    // a key as a column of the table: `c` or `a.c`
+    let column = |e: &Expr| -> Option<Ident> {
+        match e {
+            Expr::Identifier(id) => Some(id.clone()),
+            Expr::CompoundIdentifier(ids) if ids.len() == 2 && crate::dml::fold_ident(&ids[0]) == crate::dml::fold_ident(&outer) => {
+                Some(ids[1].clone())
+            }
+            _ => None,
+        }
+    };
+    let rank = |f: &Function| -> Option<Expr> {
+        if !obj_name_is(&f.name, "rank")
+            || f.uses_odbc_syntax
+            || !matches!(f.parameters, FunctionArguments::None)
+            || !matches!(&f.args, FunctionArguments::List(l) if l.args.is_empty() && l.clauses.is_empty() && l.duplicate_treatment.is_none())
+            || f.filter.is_some()
+            || f.null_treatment.is_some()
+            || !f.within_group.is_empty()
+        {
+            return None;
+        }
+        let Some(WindowType::WindowSpec(spec)) = &f.over else { return None };
+        if spec.window_name.is_some() {
+            return None;
+        }
+        let w = "__sqleq_window";
+        let mut conds = Vec::new();
+        for p in &spec.partition_by {
+            let c = column(p)?;
+            conds.push(format!("{w}.{c} IS NOT DISTINCT FROM {outer}.{c}"));
+        }
+        // w sorts before the row: lexicographically, from the last key
+        let mut before = "FALSE".to_string();
+        for o in spec.order_by.iter().rev() {
+            if o.with_fill.is_some() {
+                return None;
+            }
+            let c = column(&o.expr)?;
+            let desc = match &o.options.sort {
+                None | Some(OrderBySort::Asc) => false,
+                Some(OrderBySort::Desc) => true,
+                Some(OrderBySort::Using(_)) => return None,
+            };
+            let nulls_first = o.options.nulls_first.unwrap_or(desc);
+            let (a, b) = (format!("{w}.{c}"), format!("{outer}.{c}"));
+            let values = if desc { format!("{a} > {b}") } else { format!("{a} < {b}") };
+            let nulls = if nulls_first {
+                format!("({a} IS NULL AND {b} IS NOT NULL)")
+            } else {
+                format!("({b} IS NULL AND {a} IS NOT NULL)")
+            };
+            before = format!("(({values}) OR {nulls} OR ({a} IS NOT DISTINCT FROM {b} AND {before}))");
+        }
+        conds.push(before);
+        let text = format!("(1 + (SELECT COUNT(*) FROM {table} AS {w} WHERE {}))", conds.join(" AND "));
+        sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(&text)
+            .ok()?
+            .parse_expr()
+            .ok()
+    };
+    for item in s.projection.iter_mut() {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        // SOUNDNESS GUARD: see above. The item's subquery keeps its `RANK()`, which lowering refuses.
+        if contains_subquery(e) {
+            continue;
+        }
+        let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+            if let Expr::Function(f) = x {
+                if let Some(r) = rank(f) {
+                    *x = r;
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+}
+
+/// Whether `name` is the unqualified function `want`, case aside.
+fn obj_name_is(name: &ObjectName, want: &str) -> bool {
+    name.0.len() == 1 && name.0[0].as_ident().is_some_and(|id| id.value.eq_ignore_ascii_case(want))
+}

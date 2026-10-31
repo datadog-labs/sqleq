@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a prefix operator the frontend does not model is refused (`unary`); read as unary + is,
 --   Postgres's absolute value `@ (a - 1)` would lower to `a - 1`. No test reached that refusal until

@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather-generated
 -- binding: gather-generated
 -- origin: a statement clock and a random uuid as VALUES cells, under a unique key

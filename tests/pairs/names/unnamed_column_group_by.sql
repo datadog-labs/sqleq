@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #88: a GROUP BY name that missed the derived table's unnamed CASE column (Postgres's
 --   "case") fell back to the select-list alias "case", a constant, instead of the input column

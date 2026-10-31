@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: error
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz let DuckDB answer inf for power(0, -1), where Postgres raises
 -- argument: for a <> 0, -power(-a, -1) = -(1 / -a) = 1 / a = power(a, -1); for a = 0 Postgres raises

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: numeric division was read as exact division
 -- witness: t = {(1)}: A yields 0.99999999999999999990 (numeric division rounds to a finite scale), B yields 1

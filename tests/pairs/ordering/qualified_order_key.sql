@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: a qualified ORDER BY key is matched against the output column names by its
 --   last part, so ORDER BY t.a sorts by the projected u.a

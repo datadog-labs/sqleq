@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #122: $1 < 1 rewritten as $1 <= 0 is right for integers only, and $1 is a numeric (its first use is n * 2)

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #46: the qualified ORDER BY key mismatch, in a grouped query
 -- witness: t = {(1, 1), (2, 2)}, u = {(1, 5), (2, 3)}: A returns 5, B returns 3

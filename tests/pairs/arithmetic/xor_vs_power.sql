@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a binary operator the frontend does not model is refused (`binop`). In Postgres `#` is
 --   XOR and `^` is exponentiation; other dialects spell XOR `^`, and a lowering that read it so

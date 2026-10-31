@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #57: strip_identical_pagination matched any key's text against an alias's, so the
 --   key t.a, the input column a, counted as the output column "t.a" and the pagination was dropped

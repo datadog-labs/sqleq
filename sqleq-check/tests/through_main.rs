@@ -25,20 +25,94 @@ struct Run<'a> {
 
 impl Run<'_> {
     fn main(&self, extra: &[&str], axes: &str) -> Ran {
+        self.main_env(extra, axes, &[])
+    }
+
+    fn main_env(&self, extra: &[&str], axes: &str, env: &[(&str, &str)]) -> Ran {
         let f = self.f;
         let mut argv: Vec<String> = ["--expect", "pinned", "--axes", axes, "-j", "1"].iter().map(|x| s(x)).collect();
-        for (flag, bin) in [("--frontend", &f.frontend), ("--sqleq-solver-bin", &f.solver), ("--fuzz-bin", &f.fuzz)] {
+        for (flag, bin) in [
+            ("--frontend", &f.frontend),
+            ("--sqleq-solver-bin", &f.solver),
+            ("--fuzz-bin", &f.fuzz),
+            ("--cvc5-bin", &f.cvc5),
+        ] {
             argv.extend([s(flag), bin.to_string_lossy().into_owned()]);
         }
         argv.extend(extra.iter().map(|x| s(x)));
         argv.push(f.case.to_string_lossy().into_owned());
-        self.raw(f.path(), &argv)
+        let log = self.f.argv_log.to_string_lossy().into_owned();
+        let mut all: Vec<(&str, &str)> = vec![("FAKE_ARGV", &log), ("FAKE_SS", self.ss), ("FAKE_FUZZ", self.fuzz)];
+        all.extend_from_slice(env);
+        run(f.path(), &argv, &all)
     }
 
     fn raw(&self, cwd: &Path, argv: &[String]) -> Ran {
         let log = self.f.argv_log.to_string_lossy().into_owned();
         run(cwd, argv, &[("FAKE_ARGV", &log), ("FAKE_SS", self.ss), ("FAKE_FUZZ", self.fuzz)])
     }
+}
+
+const FE_CVC5: &str = "frontend,cvc5";
+
+#[test]
+fn a_cvc5_model_on_an_equivalent_pair_is_pinned_and_a_proof_beside_it_is_an_alarm() {
+    let f = Fakes::new();
+    let r = Run { f: &f, ss: "NEQ", fuzz: "NO-COUNTEREXAMPLE" };
+    std::fs::write(&f.case, pair(&EQ_OK, &["-- expect frontend: emit"])).unwrap();
+    // A model refutes the plan, not the pair: the plan may lack a constraint the DDL has. So it
+    // is no invariant failure on an equivalent pair, only an unpinned answer, which --bless takes.
+    let ran = r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]);
+    assert_eq!(ran.code, 1, "{}{}", ran.out, ran.err);
+    assert!(ran.out.contains("+ model"), "{}", ran.out);
+    assert_eq!(r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+    assert!(read(&f.case).contains("-- expect cvc5: model\n"), "{}", read(&f.case));
+    assert_eq!(r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+    // A proof over the same plan contradicts it, whatever the pins say.
+    let ran = r.main_env(&[], "frontend,cvc5,sqleq-solver", &[("FAKE_CVC5", "NEQ"), ("FAKE_SS", "EQ")]);
+    assert_eq!(ran.code, 1);
+    assert!(ran.out.contains("Alarms"), "{}", ran.out);
+    // The same answer under uninterpreted symbols is a candidate, not a claim: `no-proof`.
+    let ran = r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ"), ("FAKE_CVC5_INEXACT", "1")]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert!(read(&f.case).contains("-- expect cvc5: no-proof\n"), "{}", read(&f.case));
+}
+
+#[test]
+fn a_cvc5_proof_on_a_non_equivalent_pair_fails_and_an_exact_model_pins() {
+    let f = Fakes::new();
+    let r = Run { f: &f, ss: "NEQ", fuzz: "NOT-EQUIVALENT" };
+    std::fs::write(&f.case, pair(&NEQ_OK, &["-- expect frontend: emit"])).unwrap();
+    let ran = r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "EQ")]);
+    assert_eq!(ran.code, 1, "{}{}", ran.out, ran.err);
+    assert!(ran.out.contains("‼ proved"), "{}", ran.out);
+    assert_eq!(r.main_env(&["--bless"], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+    assert!(read(&f.case).contains("-- expect cvc5: model\n"), "{}", read(&f.case));
+    assert_eq!(r.main_env(&[], FE_CVC5, &[("FAKE_CVC5", "NEQ")]).code, 0);
+}
+
+#[test]
+fn the_cvc5_driver_gets_the_plan_under_the_case_name() {
+    let f = Fakes::new();
+    let r = Run { f: &f, ss: "NEQ", fuzz: "NO-COUNTEREXAMPLE" };
+    std::fs::write(&f.case, pair(&EQ_OK, &["-- expect frontend: emit", "-- expect cvc5: proved"])).unwrap();
+    let argv_log = f.path().join("cvc5.argv");
+    let log = argv_log.to_string_lossy().into_owned();
+    let ran = r.main_env(
+        &["--cvc5-semantics", "sets", "--cvc5-opt", "bags-deq-decompose=false", "--cvc5-timeout", "1500"],
+        FE_CVC5,
+        &[("FAKE_CVC5", "EQ"), ("FAKE_CVC5_ARGV", &log)],
+    );
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    assert!(argv.contains("--semantics=sets"), "{argv}");
+    assert!(argv.contains("--opt=bags-deq-decompose=false"), "{argv}");
+    assert!(argv.contains("--timeout-ms="), "{argv}");
+    let job: String = argv.split_whitespace().find(|a| a.ends_with(".job.jsonl")).unwrap().to_string();
+    let line = std::fs::read_to_string(&job).unwrap_or_default();
+    // Under --keep the job survives; without it the directory is gone by now, and the argument
+    // alone says the driver was handed a job file.
+    assert!(line.is_empty() || line.contains("\"ir\""), "{line}");
 }
 
 const FE_SS: &str = "frontend,sqleq-solver";

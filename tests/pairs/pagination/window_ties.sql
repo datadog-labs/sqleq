@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz compared how DuckDB numbered rows tied in a window ORDER BY as a bag,
 --   though Postgres numbers them by physical order

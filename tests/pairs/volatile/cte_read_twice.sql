@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #49: the reflexivity check inlined a WITH binding read twice, duplicating the
 --   random() call in it; Postgres evaluates the binding once

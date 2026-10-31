@@ -41,6 +41,7 @@ impl<'a> Portfolio<'a> {
             ("--sqleq-solver-bin", &f.solver),
             ("--fuzz-bin", &f.fuzz),
             ("--lean-bin", &f.lean),
+            ("--cvc5-bin", &f.cvc5),
         ] {
             argv.extend([s(flag), bin.to_string_lossy().into_owned()]);
         }
@@ -315,3 +316,33 @@ fn a_refused_pair_whose_sides_are_one_query_is_equivalent() {
     assert_eq!(verdict(&c), "undecided");
 }
 
+
+#[test]
+fn a_cvc5_model_is_a_candidate_and_contradicts_a_proof() {
+    let f = setup();
+    let mut p = Portfolio::new(&f);
+    p.set("FAKE_CVC5", "NEQ");
+    // Alone, a model decides nothing: it refutes the plan, which may lack a constraint the DDL has.
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(verdict(&case), "undecided");
+    assert_eq!(case["c_bucket"], "model");
+    assert_eq!(case["c_note"], "t=[(0)]");
+
+    p.set("FAKE_QED", "proved");
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 1, "an alarm fails the run");
+    assert_eq!(verdict(&case), "alarm");
+
+    // A model under uninterpreted symbols decides nothing.
+    p.set("FAKE_QED", "no-proof").set("FAKE_CVC5_INEXACT", "1");
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(verdict(&case), "undecided");
+    assert_eq!(case["c_bucket"], "no-proof");
+
+    p.set("FAKE_CVC5", "EQ");
+    let (_, case) = p.case(&["--axes", "cvc5", "--expect", "report-only"]);
+    assert_eq!(verdict(&case), "equivalent");
+    assert_eq!(strings(&case["portfolio"]["by"]), ["cvc5"]);
+}

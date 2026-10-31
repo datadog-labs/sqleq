@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a domain's DEFAULT was not read, so a column of a domain whose default is a sequence was
 --   taken for row-determined by the INSERT reduction

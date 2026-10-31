@@ -6,8 +6,8 @@
 //! Portfolio solving: every backend at once on each case, under one deadline, and one verdict.
 //!
 //! `--portfolio` starts sqleq-fuzz and Lean on a case the moment it is picked up, beside the
-//! frontend, and the QED prover and sqleq-solver as soon as the frontend has lowered and packaged
-//! the pair. Every one of them gets whatever is left of the case's `--timeout`, and what is still
+//! frontend, and the QED prover, sqleq-solver and cvc5 as soon as the frontend has lowered and
+//! packaged the pair. Every one of them gets whatever is left of the case's `--timeout`, and what is still
 //! running when it passes is killed with its process group. No backend is stopped because another
 //! answered: a proof and a counterexample on the same pair is a soundness alarm in one of them, and
 //! a run that stopped at the first answer could not see it.
@@ -23,11 +23,11 @@ use std::time::Instant;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::axes::{fuzz, lean, solver};
+use crate::axes::{cvc5, fuzz, lean, solver};
 use crate::case::{self, Case, Workdir, ERROR, LOWERED, PANIC, TIMEOUT as CASE_TIMEOUT};
-use crate::discover::SsDriver;
+use crate::discover::{Cvc5Driver, SsDriver};
 use crate::inputs::{first_row_name, CorpusRow, Item};
-use crate::suite::{self, AXES, BINDINGS, GATHER, GATHER_GENERATED, INDEX};
+use crate::suite::{self, ALARM_BINDINGS, AXES, GATHER, GATHER_GENERATED, INDEX};
 use crate::util::tail;
 
 /// A proof and a counterexample under the same binding: one of the two backends is wrong.
@@ -99,8 +99,10 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
     // An answer can contradict another only under the binding both answer under: a Lean proof and
     // a fuzz counterexample found with `$N` bound alike are about different relations between the
     // two sides' parameters, and a Lean proof and a fuzz counterexample under the gather rule are
-    // not.
-    for b in BINDINGS {
+    // not. A cvc5 model refutes under the plan's own reading, where every prover's proof also
+    // claims, so a proof and a model over one plan are an alarm; a fuzz `no-counterexample` is no
+    // contradiction to it, since Postgres runs the pair under constraints the plan may lack.
+    for b in ALARM_BINDINGS {
         let claims = saying(b, &|a| suite::claims_equivalent(a, b));
         let refuted = saying(b, &|a| suite::refutes(a, b));
         if !claims.is_empty() && !refuted.is_empty() {
@@ -145,6 +147,9 @@ pub struct Ctx<'a> {
     pub ss: Option<&'a SsDriver>,
     /// `--sqleq-solver-timeout`: a cap within the deadline, when one was given.
     pub ss_cap_ms: Option<u64>,
+    pub cvc5: Option<&'a Cvc5Driver>,
+    /// `--cvc5-timeout`, likewise.
+    pub cvc5_cap_ms: Option<u64>,
     pub fuzz: Option<&'a str>,
     pub lean: Option<&'a str>,
     pub timeout: f64,
@@ -331,6 +336,19 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                             s.spawn(move || (ss_one(d, &name, &job, &out, ctx.ss_cap_ms, ctx.ss_mem, deadline), since(t0)))
                         })
                     });
+                    // The cvc5 axis's job: the plan under the case's name, in the case's directory.
+                    let cv = ctx.cvc5.and_then(|d| {
+                        let job = workdir.join("cvc5.job.jsonl");
+                        let out = workdir.join("cvc5.results.jsonl");
+                        if let Err(e) = cvc5::write_job(name, &workdir.join(&json), &job) {
+                            case.c_bucket = Some(cvc5::ERROR.into());
+                            case.c_note = format!("could not write the cvc5 job: {e}");
+                        }
+                        case.c_bucket.is_none().then(|| {
+                            let name = name.to_string();
+                            s.spawn(move || (cvc5::cvc5_one(d, &name, &job, &out, ctx.cvc5_cap_ms, left(deadline)), since(t0)))
+                        })
+                    });
                     match ctx.prover {
                         Some(p) => {
                             if left(deadline) > 0.0 {
@@ -342,6 +360,12 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                             done.insert("qed".into(), since(t0));
                         }
                         None => case.status = LOWERED.into(),
+                    }
+                    if let Some(h) = cv {
+                        if let Ok((answer, t)) = h.join() {
+                            cvc5::settle(&mut case, answer);
+                            done.insert("cvc5".into(), t);
+                        }
                     }
                     if let Some(h) = ss {
                         if let Ok((answer, t)) = h.join() {
@@ -400,6 +424,7 @@ pub fn worth_retrying(case: &Case) -> bool {
             case.status == PANIC
                 || case.status == ERROR
                 || matches!(case.s_bucket.as_deref(), Some(solver::ERROR) | Some(solver::MISSING))
+                || matches!(case.c_bucket.as_deref(), Some(cvc5::ERROR) | Some(cvc5::MISSING))
         }
         _ => false,
     }
@@ -450,6 +475,20 @@ mod tests {
             ("the frontend cut off", vec![("frontend", "timeout"), ("qed", "no-plan"), ("fuzz", "no-counterexample")], TIMEOUT),
             ("a refusal", vec![("frontend", "refuse:unsupported"), ("qed", "no-plan"), ("fuzz", "error")], UNDECIDED),
             ("a proof beats a cut-off", vec![("qed", "proved"), ("sqleq-solver", "timeout")], EQUIVALENT),
+            // cvc5's model refutes under the plan's reading only: alone it decides nothing (the
+            // database may be one the DDL forbids), against a proof over the same plan it is an
+            // alarm. Its proof is a claim, so against a refutation it is an alarm too, but the axis
+            // is experimental and its proof is no evidence (`suite::evidence_equivalent`): alone it
+            // decides nothing either. Under set semantics its answers are about an approximation,
+            // and neither claim nor refute.
+            ("a cvc5 model", vec![("qed", "no-proof"), ("cvc5", "model"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("a cvc5 proof", vec![("qed", "no-proof"), ("cvc5", "proved"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("a proof and a cvc5 model", vec![("qed", "proved"), ("cvc5", "model")], ALARM),
+            ("a cvc5 proof and a counterexample", vec![("cvc5", "proved"), ("fuzz", "counterexample")], ALARM),
+            ("a cvc5 proof under sets", vec![("qed", "no-proof"), ("cvc5", "proved-sets"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("a cvc5 proof under sets and a counterexample", vec![("cvc5", "proved-sets"), ("fuzz", "counterexample")], NOT_EQUIVALENT),
+            ("a proof and a cvc5 model under sets", vec![("qed", "proved"), ("cvc5", "model-sets")], EQUIVALENT),
+            ("cvc5 undecided", vec![("qed", "no-proof"), ("cvc5", "no-proof"), ("fuzz", "no-counterexample")], UNDECIDED),
         ];
         for (label, observed, want) in rows {
             assert_eq!(v(&observed).0, want, "{label}");

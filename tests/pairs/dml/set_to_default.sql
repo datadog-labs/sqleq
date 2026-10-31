@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #57: SET a = DEFAULT was read as a reference to a column named default
 -- witness: t = {(1, 5, 9)}: A leaves (1, 0, 9), B leaves (1, 9, 9)

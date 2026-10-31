@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #61: sqleq-solver compared decimal constants through f64, and 0.1 and 0.10000000000000001 are one double
 -- witness: t = {(1, 2)}: numeric is exact and 0.10000000000000001 > 0.1, so A returns 1 and B returns nothing

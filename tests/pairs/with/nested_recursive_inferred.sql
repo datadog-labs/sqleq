@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #50: under an inferred catalog only a top-level WITH was refused; a WITH RECURSIVE

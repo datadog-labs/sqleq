@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: no-witness
 -- binding: gather
 -- origin: #110: ON CONFLICT ON CONSTRAINT naming a deferrable constraint

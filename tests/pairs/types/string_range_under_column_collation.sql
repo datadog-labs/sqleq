@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #87: a string range was decided by code point, but s compares under en_US.utf8, where 'a' < 'b' < 'B'
 -- witness: t = {(1, 'b')}: under en_US.utf8 'a' < 'b' and 'b' < 'B', so A returns 1 and B returns nothing

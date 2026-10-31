@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
 -- expect sqlsolver-jvm: unsupported
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a parameter dead on one side counts where the other side uses it, so the pair aligns and

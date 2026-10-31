@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #164: collation::BLIND spelled the JSON symbols in lower case, so a key lookup was
 --   refused beside any column that declares a collation

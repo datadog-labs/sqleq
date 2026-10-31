@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #163: a call of a function named `<` was lowered as the comparison `<`
 -- witness: t = {(1, 5)}: A calls the declared "<", which returns true, so A yields 1; B compares

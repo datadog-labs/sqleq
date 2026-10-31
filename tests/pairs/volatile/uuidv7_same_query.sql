@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #63: uuidv7() was missing from sqleq-fuzz's list of nondeterministic functions, so two runs of one query were compared
 -- argument: the two sides are the same query

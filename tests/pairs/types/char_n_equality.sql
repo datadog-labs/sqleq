@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: char(n) was mapped to VARCHAR, whose equality counts trailing spaces; a char(n) value is now refused
 -- witness: t = {('a')} (char(3)): A yields no rows (char(n) comparison ignores trailing spaces), B yields ('a  ')

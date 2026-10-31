@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: an ALTER TABLE after the CREATE TABLE was not read, so a primary key a later DROP
 --   CONSTRAINT dropped was still taken for a key

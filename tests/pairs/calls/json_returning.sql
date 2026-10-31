@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: the SQL/JSON RETURNING clause was dropped
 -- witness: t = {('{"b":1,"a":2}')}: A yields [{"b":1,"a":2}], B yields [{"a": 2, "b": 1}]

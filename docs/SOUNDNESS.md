@@ -27,13 +27,44 @@ The provers are taken to be sound: each proves only genuinely equivalent pairs *
 (the JVM SQLSolver has known exceptions, listed in [SQLSOLVER.md](SQLSOLVER.md)). So, short of the
 two assumptions below, a false positive can only come from unfaithful lowering. The frontend
 therefore **refuses** (returns an error) any construct it cannot lower faithfully — window
-functions, `HAVING` it can't express, correlated columns it can't resolve, `INTERSECT/EXCEPT ALL`,
+functions (but for the one `RANK()` shape rewritten below), `HAVING` it can't express, correlated
+columns it can't resolve,
 `LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
 a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
 TIES`, a `WITH` it cannot inline (`RECURSIVE`, or one with a data-modifying binding, at any level),
 etc. — rather than emitting best-effort IR. It never panics or exits on bad input: a statement whose
 expressions or set operations nest more than 1,024 levels deep, which the parser builds with a loop
 from a long chain such as `a + a + … + a`, is refused before any pass recurses on it.
+
+`INTERSECT ALL` and `EXCEPT ALL` keep multiplicities, so they have IR nodes of their own,
+`intersectAll` and `exceptAll`, apart from the set operations `intersect` and `except`: a prover over
+sets refuses them (`sqleq-solver` answers unsupported; QED is not handed such a plan, and answers
+`no-plan`), and the cvc5 axis states them over bags as `bag.inter_min` and
+`bag.difference_subtract`.
+
+Two constructs are rewritten into ones the IR has, each under guards that keep the rewrite exactly
+what SQL defines the construct as, and refused outside them:
+
+- `RANK() OVER (PARTITION BY p.. ORDER BY o..)` in the select list of a query over one table and
+  nothing else is one more than the number of the table's rows in the row's partition that sort
+  strictly before it, `1 + (SELECT COUNT(*) FROM t AS w WHERE ..)`, each key in its direction and
+  with its nulls where the clause puts them (`normalize::lower_rank_windows`). Only where the window
+  sees exactly the table's rows: one table in `FROM`, no join, `WHERE`, `GROUP BY`, `HAVING`,
+  `DISTINCT`, `QUALIFY` or named window, keys that are the table's columns, and a select item with
+  no subquery in it (a `RANK()` inside a subquery is over that subquery's rows). Any other window
+  call is refused as before.
+- `GROUPING SETS`, `ROLLUP` and `CUBE` are the union of one `GROUP BY` per grouping set, the
+  columns a set leaves out NULL of their type in its rows, the empty set `GROUP BY ()`, and
+  `GROUPING(..)` the bit mask of its arguments the set leaves out; a `DISTINCT` is over the whole
+  result, so the branches are joined by `UNION` (`lower::expand_grouping_sets`). A grouping
+  expression is matched by its text from the top of each expression down, so the expansion refuses
+  what that match cannot see or could mistake: a wildcard, a subquery in the select list or
+  `HAVING`, `DISTINCT ON`, a grouping construct nested in another, and a `GROUPING` of no argument
+  or of more than 31.
+
+Both write identifiers of their own (`__sqleq_window`, the expansion's placeholders), and every
+identifier of the input that begins with `__sqleq_` is refused before any rewrite runs
+(`lower::refuse_reserved_identifiers`), so none can be taken for one of them.
 
 Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
 `OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: a numeric cast to text was a function of its value, which REAL carries without the scale the text shows
 -- witness: t = {(2)}: A yields '2.0', B yields '2.00'

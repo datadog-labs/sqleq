@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: COUNT(x) must not be read as COUNT(*): one ignores NULLs, the other counts rows
 -- witness: t = {(1, NULL)}: A returns 0, B returns 1

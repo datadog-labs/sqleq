@@ -33,6 +33,10 @@ sqleq-check --expect pinned --axes qed tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
 # The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
 sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
+# The cvc5 axis, which needs sqleq-cvc5 built by `sh tools/build_cvc5.sh` (docs/CVC5.md). Its
+# `model` refutes the plan, not the pair, so an equivalent pair may carry one; a `proved` on a
+# non-equivalent pair is an invariant failure like any prover's:
+sqleq-check --expect pinned --axes cvc5 tests/pairs examples/*.sql
 ```
 
 The output is one row per pair, with its `truth` and one column per axis that ran. Exit code 0
@@ -75,7 +79,7 @@ reads looks exactly like one that holds.
 | `catalog:` | a person | `declared` (the default), `inferred` or `inferred-seeded`. A pair that uses `$N` needs an inferred catalog: under the declared one the frontend refuses a bare placeholder. |
 | `origin:` | a person; required | why the pair is here — the defect, and the commit or PR that fixed it |
 | `witness:` | a person | for a non-equivalent pair, an instance on which the two sides differ. Required unless the pair pins `expect fuzz: counterexample` under `binding: index`, or `expect fuzz: counterexample-gather` under `binding: gather`. |
-| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal`, the frontend's is `emit-reflexive` or `reflexive`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
+| `argument:` | a person | for an equivalent pair, why it is one. Required unless a prover's pin is `proved` or `proved-literal` (cvc5's `proved` excepted, while the axis is experimental), the frontend's is `emit-reflexive` or `reflexive`, or Lean's is `proved-gather` under `binding: gather`, or `proved-gather-generated` (or `proved-gather`) under `binding: gather-generated`. |
 
 ## What each axis may say
 
@@ -86,8 +90,9 @@ nothing and changing what is refused moves a pin.
 |---|---|
 | `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `reflexive` (refused, but the two sides normalize to the same tree: settled without a plan), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
 | `fuzz` | `counterexample`, `no-counterexample`, `counterexample-gather`, `no-counterexample-gather` (the same two, for a pair it ran under the gather rule), `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
-| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed), `panic`, `error` |
+| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed; or the plan has a node QED's IR cannot read, `INTERSECT ALL` or `EXCEPT ALL`, and was not handed to it), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
+| `cvc5` | `proved`, `proved-literal`, `model` (a database on which cvc5's encodings of the two plans differ: a refutation of the plan under its own reading, which lacks the constraints the frontend does not carry, so an equivalent pair may carry one), `proved-sets`, `model-sets` (the same two under `--cvc5-semantics sets`, an approximation under which duplicates collapse, so neither claims nor refutes anything), `no-proof`, `unsupported`, `no-plan`, `error` — see [CVC5.md](../../docs/CVC5.md). The axis is experimental: its `proved` is reported, and is an alarm against a refutation, but it decides no portfolio verdict and is no evidence for a pair's truth. |
 | `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `proved-gather-generated`, `no-witness-generated` (the same, under the weaker claim for generated cells), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
 
 `sqleq-solver` is the Rust rewrite of SQLSolver in this repository, and `sqlsolver-jvm` the original,
@@ -182,6 +187,10 @@ drift between reviews. The last time every axis was blessed together:
   at its revision `8c5548b` (a commit of that fork, not of this repository).
 * **sqleq-solver**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
   the toolchain `lean/lean-toolchain` names, as in CI.
+* **cvc5** — `sqleq-cvc5` of this tree on the `bags-algebra` branch of cvc5 at the commit
+  `tools/build_cvc5.sh` pins (`249a95c0`), under bag semantics, 60 s per case with 8 cases at a
+  time. A pair cvc5 answers only past that budget carries no cvc5 pin: a timeout is never pinned,
+  and a pin blessed with a longer budget would fail wherever the budget is the default one.
 
 The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared
 statement, the `unnest` side under the gather binding of the `VALUES` side's parameters, once on an

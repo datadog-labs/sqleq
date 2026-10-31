@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: an unaliased CAST(a AS TEXT) is the output column a in Postgres, so A's bare
 --   key a sorts by the text; B aliases the cast w, so its key a is the input column. Lowering

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #87: the ORDER BY ... LIMIT both sides share was stripped, but it sorts by c under C on one side and by d under the database's default on the other
 -- witness: in a database created with LC_COLLATE 'en_US.utf8', t = {(1, 'a', 'a'), (2, 'B', 'B')}: under C 'B' sorts first and under en_US.utf8 'a', so A returns 'B' and B returns 'a'

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #87: under COLLATE "C" strings are ordered by code point, as the provers order them, so the comparison stays native and the QED prover decides it
 -- argument: under C 'B' < 'a' (0x42 < 0x61), so s = 'B' implies s < 'a' and the second conjunct is redundant

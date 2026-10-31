@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: SELECT DISTINCT was once lowered as a plain projection
 -- witness: t = {(1, 0), (2, 0)}: A returns 0 twice, B once

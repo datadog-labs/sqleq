@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: numeric division rounds to a scale that follows its operands' scales
 -- witness: t = {(1.0)}, u = {(1.000000000000000000000)}: A yields 0.33333333333333333333, B yields 0.333333333333333333333

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 1: booleans/not_eq_as_ne.sql in a select list, where a NOT is lowered outside a predicate and a NULL result is part of the output
 -- argument: <> is the negator of =: when a is NULL both sides yield NULL, and otherwise one yields true exactly when the other yields false

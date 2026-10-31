@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #142: the UPDATE reduction compared the values the two statements write, and a
 --   BEFORE UPDATE trigger counts the rows an UPDATE touches, whether or not it changes them
