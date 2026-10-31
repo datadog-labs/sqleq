@@ -230,3 +230,79 @@ fn a_string_literal_beyond_ascii_is_one_string() {
         assert!(matches!(r, Ok(Outcome::Equivalent)), "{r:?}");
     }
 }
+
+#[test]
+fn a_row_slice_whose_bound_overflows_is_refused() {
+    // `ORDER BY k LIMIT 9223372036854775807 OFFSET 1` over a key: `OFFSET + LIMIT` has no i64, and
+    // a wrapped bound would keep no row, which made the slice equal to `WHERE false`.
+    let keyed = vec![table("t", &["INTEGER"], &[false], &[&[0]])];
+    let slice = json!({ "sort": { "source": scan(0), "collation": [[0, "INTEGER", "ASCENDING NULLS LAST"]],
+                                  "offset": lit("1", "INTEGER"), "limit": lit("9223372036854775807", "INTEGER") } });
+    let none = filter(scan(0), lit("false", "BOOLEAN"));
+    match run(Semantics::Bags, keyed, slice, none) {
+        Err(Failure::Refused(Refusal::Unsupported(what))) => assert!(what.contains("overflows"), "{what}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_character_beyond_smt_libs_alphabet_is_refused() {
+    // U+30000 has no SMT-LIB escape: cvc5 keeps `\u{30000}` as nine characters, so the literal for
+    // the character and the literal for that text, which differ, would be one string.
+    let schemas = vec![table("s", &["VARCHAR"], &[true], &[])];
+    let eq = |s: &str| filter(scan(0), pred("=", vec![col(0, "VARCHAR"), lit(s, "VARCHAR")]));
+    for r in both(schemas, eq("\u{30000}"), eq("\\u{30000}")) {
+        match r {
+            Err(Failure::Refused(Refusal::Unsupported(what))) => assert!(what.contains("U+30000"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn min_over_strings_is_the_default_collations_order_not_code_point() {
+    // `MIN(b)` folds with `str_lt:default`, an uninterpreted order: under `en_US.utf8` `'a' < 'B'`,
+    // under `C` `'B' < 'a'`, and no input says which the database runs. A native `b < 'x'`, which
+    // the frontend emits only under `C`/`POSIX`, stays `str.<`.
+    let min_b = |src: Value| group(src, vec![], vec![agg("MIN", "VARCHAR", vec![col(1, "VARCHAR")])]);
+    let below_x = filter(scan(0), pred("<", vec![col(1, "VARCHAR"), lit("x", "VARCHAR")]));
+    let input = Input::parse(&json!({ "schemas": t(), "queries": [min_b(scan(0)), min_b(below_x)] })).unwrap();
+    let text = smt2(&input, &opts(Semantics::Bags)).unwrap();
+    assert!(text.contains("str_lt:default"), "{text}");
+    assert!(text.contains("str.<"), "{text}");
+    // `MIN` over `('a'), ('B')` against `'B'`, which code point order proved: no proof now.
+    let values = |rows: Vec<&str>| {
+        let content: Vec<Vec<Value>> = rows.iter().map(|s| vec![lit(s, "VARCHAR")]).collect();
+        json!({ "values": { "schema": ["VARCHAR"], "content": content } })
+    };
+    let min = group(values(vec!["a", "B"]), vec![], vec![agg("MIN", "VARCHAR", vec![col(0, "VARCHAR")])]);
+    for r in both(t(), min, values(vec!["B"])) {
+        match r {
+            Ok(Outcome::Different { exact: false, .. }) | Ok(Outcome::Unknown(_)) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_scalar_subquery_is_encoded_only_where_its_shape_bounds_it_to_one_row() {
+    // `(SELECT a FROM t)` may return two rows on a database the enclosing query still runs over --
+    // `COALESCE(x, (SELECT a FROM t))` evaluates it lazily -- so no constraint to one row is sound,
+    // and the subquery is refused; `(SELECT COUNT(*) FROM t)` is one row by shape, and is encoded.
+    // Inside the subquery the enclosing row's two columns come first: t.a is column 2 there.
+    let scalar = |q: Value| json!({ "operator": "$SCALAR_QUERY", "type": "INTEGER", "operand": [], "query": q });
+    let many = project(scan(0), vec![col(2, "INTEGER")]);
+    let one = project(group(scan(0), vec![], vec![agg("COUNT", "INTEGER", vec![])]), vec![col(2, "INTEGER")]);
+    let plain = project(scan(0), vec![col(0, "INTEGER")]);
+    for r in both(t(), project(scan(0), vec![scalar(many)]), plain.clone()) {
+        match r {
+            Err(Failure::Refused(Refusal::Unsupported(what))) => assert!(what.contains("more than one row"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let bounded = Input::parse(&json!({ "schemas": t(), "queries": [project(scan(0), vec![scalar(one)]), plain] })).unwrap();
+    for sem in [Semantics::Bags, Semantics::Sets] {
+        let text = smt2(&bounded, &opts(sem)).unwrap();
+        assert!(!text.contains("at most one row"), "{text}");
+    }
+}

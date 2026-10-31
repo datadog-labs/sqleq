@@ -24,9 +24,12 @@
 //!   (`(= (bag.count (tuple null) ((_ table.project i) T)) 0)`), the same shape the key
 //!   constraints already take. It spares a `bag.map` at every scan.
 //! * **Subqueries.** Calcite rewrites `EXISTS`/`IN` into joins before Java sees them; the IR keeps
-//!   them, so a non-correlated `EXISTS`, `IN` (with SQL's three-valued reading) and scalar
-//!   subquery are encoded here. A correlated one -- a column of an enclosing row read inside the
-//!   subquery -- is refused (`correlated`), as `IrToRel` refuses it.
+//!   them, so `EXISTS`, `IN` (with SQL's three-valued reading) and scalar subqueries are encoded
+//!   here, correlated ones included: a column of an enclosing row read inside the subquery is the
+//!   enclosing lambda's variable. A scalar subquery is encoded only where its shape bounds it to
+//!   one row (`at_most_one_row`): Postgres evaluates an uncorrelated one lazily, so a database on
+//!   which it has two rows may still run the query, and a constraint to one row would prove pairs
+//!   that differ on such a database.
 //! * **`AVG`** is `avg(sum, count)`, an uninterpreted function of the two, as in `sqleq-solver`:
 //!   Postgres's `avg` over integers is a `numeric` with its own rounding, which `/` is not.
 //!
@@ -34,7 +37,9 @@
 //!
 //! The IR's `INTEGER`, `DATE`, `TIME` and `TIMESTAMP` are cvc5 integers (unbounded: no overflow,
 //! no `infinity`), `REAL` is a cvc5 real (an exact rational: `2.0` and `2.00` are one value,
-//! where Postgres prints them apart), `VARCHAR` is a cvc5 string compared by code point, and the
+//! where Postgres prints them apart), `VARCHAR` is a cvc5 string (`=` is identity; code point
+//! order only where the frontend emitted a native comparison, which it does under the `C` and
+//! `POSIX` collations alone, and an uninterpreted order everywhere else: see `less`), and the
 //! opaque `VARBINARY` and `INTERVAL` are uninterpreted sorts whose `=` is identity, which
 //! Postgres's is not (`'1 day' = '24 hours'`). A proof holds under these readings; a model is a
 //! database under them, and may use a value Postgres has not got (a 40-digit integer, say). The
@@ -638,13 +643,6 @@ impl Encoder {
         })
     }
 
-    fn card(&mut self, table: Term) -> R<Term> {
-        Ok(match self.sem {
-            Semantics::Bags => self.tm.mk_term(Kind::BagCard, &[table])?,
-            Semantics::Sets => self.tm.mk_term(Kind::SetCard, &[table])?,
-        })
-    }
-
     fn choose(&mut self, table: Term) -> R<Term> {
         Ok(match self.sem {
             Semantics::Bags => self.tm.mk_term(Kind::BagChoose, &[table])?,
@@ -993,7 +991,7 @@ impl Encoder {
             let tie = self.and(vec![same, before])?;
             before = self.or(vec![less, tie])?;
         }
-        let p = self.lambda(&[y.clone()], before)?;
+        let p = self.lambda(std::slice::from_ref(&y), before)?;
         let earlier = self.tm.mk_term(self.filter_kind(), &[p, rows.clone()])?;
         // the place: a fold counting the rows before x
         let int = self.tm.integer_sort();
@@ -1007,7 +1005,13 @@ impl Encoder {
         let first = self.tm.mk_integer(off);
         let mut kept = vec![self.tm.mk_term(Kind::Geq, &[place.clone(), first])?];
         if let Some(l) = lim {
-            let end = self.tm.mk_integer(off + l);
+            // SOUNDNESS: `off + l` wraps in a release build, and a wrapped bound would make
+            // `LIMIT 9223372036854775807 OFFSET 1` an empty slice, equal to `WHERE false`. A
+            // slice whose end has no i64 is refused instead.
+            let end = off
+                .checked_add(l)
+                .ok_or_else(|| unsupported(format!("a row slice whose bound OFFSET {off} + LIMIT {l} overflows")))?;
+            let end = self.tm.mk_integer(end);
             kept.push(self.tm.mk_term(Kind::Lt, &[place, end])?);
         }
         let body = self.and(kept)?;
@@ -1441,10 +1445,10 @@ impl Encoder {
         let elem = self.elem_of(&product)?;
         let t = self.var(elem, "t")?;
         let mut equal = Vec::new();
-        for p in 1..parts.len() {
+        for offset in offsets.iter().skip(1) {
             for k in 0..nk {
                 let a = self.select(t.clone(), k)?;
-                let b = self.select(t.clone(), offsets[p] + k)?;
+                let b = self.select(t.clone(), offset + k)?;
                 equal.push(self.tm.mk_term(Kind::Equal, &[a, b])?);
             }
         }
@@ -1452,7 +1456,7 @@ impl Encoder {
             product
         } else {
             let body = self.and(equal)?;
-            let p = self.lambda(&[t.clone()], body)?;
+            let p = self.lambda(std::slice::from_ref(&t), body)?;
             self.tm.mk_term(self.filter_kind(), &[p, product])?
         };
         let mut cells = Vec::with_capacity(nk + calls.len());
@@ -1678,14 +1682,26 @@ impl Encoder {
         self.ite(arg_null, acc, seeded)
     }
 
-    /// `a < b` on two values of one sort, in the sort's own order.
+    /// `a < b` on two values of one sort, in the sort's own order: integers and reals in theirs,
+    /// booleans with FALSE before TRUE, and strings in the database's default collation's order,
+    /// which no input states (see `src/collation.rs`), so an uninterpreted strict predicate
+    /// `str_lt:default`. The callers -- the `MIN`/`MAX` fold and the row slice -- are operations
+    /// the frontend lowers with no collation at all; code point order (`str.<`) belongs only where
+    /// the frontend emitted a native comparison, which it does under the `C` and `POSIX`
+    /// collations alone ([`Self::compare`]).
     fn less(&mut self, a: Term, b: Term) -> R<Term> {
         let s = a.sort();
         if s.is_integer() || s.is_real() {
             return Ok(self.tm.mk_term(Kind::Lt, &[a, b])?);
         }
         if s.is_string() {
-            return Ok(self.tm.mk_term(Kind::StringLt, &[a, b])?);
+            // SOUNDNESS: under `en_US.utf8` `'a' < 'B'`, under `C` `'B' < 'a'`, and which one the
+            // database runs is unknown, so `str.<` would prove `MIN` over `('a'), ('B')` to be
+            // `'B'`. The real order is one interpretation of the predicate, so what holds under
+            // every interpretation holds under it: a proof can be lost here, never gained.
+            let bool = self.tm.boolean_sort();
+            let f = self.fun("str_lt:default", &[s.clone(), s], bool)?;
+            return self.apply(f, &[a, b]);
         }
         if s.is_boolean() {
             // FALSE < TRUE, as Postgres orders booleans.
@@ -1782,14 +1798,14 @@ impl Encoder {
                     let r = self.lift(Kind::ToReal, &[v])?;
                     return self.as_type(r, e.ty());
                 }
-                let f = self.fun(&name, &[base.clone()], out.clone())?;
+                let f = self.fun(&name, std::slice::from_ref(&base), out.clone())?;
                 if base.is_real() && out.is_integer() {
                     // `numeric` to an integer rounds, which only a value with a fraction shows: an
                     // integral value is itself, the rest is the uninterpreted cast
                     self.strict(&[v], |enc, vals| {
                         let x = vals[0].clone();
-                        let integral = enc.tm.mk_term(Kind::IsInteger, &[x.clone()])?;
-                        let exact = enc.tm.mk_term(Kind::ToInteger, &[x.clone()])?;
+                        let integral = enc.tm.mk_term(Kind::IsInteger, std::slice::from_ref(&x))?;
+                        let exact = enc.tm.mk_term(Kind::ToInteger, std::slice::from_ref(&x))?;
                         let other = enc.apply(f, &vals)?;
                         enc.ite(integral, exact, other)
                     })?
@@ -1819,7 +1835,7 @@ impl Encoder {
                 "false" => self.tm.mk_false(),
                 _ => return Err(refuse()),
             },
-            Type::Varchar => self.string(value),
+            Type::Varchar => self.string(value)?,
             // An opaque literal is a constant of the opaque sort: two spellings may or may not be
             // one value (`'{"a":1}'` and `'{"a": 1}'` as jsonb are), so nothing relates them.
             Type::Varbinary | Type::Interval => {
@@ -1863,7 +1879,7 @@ impl Encoder {
     /// The sort a `CASE` or `COALESCE` typed `ty` takes: the nullable sort of `ty`, unless `ty` is
     /// the opaque VARBINARY -- the frontend's type for a result it could not type, a `COALESCE`
     /// over a REAL and an INTEGER say -- when it is the branches' own sort, reals if any branch is
-    /// real and the rest are integers. A null literal among them has no say (see [`as_sort`]).
+    /// real and the rest are integers. A null literal among them has no say (see [`Self::as_sort`]).
     fn result_sort(&mut self, ty: Type, branches: &[Term]) -> R<Sort> {
         if ty != Type::Varbinary {
             return self.col_sort(ty);
@@ -2063,9 +2079,12 @@ impl Encoder {
                 let null = self.null(a.sort())?;
                 self.ite(equal, null, a)
             }
-            // Interpreted only where the frontend typed the call as cvc5 would: a `UPPER` it types
+            // Interpreted only where the frontend typed the call as cvc5 would: a call it types
             // VARBINARY is a function it does not know, and so stays uninterpreted here, named
-            // alike on both sides.
+            // alike on both sides. `UPPER` and `LOWER` are never interpreted: cvc5's `str.to_upper`
+            // and `str.to_lower` map ASCII only, where Postgres maps by the collation's locale,
+            // which no input states (see `src/collation.rs`); they take the strict uninterpreted
+            // path below.
             ("||", 2) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringConcat, &args),
             ("SUBSTRING", 2 | 3) if ty == Type::Varchar && self.all_strings(&args[..1])? && self.all_integers(&args[1..])? => {
                 // Postgres counts from 1 and clips: characters a .. a + n - 1 that exist, none for a
@@ -2086,8 +2105,6 @@ impl Encoder {
                     Ok(enc.tm.mk_term(Kind::StringSubstr, &[v[0].clone(), start, length])?)
                 })
             }
-            ("UPPER", 1) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringToUpper, &args),
-            ("LOWER", 1) if ty == Type::Varchar && self.all_strings(&args)? => self.lift(Kind::StringToLower, &args),
             ("ABS", 1) if matches!(ty, Type::Integer | Type::Real) && self.numeric(&args[0])? => self.lift(Kind::Abs, &args),
             ("LIKE", 2) => match (&operand[1], self.all_strings(&args)?) {
                 (Expr::Literal { value, ty: Type::Varchar }, true) => {
@@ -2127,7 +2144,12 @@ impl Encoder {
 
     /// `a op b` for an order comparison, by the operands' sort: integers and reals in their order,
     /// strings by code point (`str.<`), booleans with FALSE before TRUE, and an uninterpreted
-    /// strict predicate on a sort with no order cvc5 knows.
+    /// strict predicate on a sort with no order cvc5 knows. Code point order is right here and
+    /// here alone: the frontend emits a native comparison on strings only under the `C` and
+    /// `POSIX` collations, which order by code point, and lowers every other string order -- a
+    /// comparison under another collation (`q_str_lt`), `MIN`/`MAX`, a row slice -- with no
+    /// native operator (see `src/collation.rs`); those take the uninterpreted order of
+    /// [`Self::less`].
     fn compare(&mut self, op: &str, a: Term, b: Term) -> R<Term> {
         let s = a.sort().nullable_element_sort()?;
         if s.is_integer() || s.is_real() {
@@ -2209,17 +2231,22 @@ impl Encoder {
 
     /// `s` as a cvc5 string. cvc5 refuses a character beyond printable ASCII in a plain string, so
     /// every other character, and the backslash, is written as its SMT-LIB escape: `é` as `\u{e9}`.
-    /// (`Cvc5AbstractTranslator.mkString` does the same.)
-    fn string(&mut self, s: &str) -> Term {
+    /// (`Cvc5AbstractTranslator.mkString` does the same.) SMT-LIB's alphabet ends at U+2FFFF, and
+    /// cvc5 keeps a `\u{30000}` as the nine characters of its spelling, which would make the
+    /// literal for U+30000 itself and the literal for that spelling one string; a character above
+    /// U+2FFFF is refused.
+    fn string(&mut self, s: &str) -> R<Term> {
         let mut escaped = String::with_capacity(s.len());
         for c in s.chars() {
             if (' '..='~').contains(&c) && c != '\\' {
                 escaped.push(c);
+            } else if c as u32 > 0x2FFFF {
+                return Err(unsupported(format!("a string with the character U+{:X}, beyond SMT-LIB's U+2FFFF", c as u32)));
             } else {
                 escaped.push_str(&format!("\\u{{{:x}}}", c as u32));
             }
         }
-        self.tm.mk_string(&escaped, true)
+        Ok(self.tm.mk_string(&escaped, true))
     }
 
     /// `pattern` as a regular expression: `%` any string, `_` any character, a backslash escaping
@@ -2230,7 +2257,7 @@ impl Encoder {
         let mut chars = pattern.chars();
         let flush = |enc: &mut Encoder, literal: &mut String, parts: &mut Vec<Term>| -> R<()> {
             if !literal.is_empty() {
-                let s = enc.string(literal);
+                let s = enc.string(literal)?;
                 parts.push(enc.tm.mk_term(Kind::StringToRegexp, &[s])?);
                 literal.clear();
             }
@@ -2309,12 +2336,15 @@ impl Encoder {
                 if sorts.len() != 1 {
                     return Err(TranslateError::ScalarSubqueryArity.into());
                 }
-                // At most one row, or Postgres raises an error: the database is one on which the
-                // query runs at all.
-                let card = self.card(inner.clone())?;
-                let one = self.tm.mk_integer(1);
-                let at_most_one = self.tm.mk_term(Kind::Leq, &[card, one])?;
-                self.constraints.push(("a scalar subquery returns at most one row".into(), at_most_one));
+                // SOUNDNESS: Postgres raises on a scalar subquery of two rows, but evaluates an
+                // uncorrelated one lazily: `COALESCE(u.x, (SELECT t.a FROM t))` runs without error
+                // over a `t` of two rows wherever `u.x` is not NULL, so a constraint
+                // `(<= (bag.card q) 1)` on the whole database would prove pairs that differ on a
+                // database Postgres accepts. Only a subquery whose shape bounds it to one row is
+                // encoded; the rest are refused.
+                if !at_most_one_row(query) {
+                    return Err(unsupported("a scalar subquery that may return more than one row"));
+                }
                 if self.sem == Semantics::Bags {
                     // The column of the row, or NULL where there is none: a fold that keeps the
                     // value of the row it reads, seeded with NULL. `SINGLE_VALUE`, which Calcite
@@ -2660,6 +2690,33 @@ fn relation_keys(rel: &Relation, base: usize, schemas: &[Schema]) -> Vec<Vec<usi
     }
 }
 
+/// Whether `rel` has at most one row on every database, by its shape: an aggregate without
+/// `GROUP BY` (exactly one row), a `VALUES` of at most one row, a sort with a literal `LIMIT 0` or
+/// `LIMIT 1`, and a projection, filter, duplicate removal or sort without a limit over one of
+/// those. A scalar subquery is encoded only over such a relation ([`Encoder::subquery`]).
+/// Conservative: a scan, a join, a set operation and any other slice may return more.
+fn at_most_one_row(rel: &Relation) -> bool {
+    match rel {
+        Relation::Group { keys, .. } => keys.is_empty(),
+        Relation::Values { content, .. } => content.len() <= 1,
+        Relation::Sort { source, limit: None, .. } => at_most_one_row(source),
+        Relation::Sort { limit: Some(Expr::Literal { value, .. }), .. } => {
+            matches!(value.trim().parse::<i64>(), Ok(0 | 1))
+        }
+        Relation::Sort { .. } => false,
+        Relation::Project { source, .. } | Relation::Filter { source, .. } | Relation::Distinct(source) => {
+            at_most_one_row(source)
+        }
+        Relation::Scan(_)
+        | Relation::Join { .. }
+        | Relation::Union(_)
+        | Relation::Except(_)
+        | Relation::Intersect(_)
+        | Relation::IntersectAll(_)
+        | Relation::ExceptAll(_) => false,
+    }
+}
+
 /// Whether column `c` of `rel` is NULL in every row: a NULL literal (or a cast of one) in a VALUES
 /// or a projection, carried through filters, sorts, duplicate removal, projections that copy it,
 /// joins and set operations. Conservative: anything else is not known to be.
@@ -2796,5 +2853,42 @@ mod tests {
     fn symbols_carry_their_types() {
         let e = Expr::Column { index: 0, ty: Type::Integer };
         assert_eq!(typed_symbol("POWER", &[e.clone(), e], Type::Real), "POWER(INTEGER,INTEGER)->REAL");
+    }
+
+    #[test]
+    fn a_scalar_subquery_is_bounded_to_one_row_by_shape() {
+        let scan = || Box::new(Relation::Scan(0));
+        let count = AggCall { operator: "COUNT".into(), ty: Type::Integer, distinct: false, operand: vec![] };
+        let one = || Box::new(Relation::Group { source: scan(), keys: vec![], function: vec![count.clone()] });
+        let lit = |v: &str| Expr::Literal { value: v.into(), ty: Type::Integer };
+        let col = Expr::Column { index: 0, ty: Type::Integer };
+        let sort = |source: Box<Relation>, offset: Option<Expr>, limit: Option<Expr>| Relation::Sort {
+            source,
+            offset,
+            limit,
+            keys: vec![],
+        };
+        // one row by shape: a scalar aggregate, and what copies or trims its rows
+        assert!(at_most_one_row(&one()));
+        assert!(at_most_one_row(&Relation::Project { source: one(), target: vec![col.clone()] }));
+        assert!(at_most_one_row(&Relation::Filter { source: one(), condition: col.clone() }));
+        assert!(at_most_one_row(&Relation::Distinct(one())));
+        assert!(at_most_one_row(&sort(one(), Some(lit("2")), None)));
+        assert!(at_most_one_row(&sort(scan(), None, Some(lit("1")))));
+        assert!(at_most_one_row(&sort(scan(), Some(lit("5")), Some(lit("0")))));
+        assert!(at_most_one_row(&Relation::Values { schema: vec![Type::Integer], content: vec![vec![lit("1")]] }));
+        assert!(at_most_one_row(&Relation::Values { schema: vec![Type::Integer], content: vec![] }));
+        // possibly more: a scan, a keyed group, a wider or computed slice, a set operation
+        assert!(!at_most_one_row(&scan()));
+        assert!(!at_most_one_row(&Relation::Group { source: scan(), keys: vec![col.clone()], function: vec![count.clone()] }));
+        assert!(!at_most_one_row(&sort(scan(), None, Some(lit("2")))));
+        assert!(!at_most_one_row(&sort(scan(), None, Some(col.clone()))));
+        assert!(!at_most_one_row(&sort(scan(), Some(lit("1")), None)));
+        assert!(!at_most_one_row(&Relation::Project { source: scan(), target: vec![col] }));
+        assert!(!at_most_one_row(&Relation::Union([one(), one()])));
+        assert!(!at_most_one_row(&Relation::Values {
+            schema: vec![Type::Integer],
+            content: vec![vec![lit("1")], vec![lit("2")]]
+        }));
     }
 }

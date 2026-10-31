@@ -8,7 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
--- expect cvc5: model
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #60: sqleq-solver read a scalar subquery as NULL only when it returns no row, so one row holding NULL was not NULL
 -- witness: t = {(1)}, s = {(1, NULL)}: the subquery returns one row, whose value is NULL, so A returns 1 and B returns nothing

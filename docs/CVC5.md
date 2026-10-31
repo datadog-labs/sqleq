@@ -63,8 +63,8 @@ sqleq-check --axes frontend,cvc5 --expect report-only -t 10 -j 6 pairs/
 # Set semantics, and a cvc5 option:
 sqleq-check --cvc5 --cvc5-semantics sets --expect report-only pairs/
 sqleq-check --cvc5 --cvc5-opt bags-deq-decompose=false --expect report-only pairs/
-# In a portfolio, where a cvc5 proof decides `equivalent`, and a cvc5 model against a QED proof
-# is an alarm:
+# In a portfolio, where a cvc5 proof against a fuzz counterexample, or a cvc5 model against a QED
+# proof, is an alarm, and neither decides a verdict on its own:
 sqleq-check --portfolio --axes qed,cvc5,fuzz --expect report-only -v pairs/
 ```
 
@@ -72,7 +72,7 @@ sqleq-check --portfolio --axes qed,cvc5,fuzz --expect report-only -v pairs/
 |---|---|
 | `--cvc5` | Ask the axis; the same as adding `cvc5` to `--axes`. A prover, so it brings the frontend in. |
 | `--cvc5-bin PATH` | The binary (else `--bin-dir`, `$SQLEQ_CVC5_BIN`, `PATH`, this repo's build). |
-| `--cvc5-semantics bags\|sets` | Bag semantics, SQL's own, is the default; set semantics collapses duplicates and is far easier for the solver. |
+| `--cvc5-semantics bags\|sets` | Bag semantics, SQL's own, is the default; set semantics collapses duplicates and is far easier for the solver. Under sets the answers are `proved-sets` and `model-sets`: about the approximation, so they neither claim nor refute anything about the pair. |
 | `--cvc5-opt NAME=VALUE` | A further cvc5 `set-option`, repeatable. |
 | `--cvc5-timeout MS` | cvc5's own time limit on each case's check (default `-t`), with the process killed at the case's deadline as the backstop. |
 
@@ -80,8 +80,16 @@ Outside `--portfolio`, the axis runs after the prover pass, one `sqleq-cvc5` pro
 wide: the driver is cheap to start, and cvc5 does not always notice its time limit inside a long
 rewrite, so a process the harness can kill is the only reliable cap. Under `--portfolio` it runs
 beside the other backends within the case's deadline. Its answers never move the exit code of
-`--expect equivalent` or `report-only`, except through an alarm; under `--portfolio` and `--expect
-pinned` they count like any axis's.
+`--expect equivalent` or `report-only`, except through an alarm; under `--expect pinned` its pins
+are checked like any axis's.
+
+**The axis is experimental.** Its bag reasoning lives in an unreleased branch of cvc5
+([above](#building-it)), and its proofs are not checked. So a cvc5 `proved` is reported, and
+against a sqleq-fuzz counterexample it is an alarm, like any prover's; but it decides no
+`--portfolio` verdict (a pair only cvc5 proves is `undecided`) and is no evidence for a pinned
+pair's truth (`sqleq-check/src/suite.rs`, `evidence_equivalent`), until the bag work is in a cvc5
+release and the axis has been cross-checked against sqleq-fuzz. A `model` likewise decides nothing
+alone: it refutes the plan, which lacks the constraints the frontend does not carry, not the pair.
 
 The binary speaks `IrDriver`'s contract -- `sqleq-cvc5 <jobs.jsonl> <results.jsonl>
 [--timeout-ms=N]` -- with `--semantics`, `--opt`, `--smt2=DIR` (each problem as SMT-LIB, for the
@@ -119,16 +127,17 @@ Each relational operator is one term over its inputs:
 | `filter` | `bag.filter (lambda t. cond)` | `set.filter` |
 | `project` of column references | `(_ table.project i..)` | `(_ rel.project i..)` |
 | `project` of expressions | `bag.map (lambda t. (tuple e..))` | `set.map` |
-| `join` | `table.product` under a `bag.filter`; an outer join adds the unmatched rows (`bag.difference_remove` against the product's projection, mapped to a padded row) | `rel.product`, `set.minus` |
+| `join` | `table.product` under a `bag.filter`; an outer join adds the unmatched rows of a side, a `bag.filter` keeping the rows no row of the other side joins with (an anti-join), mapped to a padded row | `rel.product`, `set.filter` |
 | `distinct`, `intersect`, `except` | `bag.setof`, over `bag.inter_min` and `bag.difference_remove` | nothing, `set.inter`, `set.minus` |
+| `intersectAll`, `exceptAll` | `bag.inter_min`, `bag.difference_subtract` | refused: multiplicities, which a set has not got |
 | `union` (always `UNION ALL`) | `bag.union_disjoint` | `set.union` |
 | `group` with no call | `bag.setof` of a projection | a projection |
-| `group` with calls | `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`), guarded by `(ite (= T bag.empty) bag.empty ...)` when there are keys, since `table.aggr` folds the empty table as one empty group | `rel.aggr` |
+| `group` with calls | `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`), with a hidden count of the group's rows when there are keys, since `table.aggr` folds the empty table as one empty group: its row is the one with count 0, filtered out before the counter is projected away | `rel.aggr` |
 | `values` | `bag.union_disjoint` of `(bag row 1)` | `set.union` of `set.singleton` |
-| `sort` | the source, when it has no `offset` or `limit`; refused otherwise | |
+| `sort` | the source, when it has no `offset` or `limit`; `LIMIT 0` the empty bag; a row slice under an `ORDER BY` whose keys contain a key of the rows, so that no two rows tie, a `bag.filter` keeping the rows whose place -- a `bag.fold` counting the rows sorted before them -- lies in `[offset, offset + limit)`; refused under possible ties, for a computed size, and when `offset + limit` overflows an i64 | the source, or the empty set for `LIMIT 0`; a slice is refused |
 | `EXISTS q` | `(distinct q bag.empty)` | |
 | `l IN q`, one column | `(bag.member (tuple l) q)`, else null when `l` is null and `q` has a row or `q` holds a null, else false | |
-| scalar subquery | `(ite (= q empty) null ((_ tuple.select 0) (bag.choose q)))`, with `(<= (bag.card q) 1)` asserted: the database is one the query runs on | |
+| scalar subquery | a `bag.fold` keeping the value of the row it reads, seeded with null (the shape Calcite's `SINGLE_VALUE` folds to); encoded only when `q` has at most one row by shape -- an aggregate without `GROUP BY`, a `VALUES` of one row, `LIMIT 0` or `1`, and projections, filters, duplicate removal and bare sorts of those -- and refused otherwise, since Postgres evaluates an uncorrelated scalar subquery lazily, so a database on which `q` has two rows may still run the query, and a constraint `(<= (bag.card q) 1)` would prove pairs that differ on it | `(ite (= q set.empty) null ((_ tuple.select 0) (set.choose q)))`, under the same guard |
 
 Expressions are lifted over the nullable columns with SQL's three-valued logic: a strict operator
 is `(ite (or (is_null a) (is_null b)) null (some (op a b)))`, `AND`/`OR` test for their dominant
@@ -150,20 +159,26 @@ Where this encoding departs from the Java translator, deliberately:
   source and target type, and so is every function the encoding does not interpret -- strict
   (null exactly when an argument is) where the frontend's naming guarantees it (`q_conv_*`,
   `q_arith_*` over other types, `q_cast_*`, `QCASTn`, and the handful `sqleq-solver` lists), and
-  otherwise a function over the nullable sorts, which assumes nothing about null. `UPPER` and its
-  kind are interpreted only where the frontend typed them as cvc5 would; a `UPPER` it types opaque
-  is a function it does not know, and stays one here, named alike on both sides.
+  otherwise a function over the nullable sorts, which assumes nothing about null. `||`,
+  `SUBSTRING`, `ABS` and `LIKE` against a literal pattern are interpreted only where the frontend
+  typed them as cvc5 would; a call it types opaque is a function it does not know, and stays one
+  here, named alike on both sides. `UPPER` and `LOWER` are never interpreted: cvc5's `str.to_upper`
+  and `str.to_lower` map ASCII only, where Postgres maps by the collation's locale
+  ([below](#what-the-encoding-approximates)).
 * **`NOT NULL` is a constraint, not a sort**, as above. Java declares a table with the schema's
   sorts and maps it back to nullable columns, a `bag.map` at every scan.
-* **Subqueries** are encoded, the non-correlated ones; Calcite rewrites them away before Java sees
-  them. A column of an enclosing row read inside a subquery is refused (`correlated`), as
-  `IrToRel` refuses it.
+* **Subqueries** are encoded, correlated ones included; Calcite rewrites them away before Java
+  sees them. A column of an enclosing row read inside a subquery is the enclosing lambda's
+  variable, which the subquery's own lambdas name apart from theirs. A scalar subquery is encoded
+  only where its shape bounds it to one row (the table above).
 * **Lambdas share their variables.** Every lambda over one sort binds the same variable, and
   nullable lifting is spelled out as an `ite` rather than cvc5's `nullable.lift`, which wraps the
   operator in a lambda with fresh variables each time. The bags solver relates two maps or filters
   by the identity of their functions and does not rewrite under the binder before comparing them,
-  so two sides that compute `a + 5` the same way must be one term; each lambda body is also
-  rewritten (`simplify`) before it is bound, so `a + 10 / 2` and `a + 5` are.
+  so two sides that compute `a + 5` the same way must be one term. No body is rewritten before it
+  is bound: cvc5 rewrites the assertions, lambda bodies included, after its `bags-facts` pass has
+  read the keys and `NOT NULL` columns off the constraints, and a body rewritten earlier would keep
+  a form that pass has not seen; `a + 10 / 2` and `a + 5` meet there.
 
 ## What the encoding approximates
 
@@ -174,12 +189,19 @@ A proof holds, and a model is a database, under these readings of the IR's types
 * `REAL` is a cvc5 real: an exact rational, so `2.0` and `2.00` are one value where Postgres prints
   them apart, and `1/3` is exact where `numeric` rounds. Numeric division is left to the frontend's
   uninterpreted `q_arith_div_real_*` for that reason.
-* `VARCHAR` is a cvc5 string, compared by code point: a deterministic collation.
+* `VARCHAR` is a cvc5 string, so `=` is identity: a deterministic collation. Its order is code
+  point order only where the frontend emitted a native comparison, which it does under the `C` and
+  `POSIX` collations alone (`src/collation.rs`); `MIN`, `MAX` and a row slice ordered by a string
+  read the database's default collation, which no input states, and fold with an uninterpreted
+  strict order `str_lt:default` instead, as a comparison under any other collation is the
+  frontend's uninterpreted `q_str_lt`. `UPPER` and `LOWER` are uninterpreted for the same reason:
+  cvc5's `str.to_upper` maps ASCII, Postgres maps by the collation's locale. A character above
+  U+2FFFF, the end of SMT-LIB's alphabet, is refused: cvc5 would keep its `\u{..}` escape as text,
+  and the character and the text of its escape would be one string.
 * The opaque `VARBINARY` and `INTERVAL` are uninterpreted sorts whose `=` is identity, which
   Postgres's is not (`'1 day' = '24 hours'`; `0 = -0` for `double precision`). A `VARBINARY`
   annotation on a value the encoding computed from typed operands -- a `COALESCE` over a REAL and
   an INTEGER, which the frontend cannot type -- keeps the computed sort.
-* A scalar subquery is read on databases where it returns at most one row.
 * A `NULL` literal the frontend typed by default takes the sort it is wanted at.
 
 These are the readings under which `proved` is a proof. They, and the constraints the plan lacks,
@@ -209,10 +231,15 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
   internal error through the C API). The harness records the case as an `error`; what it says is
   that cvc5 found a model its own checker rejects, which is the checker doing its job. Set
   semantics with `set.filter` lambdas is where it has been seen.
-* **Refused**: a correlated subquery, `IN` over more than one column, a `DISTINCT` aggregate beside
-  another call, an aggregate other than `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `MIN`/`MAX` over a sort with
-  no order cvc5 knows, a row slice (`LIMIT`/`OFFSET`), a set operation over branches of different
-  row sorts, arithmetic or an order comparison over an opaque sort.
+* **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
+  without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
+  duplicate removal or bare sorts of those), an aggregate other than
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` and Calcite's `SINGLE_VALUE`, or one of several arguments but
+  `COUNT`, `MIN`/`MAX` over a sort with no order cvc5 knows, a row slice under possible ties (no key
+  of the rows among the `ORDER BY` keys), of a computed size, whose `OFFSET + LIMIT` overflows an
+  i64, or under set semantics, `INTERSECT ALL` and `EXCEPT ALL` under set semantics, a string
+  literal with a character above U+2FFFF, a set operation over branches of different row sorts,
+  arithmetic or an order comparison over an opaque sort.
 * **Bag semantics is hard.** Under bags cvc5 proves far less than under sets within a budget, and
   what it proves depends on the shape of the plan more than on the size of the pair: a projection
   that drops a column is a non-injective `bag.map`, which the bags solver reasons about weakly.

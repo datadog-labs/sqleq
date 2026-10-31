@@ -8,7 +8,6 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
--- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #92 item 4: the guard for the conversion of an IN subquery's column: the column is converted to the operand's type, not the operand to the column's
 -- witness: t = {(1, 1.5)}, u = {(2)}: A compares 1.5 = 2 and returns nothing; B compares 2 = 2 and returns 1
