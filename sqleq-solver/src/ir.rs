@@ -131,12 +131,15 @@ pub enum TranslateError {
     /// harmless on real input (which is always well-formed), and strictly safer than a panic.
     MalformedShape(String),
     /// Translation-stage-only, not part of `IrToRel`'s taxonomy: a `Sort` with an `offset`/`limit`
-    /// present. Bare `ORDER BY` (no offset/limit) is a no-op under bag semantics and passes through;
-    /// real LIMIT/OFFSET semantics (SQLSolver's `OrderbySupport`) is not ported.
+    /// that changes which rows it keeps. Bare `ORDER BY` (no offset/limit) is a no-op under bag
+    /// semantics and passes through, and so do `OFFSET 0`, `LIMIT 0` (no rows), and a literal
+    /// `LIMIT` of one or more over a source with at most one row (see `card`). Any other slice is
+    /// translated only where the same slice of an equal source stands on the other side (see
+    /// `opaque`); real LIMIT/OFFSET semantics (SQLSolver's `OrderbySupport`) is not ported.
     UnsupportedSort,
-    /// Translation-stage-only: an aggregate call with `distinct: true`. SQLSolver's own translator
-    /// handles this via a second nested existential sum; this phase deliberately doesn't port that
-    /// and refuses instead, deferring it rather than half-building it.
+    /// Translation-stage-only: an aggregate call with `distinct: true` other than `COUNT`, `MAX`
+    /// and `MIN`. `COUNT(DISTINCT x)` is SQLSolver's nested existential sum, and a `MAX`/`MIN`
+    /// ignores `DISTINCT`; `SUM`/`AVG(DISTINCT)` would need a sum over values, which is refused.
     DistinctAggregateUnsupported,
     /// Translation-stage-only: a scalar subquery (`$SCALAR_QUERY`) whose inner relation doesn't have
     /// exactly one output column.
@@ -213,15 +216,35 @@ impl JoinKind {
     }
 }
 
-/// Checks one `[columnIndex, type, "ASCENDING NULLS LAST"]` sort key's shape, which is all that is
-/// done with it: a sort is translated only when it has no `offset` or `limit`, and then its order
-/// is erased (bag semantics), so nothing reads the key itself.
+/// Checks one `[columnIndex, type, "ASCENDING NULLS LAST"]` sort key's shape. Translation erases a
+/// sort's order (bag semantics); the keys are read only to tell whether two slices are the same
+/// slice (see `opaque`).
 fn check_collation(v: &Value) -> Result<(), TranslateError> {
     let arr = v.as_array().filter(|a| a.len() >= 3).ok_or(TranslateError::CollationShape)?;
     arr[0].as_u64().ok_or(TranslateError::CollationShape)?;
     Type::parse(arr[1].as_str().ok_or(TranslateError::CollationShape)?)?;
     arr[2].as_str().ok_or(TranslateError::CollationShape)?;
     Ok(())
+}
+
+/// One key of an `ORDER BY`: the column, whether it sorts descending, and whether nulls come first,
+/// read off a `collation` entry `[column, type, "ASCENDING NULLS LAST"]` (see `check_collation`).
+/// The column is a position in the sort's own source, not a level: the frontend's `sort_sandwich`
+/// widens that source with any key the query does not output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: u32,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+impl SortKey {
+    fn parse(v: &Value) -> Result<SortKey, TranslateError> {
+        let arr = v.as_array().filter(|a| a.len() >= 3).ok_or(TranslateError::CollationShape)?;
+        let column = arr[0].as_u64().ok_or(TranslateError::CollationShape)? as u32;
+        let spec = arr[2].as_str().ok_or(TranslateError::CollationShape)?;
+        Ok(SortKey { column, descending: spec.starts_with("DESC"), nulls_first: spec.ends_with("FIRST") })
+    }
 }
 
 /// One `GROUP BY`/global aggregate function call. `distinct` and `operand` are both optional on the
@@ -250,12 +273,11 @@ impl AggCall {
     }
 }
 
-/// A relation node: exactly the 11 tags `IrToRel.rel()` dispatches on (`scan`/`distinct`/`filter`/
-/// `project`/`join`/`group`/`sort`/`values`/`union`/`except`/`intersect`). A bare `"singleton"`
-/// string relation (a `FROM`-less query) is *not* a variant here, deliberately: `IrToRel.rel()`
-/// requires `r.isObject()` unconditionally and refuses a bare string as `rel-not-object`, so this
-/// bridge already can't reach a FROM-less query and this port must refuse it the same way rather
-/// than add a case Java doesn't have.
+/// A relation node: the 11 tags `IrToRel.rel()` dispatches on (`scan`/`distinct`/`filter`/
+/// `project`/`join`/`group`/`sort`/`values`/`union`/`except`/`intersect`). The bare `"singleton"`
+/// string the frontend lowers a `FROM`-less query over is read as what it stands for, a `values`
+/// of one row and no columns. `IrToRel.rel()` refuses it (`rel-not-object`, since it requires
+/// `r.isObject()`); the JVM fork is a cross-check of this port now, not a contract it must match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
     Scan(usize),
@@ -264,8 +286,9 @@ pub enum Relation {
     Project { source: Box<Relation>, target: Vec<Expr> },
     Join { left: Box<Relation>, right: Box<Relation>, kind: JoinKind, condition: Expr },
     Group { source: Box<Relation>, keys: Vec<Expr>, function: Vec<AggCall> },
-    /// A sort's keys are checked when parsed (see `check_collation`) and not kept.
-    Sort { source: Box<Relation>, offset: Option<Expr>, limit: Option<Expr> },
+    /// A sort's keys are checked when parsed (see `check_collation`) and kept, in clause order, for a
+    /// prover that compares row slices.
+    Sort { source: Box<Relation>, offset: Option<Expr>, limit: Option<Expr>, keys: Vec<SortKey> },
     Values { schema: Vec<Type>, content: Vec<Vec<Expr>> },
     Union([Box<Relation>; 2]),
     Except([Box<Relation>; 2]),
@@ -277,6 +300,9 @@ impl Relation {
     /// everything scope-dependent (`correlated`, aggregate-name support, ordinal resolution of group
     /// keys/agg args) is the translation stage's job, not this one's (see the module doc).
     pub fn parse(v: &Value, schema_count: usize) -> Result<Relation, TranslateError> {
+        if v.as_str() == Some("singleton") {
+            return Ok(Relation::Values { schema: Vec::new(), content: vec![Vec::new()] });
+        }
         let o = v.as_object().ok_or(TranslateError::RelNotObject)?;
 
         if let Some(x) = o.get("scan") {
@@ -327,10 +353,12 @@ impl Relation {
         }
         if let Some(x) = o.get("sort") {
             let source = Relation::parse(field(x, "source")?, schema_count)?;
-            array(field(x, "collation")?)?.iter().try_for_each(check_collation)?;
+            let collation = array(field(x, "collation")?)?;
+            collation.iter().try_for_each(check_collation)?;
+            let keys = collation.iter().map(SortKey::parse).collect::<Result<_, _>>()?;
             let offset = opt_expr(x, "offset", schema_count)?;
             let limit = opt_expr(x, "limit", schema_count)?;
-            return Ok(Relation::Sort { source: Box::new(source), offset, limit });
+            return Ok(Relation::Sort { source: Box::new(source), offset, limit, keys });
         }
         if let Some(x) = o.get("values") {
             let schema = array(field(x, "schema")?)?
@@ -347,11 +375,12 @@ impl Relation {
                     array(row)?
                         .iter()
                         .map(|cell| match Expr::parse(cell, schema_count)? {
-                            // `LogicalValues` holds literals only (`IrToRel.values()`): a computed
-                            // cell would need a `Project` over a one-row values, which our frontend
-                            // never emits.
-                            lit @ Expr::Literal { .. } => Ok(lit),
-                            _ => Err(TranslateError::ValuesNonLiteral),
+                            // `LogicalValues` holds literals only (`IrToRel.values()`), but the
+                            // frontend also writes a parameter, a cast or a call into a cell (a
+                            // `VALUES` row, a closed `FROM`-less `SELECT`), which translation reads
+                            // as the value it computes. A subquery cell is still refused.
+                            Expr::Subquery { .. } => Err(TranslateError::ValuesNonLiteral),
+                            cell => Ok(cell),
                         })
                         .collect::<Result<_, _>>()
                 })
@@ -577,6 +606,14 @@ impl Schema {
             .unwrap_or_default();
         Ok(Schema { name, types, key, nullable, opaque_identity })
     }
+
+    /// The key groups Postgres enforces on every row: non-empty, with every column NOT NULL. A
+    /// unique key over a nullable column admits any number of rows holding NULL in it, so it is
+    /// dropped (the frontend emits only these already; `ic` and `card` both read them here).
+    pub fn enforced_keys(&self) -> impl Iterator<Item = &Vec<usize>> {
+        let not_null = |c: &usize| self.nullable.get(*c) == Some(&false);
+        self.key.iter().filter(move |k| !k.is_empty() && k.iter().all(not_null))
+    }
 }
 
 /// The top-level `Input`: `{"schemas": [...], "queries": [Relation, Relation], "help": [String,
@@ -689,10 +726,15 @@ mod tests {
 
     #[test]
     fn refuses_a_non_object_relation() {
-        // The bug `IrToRel.rel()` guards against with `r.isObject()`: a FROM-less "singleton" query
-        // is a bare string on the wire, which this bridge has never been able to accept.
-        let err = Relation::parse(&json!("singleton"), 1).unwrap_err();
+        let err = Relation::parse(&json!("elsewhere"), 1).unwrap_err();
         assert_eq!(err.to_string(), "rel-not-object");
+    }
+
+    #[test]
+    fn reads_the_singleton_relation_as_one_empty_row() {
+        // A FROM-less query is lowered over the bare string `"singleton"`.
+        let r = Relation::parse(&json!("singleton"), 0).unwrap();
+        assert_eq!(r, Relation::Values { schema: vec![], content: vec![vec![]] });
     }
 
     #[test]
@@ -777,15 +819,38 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_non_literal_values_cell() {
-        let err = Relation::parse(
-            &json!({ "values": {
-                "schema": ["INTEGER"],
-                "content": [[{ "operator": "ABS", "type": "INTEGER", "operand": [{ "operator": "1", "type": "INTEGER" }] }]],
+    fn reads_a_computed_values_cell_and_refuses_a_subquery_cell() {
+        let computed = json!({ "values": {
+            "schema": ["INTEGER"],
+            "content": [[{ "operator": "ABS", "type": "INTEGER", "operand": [{ "operator": "1", "type": "INTEGER" }] }]],
+        }});
+        assert!(matches!(Relation::parse(&computed, 0), Ok(Relation::Values { .. })));
+        let subquery = json!({ "values": {
+            "schema": ["BOOLEAN"],
+            "content": [[{ "operator": "EXISTS", "type": "BOOLEAN", "operand": [], "query": { "scan": 0 } }]],
+        }});
+        assert_eq!(Relation::parse(&subquery, 1).unwrap_err().to_string(), "values-nonliteral");
+    }
+
+    #[test]
+    fn keeps_a_sorts_keys_in_clause_order() {
+        let r = Relation::parse(
+            &json!({ "sort": {
+                "source": { "scan": 0 },
+                "collation": [[1, "INTEGER", "DESCENDING NULLS FIRST"], [0, "INTEGER", "ASCENDING NULLS LAST"]],
+                "limit": { "operator": "1", "operand": [], "type": "INTEGER" },
             }}),
-            0,
+            1,
         )
-        .unwrap_err();
-        assert_eq!(err.to_string(), "values-nonliteral");
+        .unwrap();
+        let Relation::Sort { keys, limit, offset, .. } = r else { panic!("not a sort") };
+        assert_eq!(
+            keys,
+            vec![
+                SortKey { column: 1, descending: true, nulls_first: true },
+                SortKey { column: 0, descending: false, nulls_first: false },
+            ]
+        );
+        assert!(limit.is_some() && offset.is_none());
     }
 }

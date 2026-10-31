@@ -13,6 +13,7 @@ use crate::alpha::alpha_eq;
 use crate::ic::Ics;
 use crate::ir::{Input, TranslateError};
 use crate::normalize::Normalizer;
+use crate::opaque;
 use crate::setsolver;
 use crate::translate::{translate_input, Query};
 
@@ -82,6 +83,15 @@ pub fn verify(ir: &serde_json::Value) -> Verdict {
 
 /// The prover proper, for a pair tier 0 did not answer.
 pub fn prove(input: &Input) -> Verdict {
+    prove_at(input, 0)
+}
+
+/// [`prove`] for a pair met `depth` sub-proofs deep: the sources of two slices compared by
+/// [`opaque`], which first replaces the nodes translation cannot read by tables shared between the
+/// two sides, where it can.
+pub fn prove_at(input: &Input, depth: usize) -> Verdict {
+    let abstracted = opaque::abstract_opaque(input, depth);
+    let input = abstracted.as_ref().unwrap_or(input);
     let [l, r] = match translate_input(input) {
         Ok(sides) => sides,
         Err(e) => return Verdict::Refused(e),

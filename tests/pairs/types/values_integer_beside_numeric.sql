@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #177: a VALUES column took its first row's type, so the integer row reached the
 --   prover under a numeric column and QED panicked

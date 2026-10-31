@@ -52,6 +52,7 @@
 //! other (see `dedup_by_identity`). So does `MAX`/`MIN`, which binds the extremum to an input by
 //! identity, and is refused the same way (see `extremum_by_identity`).
 
+use crate::card::{self, Slice};
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
 
@@ -401,17 +402,21 @@ impl<'s> Translator<'s> {
     fn rel(&mut self, r: &Relation, base: usize) -> Result<Translated, TranslateError> {
         match r {
             Relation::Scan(i) => self.scan(*i),
-            Relation::Values { schema, content } => self.values(schema, content),
+            Relation::Values { schema, content } => self.values(schema, content, base),
             Relation::Filter { source, condition } => self.filter(source, condition, base),
             Relation::Project { source, target } => self.project(source, target, base),
             Relation::Distinct(source) => self.distinct(source, base),
             Relation::Join { left, right, kind, condition } => self.join(left, right, *kind, condition, base),
             Relation::Group { source, keys, function } => self.group(source, keys, function, base),
+            // The order is erased (bag semantics). A slice is read only where it keeps every row or
+            // none (`card::slice`); any other is refused here, and translated only as the same slice
+            // of an equal source on both sides (`opaque`).
             Relation::Sort { source, offset, limit, .. } => {
-                if offset.is_some() || limit.is_some() {
-                    return Err(TranslateError::UnsupportedSort);
+                match card::slice(source, offset.as_ref(), limit.as_ref(), base, self.schemas) {
+                    Slice::Identity => self.rel(source, base),
+                    Slice::Empty => Ok(Translated { term: UTerm::Const(UConst::Int(0)), ..self.rel(source, base)? }),
+                    Slice::Opaque => Err(TranslateError::UnsupportedSort),
                 }
-                self.rel(source, base)
             }
             Relation::Union(sides) => self.set_op(SetOpKind::Union, sides, base),
             Relation::Except(sides) => self.set_op(SetOpKind::Except, sides, base),
@@ -437,20 +442,34 @@ impl<'s> Translator<'s> {
         Ok(Translated { term, local, types, exposed: vec![var] })
     }
 
-    fn values(&mut self, schema: &[Type], content: &[Vec<Expr>]) -> Result<Translated, TranslateError> {
+    /// A computed cell is the value it computes over no columns of its own: a parameter or a cast
+    /// is read as anywhere else, and a column reference can only reach an enclosing query, which is
+    /// refused (`correlated`). Its IR type must be its column's, since the cell's value is bound to
+    /// the column as is. With no columns at all (the `"singleton"` a `FROM`-less query is lowered
+    /// over) the rows are copies of the empty tuple, a multiplicity with no var to sum over.
+    fn values(&mut self, schema: &[Type], content: &[Vec<Expr>], base: usize) -> Result<Translated, TranslateError> {
+        if schema.is_empty() {
+            if content.iter().any(|row| !row.is_empty()) {
+                return Err(TranslateError::MalformedShape("values row width does not match schema".into()));
+            }
+            let term = UTerm::Const(UConst::Int(content.len() as i64));
+            return Ok(Translated { term, local: Vec::new(), types: Vec::new(), exposed: Vec::new() });
+        }
         let var = self.fresh_var(schema.len());
         let local: Vec<UVar> = (0..schema.len() as u32).map(|idx| UVar::proj(idx, var.clone())).collect();
+        let no_columns = Scope { base, local: Vec::new(), types: Vec::new() };
         let mut rows = Vec::with_capacity(content.len());
         for row in content {
             if row.len() != local.len() {
                 return Err(TranslateError::MalformedShape("values row width does not match schema".into()));
             }
             let mut factors = Vec::with_capacity(row.len());
-            for (col, cell) in local.iter().zip(row.iter()) {
+            for ((col, cell), ty) in local.iter().zip(row.iter()).zip(schema) {
                 let v = match cell {
                     Expr::Literal { value, ty } => self.literal_value(value, *ty)?,
-                    // `ir::Relation::parse` already guarantees every `values` cell is a literal
-                    // before this stage ever runs.
+                    // `ir::Relation::parse` refuses a subquery cell before this stage runs.
+                    Expr::Subquery { .. } => return Err(TranslateError::ValuesNonLiteral),
+                    computed if computed.ty() == *ty => self.translate_value(computed, &no_columns)?,
                     _ => return Err(TranslateError::ValuesNonLiteral),
                 };
                 factors.push(value_eq(&UTerm::Var(col.clone()), &v));
@@ -601,11 +620,24 @@ impl<'s> Translator<'s> {
         scope: &Scope,
         col: &UVar,
     ) -> Result<UTerm, TranslateError> {
-        if call.distinct {
+        // `MAX`/`MIN` of the distinct values is `MAX`/`MIN` of the values.
+        if call.distinct && !matches!(call.operator.as_str(), "COUNT" | "MAX" | "MIN") {
             return Err(TranslateError::DistinctAggregateUnsupported);
         }
         let outcol = UTerm::Var(col.clone());
         match call.operator.as_str() {
+            // `COUNT(DISTINCT x)`: one per value some non-NULL `x` of the group is, SQLSolver's
+            // nested existential sum. Telling values apart by identity is deduplication, faithful
+            // only where `=` is identity ([`dedup_by_identity`]).
+            "COUNT" if call.distinct => {
+                let [Expr::Column { .. }] = call.operand.as_slice() else { return Err(TranslateError::AggArgNonRef) };
+                let x = Self::agg_arg(&call.operand, scope)?;
+                dedup_by_identity(&[Some(scope.eq_type(&call.operand[0]))])?;
+                let v = self.fresh_var(1);
+                let is_v = UTerm::Pred { kind: PredKind::Eq, args: vec![UTerm::Var(UVar::proj(0, v.clone())), x.value] };
+                let some_row = mk_squash(mk_sum(source_exposed.to_vec(), mk_mul([group_by_term.clone(), mk_neg(x.is_null), is_v])));
+                Ok(value_eq(&outcol, &Value::not_null(mk_sum(vec![v], some_row))))
+            }
             "COUNT" => {
                 let count = if call.operand.is_empty() {
                     mk_sum(source_exposed.to_vec(), group_by_term.clone())
@@ -778,8 +810,11 @@ impl<'s> Translator<'s> {
         }
     }
 
+    /// Whether `query` returns a row, which a `LIMIT` of one or more does not change
+    /// ([`card::strip_nonempty_slices`]).
     fn exists_predicate(&mut self, query: &Relation, scope: &Scope) -> Result<UTerm, TranslateError> {
-        let inner = self.rel(query, scope.base + scope.local.len())?;
+        let stripped = card::strip_nonempty_slices(query);
+        let inner = self.rel(stripped.as_ref().unwrap_or(query), scope.base + scope.local.len())?;
         Ok(mk_squash(mk_sum(inner.exposed, inner.term)))
     }
 

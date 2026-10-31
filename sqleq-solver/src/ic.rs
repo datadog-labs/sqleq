@@ -30,12 +30,7 @@ impl Ics {
             // An absent `nullable` list says nothing, so every column stays nullable.
             let not_null: HashSet<u32> =
                 s.nullable.iter().enumerate().filter(|(_, n)| !**n).map(|(i, _)| i as u32).collect();
-            let keys: Vec<Vec<u32>> = s
-                .key
-                .iter()
-                .map(|k| k.iter().map(|c| *c as u32).collect::<Vec<u32>>())
-                .filter(|k| !k.is_empty() && k.iter().all(|c| not_null.contains(c)))
-                .collect();
+            let keys: Vec<Vec<u32>> = s.enforced_keys().map(|k| k.iter().map(|c| *c as u32).collect()).collect();
             if !not_null.is_empty() {
                 ics.not_null.insert(s.name.clone(), not_null);
             }

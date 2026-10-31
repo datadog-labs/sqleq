@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: nondet-skip
 -- expect qed: proved
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: proved
 -- expect lean: unsupported
 -- origin: issue #124: sqleq-fuzz compared a trial whose LIMIT leaves ties by cardinality alone even under a
 --   filter, where the tied row the LIMIT keeps decides how many rows survive

@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: proved
 -- expect lean: unsupported
 -- origin: issue #177: a NULL branch is typed INTEGER, and a text column under it reached the prover
 --   ill-typed
