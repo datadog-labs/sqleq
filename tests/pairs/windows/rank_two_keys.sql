@@ -17,4 +17,4 @@
 --   it; the subquery counts exactly those, each key in its direction and nulls order
 create table t (a integer, b integer, c integer);
 SELECT a, RANK() OVER (PARTITION BY a ORDER BY b ASC NULLS FIRST, c DESC NULLS LAST) AS r FROM t;
-SELECT a, 1 + (SELECT COUNT(*) FROM t AS __sqleq_window WHERE __sqleq_window.a IS NOT DISTINCT FROM t.a AND (((__sqleq_window.b < t.b)) OR (__sqleq_window.b IS NULL AND t.b IS NOT NULL) OR (__sqleq_window.b IS NOT DISTINCT FROM t.b AND (((__sqleq_window.c > t.c)) OR (t.c IS NULL AND __sqleq_window.c IS NOT NULL) OR (__sqleq_window.c IS NOT DISTINCT FROM t.c AND FALSE))))) AS r FROM t;
+SELECT a, 1 + (SELECT COUNT(*) FROM t AS w WHERE w.a IS NOT DISTINCT FROM t.a AND (((w.b < t.b)) OR (w.b IS NULL AND t.b IS NOT NULL) OR (w.b IS NOT DISTINCT FROM t.b AND (((w.c > t.c)) OR (t.c IS NULL AND w.c IS NOT NULL) OR (w.c IS NOT DISTINCT FROM t.c AND FALSE))))) AS r FROM t;

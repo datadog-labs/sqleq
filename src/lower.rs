@@ -519,6 +519,42 @@ pub(crate) fn refuse_reserved_call_names(statements: &[sqlparser::ast::Statement
     Ok(())
 }
 
+/// The prefix of every identifier the frontend's own rewrites write: `__sqleq_alias_N`
+/// ([`crate::normalize::canonical_aliases`]), `__sqleq_window`
+/// ([`crate::normalize::lower_rank_windows`]), and the placeholders and the [`NULL_OF`] marker of
+/// [`expand_grouping_sets`]. No identifier of the input may begin with it
+/// ([`refuse_reserved_identifiers`]).
+pub(crate) const RESERVED_PREFIX: &str = "__sqleq_";
+
+/// SOUNDNESS GUARD: an identifier of the input that a rewrite's own symbol could be taken for. A
+/// table the input aliases `__sqleq_window` would be the `RANK()` rewrite's own alias, compared with
+/// itself and never before itself, so every rank 1; a column named like a grouping-set placeholder
+/// would be read back as one. Read off the tokens of each statement's text, so that every position
+/// an identifier can take is covered -- alias, column, table, function, binding, qualifier, quoted
+/// or not, in any case. No name a query could otherwise mean begins with the prefix.
+pub(crate) fn refuse_reserved_identifiers(statements: &[sqlparser::ast::Statement]) -> Result<()> {
+    for st in statements {
+        if let Some(name) = reserved_identifier(&st.to_string())? {
+            return Err(unsupported(format!(
+                "an identifier named {name}, which the frontend reserves for its own rewrites"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first identifier of `sql` that begins with [`RESERVED_PREFIX`], case aside, or `None`.
+pub(crate) fn reserved_identifier(sql: &str) -> Result<Option<String>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+        .tokenize()
+        .map_err(|e| unsupported(format!("a statement whose text does not tokenize: {e}")))?;
+    Ok(tokens.into_iter().find_map(|t| match t {
+        Token::Word(w) if w.value.to_ascii_lowercase().starts_with(RESERVED_PREFIX) => Some(w.value),
+        _ => None,
+    }))
+}
+
 /// SOUNDNESS GUARD: see [`VOLATILE_FUNCTIONS`]. Matched on the *bare* name, because
 /// `pg_catalog.random` is still `random` and widening a refusal can only ever cost completeness.
 fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {
@@ -2544,6 +2580,11 @@ fn call_or_column_name(e: &Expr) -> Option<String> {
         Expr::Function(f) => {
             let [.., last] = &f.name.0[..] else { return None };
             let name = fold_name(last.as_ident()?);
+            // The typed NULL of a grouping column a grouping set leaves out ([`NULL_OF`]): named as
+            // the column is, like the NULL that stands in it.
+            if name == NULL_OF {
+                return null_of_arg(f).and_then(call_or_column_name);
+            }
             // Cast rule 5b's wrapper (`casts.rs`): the cast it stands for, over its one operand.
             if name.strip_prefix("qcast").is_some_and(|n| n.parse::<u32>().is_ok()) {
                 let FunctionArguments::List(l) = &f.args else { return None };
@@ -2563,27 +2604,72 @@ fn call_or_column_name(e: &Expr) -> Option<String> {
     }
 }
 
-/// `GROUP BY` with `GROUPING SETS`, `ROLLUP` or `CUBE`, written as the `UNION ALL` of one plain
-/// `GROUP BY` per grouping set, which is what SQL defines them as: each grouping set groups the rows
-/// by its own columns, the grouping columns it leaves out are NULL in its rows, and `GROUPING(a, ..)`
-/// is the bit mask of the arguments it leaves out (the last argument the lowest bit). Outside the
-/// aggregates only: an aggregate's arguments read the input rows, where every column has its value.
-/// `None` when the `GROUP BY` has no grouping sets.
+/// `GROUP BY` with `GROUPING SETS`, `ROLLUP` or `CUBE`, written as the union of one plain `GROUP BY`
+/// per grouping set, which is what SQL defines them as: each grouping set groups the rows by its own
+/// columns, the grouping columns it leaves out are NULL in its rows, and `GROUPING(a, ..)` is the bit
+/// mask of the arguments it leaves out (the last argument the lowest bit). Outside the aggregates
+/// only: an aggregate's arguments read the input rows, where every column has its value. `None`
+/// when the `GROUP BY` has no grouping sets.
+///
+/// SOUNDNESS GUARDS, each a way the expansion once gave rows Postgres does not:
+///
+/// * The empty grouping set is `GROUP BY ()`: one group of all the rows, and so exactly one row,
+///   of an empty table too. Written as an empty `GROUP BY`, it was a plain `SELECT` wherever no
+///   aggregate made the branch group, one row per input row.
+/// * `DISTINCT` is over the whole result, so the branches carry none and are joined by `UNION`
+///   instead of `UNION ALL`. Kept on every branch, it merged each set's rows alone. `DISTINCT ON`
+///   is refused.
+/// * A grouping column the set leaves out is NULL *of its type* ([`NULL_OF`]). A bare NULL is an
+///   INTEGER, and `COALESCE(NULL, 1) / 2` divides integers where `COALESCE(a, 1) / 2` over a
+///   `numeric` `a` does not.
+/// * The grouping expressions are matched from the top of each expression down, so that in a set
+///   keeping `a / 10` and not `a` the whole `a / 10` is kept before the `a` inside it could be
+///   nulled. Matched bottom-up, the `a` went first.
+/// * The match is by text and knows no scope, so a subquery in the select list or `HAVING`, a
+///   column of whose own tables could be taken for a grouping column, is refused; so is a
+///   wildcard, which names columns the match does not see.
+/// * A grouping construct nested in another is refused rather than read as a call, and so is a
+///   `GROUPING` of no argument or of more than 31, which Postgres refuses too.
+/// * The placeholders this writes are reserved names ([`RESERVED_PREFIX`]), which no input spells,
+///   so no column of the input can be taken for one.
 fn expand_grouping_sets(fns: &Fns, s: &Select) -> Result<Option<SetExpr>> {
     let GroupByExpr::Expressions(items, modifiers) = &s.group_by else { return Ok(None) };
+    // sqlparser reads a `ROLLUP(..)` or `CUBE(..)` nested in `GROUPING SETS (..)` as a call
+    let is_sets = |e: &Expr| {
+        matches!(e, Expr::GroupingSets(_) | Expr::Rollup(_) | Expr::Cube(_))
+            || matches!(e, Expr::Function(f) if ["rollup", "cube"].iter().any(|n| obj_name(&f.name).eq_ignore_ascii_case(n)))
+    };
     // a plain `GROUP BY` is its one grouping set, which `GROUPING(..)` may still read
-    if !items.iter().any(|e| matches!(e, Expr::GroupingSets(_) | Expr::Rollup(_) | Expr::Cube(_)))
-        && (items.is_empty() || !reads_grouping(s))
-    {
+    if !items.iter().any(is_sets) && (items.is_empty() || !reads_grouping(s)) {
         return Ok(None);
     }
     if !modifiers.is_empty() {
         return Err(unsupported("GROUP BY modifiers beside grouping sets"));
     }
+    let distinct = match &s.distinct {
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct) => true,
+        Some(Distinct::On(_)) => return Err(unsupported("DISTINCT ON beside grouping sets")),
+    };
+    let exprs: Vec<&Expr> = s
+        .projection
+        .iter()
+        .map(|it| item_expr(it).ok_or_else(|| unsupported("a wildcard beside grouping sets")))
+        .collect::<Result<_>>()?;
+    if exprs.iter().copied().chain(s.having.as_ref()).any(crate::normalize::contains_subquery) {
+        return Err(unsupported("a subquery in the select list or HAVING beside grouping sets"));
+    }
     // the grouping sets: one alternative of every item, all combinations
+    let nested = |lists: &[Vec<Expr>]| lists.iter().flatten().any(is_sets);
     let mut sets: Vec<Vec<Expr>> = vec![Vec::new()];
     for item in items {
         let alternatives: Vec<Vec<Expr>> = match item {
+            Expr::GroupingSets(gs) if nested(gs) => {
+                return Err(unsupported("a ROLLUP, CUBE or GROUPING SETS nested in GROUPING SETS"))
+            }
+            Expr::Rollup(r) | Expr::Cube(r) if nested(r) => {
+                return Err(unsupported("a grouping set nested in ROLLUP or CUBE"))
+            }
             Expr::GroupingSets(gs) => gs.clone(),
             Expr::Rollup(r) => (0..=r.len()).rev().map(|k| r[..k].concat()).collect(),
             Expr::Cube(c) => {
@@ -2611,82 +2697,21 @@ fn expand_grouping_sets(fns: &Fns, s: &Select) -> Result<Option<SetExpr>> {
             })
             .collect();
     }
-    let key = |e: &Expr| e.to_string().to_lowercase();
     let mut all: Vec<Expr> = Vec::new();
-    for set in &sets {
-        for e in set {
-            if !all.iter().any(|a| key(a) == key(e)) {
-                all.push(e.clone());
-            }
+    for e in sets.iter().flatten() {
+        if !all.iter().any(|a| grouping_key(a) == grouping_key(e)) {
+            all.push(e.clone());
         }
     }
     let mut branches: Vec<SetExpr> = Vec::new();
     for set in &sets {
-        let in_set = |e: &Expr| set.iter().any(|g| key(g) == key(e));
         let mut b = s.clone();
-        b.group_by = GroupByExpr::Expressions(set.clone(), Vec::new());
-        let rewrite = |e: &mut Expr| -> Result<()> {
-            // 1. aggregates aside: their arguments read the rows, not the grouping
-            let mut saved: Vec<Expr> = Vec::new();
-            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
-                if is_agg_call(fns, x) {
-                    let n = saved.len();
-                    saved.push(std::mem::replace(x, Expr::Identifier(sqlparser::ast::Ident::new(format!("__sqleq_agg_{n}")))));
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            // 2. GROUPING(..) as its mask, before its arguments change
-            let mut bad = false;
-            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
-                if let Expr::Function(f) = x {
-                    if obj_name(&f.name).eq_ignore_ascii_case("grouping") {
-                        let args: Vec<Expr> = match &f.args {
-                            FunctionArguments::List(l) => l
-                                .args
-                                .iter()
-                                .filter_map(|a| match a {
-                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
-                                    _ => None,
-                                })
-                                .collect(),
-                            _ => Vec::new(),
-                        };
-                        let n = args.len();
-                        let mut mask: u64 = 0;
-                        for (i, a) in args.iter().enumerate() {
-                            if !all.iter().any(|g| key(g) == key(a)) {
-                                bad = true;
-                            }
-                            if !in_set(a) {
-                                mask |= 1 << (n - 1 - i);
-                            }
-                        }
-                        *x = Expr::value(sqlparser::ast::Value::Number(mask.to_string(), false));
-                    }
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            if bad {
-                return Err(unsupported("GROUPING of an expression that is not a grouping column"));
-            }
-            // 3. the grouping columns this set leaves out are NULL
-            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
-                if all.iter().any(|g| key(g) == key(x)) && !in_set(x) {
-                    *x = Expr::value(sqlparser::ast::Value::Null);
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            // 4. the aggregates back
-            let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
-                if let Expr::Identifier(id) = x {
-                    if let Some(n) = id.value.strip_prefix("__sqleq_agg_").and_then(|n| n.parse::<usize>().ok()) {
-                        *x = saved[n].clone();
-                    }
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            Ok(())
-        };
+        b.distinct = None;
+        // `GROUP BY ()` for the empty set: one group, which `group_by_exprs` reads as no key
+        b.group_by = GroupByExpr::Expressions(
+            if set.is_empty() { vec![Expr::Tuple(Vec::new())] } else { set.clone() },
+            Vec::new(),
+        );
         for item in b.projection.iter_mut() {
             match item {
                 SelectItem::UnnamedExpr(e) => {
@@ -2697,17 +2722,17 @@ fn expand_grouping_sets(fns: &Fns, s: &Select) -> Result<Option<SetExpr>> {
                         _ => None,
                     };
                     let before = e.clone();
-                    rewrite(e)?;
+                    rewrite_for_grouping_set(fns, &all, set, e)?;
                     if let (Some(alias), true) = (name, *e != before) {
                         *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
                     }
                 }
-                SelectItem::ExprWithAlias { expr, .. } => rewrite(expr)?,
+                SelectItem::ExprWithAlias { expr, .. } => rewrite_for_grouping_set(fns, &all, set, expr)?,
                 _ => return Err(unsupported("a wildcard beside grouping sets")),
             }
         }
         if let Some(h) = b.having.as_mut() {
-            rewrite(h)?;
+            rewrite_for_grouping_set(fns, &all, set, h)?;
         }
         branches.push(SetExpr::Select(Box::new(b)));
     }
@@ -2717,11 +2742,188 @@ fn expand_grouping_sets(fns: &Fns, s: &Select) -> Result<Option<SetExpr>> {
         out = SetExpr::SetOperation {
             left: Box::new(out),
             op: SetOperator::Union,
-            set_quantifier: SetQuantifier::All,
+            // `SELECT DISTINCT` over the union of the branches is their `UNION`
+            set_quantifier: if distinct { SetQuantifier::None } else { SetQuantifier::All },
             right: Box::new(b),
         };
     }
     Ok(Some(out))
+}
+
+/// How two grouping expressions are told to be the same one: by their text, case aside.
+fn grouping_key(e: &Expr) -> String {
+    e.to_string().to_lowercase()
+}
+
+/// One select item or the `HAVING` of a grouping set's branch, rewritten for that set: each
+/// aggregate as written, `GROUPING(..)` as its mask, each grouping expression the set keeps as
+/// itself and each it leaves out as [`NULL_OF`] it. Top-down ([`GroupingSetRewrite`]), with a
+/// placeholder standing in for whatever the walk must not descend into, put back at the end.
+fn rewrite_for_grouping_set(fns: &Fns, all: &[Expr], set: &[Expr], e: &mut Expr) -> Result<()> {
+    let mut pass = GroupingSetRewrite { fns, all, set, saved: Vec::new(), error: None };
+    let _ = sqlparser::ast::VisitMut::visit(e, &mut pass);
+    if let Some(err) = pass.error {
+        return Err(err);
+    }
+    let saved = pass.saved;
+    let mut unwritten = false;
+    let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+        if let Expr::Identifier(id) = x {
+            if let Some(n) = id.value.strip_prefix(PLACEHOLDER).and_then(|n| n.parse::<usize>().ok()) {
+                match saved.get(n) {
+                    Some(v) => *x = v.clone(),
+                    None => unwritten = true,
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if unwritten {
+        // Unreachable while `refuse_reserved_identifiers` holds; refused rather than indexed.
+        return Err(unsupported("a grouping-set placeholder the rewrite did not write"));
+    }
+    Ok(())
+}
+
+/// The placeholders of [`rewrite_for_grouping_set`], `__sqleq_gs_N`, N an index into its `saved`.
+const PLACEHOLDER: &str = "__sqleq_gs_";
+
+/// `__sqleq_null_of(x)`: NULL, of `x`'s type. Written by [`expand_grouping_sets`] for a grouping
+/// column a set leaves out, and lowered by [`lower_expr`] and [`AggCtx::lower_post`] from `x`
+/// lowered in the FROM scope, where `x` is a column whatever the branch groups by.
+const NULL_OF: &str = "__sqleq_null_of";
+
+/// The argument of a [`NULL_OF`] call, or `None` for any other call.
+fn null_of_arg(f: &Function) -> Option<&Expr> {
+    if !obj_name(&f.name).eq_ignore_ascii_case(NULL_OF) {
+        return None;
+    }
+    match &f.args {
+        FunctionArguments::List(l) => match &l.args[..] {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))] => Some(x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`NULL_OF`] over `x`.
+fn null_of(x: Expr) -> Expr {
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(NULL_OF))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(x))],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
+/// The rewrite of one expression for one grouping set; see [`rewrite_for_grouping_set`].
+struct GroupingSetRewrite<'a> {
+    fns: &'a Fns,
+    /// Every grouping expression of the query.
+    all: &'a [Expr],
+    /// The ones this set groups by.
+    set: &'a [Expr],
+    /// What each placeholder stands for: an aggregate call as written, a grouping expression the set
+    /// keeps, or the [`NULL_OF`] of one it leaves out.
+    saved: Vec<Expr>,
+    error: Option<crate::error::FrontendError>,
+}
+
+impl GroupingSetRewrite<'_> {
+    fn placeholder(&mut self, stands_for: Expr) -> Expr {
+        let n = self.saved.len();
+        self.saved.push(stands_for);
+        Expr::Identifier(sqlparser::ast::Ident::new(format!("{PLACEHOLDER}{n}")))
+    }
+
+    fn is_grouping(&self, e: &Expr) -> bool {
+        let k = grouping_key(e);
+        self.all.iter().any(|g| grouping_key(g) == k)
+    }
+
+    fn in_set(&self, e: &Expr) -> bool {
+        let k = grouping_key(e);
+        self.set.iter().any(|g| grouping_key(g) == k)
+    }
+
+    /// `GROUPING(args)` for this set: the bit mask of the arguments the set leaves out.
+    fn grouping_mask(&self, f: &Function) -> Result<u32> {
+        let args: Vec<&Expr> = match &f.args {
+            FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let n = args.len();
+        if n == 0 || n > 31 {
+            return Err(unsupported("GROUPING of no argument, or of more than 31"));
+        }
+        let mut mask: u32 = 0;
+        for (i, a) in args.iter().enumerate() {
+            if !self.is_grouping(a) {
+                return Err(unsupported("GROUPING of an expression that is not a grouping column"));
+            }
+            if !self.in_set(a) {
+                mask |= 1 << (n - 1 - i);
+            }
+        }
+        Ok(mask)
+    }
+}
+
+impl sqlparser::ast::VisitorMut for GroupingSetRewrite<'_> {
+    type Break = ();
+
+    /// Before anything inside the expression is looked at; what a placeholder replaces has no inside
+    /// left to look at, so the walk never reaches into an aggregate's arguments or a kept grouping
+    /// expression.
+    fn pre_visit_expr(&mut self, x: &mut Expr) -> ControlFlow<()> {
+        if self.error.is_some() {
+            return ControlFlow::Break(());
+        }
+        // 1. aggregates aside: their arguments read the rows, not the grouping
+        if is_agg_call(self.fns, x) {
+            *x = self.placeholder(x.clone());
+            return ControlFlow::Continue(());
+        }
+        // 2. GROUPING(..) as its mask, read off its arguments as written
+        let mask = match &*x {
+            Expr::Function(f) if obj_name(&f.name).eq_ignore_ascii_case("grouping") => Some(self.grouping_mask(f)),
+            _ => None,
+        };
+        match mask {
+            Some(Ok(mask)) => {
+                *x = Expr::value(sqlparser::ast::Value::Number(mask.to_string(), false));
+                return ControlFlow::Continue(());
+            }
+            Some(Err(e)) => {
+                self.error = Some(e);
+                return ControlFlow::Break(());
+            }
+            None => {}
+        }
+        // 3. a grouping expression: kept as it is, or NULL of its type where the set leaves it out
+        if self.is_grouping(x) {
+            let stands_for = if self.in_set(x) { x.clone() } else { null_of(x.clone()) };
+            *x = self.placeholder(stands_for);
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Whether the projection or the `HAVING` of `s` calls `GROUPING(..)`.
@@ -3208,6 +3410,12 @@ impl AggCtx<'_> {
                 Ok(make_case(ops))
             }
             Expr::Function(f) => {
+                // NULL of a grouping column's type, for a grouping set that leaves it out
+                // ([`NULL_OF`]): the column is read in the FROM scope, whatever this branch groups by.
+                if let Some(x) = null_of_arg(f) {
+                    let v = lower_expr(self.cat, self.scope, self.fns, x)?;
+                    return Ok(json!({ "operator": "NULL", "operand": [], "type": ty_of(&v) }));
+                }
                 // a scalar function over keys/aggregates (is_agg_call already returned false)
                 let (name, bare) = fn_names(f);
                 reject_quantifier_call(&name, &bare)?;
@@ -3225,7 +3433,7 @@ impl AggCtx<'_> {
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
                 let operand =
-                    if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
+                    if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -3689,6 +3897,20 @@ fn lower_comparison(
     })
 }
 
+/// The type of `SUBSTRING` or `TRIM` over `x`. Postgres has each for `text` and for `bytea`, and the
+/// result is of the argument's type; typed VARCHAR whatever the argument, a `bytea` came out a
+/// string. An opaque type stands for `bytea`, and for any type the frontend does not know, which it
+/// reads the same way: the result is of the argument's kind ([`crate::equality`]). Over any other
+/// type Postgres has no such function, so the call is refused.
+fn string_function_type(what: &str, x: &Value) -> Result<String> {
+    let t = ty_of(x);
+    if t == "VARCHAR" || is_opaque(&t) {
+        Ok(t)
+    } else {
+        Err(unsupported(format!("{what} over a value of type {t}")))
+    }
+}
+
 /// Lower a scalar expression to an `Expr` Value.
 fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value> {
     match e {
@@ -3701,6 +3923,11 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         }
         Expr::Value(v) => lower_value(&v.value),
         Expr::Function(f) => {
+            // NULL of a grouping column's type, for a grouping set that leaves it out ([`NULL_OF`]).
+            if let Some(x) = null_of_arg(f) {
+                let v = lower_expr(cat, scope, fns, x)?;
+                return Ok(json!({ "operator": "NULL", "operand": [], "type": ty_of(&v) }));
+            }
             if f.over.is_some() {
                 return Err(unsupported("window function (OVER)"));
             }
@@ -3731,7 +3958,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .collect::<Result<Vec<_>>>()?;
             let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
             let operand =
-                if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
+                if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
             Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
@@ -3993,7 +4220,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         }
         // `SUBSTRING(x FROM a FOR b)` and `TRIM(BOTH c FROM x)` have syntax of their own; they are
         // the strict functions `SUBSTRING` and `TRIM_BOTH`/`TRIM_LEADING`/`TRIM_TRAILING` over
-        // their arguments, which the provers do not interpret.
+        // their arguments, which the provers do not interpret, of their first argument's type
+        // ([`string_function_type`]).
         Expr::Substring { expr, substring_from, substring_for, .. } => {
             let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
             operand.push(match substring_from {
@@ -4004,7 +4232,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             if let Some(n) = substring_for {
                 operand.push(lower_expr(cat, scope, fns, n)?);
             }
-            Ok(json!({ "operator": "SUBSTRING", "operand": operand, "type": "VARCHAR" }))
+            let ty = string_function_type("SUBSTRING", &operand[0])?;
+            Ok(json!({ "operator": "SUBSTRING", "operand": operand, "type": ty }))
         }
         Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
             if trim_characters.is_some() {
@@ -4020,7 +4249,8 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 Some(w) => lower_expr(cat, scope, fns, w)?,
                 None => string_literal(" "),
             });
-            Ok(json!({ "operator": format!("TRIM_{side}"), "operand": operand, "type": "VARCHAR" }))
+            let ty = string_function_type("TRIM", &operand[0])?;
+            Ok(json!({ "operator": format!("TRIM_{side}"), "operand": operand, "type": ty }))
         }
         other => Err(unsupported(format!("expr: {other:?}"))),
     }

@@ -3121,7 +3121,15 @@ mod tests {
 /// query to keep its meaning: it is skipped for a query that declares one alias name twice, or one
 /// that is also a table it reads without an alias (whose implicit qualifier it would rename too), or
 /// one that is already of the canonical form. Canonical names are distinct, so the renaming is
-/// injective, and two queries renamed to one tree differ by a renaming of their aliases only.
+/// injective, and two queries renamed to one tree differ by a renaming of their aliases only -- as
+/// long as every way the query names an alias was renamed. The renaming reaches a declaration, a
+/// qualifier `a.x` and a qualified wildcard `a.*` in a select list, and nothing else that can name
+/// one: not a whole-row reference (`row_to_json(e)`, `(e).x`, `e.*` as an argument), not the alias
+/// of an `UNNEST`, a function or a parenthesized join (which the collection does not see either, so
+/// a duplicate of one escapes the clash check), not a three-part name. Each would leave the name in
+/// place while its declaration, or another alias's, was renamed, and two queries Postgres tells
+/// apart could become one tree. So a query in whose text an alias's name is still an identifier
+/// after the renaming is put back as it was ([`names_remain`]).
 pub fn canonical_aliases(queries: &mut [Query]) {
     for q in queries {
         let mut seen = CollectAliases::default();
@@ -3143,8 +3151,41 @@ pub fn canonical_aliases(queries: &mut [Query]) {
         if map.is_empty() || clash {
             continue;
         }
+        let before = q.clone();
         let _ = VisitMut::visit(q, &mut RenameAliases { map: &map });
+        if names_remain(q, &map) {
+            *q = before;
+        }
     }
+}
+
+/// Whether an identifier token of `q`'s text, folded as [`crate::dml::fold_ident`] folds one, is a
+/// key of `map`: an alias name the renaming left in place. `true` as well when the text does not
+/// tokenize, which keeps the renaming out.
+fn names_remain(q: &Query, map: &HashMap<String, String>) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, &q.to_string()).tokenize() else {
+        return true;
+    };
+    tokens.iter().any(|t| match t {
+        Token::Word(w) => map.contains_key(&match w.quote_style {
+            Some(_) => w.value.clone(),
+            None => w.value.to_ascii_lowercase(),
+        }),
+        _ => false,
+    })
+}
+
+/// Whether `e` has a subquery anywhere in it.
+pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    struct Subquery;
+    impl Visitor for Subquery {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+    }
+    Visit::visit(e, &mut Subquery).is_break()
 }
 
 /// The aliases a query declares, folded, in order, and the bare names of the tables it reads without
@@ -3252,8 +3293,12 @@ impl VisitorMut for RenameAliases<'_> {
 ///
 /// SOUNDNESS GUARD. Only where the window sees exactly the table's rows: one table in `FROM`, with no
 /// join, and no `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `QUALIFY` or named window; partition and
-/// order keys that are columns of that table; `RANK()` with no argument and no `FILTER`. Any other
-/// window call is left alone, and lowering refuses it as before.
+/// order keys that are columns of that table; `RANK()` with no argument and no `FILTER`; and only in
+/// a select item with no subquery in it, since the walk over an item enters every expression of it,
+/// and a `RANK()` inside a subquery is over that subquery's rows, not this table's. Any other window
+/// call is left alone, and lowering refuses it as before. The alias the rewrite writes,
+/// `__sqleq_window`, is a name no input spells ([`crate::lower::refuse_reserved_identifiers`]), so a
+/// table the input aliases so cannot be taken for it.
 pub fn lower_rank_windows(queries: &mut [Query]) {
     for q in queries {
         let _ = VisitMut::visit(q, &mut RankWindows);
@@ -3361,6 +3406,10 @@ fn rank_windows_in(s: &mut sqlparser::ast::Select) {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
             _ => continue,
         };
+        // SOUNDNESS GUARD: see above. The item's subquery keeps its `RANK()`, which lowering refuses.
+        if contains_subquery(e) {
+            continue;
+        }
         let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
             if let Expr::Function(f) = x {
                 if let Some(r) = rank(f) {

@@ -17,4 +17,4 @@
 --   it; the subquery counts exactly those, each key in its direction and nulls order
 create table t (a integer, b integer, c integer);
 SELECT a, RANK() OVER () AS r FROM t;
-SELECT a, 1 + (SELECT COUNT(*) FROM t AS __sqleq_window WHERE FALSE) AS r FROM t;
+SELECT a, 1 + (SELECT COUNT(*) FROM t AS w WHERE FALSE) AS r FROM t;

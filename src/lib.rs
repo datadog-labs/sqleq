@@ -736,6 +736,11 @@ fn normalized_pair(
     let Ok((_, mut statements)) = parse_statements(src) else {
         return None;
     };
+    // As in `parse_input`: an identifier spelled like one of the rewrites' own could be read as it,
+    // so such a pair is not compared.
+    if statements.iter().any(|st| !matches!(lower::reserved_identifier(&st.to_string()), Ok(None))) {
+        return None;
+    }
     // A repair of a parser bug rather than a rewrite, so it runs here for the same reason it runs
     // first in `parse_input`: everything below reads the tree it produces.
     if rewrites.has(Rewrites::FIX_PRECEDENCE)
@@ -959,6 +964,9 @@ fn parse_input(
     casts::refuse_foreign_kinds(&statements)?;
     // Also before any rewrite, which writes calls of its own under names this refuses.
     lower::refuse_reserved_call_names(&statements)?;
+    // Also before any rewrite: the aliases, placeholders and markers the rewrites write all begin
+    // with `__sqleq_`, and an identifier of the input spelled so would be read as one of them.
+    lower::refuse_reserved_identifiers(&statements)?;
     // Before the shape check and the placeholder passes, which see a `$N` only in an expression
     // position, and a typed literal's `DATE $1` is not one.
     normalize::desugar_special_forms(&mut statements);

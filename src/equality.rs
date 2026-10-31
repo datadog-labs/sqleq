@@ -150,8 +150,15 @@ pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
         // Postgres resolves these as it resolves a CASE: one common type for the arguments, a bare
         // NULL taking the others' (NULLIF: its first argument's). Over builtin types that is a
         // builtin type, and the value is one of the arguments, so it is that type here too.
-        let typed: Vec<String> = operand.iter().filter(|v| !crate::types::is_null_lit(v)).map(ty_of).collect();
-        let considered: Vec<String> = if name == "NULLIF" { typed.into_iter().take(1).collect() } else { typed };
+        // A string literal has no type of its own in Postgres either (it is `unknown`): it takes the
+        // others', unless every argument is one. `COALESCE(i, '00')` over an INTEGER `i` is an
+        // INTEGER, and `coerce_select_args` then reads the literal as the integer 0. A NULL of a type
+        // of its own (`NULL::numeric`, [`crate::types::is_bare_null`]) votes for it.
+        let typed: Vec<&Value> = operand.iter().filter(|v| !crate::types::is_bare_null(v)).collect();
+        let voters: Vec<&Value> = typed.iter().copied().filter(|v| !crate::types::is_string_literal(v)).collect();
+        let voters = if voters.is_empty() { typed } else { voters };
+        let considered: Vec<String> =
+            voters.into_iter().take(if name == "NULLIF" { 1 } else { usize::MAX }).map(ty_of).collect();
         if !considered.is_empty() && considered.iter().all(|t| crate::types::is_builtin(t)) {
             if let Some(t) = considered.into_iter().reduce(|a, b| crate::types::common_type(&a, &b)) {
                 return t;
