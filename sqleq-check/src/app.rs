@@ -637,12 +637,20 @@ pub fn main(args: Args) -> i32 {
                 c.dim(&format!("  asking {} about {n} case(s), {} at a time, {}s each…", driver.describe(), args.jobs, report::fmt_secs(cvc5_timeout_s)))
             );
         }
+        let emitted: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
         let done = |x: &Case| {
             if last_pass == "cvc5" {
                 stream.emit(x);
+                emitted.lock().unwrap_or_else(|e| e.into_inner()).insert(x.name.clone());
             }
         };
         cvc5_stats = Some(cvc5::run_cvc5(&mut cases, dir, driver, args.jobs, cvc5_cap_ms, cvc5_timeout_s, &done));
+        // A case with no cvc5 job -- never lowered, or one whose job could not be written -- has
+        // nothing more to say either, and is written now, so that `--resume` does not run it again.
+        if last_pass == "cvc5" {
+            let emitted = emitted.into_inner().unwrap_or_else(|e| e.into_inner());
+            cases.iter().filter(|x| !emitted.contains(&x.name)).for_each(|x| stream.emit(x));
+        }
     }
 
     // The fuzz axis reads the pair files itself, so it is independent of the passes above --

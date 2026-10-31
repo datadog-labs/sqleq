@@ -132,7 +132,19 @@ pub fn words(axis: &str) -> &'static [&'static str] {
         // constraints the frontend does not carry, so the database may be one the DDL forbids. An
         // equivalent pair may therefore be pinned `model`; a pair proved over the same plan may
         // not, which is an alarm.
-        "cvc5" => &["proved", "proved-literal", "model", "no-proof", "unsupported", "no-plan", "error"],
+        // `proved-sets` and `model-sets` are the same two answers under `--cvc5-semantics sets`, an
+        // approximation under which duplicates collapse, so neither claims nor refutes anything.
+        "cvc5" => &[
+            "proved",
+            "proved-literal",
+            "model",
+            "proved-sets",
+            "model-sets",
+            "no-proof",
+            "unsupported",
+            "no-plan",
+            "error",
+        ],
         // `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of
         // equivalence.
         "lean" => &[
@@ -167,7 +179,12 @@ pub fn claims_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
     }
 }
 
-/// Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is.
+/// Evidence for an equivalent truth: a claim that is not possibly vacuous, which `no-witness` is,
+/// and not experimental, which cvc5's is. The cvc5 axis is experimental: its bag reasoning lives in
+/// an unreleased branch of cvc5 and its proofs are not checked, so its `proved` is reported and is
+/// an alarm against a refutation ([`claims_equivalent`]), but it decides no portfolio verdict and
+/// stands for no pair's truth, until the bag work is in a cvc5 release and the axis has been
+/// cross-checked against sqleq-fuzz.
 pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
     if binding == GATHER_GENERATED {
         return match axis {
@@ -176,7 +193,7 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
         };
     }
     match axis {
-        "qed" | "sqleq-solver" | "sqlsolver-jvm" | "cvc5" => &PROVED_WORDS,
+        "qed" | "sqleq-solver" | "sqlsolver-jvm" => &PROVED_WORDS,
         "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather"],
         _ => &[],

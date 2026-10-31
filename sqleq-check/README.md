@@ -107,7 +107,7 @@ sqleq-check --keep ./work rewrites/
 | `--sqleq-solver-mem-gib G` / `--qed-mem-gib G` | Cap each sqleq-solver driver's or the QED prover's (z3 and cvc5 included) address space, as `ulimit -v` does. |
 | `--sqlsolver-jvm` | Ask the original SQLSolver instead, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check, and deprecated. Same jobs, same result rows, same buckets. Not with `--sqleq-solver` or `--portfolio`. |
 | `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
-| `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding and its `model` a refutation of the plan, which is half of an [alarm](#alarms) against a proof over the same plan but decides no verdict on its own. The same as adding `cvc5` to `--axes`. |
+| `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding and its `model` a refutation of the plan; each is half of an [alarm](#alarms) against the other kind of answer over the same plan, and neither decides a verdict on its own while the axis is experimental. The same as adding `cvc5` to `--axes`. |
 | `--cvc5-bin PATH` | The `sqleq-cvc5` binary ([lookup order](#requirements)). |
 | `--cvc5-semantics bags\|sets` | The semantics it encodes under (default `bags`, SQL's own; `sets` collapses duplicates and is far easier for the solver). |
 | `--cvc5-opt NAME=VALUE` | A further cvc5 option, repeatable: `bags-deq-decompose=false`, say. |
@@ -287,6 +287,14 @@ verdict on its own -- the frontend drops the constraints it cannot carry, so the
 one the DDL forbids -- and it is not an executed counterexample as sqleq-fuzz's is; the report
 never calls it one. `no-proof` is cvc5's `unknown`, a model found under uninterpreted symbols (kept
 in the note as a candidate), or two queries whose rows the encoding cannot compare.
+
+The axis is **experimental**: its bag reasoning lives in an unreleased branch of cvc5 and its
+proofs are not checked. So `proved` is reported, and is an alarm against a sqleq-fuzz
+counterexample, but it decides no portfolio verdict and counts as evidence for no pinned pair's
+truth, until the bag work is in a cvc5 release and the axis has been cross-checked against
+sqleq-fuzz. Under `--cvc5-semantics sets` the answers are `proved-sets` and `model-sets`: about an
+approximation under which duplicates collapse (`UNION ALL` and `UNION` are one set), so they
+neither claim nor refute anything about the pair.
 [`../docs/CVC5.md`](../docs/CVC5.md) has the encoding, its approximations and how to build the
 binary.
 

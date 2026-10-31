@@ -49,6 +49,8 @@ pub fn observe(case: &Case, axes: &[&str]) -> HashMap<String, (String, String)> 
     if axes.contains(&"qed") {
         if no_plan {
             put("qed", "no-plan", "");
+        } else if let Some(why) = &case.qed_unasked {
+            put("qed", "no-plan", why);
         } else {
             let mut word = qed_word(&case.status);
             if word == "proved" && case.trivial == Some(true) {

@@ -47,11 +47,19 @@ pub const MODEL: &str = "model";
 pub const NO_PROOF: &str = "no-proof";
 /// The plan was not encoded: a construct with no faithful term, or no plan at all.
 pub const UNSUPPORTED: &str = "unsupported";
+/// `EQ` under `--cvc5-semantics sets`: the two encodings agree once duplicates collapse, which says
+/// nothing about the pair under SQL's bags (`UNION ALL` and `UNION` are one set), so it is no proof
+/// and claims nothing.
+pub const PROVED_SETS: &str = "proved-sets";
+/// A model under `--cvc5-semantics sets`: a database on which the two set approximations differ,
+/// which the bag encodings need not, so it refutes nothing.
+pub const MODEL_SETS: &str = "model-sets";
 pub const TIMEOUT: &str = "timeout";
 pub const ERROR: &str = "error";
 /// Never answered.
 pub const MISSING: &str = "missing";
-pub const ORDER: [&str; 8] = [PROVED, PROVED_LITERAL, MODEL, NO_PROOF, UNSUPPORTED, TIMEOUT, ERROR, MISSING];
+pub const ORDER: [&str; 10] =
+    [PROVED, PROVED_LITERAL, MODEL, PROVED_SETS, MODEL_SETS, NO_PROOF, UNSUPPORTED, TIMEOUT, ERROR, MISSING];
 
 /// The driver's raw verdicts, bucketed. `NEQ` is a `model` only with an exact model: one found
 /// with no uninterpreted symbol in the problem, so that it is a database and nothing more. A model
@@ -95,15 +103,25 @@ pub fn attach(case: &mut Case, rec: &Value) {
     if bucket == PROVED && flag("literal") {
         bucket = PROVED_LITERAL;
     }
+    // Under set semantics an answer is about the approximation, not the pair: its own words, which
+    // the suite reads neither as a claim nor as a refutation. A literal proof is the two plans being
+    // one, which holds under any semantics.
+    if rec.get("semantics").and_then(Value::as_str) == Some("sets") {
+        bucket = match bucket {
+            PROVED => PROVED_SETS,
+            MODEL => MODEL_SETS,
+            other => other,
+        };
+    }
     // A row cut off at the cap arrives as `UNKNOWN`; `killed` tells it from one cvc5 gave up on.
     // A proof or a model that landed on the boundary is still a claim.
-    if flag("killed") && bucket != PROVED && bucket != PROVED_LITERAL && bucket != MODEL {
+    if flag("killed") && !matches!(bucket, PROVED | PROVED_LITERAL | MODEL | PROVED_SETS | MODEL_SETS) {
         bucket = TIMEOUT;
     }
     case.c_bucket = Some(bucket.to_string());
     let text = |k: &str| rec.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     case.c_note = match bucket {
-        MODEL => text("counterexample").unwrap_or_default(),
+        MODEL | MODEL_SETS => text("counterexample").unwrap_or_default(),
         NO_PROOF if rec.get("model").is_some() => {
             format!("candidate model, under uninterpreted symbols: {}", text("counterexample").unwrap_or_default())
         }

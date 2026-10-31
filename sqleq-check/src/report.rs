@@ -879,15 +879,13 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result
         "f_verdict",
         "f_note",
         "f_ms",
-        "c_bucket",
-        "c_verdict",
-        "c_ms",
-        "c_note",
     ];
-    // Appended, so a reader of the batch columns finds them where they always were.
+    // Appended, so a reader of the batch columns finds them where they always were; the cvc5
+    // axis's columns after the portfolio's, which were there first.
     if portfolio {
         cols.extend(["p_verdict", "p_by", "p_pending", "p_first_s", "p_retried"]);
     }
+    cols.extend(["c_bucket", "c_verdict", "c_ms", "c_note"]);
     let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_path(path)?;
     w.write_record(&cols)?;
     let opt = |v: &Option<String>| v.clone().unwrap_or_default();
@@ -917,10 +915,6 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result
             opt(&x.f_verdict),
             x.f_note.clone(),
             x.f_ms.map(|m| m.to_string()).unwrap_or_default(),
-            opt(&x.c_bucket),
-            opt(&x.c_verdict),
-            num(&x.c_ms),
-            x.c_note.clone(),
         ];
         if portfolio {
             let o = x.portfolio.clone().unwrap_or_default();
@@ -932,6 +926,7 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool) -> std::io::Result
                 o.retried.to_string(),
             ]);
         }
+        row.extend([opt(&x.c_bucket), opt(&x.c_verdict), num(&x.c_ms), x.c_note.clone()]);
         w.write_record(&row)?;
     }
     w.flush()

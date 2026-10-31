@@ -63,6 +63,11 @@ pub struct Case {
     pub stats: Value,
     /// Error detail when not provable/unprovable.
     pub message: String,
+    /// Why QED was not handed the plan although there is one: a node its IR has no reading of
+    /// (`intersectAll`, `exceptAll`), on which it would fail to deserialize the plan. Its answer is
+    /// then `no-plan`, as for a pair that never lowered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qed_unasked: Option<String>,
     // The second opinion, only when one was asked for. `s_verdict` is that prover's raw label, kept
     // beside the bucket purely for audit: nothing may branch on it, because `NEQ` is not a
     // refutation.
@@ -159,6 +164,7 @@ impl Case {
             l_raw: None,
             q_tail: String::new(),
             q_rc: None,
+            qed_unasked: None,
             row: None,
         }
     }
@@ -631,6 +637,14 @@ pub fn prove(
     smt_timeout_ms: Option<u64>,
     mem_bytes: Option<u64>,
 ) {
+    // A plan with a node QED's IR has no reading of is not handed to it: it would panic on the
+    // deserialization, and a panic says nothing about the pair. The bag set operations are nodes of
+    // this frontend's own (docs/SOUNDNESS.md), which a set-semantics prover has no answer to.
+    if let Some(node) = bag_set_op(&workdir.join(json_name)) {
+        case.status = s(LOWERED);
+        case.qed_unasked = Some(format!("the plan has an {node} node, which QED's IR cannot read"));
+        return;
+    }
     let env: Vec<(String, String)> =
         smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
     let argv = [prover.to_string(), json_name.to_string()];
@@ -643,6 +657,14 @@ pub fn prove(
     }
     let stem = json_name.strip_suffix(".json").unwrap_or(json_name);
     read_result(case, &workdir.join(format!("{stem}.result")), &qr);
+}
+
+/// The first of the plan's `intersectAll` and `exceptAll` nodes, read off the plan's text at `path`:
+/// a node is an object key, `"exceptAll"`, and a string value spelling the same is escaped
+/// (`\"exceptAll\"`), so the quoted name alone is the key.
+fn bag_set_op(path: &Path) -> Option<&'static str> {
+    let text = std::fs::read_to_string(path).ok()?;
+    ["intersectAll", "exceptAll"].into_iter().find(|node| text.contains(&format!("\"{node}\"")))
 }
 
 /// The last 600 characters of the prover's stdout and of its stderr: what tells one crash from

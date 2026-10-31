@@ -477,11 +477,17 @@ mod tests {
             ("a proof beats a cut-off", vec![("qed", "proved"), ("sqleq-solver", "timeout")], EQUIVALENT),
             // cvc5's model refutes under the plan's reading only: alone it decides nothing (the
             // database may be one the DDL forbids), against a proof over the same plan it is an
-            // alarm; its proof proves like any prover's.
+            // alarm. Its proof is a claim, so against a refutation it is an alarm too, but the axis
+            // is experimental and its proof is no evidence (`suite::evidence_equivalent`): alone it
+            // decides nothing either. Under set semantics its answers are about an approximation,
+            // and neither claim nor refute.
             ("a cvc5 model", vec![("qed", "no-proof"), ("cvc5", "model"), ("fuzz", "no-counterexample")], UNDECIDED),
-            ("a cvc5 proof", vec![("qed", "no-proof"), ("cvc5", "proved"), ("fuzz", "no-counterexample")], EQUIVALENT),
+            ("a cvc5 proof", vec![("qed", "no-proof"), ("cvc5", "proved"), ("fuzz", "no-counterexample")], UNDECIDED),
             ("a proof and a cvc5 model", vec![("qed", "proved"), ("cvc5", "model")], ALARM),
             ("a cvc5 proof and a counterexample", vec![("cvc5", "proved"), ("fuzz", "counterexample")], ALARM),
+            ("a cvc5 proof under sets", vec![("qed", "no-proof"), ("cvc5", "proved-sets"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("a cvc5 proof under sets and a counterexample", vec![("cvc5", "proved-sets"), ("fuzz", "counterexample")], NOT_EQUIVALENT),
+            ("a proof and a cvc5 model under sets", vec![("qed", "proved"), ("cvc5", "model-sets")], EQUIVALENT),
             ("cvc5 undecided", vec![("qed", "no-proof"), ("cvc5", "no-proof"), ("fuzz", "no-counterexample")], UNDECIDED),
         ];
         for (label, observed, want) in rows {
