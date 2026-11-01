@@ -17,7 +17,9 @@
 //! into a U-expression (`uterm`), with SQL's three-valued logic kept explicit; `normalize` rewrites
 //! both sides toward a canonical sum-of-products form, using the schemas' integrity constraints
 //! (`ic`); `alpha` compares them up to renaming of bound variables (SQLSolver's rung 2);
-//! `setsolver` hands set-shaped leftovers to Z3 (rung 3); `prove` is the ladder over all of it.
+//! `setsolver` hands set-shaped leftovers to Z3 (rung 3); `bagsolver` matches the two terms'
+//! structure under bag semantics and has Z3 decide only their 0/1 parts, a rung SQLSolver does not
+//! have; `smt` is the Z3 encoding the last two share; `prove` is the ladder over all of it.
 //! Row slices are read where the IR settles them: `card` finds the relations that return at most
 //! one row, over which a `LIMIT` keeps everything, and `opaque` replaces the same slice (or opaque
 //! aggregate) of equal sources on the two sides by one shared table before translation.
@@ -30,6 +32,7 @@
 //! infinities included.
 
 pub mod alpha;
+pub mod bagsolver;
 pub mod card;
 pub mod eval;
 pub mod ic;
@@ -38,6 +41,7 @@ pub mod normalize;
 pub mod opaque;
 pub mod prove;
 pub mod setsolver;
+pub mod smt;
 pub mod translate;
 pub mod uterm;
 

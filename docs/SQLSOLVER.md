@@ -150,6 +150,20 @@ What it rewrites, in the order the ladder runs it:
   so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
   used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
   of one type are totally ordered.
+* **Bag congruence** (`bagsolver`), a rung the fork does not have, after the set solver. A query
+  without `DISTINCT` keeps a sum at the top, so no rung above hands it to Z3, and two such queries
+  that say the same thing in two ways (`x IS NULL OR x IS NULL`, an `IN` list a disjunction already
+  implies, an `UPDATE` guarded by `col IS DISTINCT FROM $1`) went unproved. This rung matches the two
+  normalized terms' structure: sums by a bijection of their bound vars that keeps each guarded by
+  the same tables, sums of terms one to one, and products by their factors that are not 0/1, which
+  must match exactly. Only the 0/1 factors go to Z3, as `ctx ⇒ (A ⇔ B)` with `ctx` saying each matched
+  table holds its row. Matched products are then equal wherever their shared factors are non-zero,
+  so the claim is pointwise; a different number of tables, or a predicate that changes how often a
+  row counts, is not matched and not proved. Its encoding (`smt`, shared with the set solver) also
+  reads `CASE`, `COALESCE` and NULL sentinels as selections, with the exclusivity of their guards a
+  proof obligation; gives every row its table's NOT NULL columns and the BOOLEAN domain; and pairs
+  aggregates and scalar subqueries across the sides by the same matching. It gives up five seconds
+  into a pair's ladder, both attempts together.
 * **Row slices**, where the IR settles them, not through the fork's `OrderbySupport`. A literal
   `LIMIT` of one or more over a query that cannot return two rows keeps every row (`card`): a table
   whose NOT NULL unique key a conjunct of the `WHERE` or of an inner join's `ON` holds to one value

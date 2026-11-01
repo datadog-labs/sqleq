@@ -6,15 +6,19 @@
 //! The decision ladder: what `IrDriver.java` + `Verification.verify` do for one job row, ported rung
 //! by rung. Tier 0 (identical IR trees) answers first; then both sides are translated, checked for
 //! equal arity and equal output column types, normalized with and without the integrity
-//! constraints, and compared up to renaming of bound variables (rung 2), with the set solver as the
-//! last resort (rung 3).
+//! constraints, and compared up to renaming of bound variables (rung 2), then by the set solver
+//! (rung 3), and last by the bag congruence rung, which has no counterpart in Java.
+
+use std::time::Instant;
 
 use crate::alpha::alpha_eq;
+use crate::bagsolver;
 use crate::ic::Ics;
 use crate::ir::{Input, TranslateError};
 use crate::normalize::Normalizer;
 use crate::opaque;
 use crate::setsolver;
+use crate::smt::Facts;
 use crate::translate::{translate_input, Query};
 
 /// Terms bigger than this (read as trees, see [`crate::uterm::UTerm::tree_size`]) are not rewritten.
@@ -96,10 +100,10 @@ pub fn prove_at(input: &Input, depth: usize) -> Verdict {
         Ok(sides) => sides,
         Err(e) => return Verdict::Refused(e),
     };
-    decide(&l, &r, &Ics::from_schemas(&input.schemas))
+    decide(&l, &r, &Ics::from_schemas(&input.schemas), &Facts::from_schemas(&input.schemas))
 }
 
-fn decide(l: &Query, r: &Query, ics: &Ics) -> Verdict {
+fn decide(l: &Query, r: &Query, ics: &Ics, facts: &Facts) -> Verdict {
     if l.arity != r.arity {
         return Verdict::NotProved(NotProvedReason::ArityMismatch);
     }
@@ -123,8 +127,9 @@ fn decide(l: &Query, r: &Query, ics: &Ics) -> Verdict {
     let mut too_large = false;
     let none = Ics::default();
     let attempts: Vec<&Ics> = if ics.is_empty() { vec![&none] } else { vec![ics, &none] };
+    let deadline = Instant::now() + bagsolver::BUDGET;
     for ics in attempts {
-        match rung2(l, r, ics) {
+        match rung2(l, r, ics, facts, deadline) {
             Some(true) => return Verdict::Eq { literal: false },
             Some(false) => {}
             None => too_large = true,
@@ -134,9 +139,11 @@ fn decide(l: &Query, r: &Query, ics: &Ics) -> Verdict {
 }
 
 /// Normalize each side, then compare up to renaming of bound vars (rung 2), and failing that ask
-/// the set solver (rung 3), as `SqlSolver.proveEq` does. `None` when a side outgrows the size
-/// budget.
-fn rung2(l: &Query, r: &Query, ics: &Ics) -> Option<bool> {
+/// the set solver (rung 3), as `SqlSolver.proveEq` does, and then the bag congruence rung, which
+/// has no counterpart there. `None` when a side outgrows the size budget. The row facts hold on
+/// every database the claims are about, so they are given to the last rung on both attempts, which
+/// share its `deadline`.
+fn rung2(l: &Query, r: &Query, ics: &Ics, facts: &Facts, deadline: Instant) -> Option<bool> {
     let mut nl = Normalizer::new(l.widths.clone(), MAX_TREE_SIZE).with_ics(ics.clone());
     let mut nr = Normalizer::new(r.widths.clone(), MAX_TREE_SIZE).with_ics(ics.clone());
     let tl = nl.normalize(&l.term).ok()?;
@@ -144,7 +151,10 @@ fn rung2(l: &Query, r: &Query, ics: &Ics) -> Option<bool> {
     if alpha_eq(&tl, &nl.widths, &tr, &nr.widths) {
         return Some(true);
     }
-    Some(setsolver::prove(&tl, &nl.widths, &tr, &nr.widths) == Some(true))
+    if setsolver::prove(&tl, &nl.widths, &tr, &nr.widths) == Some(true) {
+        return Some(true);
+    }
+    Some(bagsolver::prove(&tl, &nl.widths, &tr, &nr.widths, facts, deadline))
 }
 
 #[cfg(test)]
