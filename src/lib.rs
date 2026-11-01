@@ -78,6 +78,7 @@ mod verify;
 pub mod internals {
     pub use crate::catalog::{enforced_per_statement, obj_name, Catalog, SYSTEM_COLUMNS};
     pub use crate::infer::{declares, nid};
+    pub use crate::normalize::system_relation;
 
     /// Aliased rather than re-exported: `DIALECT` sits at the crate root, where making it
     /// `pub` would widen the default API even with this feature off.

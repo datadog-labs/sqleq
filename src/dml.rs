@@ -1101,9 +1101,13 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
 ///
 /// That is how [`resolve_tables`][crate::normalize::resolve_tables] resolves the queries' own
 /// references before [`lower`][crate::lower] reads them, so this resolves the target the same way the
-/// rest of the pipeline will. Where the pair's guards keep a reference qualified (a system schema, or
-/// one bare name reached through two qualifiers) `lower` then fails to resolve the target and the pair
-/// is refused, so a mismatch here costs a refusal and never a proof.
+/// rest of the pipeline will. Where the pair's guards keep a reference as written (one bare name
+/// reached through two qualifiers) `lower` reads the name as written, and a target that is not
+/// declared so fails to resolve and the pair is refused, so a mismatch here costs a refusal and never
+/// a proof. A relation Postgres reads from a system schema, a bare `pg_*` or one under a system
+/// schema ([`crate::normalize::system_relation`]), *is* found here when the DDL names it, and so it is
+/// refused by name: by `lower` where the target becomes a scan (`UPDATE`, `DELETE`), and by
+/// [`insert_pair`], whose target never does.
 fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
     cat.resolve(name)
 }
@@ -1351,6 +1355,17 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
             ControlFlow::<()>::Continue(())
         });
     }
+    // SOUNDNESS GUARD (#202), before the declared short-circuit below: the target is replaced by its
+    // source, so `lower`'s refusal of a system relation never sees it. `INSERT INTO pg_attribute`
+    // writes `pg_catalog.pg_attribute`, whose columns, types and keys are not the DDL's.
+    for n in [na, nb] {
+        if crate::normalize::system_relation(n) {
+            return Err(unsupported(format!(
+                "the INSERT target {} names a system relation, which Postgres writes in place of any table the DDL declares",
+                obj_name(n)
+            )));
+        }
+    }
     // As in `resolve_tables`, a name the DDL declares exactly as written is that table and needs no
     // stripping, so only a target that would be stripped is held to the check.
     let declared = cat.declares(&name) && cat.declares(&other);
@@ -1379,6 +1394,14 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
 
     let idx = find_target(cat, &name)
         .ok_or_else(|| schema(format!("no declared schema for INSERT target {name}")))?;
+    // A bare target can resolve to a table the DDL puts under a system schema (`t` to a declared
+    // `pg_catalog.t`), as a query's `FROM t` does in `resolve_tables` before `lower` refuses it.
+    if crate::normalize::system_key(&cat.tables[idx].name) {
+        return Err(unsupported(format!(
+            "the INSERT target {name} resolves to {}, a system relation, not a table the DDL declares",
+            cat.tables[idx].name
+        )));
+    }
     no_trigger(cat, &name)?;
     let t = &cat.tables[idx];
     // The declared prefix, for the reason [`update_pair`] gives: a system column is not written by

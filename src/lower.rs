@@ -2213,6 +2213,17 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 return Err(unsupported(format!("table factor with {m}")));
             }
             let tn = obj_name(name);
+            // SOUNDNESS GUARD (#202): a bare `pg_*` name reads `pg_catalog`'s relation, which Postgres
+            // searches before the search path, and a name under a system schema reads that schema's.
+            // Neither reads the table the DDL declares, so its columns and keys say nothing about the
+            // rows read: `SELECT DISTINCT attname FROM pg_attribute` is not made redundant by a
+            // declared `pg_attribute (attname PRIMARY KEY)`. Before the lookup, so the refusal is the
+            // same whether the DDL declares the name or not.
+            if crate::normalize::system_relation(name) {
+                return Err(unsupported(format!(
+                    "{tn} names a system relation, which Postgres reads in place of any table the DDL declares"
+                )));
+            }
             let unknown = || schema(format!("unknown table {tn}{}", same_last_name(cat, &tn)));
             let idx = cat.find(&tn).ok_or_else(unknown)?;
             // An alias's column list renames the table's columns in order, and may stop short:
