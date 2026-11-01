@@ -3056,7 +3056,7 @@ impl AggCtx<'_> {
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
                 let operand =
-                    if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
+                    if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -3520,6 +3520,20 @@ fn lower_comparison(
     })
 }
 
+/// The type of `SUBSTRING` or `TRIM` over `x`. Postgres has each for `text` and for `bytea`, and the
+/// result is of the argument's type; typed VARCHAR whatever the argument, a `bytea` came out a
+/// string. An opaque type stands for `bytea`, and for any type the frontend does not know, which it
+/// reads the same way: the result is of the argument's kind ([`crate::equality`]). Over any other
+/// type Postgres has no such function, so the call is refused.
+fn string_function_type(what: &str, x: &Value) -> Result<String> {
+    let t = ty_of(x);
+    if t == "VARCHAR" || is_opaque(&t) {
+        Ok(t)
+    } else {
+        Err(unsupported(format!("{what} over a value of type {t}")))
+    }
+}
+
 /// Lower a scalar expression to an `Expr` Value.
 fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value> {
     match e {
@@ -3562,7 +3576,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .collect::<Result<Vec<_>>>()?;
             let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
             let operand =
-                if crate::equality::returns_an_argument(&name) { coerce_literal_args(operand, &ret) } else { operand };
+                if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
             Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
@@ -3821,6 +3835,40 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 operand.push(lower_expr(cat, scope, fns, i)?);
             }
             Ok(subscript_call(operand))
+        }
+        // `SUBSTRING(x FROM a FOR b)` and `TRIM(BOTH c FROM x)` have syntax of their own; they are
+        // the strict functions `SUBSTRING` and `TRIM_BOTH`/`TRIM_LEADING`/`TRIM_TRAILING` over
+        // their arguments, which the provers do not interpret, of their first argument's type
+        // ([`string_function_type`]).
+        Expr::Substring { expr, substring_from, substring_for, .. } => {
+            let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
+            operand.push(match substring_from {
+                Some(f) => lower_expr(cat, scope, fns, f)?,
+                // `SUBSTRING(x FOR n)` starts at the first character
+                None => json!({ "operator": "1", "operand": [], "type": "INTEGER" }),
+            });
+            if let Some(n) = substring_for {
+                operand.push(lower_expr(cat, scope, fns, n)?);
+            }
+            let ty = string_function_type("SUBSTRING", &operand[0])?;
+            Ok(json!({ "operator": "SUBSTRING", "operand": operand, "type": ty }))
+        }
+        Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
+            if trim_characters.is_some() {
+                return Err(unsupported("TRIM with a list of characters"));
+            }
+            let side = match trim_where {
+                Some(sqlparser::ast::TrimWhereField::Leading) => "LEADING",
+                Some(sqlparser::ast::TrimWhereField::Trailing) => "TRAILING",
+                _ => "BOTH",
+            };
+            let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
+            operand.push(match trim_what {
+                Some(w) => lower_expr(cat, scope, fns, w)?,
+                None => string_literal(" "),
+            });
+            let ty = string_function_type("TRIM", &operand[0])?;
+            Ok(json!({ "operator": format!("TRIM_{side}"), "operand": operand, "type": ty }))
         }
         other => Err(unsupported(format!("expr: {other:?}"))),
     }
