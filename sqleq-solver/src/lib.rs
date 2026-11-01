@@ -18,6 +18,9 @@
 //! both sides toward a canonical sum-of-products form, using the schemas' integrity constraints
 //! (`ic`); `alpha` compares them up to renaming of bound variables (SQLSolver's rung 2);
 //! `setsolver` hands set-shaped leftovers to Z3 (rung 3); `prove` is the ladder over all of it.
+//! Row slices are read where the IR settles them: `card` finds the relations that return at most
+//! one row, over which a `LIMIT` keeps everything, and `opaque` replaces the same slice (or opaque
+//! aggregate) of equal sources on the two sides by one shared table before translation.
 //! `eval` evaluates a term on a small concrete database, which is how the tests check that a
 //! rewrite preserves meaning. SQLSolver's LIA* rung is not rewritten. What it adds is mostly
 //! reasoning across summands (a disjoint `OR` against a `UNION ALL`), and its integer reading of
@@ -27,10 +30,12 @@
 //! infinities included.
 
 pub mod alpha;
+pub mod card;
 pub mod eval;
 pub mod ic;
 pub mod ir;
 pub mod normalize;
+pub mod opaque;
 pub mod prove;
 pub mod setsolver;
 pub mod translate;

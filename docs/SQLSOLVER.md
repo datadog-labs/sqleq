@@ -150,6 +150,17 @@ What it rewrites, in the order the ladder runs it:
   so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
   used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
   of one type are totally ordered.
+* **Row slices**, where the IR settles them, not through the fork's `OrderbySupport`. A literal
+  `LIMIT` of one or more over a query that cannot return two rows keeps every row (`card`): a table
+  whose NOT NULL unique key a conjunct of the `WHERE` or of an inner join's `ON` holds to one value
+  (a literal, a parameter, a column equated with one) contributes one row at most, and so does a
+  group whose keys are all held. `LIMIT 0` keeps none and `OFFSET 0` all. Before translation, the
+  same slice — same sort keys and counts — of two sources proved to return the same bag is replaced
+  on both sides by one fresh table (`opaque`), and so is the same opaque aggregate (the frontend's
+  `DISTINCT ON` carrier) over equal sources. That reads a slice as a function of its source's bag,
+  the reading QED's opaque `limit` and the frontend's `strip_identical_pagination` already take; a
+  slice over an `ORDER BY` translation erases is not replaced unless its own keys cover every
+  column, since that order decides the ties.
 
 Not rewritten: the **LIA\* rung**. What it adds over the rungs above is mostly reasoning across
 summands (a disjoint `OR` against a `UNION ALL`, a count compared with a constant), and several of
@@ -158,7 +169,8 @@ one: `ts >= k AND ts < k + 1` is not `ts = k` for a timestamp, and `'infinity'::
 `infinity`, so even `d + 1 > d` fails. The IR names every temporal operation and conversion
 (`q_arith_add_date_integer`, `q_conv_date_timestamp` and the like), which is what such a rung would
 have to interpret, infinities included. **`LIMIT`/`OFFSET`** (`OrderbySupport`) is not rewritten
-either; a bare `ORDER BY` is erased, which is sound under the bag semantics `sqleq` decides.
+either: any slice the rule above does not settle is refused (`unsupported-sort`). A bare `ORDER BY`
+is erased, which is sound under the bag semantics `sqleq` decides.
 
 ### Where it deliberately differs from the fork
 
@@ -201,8 +213,9 @@ Each difference is there for soundness:
 
 So the two disagree in both directions: some pairs the fork proves `sqleq-solver` does not (the
 LIA\* rung, pairs that rely on a parameter never being `NULL`, and the false proofs listed at the
-top), and some `sqleq-solver` proves the fork does not (rewrites the fork does not normalize, and
-pairs where it runs out of time). Either way an `EQ` is a claim to be checked against `sqleq-fuzz`.
+top), and some `sqleq-solver` proves the fork does not (rewrites the fork does not normalize, pairs
+where it runs out of time, and plans the bridge refuses: a `FROM`-less query, lowered over the bare
+`"singleton"`, and a `VALUES` cell that computes its value). Either way an `EQ` is a claim to be checked against `sqleq-fuzz`.
 
 ### How it is checked
 

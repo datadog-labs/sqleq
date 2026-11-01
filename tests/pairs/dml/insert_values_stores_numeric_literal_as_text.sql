@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: no-proof
 -- expect lean: unsupported
 -- origin: issue #107: an INSERT ... VALUES stored a numeric literal in a text column by its value, and
 --   2.0 = 2.00
