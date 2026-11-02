@@ -74,7 +74,8 @@ fn both_spellings_in_one_from_are_not_a_self_join() {
 }
 
 /// The refusal fires wherever inference runs, the seeded catalog included: there inference attributes
-/// columns by the folded table name too, and lowering finds both spellings in one declared table.
+/// columns by the folded table name too. Lowering would refuse the pair anyway, since it finds no
+/// declared table for `"Orders"` (#203), but this refusal comes first.
 #[test]
 fn the_seeded_catalog_refuses_both_spellings_too() {
     refused(
@@ -82,6 +83,14 @@ fn the_seeded_catalog_refuses_both_spellings_too() {
         CatalogSource::InferredSeeded,
         "two tables named orders up to case",
     );
+}
+
+/// A quoted part that holds a dot is refused under inference, which names a table by its folded
+/// parts joined by dots: the one-part `"s.t"` would be named as the two-part `s.t`, another table
+/// (#203).
+#[test]
+fn a_quoted_part_holding_a_dot_is_refused() {
+    refused(r#"SELECT "a" FROM "s.t"; SELECT "a" FROM "s.t";"#, CatalogSource::Inferred, "a part that holds a dot");
 }
 
 // --- controls: what is one name stays one -----------------------------------------------------------

@@ -165,8 +165,8 @@ pub enum CatalogSource {
     /// constant or a `USING` list lowers as it does under the declared catalog. Inference and the
     /// stages after it can still refuse for reasons of their own (a type conflict, an ambiguous
     /// column, a call no declaration can be synthesized for), and inference refuses a pair that
-    /// names two tables one up to case (`"Orders"` and `orders`), which the declared catalog would
-    /// lower by finding both in a declared `orders`.
+    /// names two tables one up to case (`"Orders"` and `orders`), where the declared catalog finds a
+    /// declared `orders` for the second only, and refuses the first as an unknown table.
     InferredSeeded,
     /// Infer from the queries alone and lower against the synthesized catalog.
     ///

@@ -150,10 +150,13 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             })
             .collect();
         let n_declared = cols.len();
+        // A schema without a name predates the field rather than naming nothing, so fall back to
+        // the positional spelling instead of emitting a table no scan can address.
+        let name = s["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("t{i}"));
         tables.push(crate::catalog::Table {
-            // A schema without a name predates the field rather than naming nothing, so fall back to
-            // the positional spelling instead of emitting a table no scan can address.
-            name: s["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("t{i}")),
+            // Like `row_determined`: nothing looks a table up here, so the label is its one part.
+            path: vec![name.clone()],
+            name,
             cols,
             // Like `row_determined`: nothing reads it here, and no DDL spelled the types.
             declared_types: vec![String::new(); n_declared],
