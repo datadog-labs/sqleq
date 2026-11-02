@@ -573,6 +573,14 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     let TableObject::TableName(name) = &i.table else {
         return Err(unsupported("INSERT target is not a plain table"));
     };
+    // As the frontend refuses it (#202): a bare `pg_*` target is `pg_catalog`'s relation, which
+    // Postgres searches before the search path, and a target under a system schema is that schema's.
+    // The schema is keyed by the bare name, so either would be read as the DDL's table of that name.
+    if sqleq_frontend::internals::system_relation(name) {
+        return Err(unsupported(format!(
+            "INSERT target {name} names a system relation, which Postgres writes in place of any table the DDL declares"
+        )));
+    }
     let Some(target) = last_name(name) else {
         return Err(unsupported("INSERT target is not a plain name"));
     };
@@ -721,6 +729,20 @@ mod tests {
         ] {
             assert!(matches!(rec(sql), Err(Refusal::Unsupported(_))), "{sql} was not refused");
         }
+    }
+
+    /// A target Postgres resolves into a system schema is not the DDL's table of that bare name
+    /// (#202), and a `pg_*` table in a user's schema still is.
+    #[test]
+    fn a_system_relation_target_is_refused() {
+        for sql in [
+            "INSERT INTO pg_attribute (attname) VALUES ($1)",
+            "INSERT INTO pg_catalog.t (a) VALUES ($1)",
+            "INSERT INTO information_schema.t (a) VALUES ($1)",
+        ] {
+            assert!(matches!(rec(sql), Err(Refusal::Unsupported(r)) if r.contains("system relation")), "{sql}");
+        }
+        rec("INSERT INTO public.pg_attribute (attname) VALUES ($1)").unwrap();
     }
 
     #[test]

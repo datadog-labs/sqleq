@@ -1610,9 +1610,54 @@ impl VisitorMut for ReplaceCteRefs<'_> {
     }
 }
 
-/// Schemas whose contents are the server's, not the user's. A table under one of these is not the
-/// table the DDL declares even if the bare names collide.
-const SYS_SCHEMAS: [&str; 4] = ["pg_catalog", "information_schema", "pg_temp", "sys"];
+/// Whether a schema is the server's rather than the user's: `information_schema`, or any name under
+/// the `pg_` prefix, which Postgres reserves for its own schemas (`CREATE SCHEMA pg_x` is an error).
+/// That is `pg_catalog`, `pg_toast`, the session's `pg_temp` and every `pg_temp_N` and
+/// `pg_toast_temp_N`. A table under one of these is not the table the DDL declares, even if the bare
+/// names collide.
+///
+/// Over-approximated, which only refuses more: compared lower-cased, though a quoted `"PG_CATALOG"`
+/// is a schema a user may create, and `information_schema` as a whole, though a superuser may add a
+/// table of their own to it.
+pub(crate) fn system_schema(schema: &str) -> bool {
+    let s = schema.to_lowercase();
+    s.starts_with("pg_") || s == "information_schema"
+}
+
+/// Whether a relation reference names a relation Postgres reads from a system schema, whatever the
+/// DDL declares under that name:
+///
+/// * **A bare `pg_*` name.** Postgres searches `pg_catalog` before the search path unless the path
+///   names it, so `FROM pg_attribute` reads `pg_catalog.pg_attribute` even after a `CREATE TABLE
+///   pg_attribute` has put a table of that name in `public`. Postgres documents that its system
+///   relations keep the `pg_` prefix so that they cannot collide with user tables that avoid it, so
+///   the prefix is the rule, not a list of one major's catalog: a list that misses a relation a newer
+///   major adds would lower that relation against the DDL. A user table named `pg_*` is read
+///   through its schema (`public.pg_x`), which this does not refuse.
+/// * **Any qualifier that is a system schema** (`system_schema`): `information_schema`, or any name
+///   under the `pg_` prefix Postgres reserves. `pg_catalog.pg_attribute` is the catalog's even
+///   when the DDL "declares" it, since Postgres would not run that `CREATE TABLE`.
+///
+/// Lower-cased, as `safe_to_strip` keys a bare name, so `"PG_X"` (not `pg_x` to Postgres) is
+/// refused too; that costs only a refusal. A part that is not an identifier counts as no name.
+pub fn system_relation(name: &ObjectName) -> bool {
+    let parts: Vec<String> =
+        name.0.iter().map(|p| p.as_ident().map(|id| id.value.to_lowercase()).unwrap_or_default()).collect();
+    system_path(&parts)
+}
+
+/// [`system_relation`] over a catalog key, the dotted, lower-cased name `catalog::scan_ddl` stores.
+pub(crate) fn system_key(key: &str) -> bool {
+    system_path(&key.split('.').map(str::to_string).collect::<Vec<_>>())
+}
+
+fn system_path(parts: &[String]) -> bool {
+    match parts.split_last() {
+        Some((bare, [])) => bare.starts_with("pg_"),
+        Some((_, qualifier)) => qualifier.iter().any(|q| system_schema(q)),
+        None => false,
+    }
+}
 
 /// Drop the schema/database qualifier from table references: `part_16.orders` -> `orders`.
 ///
@@ -1765,9 +1810,10 @@ pub(crate) fn safe_to_strip(names: &[ObjectName]) -> bool {
             .iter()
             .map(|p| p.as_ident().map(crate::dml::fold_ident).unwrap_or_default())
             .collect::<Vec<_>>();
-        // The system schemas by their lower-cased name: `"PG_CATALOG"` is not one, but stopping on it
-        // costs only a refusal.
-        if qualifier.iter().any(|q| SYS_SCHEMAS.contains(&q.to_lowercase().as_str())) {
+        // The system schemas, as `system_relation` reads them, and `sys`, which is no Postgres schema
+        // but names a catalog elsewhere. Every `pg_` schema counts: `pg_toast.t` or `pg_temp_3.t`
+        // stripped to `t` would read the DDL's `t`, which neither is.
+        if qualifier.iter().any(|q| system_schema(q) || q.eq_ignore_ascii_case("sys")) {
             return false;
         }
         // Two spellings of one bare name are two tables until proven otherwise.
@@ -2405,9 +2451,49 @@ mod tests {
             "SELECT a FROM part_1.t JOIN pg_catalog.pg_class c ON c.oid = part_1.t.oid",
             "SELECT a FROM part_1.t JOIN information_schema.columns c ON c.x = part_1.t.y",
             "SELECT a FROM part_1.t JOIN pg_class c ON c.oid = part_1.t.oid",
+            // Every `pg_` schema is the server's, not only the ones a list names (#202).
+            "SELECT a FROM pg_toast.t",
+            "SELECT a FROM pg_temp_3.t",
+            "SELECT a FROM pg_toast_temp_3.t",
         ] {
             assert_eq!(unschemad(sql), sql, "should not be rewritten");
         }
+    }
+
+    /// The relations Postgres reads from a system schema whatever the DDL says (#202): a bare `pg_*`
+    /// name, which `pg_catalog` holds ahead of the search path, and any name under a system schema.
+    /// A `pg_*` name in a user's schema is the user's table.
+    #[test]
+    fn system_relations_are_bare_pg_names_and_system_schemas() {
+        let name = |sql: &str| {
+            let q = parse_queries(sql, sql).remove(0);
+            let mut names = CollectTableNames(Vec::new());
+            let _ = Visit::visit(&q, &mut names);
+            names.0.remove(0)
+        };
+        for sql in [
+            "SELECT 1 FROM pg_attribute",
+            r#"SELECT 1 FROM "pg_attribute""#,
+            "SELECT 1 FROM PG_CLASS",
+            "SELECT 1 FROM pg_catalog.pg_attribute",
+            "SELECT 1 FROM pg_catalog.t",
+            "SELECT 1 FROM information_schema.tables",
+            "SELECT 1 FROM pg_toast.t",
+            "SELECT 1 FROM pg_temp.t",
+            "SELECT 1 FROM db.pg_catalog.t",
+        ] {
+            assert!(system_relation(&name(sql)), "{sql}");
+        }
+        for sql in [
+            "SELECT 1 FROM t",
+            "SELECT 1 FROM public.pg_attribute",
+            "SELECT 1 FROM s.pg_x",
+            "SELECT 1 FROM catalog.t",
+            "SELECT 1 FROM pgx",
+        ] {
+            assert!(!system_relation(&name(sql)), "{sql}");
+        }
+        assert!(system_key("pg_attribute") && system_key("pg_catalog.t") && !system_key("public.pg_attribute"));
     }
 
     /// `a.orders` and `b.orders` are two tables. Stripping would merge them, turning a join between

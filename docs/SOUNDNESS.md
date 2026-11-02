@@ -516,6 +516,27 @@ what it is or refused:
   `s.t`.
   An `INSERT`'s target is replaced by its source, so it is put through the same check beside the
   relations the two sources read.
+- **A system relation is not the DDL's table.** Postgres searches `pg_catalog` before the search
+  path unless the path names it, so a bare `pg_attribute` reads `pg_catalog.pg_attribute` even
+  after `CREATE TABLE pg_attribute` has put a table of that name in `public`. The declared table's
+  key would make `SELECT DISTINCT attname` and `SELECT attname` one query, and over the catalog's
+  rows they are not (#202). So a bare relation name that starts with `pg_` is refused, whatever the
+  DDL declares, as a query's relation and as a DML target. So is a name under a system schema,
+  `information_schema` or any schema starting with `pg_` (a prefix Postgres reserves). Postgres
+  refuses to create a table in `pg_catalog` or `pg_toast`, and `information_schema.tables` is its
+  view whatever a DDL says. Those qualifiers are never stripped: `pg_toast.t` is not the DDL's
+  `t`. The rule is the prefix, not a list of one major's catalog relations. Postgres documents
+  that its system relations keep the `pg_` prefix, and a list that missed a relation a later major
+  adds would lower that relation against the DDL. What it costs is refusals of tables Postgres
+  would find: a user's table named `pg_*` read bare (read through its schema, `public.pg_x`, it
+  lowers), a temporary table of such a name (the session's temporary schema is searched first), a
+  table a DDL creates as `pg_temp.t`, a new table a superuser adds to `information_schema`, and a
+  query over the catalog under an inferred catalog, which
+  would type the catalog's columns from the query rather than from Postgres. A `WITH` binding named
+  like a catalog relation is the binding, as in Postgres. Relations no input creates, a temporary
+  table or one an extension installs into `pg_catalog`, stay outside the model, as everywhere: the
+  DDL is taken as the tables there are. A `search_path` that names `pg_catalog` after the user's
+  schemas would let a bare `pg_*` name reach the DDL's table, and no input states one (#91).
 - **`ONLY` is a keyword.** In `FROM ONLY t`, `UPDATE ONLY t` or `DELETE FROM ONLY t` it leaves `t`'s
   inheritance children out. The parser reads it only in `TRUNCATE`, `ALTER TABLE` and `LOCK`, and
   elsewhere takes it as a table named `ONLY` with the alias `t`, which would resolve to a table or CTE
