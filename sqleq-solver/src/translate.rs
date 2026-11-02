@@ -313,8 +313,8 @@ fn is_null_exactly_on_null_input(op: &str) -> bool {
 fn is_boolean_operator(op: &str, arity: usize) -> bool {
     match op {
         "AND" | "OR" => true,
-        "NOT" | "IS NULL" | "IS NOT NULL" | "IS NOT TRUE" => arity == 1,
-        "=" | "<>" | "<" | "<=" | ">" | ">=" | "IS DISTINCT FROM" | "LIKE" | "= ANY" => arity == 2,
+        "NOT" | "IS NULL" | "IS NOT NULL" | "IS TRUE" | "IS NOT TRUE" => arity == 1,
+        "=" | "<>" | "<" | "<=" | ">" | ">=" | "IS DISTINCT FROM" | "IS NOT DISTINCT FROM" | "LIKE" | "= ANY" => arity == 2,
         _ => false,
     }
 }
@@ -775,14 +775,9 @@ impl<'s> Translator<'s> {
             }
             "IS NULL" => Ok(Truth::two_valued(self.translate_value(&operand[0], scope)?.is_null)),
             "IS NOT NULL" => Ok(Truth::two_valued(mk_neg(self.translate_value(&operand[0], scope)?.is_null))),
-            "IS DISTINCT FROM" => {
-                let a = self.translate_value(&operand[0], scope)?;
-                let b = self.translate_value(&operand[1], scope)?;
-                let both_null = mk_mul([a.is_null.clone(), b.is_null.clone()]);
-                let both_nonnull = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null)]);
-                let eq = sql_eq(a.value, Some(scope.eq_type(&operand[0])), b.value, Some(scope.eq_type(&operand[1])));
-                Ok(Truth::two_valued(mk_neg(mk_add([both_null, mk_mul([both_nonnull, eq])]))))
-            }
+            "IS DISTINCT FROM" => Ok(Truth::two_valued(mk_neg(self.not_distinct(operand, scope)?))),
+            "IS NOT DISTINCT FROM" => Ok(Truth::two_valued(self.not_distinct(operand, scope)?)),
+            "IS TRUE" => Ok(Truth::two_valued(self.translate_truth(&operand[0], scope)?.t)),
             "IS NOT TRUE" => Ok(Truth::two_valued(mk_neg(self.translate_truth(&operand[0], scope)?.t))),
             "LIKE" => {
                 let a = self.translate_value(&operand[0], scope)?;
@@ -808,6 +803,16 @@ impl<'s> Translator<'s> {
             }
             other => unreachable!("truth_call reached with non-boolean operator {other:?}"),
         }
+    }
+
+    /// `a IS NOT DISTINCT FROM b`, two-valued: both NULL, or neither and SQL's `=` holds.
+    fn not_distinct(&mut self, operand: &[Expr], scope: &Scope) -> Result<UTerm, TranslateError> {
+        let a = self.translate_value(&operand[0], scope)?;
+        let b = self.translate_value(&operand[1], scope)?;
+        let both_null = mk_mul([a.is_null.clone(), b.is_null.clone()]);
+        let both_nonnull = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null)]);
+        let eq = sql_eq(a.value, Some(scope.eq_type(&operand[0])), b.value, Some(scope.eq_type(&operand[1])));
+        Ok(mk_add([both_null, mk_mul([both_nonnull, eq])]))
     }
 
     /// Whether `query` returns a row, which a `LIMIT` of one or more does not change
