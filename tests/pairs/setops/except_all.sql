@@ -10,7 +10,7 @@
 -- expect sqleq-solver: unsupported
 -- expect lean: unsupported
 -- origin: EXCEPT ALL, once refused (#68), is its own IR node (docs/SOUNDNESS.md): set provers refuse
---   it, the cvc5 axis states it over bags
+--   it, a bag prover can state it
 -- witness: t = {(1), (1)}; u = {(1)}: A removes one copy and returns 1, B removes both and returns
 --   no rows
 create table "t" ("a" INTEGER);

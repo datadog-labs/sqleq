@@ -242,9 +242,11 @@ final class IrToRel {
   }
 
   /**
-   * {@code union} is bag union and the others are set operations -- {@code lower.rs:617-633} emits a
-   * bare {@code union} only for UNION ALL, wraps UNION in {@code distinct}, and refuses INTERSECT
-   * ALL / EXCEPT ALL outright. So {@code all} is true only for union.
+   * {@code union} is bag union and the others are set operations -- {@code lower_setexpr_ctx} in
+   * {@code src/lower.rs} emits a bare {@code union} only for UNION ALL and wraps UNION in
+   * {@code distinct}. INTERSECT ALL and EXCEPT ALL lower to nodes of their own, {@code intersectAll}
+   * and {@code exceptAll}, which {@code rel} refuses ({@code rel:intersectAll},
+   * {@code rel:exceptAll}). So {@code all} is true only for union.
    */
   private RelNode setOp(JsonNode arms, int base, String kind) {
     if (arms.size() != 2) throw new Refused(kind + "-arity");
