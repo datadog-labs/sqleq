@@ -39,10 +39,24 @@ pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "xmin", "cmin", "xmax", "cmax
 /// PRIMARY KEY).
 ///
 /// A column's name is the one Postgres stores: an unquoted declaration folded to lower case, a quoted
-/// one as written (`dml::fold_ident`). The table's own name is lower-cased whatever its quoting.
+/// one as written (`dml::fold_ident`). So is the table's own, part by part ([`Table::path`]).
 #[derive(Clone)]
 pub struct Table {
+    /// The table's label: its [`path`][Table::path] joined by `.` and lower-cased, so `s.t` for both
+    /// `s.t` and `"S".t`. It is what the IR names the table, and what
+    /// [`Catalog::check_case_collisions`] keeps unique. It never finds a table, since it is not the
+    /// name Postgres compares: `path` is.
     pub name: String,
+    /// The table's name as Postgres identifies it: one entry per part, each folded as Postgres folds
+    /// an identifier, an unquoted part to lower case and a quoted one as written ([`rel_path`]). So
+    /// `"S".t` is `["S", "t"]`, `s.t` and `"s"."t"` are both `["s", "t"]`, and the one-part `"s.t"` is
+    /// `["s.t"]`. Every lookup compares paths, part by part.
+    ///
+    /// Direction matters for soundness. Two names Postgres tells apart that a lookup takes for one
+    /// lower a reference against a table it does not read, keys and all: with `s.t` declared,
+    /// `"S".t` would be read as `s.t`. Two names a lookup tells apart that Postgres takes for one
+    /// only refuse.
+    pub path: Vec<String>,
     pub cols: Vec<(String, String)>,
     /// Parallel to `cols`: each column's type as the DDL spells it, rendered by sqlparser
     /// (`INTERVAL DAY`, `NUMERIC(10,2)`), and empty where no DDL declared the column. The type in
@@ -140,11 +154,12 @@ pub struct Catalog {
     pub tables: Vec<Table>,
     /// The relations the DDL creates whose columns are not read: views, a table created without a
     /// column list, and a table a later statement changed past what the reader follows. Each is
-    /// named as a table is (lower-cased, qualifier included).
+    /// named by its path, as a table is: every part, qualifier included, folded as Postgres folds an
+    /// identifier.
     ///
     /// A query over one is refused, and the name still takes its place in resolving a reference, so
     /// that `FROM t` with a view `t` and a table `s.t` is not read as `s.t`.
-    pub unread: Vec<String>,
+    pub unread: Vec<Vec<String>>,
 }
 
 /// A function declared by the `declare ... function` DSL: its return type, and whether it is an
@@ -156,51 +171,63 @@ pub struct FnDecl {
 }
 
 impl Catalog {
-    /// Index of a table by (case-insensitive) name.
-    pub fn find(&self, name: &str) -> Option<usize> {
-        let n = name.to_lowercase();
-        self.tables.iter().position(|t| t.name == n)
+    /// Index of the table a path names: the one whose path is the same, part by part.
+    ///
+    /// A path is a name's parts, each folded as Postgres folds an identifier: an unquoted part to
+    /// lower case, a quoted one as written (`rel_path`). So `["S", "t"]`, which `"S".t` names, does
+    /// not find `s.t`, and `["T"]` does not find `t`: Postgres reads another relation by each.
+    pub fn find(&self, path: &[String]) -> Option<usize> {
+        self.tables.iter().position(|t| t.path == path)
     }
 
-    /// Whether the DDL creates a relation of this (case-insensitive) name, its columns read or not.
-    pub fn declares(&self, name: &str) -> bool {
-        let n = name.to_lowercase();
-        self.find(&n).is_some() || self.unread.contains(&n)
+    /// [`Catalog::find`] for a reference as written. Nothing for a name with a part that is not an
+    /// identifier, since no declaration has one.
+    pub fn find_name(&self, name: &ObjectName) -> Option<usize> {
+        rel_path(name).and_then(|p| self.find(&p))
     }
 
-    /// Every relation's name: the tables', at their index, then the unread ones'.
-    fn names(&self) -> impl Iterator<Item = &str> + Clone {
-        self.tables.iter().map(|t| t.name.as_str()).chain(self.unread.iter().map(String::as_str))
+    /// Whether the DDL creates a relation of the name a reference spells, its columns read or not,
+    /// compared as [`Catalog::find`] compares.
+    pub fn declares(&self, name: &ObjectName) -> bool {
+        rel_path(name).is_some_and(|p| self.paths().any(|q| q == p.as_slice()))
     }
 
-    /// The table a reference names: the one declared under that name, else the one its last part
+    /// Every relation's path: the tables', at their index, then the unread ones'.
+    fn paths(&self) -> impl Iterator<Item = &[String]> + Clone {
+        self.tables.iter().map(|t| t.path.as_slice()).chain(self.unread.iter().map(Vec::as_slice))
+    }
+
+    /// The table a reference names: the one declared under that path, else the one its last part
     /// names as a bare name ([`Catalog::resolve_bare`]). Nothing if that is a relation whose columns
-    /// are not read.
-    pub fn resolve(&self, name: &str) -> Option<usize> {
-        resolve(self.names(), name).filter(|&i| i < self.tables.len())
+    /// are not read, or for a name with a part that is not an identifier.
+    pub fn resolve(&self, name: &ObjectName) -> Option<usize> {
+        resolve(self.paths(), &rel_path(name)?).filter(|&i| i < self.tables.len())
     }
 
-    /// The table a bare name names: the one declared bare, else `public`'s, else the one table of
-    /// that name declared under any schema. The last step takes the input's DDL as the tables its
-    /// queries read, which assumes the session's search path finds that table. Two schemas declaring
-    /// the name, and no bare or `public` table of it, resolve to nothing, and so does a name whose
-    /// relation's columns are not read.
+    /// The table a bare name names, given folded as Postgres folds it (`dml::fold_ident`): the one
+    /// declared bare, else `public`'s, else the one table of that name declared under any schema.
+    /// The last step takes the input's DDL as the tables its queries read, which assumes the
+    /// session's search path finds that table. Two schemas declaring the name, and no bare or
+    /// `public` table of it, resolve to nothing, and so does a name whose relation's columns are not
+    /// read. Every comparison is of whole folded parts, so `"T"` finds no `t`, the schema `"PUBLIC"`
+    /// is not `public`, and a one-part `"s.t"` is no table named `t`.
     pub fn resolve_bare(&self, bare: &str) -> Option<usize> {
-        resolve_bare(self.names(), bare).filter(|&i| i < self.tables.len())
+        resolve_bare(self.paths(), bare).filter(|&i| i < self.tables.len())
     }
 
     /// Refuse a catalog in which two tables, or two columns of one table, have names that differ
     /// only in case.
     ///
-    /// The catalog folds every table name to lower case, quoted or not, and a table is found by the
-    /// folded name. For an unquoted name that is Postgres's own rule, but a quoted one keeps its
-    /// case: `"T"` and `t` are two tables, and finding both in one slot makes `FROM "T"` lower like
-    /// `FROM t`. Where no two names collide, folding loses nothing a query that runs could need,
-    /// because a reference whose case differs from the declaration fails in Postgres.
+    /// Tables are found by their paths, which keep a quoted part's case, so `"T"` and `t` are two
+    /// tables here as in Postgres. They are refused all the same, compared by their lower-cased
+    /// labels (`Table::name`), because the label is what the IR names a table by, and a backend
+    /// that keys tables by it, or compares it up to case, would read the two as one. The label joins
+    /// the parts with `.`, so a one-part `"s.t"` and `s.t` are refused the same way.
     ///
     /// A column keeps a quoted name's case, and name resolution and type inference both tell `"S"`
     /// from `s`. Two columns of one table that differ only in case are refused all the same: that
-    /// is no longer what keeps them apart, and lifting it is a completeness change of its own.
+    /// is no longer what keeps them apart, and lifting it is a completeness change of its own, as
+    /// lifting the tables' check is.
     ///
     /// A catalog synthesized by type inference is not checked here: type inference refuses a pair
     /// that names two tables up to case, under both inferred catalogs (`infer::infer`), and a
@@ -221,27 +248,54 @@ impl Catalog {
     }
 }
 
-/// [`Catalog::resolve`] over relations' `names`: the position of the one `name` names.
-fn resolve<'a>(names: impl Iterator<Item = &'a str> + Clone, name: &str) -> Option<usize> {
-    let name = name.to_lowercase();
-    match names.clone().position(|n| n == name) {
+/// [`Catalog::resolve`] over relations' `paths`: the position of the one `path` names.
+fn resolve<'a>(paths: impl Iterator<Item = &'a [String]> + Clone, path: &[String]) -> Option<usize> {
+    match paths.clone().position(|p| p == path) {
         Some(i) => Some(i),
-        None => resolve_bare(names, name.rsplit('.').next().unwrap_or(&name)),
+        None => resolve_bare(paths, path.last()?),
     }
 }
 
-/// [`Catalog::resolve_bare`] over relations' `names`.
-fn resolve_bare<'a>(names: impl Iterator<Item = &'a str> + Clone, bare: &str) -> Option<usize> {
-    let bare = bare.to_lowercase();
-    let exact = |n: &str| names.clone().position(|m| m == n);
-    exact(&bare).or_else(|| exact(&format!("public.{bare}"))).or_else(|| {
-        let suffix = format!(".{bare}");
-        let mut named = names.clone().enumerate().filter(|(_, n)| n.ends_with(&suffix));
+/// [`Catalog::resolve_bare`] over relations' `paths`.
+fn resolve_bare<'a>(paths: impl Iterator<Item = &'a [String]> + Clone, bare: &str) -> Option<usize> {
+    let exact = |want: &[&str]| paths.clone().position(|p| p.iter().map(String::as_str).eq(want.iter().copied()));
+    exact(&[bare]).or_else(|| exact(&["public", bare])).or_else(|| {
+        let mut named =
+            paths.clone().enumerate().filter(|(_, p)| p.len() > 1 && p.last().is_some_and(|l| l == bare));
         match (named.next(), named.next()) {
             (Some((i, _)), None) => Some(i),
             _ => None,
         }
     })
+}
+
+/// A relation's name as Postgres identifies it: each part folded as Postgres folds an identifier,
+/// an unquoted part to lower case and a quoted one as written (`dml::fold_ident`). So `"S".t` is
+/// `["S", "t"]` and `S.t` is `["s", "t"]`.
+///
+/// Kept as parts, never joined, so that the one-part `"s.t"` and the two-part `s.t` stay two names.
+/// `None` for a name with a part that is not an identifier (a dialect's identifier-generating
+/// function), whose spelling, and so whose folding, is not read.
+pub fn rel_path(n: &ObjectName) -> Option<Vec<String>> {
+    n.0.iter().map(|p| p.as_ident().map(crate::dml::fold_ident)).collect()
+}
+
+/// A path's label ([`Table::name`]): its parts joined by `.` and lower-cased.
+pub fn label(path: &[String]) -> String {
+    path.join(".").to_lowercase()
+}
+
+/// A path as a message shows it: each part spelled so that it folds back to itself, quoted unless it
+/// is already lower case, so `"S".t` and a declared `"T"` read as what they are. A path of lower-case
+/// parts shows as its label.
+pub fn display_path(path: &[String]) -> String {
+    path.iter().map(|p| crate::dml::spelled(p).to_string()).collect::<Vec<_>>().join(".")
+}
+
+/// A reference's name as a message shows it: its path ([`display_path`]), or its dotted spelling
+/// ([`obj_name`]) when a part is not an identifier.
+pub fn display_name(n: &ObjectName) -> String {
+    rel_path(n).map_or_else(|| obj_name(n), |p| display_path(&p))
 }
 
 /// Render a (possibly qualified) object name as a dotted string.
@@ -548,10 +602,10 @@ pub fn build(ddl: &[Ddl]) -> Catalog {
     b.finish()
 }
 
-/// A relation the DDL creates, while [`build`] reads it: its name as a table is keyed, and its table,
+/// A relation the DDL creates, while [`build`] reads it: its path ([`Table::path`]), and its table,
 /// if its columns are read.
 struct Rel {
-    name: String,
+    path: Vec<String>,
     table: Option<Building>,
 }
 
@@ -612,24 +666,35 @@ struct Builder {
 }
 
 impl Builder {
-    fn names(&self) -> impl Iterator<Item = &str> + Clone {
-        self.rels.iter().map(|r| r.name.as_str())
+    fn paths(&self) -> impl Iterator<Item = &[String]> + Clone {
+        self.rels.iter().map(|r| r.path.as_slice())
     }
 
-    /// The relation `name` names, as a query's reference would find it.
+    /// The relation `name` names, as a query's reference would find it: by path, so a statement
+    /// about `"T"` does not touch a declared `t`.
     fn resolve(&self, name: &ObjectName) -> Option<usize> {
-        resolve(self.names(), &obj_name(name))
+        resolve(self.paths(), &rel_path(name)?)
     }
 
     /// The relations a statement about `name` may have touched: the one it resolves to, else each of
-    /// that bare name, when two schemas declare it and neither is the bare or `public` one.
+    /// that bare name, when two schemas declare it and neither is the bare or `public` one. The bare
+    /// name is folded, as Postgres compares it, and a name whose last part is not an identifier may
+    /// have touched any relation.
     fn targets(&self, name: &ObjectName) -> Vec<usize> {
         if let Some(i) = self.resolve(name) {
             return vec![i];
         }
-        let full = obj_name(name).to_lowercase();
-        let last = full.rsplit('.').next().unwrap_or(&full);
-        (0..self.rels.len()).filter(|&i| self.rels[i].name.rsplit('.').next() == Some(last)).collect()
+        let last = name.0.last().and_then(|p| p.as_ident()).map(crate::dml::fold_ident);
+        (0..self.rels.len())
+            .filter(|&i| last.is_none() || self.rels[i].path.last() == last.as_ref())
+            .collect()
+    }
+
+    /// Every relation left unread: what a statement about a name the reader cannot fold may have
+    /// changed. The Postgres parser gives every name part as an identifier, so this is never reached
+    /// on its output.
+    fn unread_all(&mut self) {
+        (0..self.rels.len()).for_each(|i| self.unread(i));
     }
 
     /// The table at `i`, if its columns are read.
@@ -682,16 +747,16 @@ impl Builder {
     /// A relation named `name` whose columns are not known. One already of that exact name is the
     /// one Postgres refused to create twice, or the one `OR REPLACE` replaced: it is unread too.
     fn create_unread(&mut self, name: &ObjectName) {
-        let name = obj_name(name).to_lowercase();
-        match self.rels.iter().position(|r| r.name == name) {
+        let Some(path) = rel_path(name) else { return self.unread_all() };
+        match self.rels.iter().position(|r| r.path == path) {
             Some(i) => self.unread(i),
-            None => self.rels.push(Rel { name, table: None }),
+            None => self.rels.push(Rel { path, table: None }),
         }
     }
 
     fn create_table(&mut self, ct: &CreateTable) {
-        let name = obj_name(&ct.name).to_lowercase();
-        if ct.if_not_exists && self.rels.iter().any(|r| r.name == name) {
+        let Some(path) = rel_path(&ct.name) else { return self.unread_all() };
+        if ct.if_not_exists && self.rels.iter().any(|r| r.path == path) {
             return;
         }
         for parent in ct.inherits.iter().flatten() {
@@ -714,17 +779,18 @@ impl Builder {
         if !complete {
             return self.create_unread(&ct.name);
         }
-        let table = self.read_create_table(ct, name.clone());
+        let table = self.read_create_table(ct, path.clone());
         // A name read again replaces an unread one. A table declared twice is kept twice, so that
         // `Catalog::check_case_collisions` refuses it.
-        self.rels.retain(|r| r.name != name || r.table.is_some());
-        self.rels.push(Rel { name, table: Some(table) });
+        self.rels.retain(|r| r.path != path || r.table.is_some());
+        self.rels.push(Rel { path, table: Some(table) });
     }
 
-    fn read_create_table(&self, ct: &CreateTable, name: String) -> Building {
+    fn read_create_table(&self, ct: &CreateTable, path: Vec<String>) -> Building {
         let mut b = Building {
             table: Table {
-                name,
+                name: label(&path),
+                path,
                 cols: Vec::new(),
                 declared_types: Vec::new(),
                 nullable: Vec::new(),
@@ -870,15 +936,20 @@ impl Builder {
                 // The new name is in the table's schema; a name already taken is one Postgres
                 // refuses.
                 Op::RenameTable { table_name: RenameTableNameKind::To(n) | RenameTableNameKind::As(n) } => {
-                    // A table is keyed lower-cased whatever its quoting, unlike a key's name.
-                    let new = obj_name(n).rsplit('.').next().unwrap_or_default().to_lowercase();
-                    let rel = &mut self.rels[i];
-                    rel.name = match rel.name.rsplit_once('.') {
-                        Some((schema, _)) => format!("{schema}.{new}"),
-                        None => new,
+                    // Folded as Postgres folds it, as a key's name is: `RENAME TO "U"` names `"U"`,
+                    // which an unquoted `u` does not read. Only the last part is replaced, so the
+                    // table stays in its schema.
+                    let Some(new) = n.0.last().and_then(|p| p.as_ident()).map(crate::dml::fold_ident) else {
+                        self.unread(i);
+                        continue;
                     };
+                    let rel = &mut self.rels[i];
+                    if let Some(last) = rel.path.last_mut() {
+                        *last = new;
+                    }
                     if let Some(t) = &mut rel.table {
-                        t.table.name = rel.name.clone();
+                        t.table.name = label(&rel.path);
+                        t.table.path = rel.path.clone();
                     }
                 }
                 op if changes_nothing_read(op) => {}
@@ -960,7 +1031,7 @@ impl Builder {
         for r in self.rels {
             match r.table {
                 Some(t) => tables.push(t.finish()),
-                None => unread.push(r.name),
+                None => unread.push(r.path),
             }
         }
         Catalog { tables, unread }
@@ -1268,4 +1339,104 @@ pub fn collect_queries(statements: Vec<Statement>) -> Result<Vec<Query>> {
         return Err(schema(format!("expected 2 queries, got {}", queries.len())));
     }
     Ok(queries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::parser::Parser;
+
+    fn cat(ddl: &str) -> Catalog {
+        crate::pgddl::parse_provided_schema(ddl)
+    }
+
+    /// A relation's name as a query spells it.
+    fn name(sql: &str) -> ObjectName {
+        Parser::new(&crate::DIALECT).try_with_sql(sql).unwrap().parse_object_name(false).unwrap()
+    }
+
+    fn path(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// Each part folds as Postgres folds an identifier, and stays a part: the one-part `"s.t"` is not
+    /// the two-part `s.t` (#203).
+    #[test]
+    fn a_path_folds_each_part() {
+        assert_eq!(rel_path(&name(r#""S".t"#)), Some(path(&["S", "t"])));
+        assert_eq!(rel_path(&name("S.T")), Some(path(&["s", "t"])));
+        assert_eq!(rel_path(&name(r#""s"."t""#)), Some(path(&["s", "t"])));
+        assert_eq!(rel_path(&name(r#""s.t""#)), Some(path(&["s.t"])));
+        assert_eq!(label(&path(&["S", "t"])), "s.t");
+        assert_eq!(display_path(&path(&["S", "t"])), r#""S".t"#);
+        assert_eq!(display_path(&path(&["s", "t"])), "s.t");
+    }
+
+    /// A reference finds the table Postgres reads by it and no other: `"S".t` is not a declared
+    /// `s.t`, nor `t` a declared `"T"` (#203).
+    #[test]
+    fn a_reference_finds_its_table_by_folded_parts() {
+        let c = cat(r#"create table "s"."t" (a int); create table "T" (a int);"#);
+        assert_eq!(c.find_name(&name("s.t")), Some(0));
+        assert_eq!(c.find_name(&name("S.t")), Some(0), "an unquoted S folds to s");
+        assert_eq!(c.find_name(&name(r#""s"."t""#)), Some(0));
+        assert_eq!(c.find_name(&name(r#""S".t"#)), None);
+        assert_eq!(c.find_name(&name(r#""T""#)), Some(1));
+        assert_eq!(c.find_name(&name("t")), None);
+        assert_eq!(c.find_name(&name("T")), None, "an unquoted T folds to t");
+        assert!(c.declares(&name(r#""T""#)));
+        assert!(!c.declares(&name("t")));
+        assert!(!c.declares(&name(r#""S".t"#)));
+    }
+
+    /// A bare name resolves by whole folded parts: `"T"` is no `t`, the schema `"PUBLIC"` is not
+    /// `public`, and the one-part `"s.t"` is no table named `t`.
+    #[test]
+    fn a_bare_name_resolves_by_whole_folded_parts() {
+        let c = cat(r#"create table "s.t" (a int); create table x.v (a int);"#);
+        assert_eq!(c.resolve_bare("t"), None, r#"the one-part "s.t" ends in .t but is not named t"#);
+        assert_eq!(c.resolve_bare("s.t"), Some(0));
+        assert_eq!(c.resolve_bare("v"), Some(1), "the one table named v, under any schema");
+        assert_eq!(c.resolve_bare("V"), None);
+        let c = cat(r#"create table "PUBLIC".u (a int); create table y.u (a int);"#);
+        assert_eq!(c.resolve_bare("u"), None, r#""PUBLIC" is not public, so two schemas declare u"#);
+        let c = cat("create table public.u (a int); create table y.u (a int);");
+        assert_eq!(c.resolve_bare("u"), Some(0));
+    }
+
+    /// A statement about `"T"` does not touch a declared `t`: neither a key `ALTER TABLE` adds nor a
+    /// unique index is `t`'s (#203). An unquoted `T` is `t`.
+    #[test]
+    fn a_statement_about_a_quoted_name_leaves_the_folded_table_alone() {
+        for ddl in [
+            r#"create table t (a int not null); alter table "T" add primary key (a);"#,
+            r#"create table t (a int not null); create unique index ix on "T" (a);"#,
+        ] {
+            assert!(cat(ddl).tables[0].keys.is_empty(), "{ddl}");
+        }
+        let c = cat("create table t (a int not null); alter table T add primary key (a);");
+        assert_eq!(c.tables[0].keys, vec![vec![0]]);
+    }
+
+    /// `RENAME TO "U"` names `"U"`, which an unquoted `u` does not read, and keeps the schema.
+    #[test]
+    fn a_rename_keeps_the_new_name_as_folded() {
+        let c = cat(r#"create table s.t (a int); alter table s.t rename to "U";"#);
+        assert_eq!(c.tables[0].path, path(&["s", "U"]));
+        assert_eq!(c.tables[0].name, "s.u");
+        assert_eq!(c.find_name(&name(r#"s."U""#)), Some(0));
+        assert_eq!(c.find_name(&name("s.u")), None);
+    }
+
+    /// Two tables whose labels are one are refused, though their paths are two.
+    #[test]
+    fn tables_one_up_to_case_are_refused() {
+        for ddl in [
+            r#"create table t (a int); create table "T" (a int);"#,
+            r#"create table "s.t" (a int); create table s.t (a int);"#,
+        ] {
+            assert!(cat(ddl).check_case_collisions().is_err(), "{ddl}");
+        }
+        assert!(cat(r#"create table "T" (a int); create table s."T" (a int);"#).check_case_collisions().is_ok());
+    }
 }

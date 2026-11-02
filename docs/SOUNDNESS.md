@@ -487,13 +487,20 @@ what it is or refused:
 - **A quoted name keeps its case.** A name is folded as Postgres folds it: an unquoted one to lower
   case (ASCII only, as under a multibyte server encoding), a quoted one not at all. So a column
   declared `"A"` is not read by `A`, a table alias `"X"` is not `x`, a `WITH "T"` binding is not a
-  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. Type inference folds names
-  the same way, so without a DDL `"createdAt"` and `createdat` are two columns, and `"Orders"` and
-  `orders` two tables. Table names are still compared case-insensitively, so a DDL that declares
+  use of `t`, and an `ORDER BY A` key is not the output column `"A"`. A table's name is folded and
+  compared part by part, its schema included, by every lookup and by every statement of the DDL
+  that names it (#203). So with `s.t` declared, `"S".t` is no declared table, and nor is `"T"` with
+  `t` declared, or `t` with `"T"` declared. A key added by `ALTER TABLE "T"`, or a unique index on
+  `"T"`, is not `t`'s, and `ALTER TABLE t RENAME TO "U"` leaves the table named `"U"`, which `u`
+  does not read. A quoted part keeps any `.` it holds, so the one-part `"s.t"` is not the table `t`
+  of schema `s`. Type inference folds names the same way, so without a DDL `"createdAt"` and
+  `createdat` are two columns, and `"Orders"` and `orders` two tables. It refuses a quoted part that
+  holds a `.`. Each table is still named in the IR by its lower-cased name, so a DDL that declares
   two tables, or two columns of one table, whose names differ only in case (`"s"` and `"S"`) is
-  refused rather than resolved to one of them, and so, under type inference, is a pair that names
-  two such tables (`"Orders"` and `orders`, `"S".t` and `s.t`). So is a derived table with two columns of one
-  name up to case, whether the select list, the alias's column list or a `*` named them.
+  refused rather than resolved to one of them. So, under type inference, is a pair that names two
+  such tables (`"Orders"` and `orders`, `"S".t` and `s.t`), and so is a derived table with two
+  columns of one name up to case, whether the select list, the alias's column list or a `*` named
+  them.
 - **A name is resolved where Postgres resolves it.** A qualified `s.x` reads the nearest relation
   called `s`, and when that relation has no column `x` it is refused, as Postgres raises an error,
   rather than read from an enclosing relation also called `s`. A bare name reads the query's own
@@ -504,10 +511,11 @@ what it is or refused:
   further out, since Postgres may have given the column exactly that name; a `GROUP BY` name is
   refused then too, rather than read as a select-list alias.
 - **A schema qualifier is part of a table's name.** A reference the DDL declares as written is that
-  table: with both `t` and `s.t` declared, `FROM s.t` reads `s.t`. Any other qualifier is dropped so
-  that `s.t` meets the DDL's `t`, but only when every reference in the pair to one bare name has the
-  same qualifier. `s1.t` against `s2.t`, or `t` against `s.t`, keeps its qualifiers, so the two sides
-  read two tables, and a DDL that declares only `t` declares neither of them. A bare name resolves to
+  table, compared part by part under Postgres's folding: with both `t` and `s.t` declared, `FROM s.t`
+  reads `s.t`. Any other qualifier is dropped so that `s.t` meets the DDL's `t`, but only when every
+  reference in the pair to one bare name has the same qualifier. `s1.t` against `s2.t`, `t` against
+  `s.t`, or `"S".t` against `s.t`, keeps its qualifiers, so the two sides read two tables, and a DDL
+  that declares only `s.t` declares neither `"S".t` nor the bare `t` of the first. A bare name resolves to
   the table declared bare, else to `public`'s, else to the one table of that name the DDL declares
   under any schema; that last step takes the input's DDL as the tables its queries read, which
   assumes the session's search path finds that table. A bare name two schemas declare, with no bare

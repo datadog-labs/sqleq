@@ -282,7 +282,7 @@ pub fn reduce(cat: &Catalog, statements: &mut [Statement]) -> Result<[Stores; 2]
             check_using(cat, b, db, &qb)?;
             same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "DELETE")?;
             same_target(da, db)?;
-            no_trigger(cat, &obj_name(target_name(da)?))?;
+            no_trigger(cat, target_name(da)?)?;
             let (ra, rb) = (delete_to_select(a)?, delete_to_select(b)?);
             install(&mut statements[i], ra)?;
             install(&mut statements[j], rb)?;
@@ -519,7 +519,7 @@ fn check_using(cat: &Catalog, d: &Delete, target: &TableWithJoins, qual: &str) -
             TableFactor::Table { name, alias, args: None, .. }
                 if alias.as_ref().is_none_or(|a| a.columns.is_empty()) =>
             {
-                find_target(cat, &obj_name(name)).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
+                find_target(cat, name).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
             }
             _ => None,
         };
@@ -529,7 +529,7 @@ fn check_using(cat: &Catalog, d: &Delete, target: &TableWithJoins, qual: &str) -
         }
     }
     let Some(items) = &d.returning else { return Ok(()) };
-    let target_cols: Vec<String> = find_target(cat, &obj_name(target_name(target)?))
+    let target_cols: Vec<String> = find_target(cat, target_name(target)?)
         .map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()).collect())
         .unwrap_or_default();
     let names_target = |q: &Ident| fold_ident(q) == qual;
@@ -642,11 +642,19 @@ fn target_name(t: &TableWithJoins) -> Result<&ObjectName> {
 /// nothing — no pair in the corpus spells its target two ways — and keeps this check independent of
 /// what [`strip_schema`][crate::normalize::strip_schema] later decides about the qualifier.
 fn same_target(a: &TableWithJoins, b: &TableWithJoins) -> Result<()> {
-    let (na, nb) = (obj_name(target_name(a)?), obj_name(target_name(b)?));
-    if na.to_lowercase() != nb.to_lowercase() {
+    let (na, nb) = (target_name(a)?, target_name(b)?);
+    if !same_relation(na, nb) {
+        let (na, nb) = (crate::catalog::display_name(na), crate::catalog::display_name(nb));
         return Err(unsupported(format!("the pair's two statements target {na} and {nb}")));
     }
     Ok(())
+}
+
+/// Whether two references name one relation as Postgres compares names: part by part, each folded
+/// ([`crate::catalog::rel_path`]). `DELETE FROM "T"` and `DELETE FROM t` write two tables, and a name
+/// with a part that is not an identifier is the same as no other.
+fn same_relation(a: &ObjectName, b: &ObjectName) -> bool {
+    matches!((crate::catalog::rel_path(a), crate::catalog::rel_path(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Postgres's identity for an identifier: an unquoted name folds to lower case, a quoted one does
@@ -666,7 +674,7 @@ pub(crate) fn fold_ident(id: &Ident) -> String {
 
 /// An identifier that [`fold_ident`] reads back as `name`: unquoted where that already folds to it,
 /// quoted otherwise.
-fn spelled(name: &str) -> Ident {
+pub(crate) fn spelled(name: &str) -> Ident {
     if name.to_ascii_lowercase() == name {
         Ident::new(name)
     } else {
@@ -742,7 +750,7 @@ fn scoped(cat: &Catalog, tf: &TableFactor) -> Scoped {
     let qual = factor_name(tf).unwrap_or_default();
     let cols = match tf {
         TableFactor::Table { name, alias, args: None, .. } if alias.as_ref().is_none_or(|a| a.columns.is_empty()) => {
-            find_target(cat, &obj_name(name)).map(|i| {
+            find_target(cat, name).map(|i| {
                 let mut cols: Vec<String> = cat.tables[i].cols.iter().map(|(c, _)| c.clone()).collect();
                 // Every table also has the system columns, which a `RETURNING` item may read.
                 cols.extend(SYSTEM_COLUMNS.iter().map(|c| c.to_string()));
@@ -984,7 +992,7 @@ fn from_is_a_filter(cat: &Catalog, u: &Update, from: &[TableWithJoins]) -> Resul
             TableFactor::Table { name, alias, args: None, .. }
                 if alias.as_ref().is_none_or(|a| a.columns.is_empty()) =>
             {
-                find_target(cat, &obj_name(name)).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
+                find_target(cat, name).map(|i| cat.tables[i].cols.iter().map(|(c, _)| c.clone()))
             }
             _ => None,
         };
@@ -1059,10 +1067,10 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
         "UPDATE",
     )?;
 
-    let name = obj_name(target_name(ta)?);
-    let idx = find_target(cat, &name)
-        .ok_or_else(|| schema(format!("no declared schema for UPDATE target {name}")))?;
-    no_trigger(cat, &name)?;
+    let target = target_name(ta)?;
+    let idx = find_target(cat, target)
+        .ok_or_else(|| schema(format!("no declared schema for UPDATE target {}", obj_name(target))))?;
+    no_trigger(cat, target)?;
     // The declared prefix: an `UPDATE` projects the table's own shape, and a system column
     // `catalog::add_system_columns` appended would change its arity. Independent of the fact that
     // the reduction currently runs before that append, so moving either cannot break this.
@@ -1073,7 +1081,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
     // projection — the update would become invisible. Refuse rather than drop it.
     for (col, _) in sets_a.iter().chain(&sets_b) {
         if !cols.contains(col) {
-            return Err(schema(format!("UPDATE sets {col}, which {name} does not declare")));
+            return Err(schema(format!("UPDATE sets {col}, which {} does not declare", obj_name(target))));
         }
     }
 
@@ -1108,7 +1116,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
 /// schema ([`crate::normalize::system_relation`]), *is* found here when the DDL names it, and so it is
 /// refused by name: by `lower` where the target becomes a scan (`UPDATE`, `DELETE`), and by
 /// [`insert_pair`], whose target never does.
-fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
+fn find_target(cat: &Catalog, name: &ObjectName) -> Option<usize> {
     cat.resolve(name)
 }
 
@@ -1116,7 +1124,7 @@ fn find_target(cat: &Catalog, name: &str) -> Option<usize> {
 /// reductions compare what the two statements write, and a trigger or rule changes what they store,
 /// or writes on its own. Checked once the pair is known to have one target, so either side's name
 /// will do.
-fn no_trigger(cat: &Catalog, name: &str) -> Result<()> {
+fn no_trigger(cat: &Catalog, name: &ObjectName) -> Result<()> {
     match find_target(cat, name) {
         Some(i) if cat.tables[i].has_trigger => {
             Err(unsupported(format!("DML on {}, which a trigger or rule names", cat.tables[i].name)))
@@ -1336,8 +1344,8 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
 fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [Stores; 2])> {
     let (na, qa, ca, sa) = insert_shape(a)?;
     let (nb, qb, cb, sb) = insert_shape(b)?;
-    let (name, other) = (obj_name(na), obj_name(nb));
-    if name.to_lowercase() != other.to_lowercase() {
+    let (name, other) = (crate::catalog::display_name(na), crate::catalog::display_name(nb));
+    if !same_relation(na, nb) {
         return Err(unsupported(format!("the pair's two statements target {name} and {other}")));
     }
     // Content *and* order: the source bag is a bag of tuples, so two lists naming the same columns
@@ -1368,7 +1376,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
     }
     // As in `resolve_tables`, a name the DDL declares exactly as written is that table and needs no
     // stripping, so only a target that would be stripped is held to the check.
-    let declared = cat.declares(&name) && cat.declares(&other);
+    let declared = cat.declares(na) && cat.declares(nb);
     if !declared && !crate::normalize::safe_to_strip(&names) {
         return Err(unsupported(format!(
             "the INSERT target {name} and a relation its source reads name one table under two spellings"
@@ -1392,7 +1400,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
     }
     same_returning(a.returning.as_deref(), b.returning.as_deref(), &qa, &qb, "INSERT")?;
 
-    let idx = find_target(cat, &name)
+    let idx = find_target(cat, na)
         .ok_or_else(|| schema(format!("no declared schema for INSERT target {name}")))?;
     // A bare target can resolve to a table the DDL puts under a system schema (`t` to a declared
     // `pg_catalog.t`), as a query's `FROM t` does in `resolve_tables` before `lower` refuses it.
@@ -1402,7 +1410,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
             cat.tables[idx].name
         )));
     }
-    no_trigger(cat, &name)?;
+    no_trigger(cat, na)?;
     let t = &cat.tables[idx];
     // The declared prefix, for the reason [`update_pair`] gives: a system column is not written by
     // an `INSERT` and would look to the guard like an omitted one.
@@ -1604,6 +1612,7 @@ mod tests {
         Catalog {
             tables: vec![Table {
                 name: name.to_string(),
+                path: name.split('.').map(str::to_string).collect(),
                 cols: cols.iter().map(|c| (c.to_string(), "INTEGER".to_string())).collect(),
                 declared_types: vec!["INTEGER".to_string(); cols.len()],
                 nullable: vec![true; cols.len()],

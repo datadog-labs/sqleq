@@ -65,7 +65,7 @@ use sqlparser::ast::{
     Query, SqlOption, Statement,
 };
 
-use crate::catalog::{obj_name, Catalog};
+use crate::catalog::Catalog;
 use crate::error::{unsupported, Result};
 use crate::scope::Scope;
 
@@ -245,9 +245,11 @@ pub fn narrow(cat: &Catalog, queries: &[Query]) -> Option<Catalog> {
     let mut named = HashSet::new();
     for q in queries {
         let _ = visit_relations(q, |n| {
-            let full = obj_name(n);
-            named.extend(cat.find(&full));
-            named.extend(full.rsplit('.').next().and_then(|last| cat.find(last)));
+            // By path, as lowering finds the table ([`Catalog::find_name`]), so every table a scan
+            // reads is named here.
+            named.extend(cat.find_name(n));
+            let last = n.0.last().and_then(|p| p.as_ident()).map(crate::dml::fold_ident);
+            named.extend(last.and_then(|last| cat.find(&[last])));
             std::ops::ControlFlow::<()>::Continue(())
         });
     }

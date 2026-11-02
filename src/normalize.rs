@@ -1646,7 +1646,9 @@ pub fn system_relation(name: &ObjectName) -> bool {
     system_path(&parts)
 }
 
-/// [`system_relation`] over a catalog key, the dotted, lower-cased name `catalog::scan_ddl` stores.
+/// [`system_relation`] over a table's label (`catalog::Table::name`), its dotted, lower-cased name.
+/// Lower-cased and split at every `.`, as `system_relation` over-approximates: a quoted
+/// `"PG_CATALOG".t`, or a one-part `"pg_catalog.t"`, is refused too, which costs only a refusal.
 pub(crate) fn system_key(key: &str) -> bool {
     system_path(&key.split('.').map(str::to_string).collect::<Vec<_>>())
 }
@@ -1730,7 +1732,8 @@ impl Visitor for CollectCteNames {
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
         if let Some(w) = &q.with {
-            self.0.extend(w.cte_tables.iter().map(|c| c.alias.name.value.to_lowercase()));
+            // Folded, as `inline_ctes` binds a use to its binding: `WITH "T"` binds no `t`.
+            self.0.extend(w.cte_tables.iter().map(|c| crate::dml::fold_ident(&c.alias.name)));
         }
         ControlFlow::Continue(())
     }
@@ -1747,21 +1750,24 @@ impl VisitorMut for ResolveTable<'_> {
 
     fn pre_visit_relation(&mut self, name: &mut ObjectName) -> ControlFlow<Self::Break> {
         let cat = self.cat;
-        if !self.strip || cat.declares(&crate::catalog::obj_name(name)) {
+        if !self.strip || cat.declares(name) {
             return ControlFlow::Continue(());
         }
         if name.0.len() > 1 {
             name.0.drain(..name.0.len() - 1);
         }
-        let Some(bare) = name.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+        // Folded, as the catalog compares it: a bare `"T"` is no declared `t`.
+        let Some(bare) = name.0.last().and_then(|p| p.as_ident()).map(crate::dml::fold_ident) else {
             return ControlFlow::Continue(());
         };
         if self.bound.contains(&bare) {
             return ControlFlow::Continue(());
         }
         if let Some(i) = cat.resolve_bare(&bare) {
-            let key = &cat.tables[i].name;
-            *name = ObjectName(key.split('.').map(|p| ObjectNamePart::Identifier(Ident::new(p))).collect());
+            // Spelled so that lowering, folding it again, finds exactly this path: a part that is
+            // not already lower case is quoted.
+            let path = &cat.tables[i].path;
+            *name = ObjectName(path.iter().map(|p| ObjectNamePart::Identifier(crate::dml::spelled(p))).collect());
         }
         ControlFlow::Continue(())
     }
@@ -1793,17 +1799,20 @@ impl VisitorMut for StripQualifier {
 
 /// The two guards, checked over every table reference of the pair before any of them is touched.
 ///
-/// The bare name is keyed lower-cased, quoted or not, because that is how the catalog and lowering
-/// will look it up: `s1."T"` and `s2.t` end up at one table there, so they are one bare name here.
-/// The qualifier is compared under Postgres's folding instead, because nothing downstream sees it
-/// once it is stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
+/// The bare name and the qualifier are both compared under Postgres's folding, an unquoted part
+/// lower-cased and a quoted one as written. The bare name, because that is how the catalog and
+/// lowering will look it up: `s1."T"` and `s2.t` end up at two tables there (`"T"` finds no `t`), so
+/// they are two bare names here. The qualifier, because nothing downstream sees it once it is
+/// stripped: `"S1"` and `s1` are two schemas, and only this check can keep them apart.
 pub(crate) fn safe_to_strip(names: &[ObjectName]) -> bool {
     let mut seen: HashMap<String, Vec<String>> = HashMap::new();
     for n in names {
-        let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase()) else {
+        let Some(bare) = n.0.last().and_then(|p| p.as_ident()).map(crate::dml::fold_ident) else {
             return false;
         };
-        if bare.starts_with("pg_") {
+        // Lower-cased, as `system_relation` reads a name: a quoted `"PG_X"` is no system relation,
+        // but stopping on it costs only a refusal.
+        if bare.to_lowercase().starts_with("pg_") {
             return false;
         }
         let qualifier = n.0[..n.0.len() - 1]
@@ -2512,6 +2521,40 @@ mod tests {
         let mut qs = parse_queries(a, b);
         strip_schema(&mut qs);
         assert_eq!((qs[0].to_string(), qs[1].to_string()), (a.to_string(), b.to_string()));
+    }
+
+    /// The bare name is compared under folding, as the catalog finds it: `s1."T"` and `s2.t` are two
+    /// tables there, so two bare names here, and stripping keeps them two (#203). A quoted
+    /// qualifier is another schema, as before.
+    #[test]
+    fn bare_names_are_compared_folded() {
+        let mut qs = parse_queries(r#"SELECT x FROM s1."T""#, "SELECT x FROM s2.t");
+        strip_schema(&mut qs);
+        assert_eq!((qs[0].to_string(), qs[1].to_string()), (r#"SELECT x FROM "T""#.into(), "SELECT x FROM t".into()));
+        let (a, b) = (r#"SELECT x FROM "S".t"#, "SELECT x FROM s.t");
+        let mut qs = parse_queries(a, b);
+        strip_schema(&mut qs);
+        assert_eq!((qs[0].to_string(), qs[1].to_string()), (a.to_string(), b.to_string()));
+    }
+
+    /// `resolve_tables` reads a reference by its folded parts (#203): an undeclared `"S".t` beside a
+    /// declared `s.t` keeps its qualifier, a bare `"T"` is not resolved to a declared `t`, and a bare
+    /// name resolved to a quoted declaration is spelled so that lowering finds that path.
+    #[test]
+    fn resolution_compares_folded_parts() {
+        let resolved = |ddl: &str, a: &str, b: &str| {
+            let cat = crate::pgddl::parse_provided_schema(ddl);
+            let mut qs = parse_queries(a, b);
+            resolve_tables(&mut qs, &cat);
+            (qs[0].to_string(), qs[1].to_string())
+        };
+        let (a, b) = (r#"SELECT a FROM "S"."t""#, r#"SELECT a FROM "s"."t""#);
+        assert_eq!(resolved(r#"create table "s"."t" (a int);"#, a, b), (a.into(), b.into()));
+        let t = "create table t (a int);";
+        assert_eq!(resolved(t, r#"SELECT a FROM "T""#, "SELECT a FROM t").0, r#"SELECT a FROM "T""#);
+        let st = r#"create table s."T" (a int);"#;
+        assert_eq!(resolved(st, r#"SELECT a FROM "T""#, r#"SELECT a FROM "T""#).0, r#"SELECT a FROM s."T""#);
+        assert_eq!(resolved(st, "SELECT a FROM t", "SELECT a FROM t").0, "SELECT a FROM t");
     }
 
     /// The same qualifier repeated is one table, not a collision.

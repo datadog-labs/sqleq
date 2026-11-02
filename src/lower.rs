@@ -17,7 +17,7 @@ use sqlparser::ast::visit_expressions;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
-    Query,
+    ObjectName, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
     Subscript, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue, Values,
 };
@@ -2224,8 +2224,12 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                     "{tn} names a system relation, which Postgres reads in place of any table the DDL declares"
                 )));
             }
-            let unknown = || schema(format!("unknown table {tn}{}", same_last_name(cat, &tn)));
-            let idx = cat.find(&tn).ok_or_else(unknown)?;
+            // By path, each part folded as Postgres folds it: `"S".t` is not a declared `s.t`, nor
+            // `"T"` a declared `t`. Postgres reads another relation by each.
+            let unknown = || {
+                schema(format!("unknown table {}{}", crate::catalog::display_name(name), same_last_name(cat, name)))
+            };
+            let idx = cat.find_name(name).ok_or_else(unknown)?;
             // An alias's column list renames the table's columns in order, and may stop short:
             // `t AS x(p, q)` makes `x.p` the first column. Resolving by the declared names instead
             // would read `x.a` in `t AS x(b, a)` as the table's own `a`.
@@ -2468,16 +2472,23 @@ fn expr_name(e: &Expr, idx: usize) -> String {
     implicit_name(e).unwrap_or_else(|| unnamed(idx))
 }
 
-/// For an `unknown table` refusal: the catalog's tables whose last dotted name is `tn`'s, up to case
-/// as [`Catalog::find`] compares, as ` (the catalog has s.t)`, or nothing when it has none.
+/// For an `unknown table` refusal: the catalog's tables whose last name is `name`'s up to case, as
+/// ` (the catalog has s.t)`, or nothing when it has none.
 ///
 /// A fact, not a diagnosis. A bare `t` against a declared `s.t` (or the reverse) is two tables, and
 /// the same message is reached for a bare `t` that two schemas declare and nothing declares bare.
-fn same_last_name(cat: &Catalog, tn: &str) -> String {
-    let last = |n: &str| n.rsplit('.').next().unwrap_or(n).to_lowercase();
-    let same: Vec<&str> =
-        cat.tables.iter().filter(|t| last(&t.name) == last(tn)).map(|t| t.name.as_str()).collect();
-    if cat.unread.iter().any(|u| *u == tn.to_lowercase()) {
+/// Up to case, though the lookup is not, so that `"S".t` or `"T"` shows the declared `s.t` or `t`
+/// it is not.
+fn same_last_name(cat: &Catalog, name: &ObjectName) -> String {
+    let last = name.0.last().and_then(|p| p.as_ident()).map(|id| id.value.to_lowercase());
+    let same: Vec<String> = cat
+        .tables
+        .iter()
+        .filter(|t| t.path.last().map(|p| p.to_lowercase()) == last)
+        .map(|t| crate::catalog::display_path(&t.path))
+        .collect();
+    let path = crate::catalog::rel_path(name);
+    if cat.unread.iter().any(|u| Some(u) == path.as_ref()) {
         " (declared, but its columns are not read)".to_string()
     } else if same.is_empty() {
         String::new()

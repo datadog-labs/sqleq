@@ -532,31 +532,37 @@ fn factor_alias(tf: &TableFactor) -> Option<String> {
     a.map(|a| fold_ident(&a.name))
 }
 
-/// A relation's name as Postgres identifies it: each part folded by [`fold_ident`], joined by `.`
-/// as [`obj_name`] joins them. So `"S".t` is `S.t` and `s.t` is `s.t`, two tables, where a
-/// lower-cased [`obj_name`] made them one.
+/// A relation's name as Postgres identifies it: its path ([`crate::catalog::rel_path`]), each part
+/// folded by [`fold_ident`], joined by `.` as [`obj_name`] joins them. So `"S".t` is `S.t` and `s.t`
+/// is `s.t`, two tables, where a lower-cased [`obj_name`] made them one.
 ///
 /// A part that is not an identifier (a dialect's identifier-generating function) has no spelling
-/// whose quoting can be read, so the name is refused rather than folded by a guess.
+/// whose quoting can be read, so the name is refused rather than folded by a guess. So is a part
+/// that holds a `.` (the one-part `"s.t"`): joined, it would be the two-part `s.t`, which is another
+/// table, so the joined name is a path only where no part has one ([`key_path`]).
 fn folded_name(n: &ObjectName) -> Result<String> {
-    let parts = n
-        .0
-        .iter()
-        .map(|p| p.as_ident().map(fold_ident))
-        .collect::<Option<Vec<_>>>()
+    let parts = crate::catalog::rel_path(n)
         .ok_or_else(|| unsupported(format!("table name {n} with a part that is not an identifier")))?;
+    if parts.iter().any(|p| p.contains('.')) {
+        return Err(unsupported(format!("table name {n} with a part that holds a dot")));
+    }
     Ok(parts.join("."))
+}
+
+/// The path a [`folded_name`] joined, as the catalog finds a table by it ([`Catalog::find`]). Exact,
+/// because `folded_name` refuses a part that holds the `.` this splits on.
+fn key_path(table: &str) -> Vec<String> {
+    table.split('.').map(str::to_string).collect()
 }
 
 fn add_factor(tf: &TableFactor, s: &mut ScopeInfo) -> Result<()> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
-            // The full dotted name, matching `factor_instance`'s `obj_name(name)` — the catalog this
-            // module synthesizes is looked up by `cat.find` with that string, so agreeing with the
-            // consumer matters more here than agreeing with sqlglot's schema-stripped `Table.name`.
-            // Prepared cases have no schema qualifiers, so the two coincide anyway. Folded, not
-            // lower-cased: `cat.find` compares up to case, and `refuse_tables_up_to_case` refuses
-            // two names that are one up to case, so the lookup cannot merge `"Orders"` with `orders`.
+            // The full folded name, matching the path `factor_instance` looks the table up by — the
+            // catalog this module synthesizes is found by `cat.find` on that path, so agreeing with
+            // the consumer matters more here than agreeing with sqlglot's schema-stripped
+            // `Table.name`. Prepared cases have no schema qualifiers, so the two coincide anyway.
+            // Folded, not lower-cased: `"Orders"` and `orders` are two tables.
             let tn = folded_name(name)?;
             let key = alias.as_ref().map(|a| fold_ident(&a.name)).unwrap_or_else(|| tn.clone());
             s.base.insert(key, tn);
@@ -622,12 +628,13 @@ struct Attributor<'a> {
 
 /// Whether a declared catalog says `table` has `col`.
 ///
-/// The table is found as lowering finds it ([`Catalog::find`]), and the column by its exact folded
-/// name, as lowering resolves it: the catalog stores a column under `dml::fold_ident`'s name, and
-/// so does attribution. Compared up to case, `"A"` over `m ("A")` and `t (a)` was declared by both, and
-/// an unquoted `A` (which is `t.a`) was declared by `m` as well.
+/// The table is named as attribution names it, by its folded parts joined by `.`, and found as
+/// lowering finds it, by that path ([`Catalog::find`]); the column by its exact folded name, as
+/// lowering resolves it: the catalog stores a column under `dml::fold_ident`'s name, and so does
+/// attribution. Compared up to case, `"A"` over `m ("A")` and `t (a)` was declared by both, and an
+/// unquoted `A` (which is `t.a`) was declared by `m` as well.
 pub fn declares(cat: &Catalog, table: &str, col: &str) -> bool {
-    cat.find(table).is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c == col))
+    cat.find(&key_path(table)).is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c == col))
 }
 
 impl<'a> Attributor<'a> {
@@ -1387,7 +1394,7 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
     if let Some(cat) = prov {
         uf.on_query(Origin::DECLARED);
         for (t, cols) in &at.cols {
-            if let Some(i) = cat.find(t) {
+            if let Some(i) = cat.find(&key_path(t)) {
                 for c in cols {
                     // `c` is folded as Postgres folds it, as every attributed name is, and so is the
                     // catalog's name for a column: an exact match is the column lowering reads.
@@ -1532,15 +1539,16 @@ fn shift_params(q: &mut Query, by: u32) {
 /// Refuse a pair that names two tables whose names are one up to case: `"Orders"` and `orders`, or
 /// `"S".t` and `s.t`.
 ///
-/// Kept apart they are two tables in Postgres, but lowering finds a table by [`Catalog::find`], up
-/// to case, so found in one slot both sides read one. [`build_inferred`], which stores a
-/// synthesized table under its lower-cased name, makes this check first, as
-/// [`Catalog::check_case_collisions`] refuses a DDL that declares two such tables.
+/// They are two tables in Postgres, and lowering finds a table by its path ([`Catalog::find`]),
+/// which keeps them apart. But a synthesized table is labelled by its lower-cased name, which the IR
+/// names it by, and a backend that keys tables by the label would read the two as one.
+/// [`build_inferred`] makes this check first, as [`Catalog::check_case_collisions`] refuses a DDL
+/// that declares two such tables.
 ///
 /// [`infer`] makes it under the seeded catalog too, where nothing is synthesized. That is the
 /// conservative choice rather than a necessary one: with only `orders` declared, the declared
-/// catalog lowers a pair that reads `"Orders"` against `orders` by finding both in `orders`, and the
-/// seeded catalog refuses it.
+/// catalog finds no table for `"Orders"` and refuses the pair as an unknown table, and the seeded
+/// catalog refuses it here, first.
 fn refuse_tables_up_to_case(
     all_tables: &BTreeSet<String>,
     cols: &HashMap<String, BTreeSet<String>>,
@@ -1597,10 +1605,10 @@ fn unread_reason(unread: &[&String], all_tables: &BTreeSet<String>) -> String {
 /// proof. Only a declared DDL may supply them.
 ///
 /// The tables and columns arrive named as Postgres identifies them (see [`Atom::Col`]). A column
-/// keeps that name, which is the one lowering resolves. A table's name is lower-cased, as the
-/// declared catalog stores it, because lowering finds a table by [`Catalog::find`], up to case. That
-/// is sound only where no two of the pair's tables are one name up to case, so a pair that names
-/// two is refused first ([`refuse_tables_up_to_case`]).
+/// keeps that name, which is the one lowering resolves. So does a table, as its path, which is what
+/// lowering finds it by ([`Catalog::find`]); its label is lower-cased, as the declared catalog's is.
+/// Labels are unique only where no two of the pair's tables are one name up to case, so a pair that
+/// names two is refused first ([`refuse_tables_up_to_case`]).
 pub fn build_inferred(
     all_tables: &BTreeSet<String>,
     cols: &HashMap<String, BTreeSet<String>>,
@@ -1643,7 +1651,8 @@ pub fn build_inferred(
             .collect();
         let n = cols.len();
         tables.push(Table {
-            name: t.to_lowercase(),
+            name: crate::catalog::label(&key_path(t)),
+            path: key_path(t),
             n_declared: n,
             cols,
             // No DDL was read, so no type was spelled. No DML reduction runs on this catalog.
