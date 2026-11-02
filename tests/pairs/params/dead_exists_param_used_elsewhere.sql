@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-proof
--- expect sqleq-solver: unsupported
+-- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: unsupported
 -- expect lean: unsupported
 -- catalog: inferred-seeded

@@ -9,7 +9,7 @@
 //! constraints, and compared up to renaming of bound variables (rung 2), then by the set solver
 //! (rung 3), and last by the bag congruence rung, which has no counterpart in Java.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::alpha::alpha_eq;
 use crate::bagsolver;
@@ -26,6 +26,13 @@ use crate::translate::{translate_input, Query};
 /// pathological pair must not stall a batch. Terms that large come from long chains of outer
 /// joins; a pair whose two sides are identical never gets here, because tier 0 answers it first.
 pub const MAX_TREE_SIZE: usize = 1_000_000;
+
+/// How long a pair's normalization may run, both attempts together. Past it, normalization stops
+/// between rounds with the term it has -- every intermediate term is equivalent to the input -- and
+/// the rungs compare that, so a pair that would normalize past the driver's cap answers instead.
+/// The proofs found on the benchmark corpus take well under half of it; the pairs that outgrow it
+/// are long chains of outer joins, some under a correlated subquery.
+pub const NORMALIZE_BUDGET: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -127,9 +134,10 @@ fn decide(l: &Query, r: &Query, ics: &Ics, facts: &Facts) -> Verdict {
     let mut too_large = false;
     let none = Ics::default();
     let attempts: Vec<&Ics> = if ics.is_empty() { vec![&none] } else { vec![ics, &none] };
-    let deadline = Instant::now() + bagsolver::BUDGET;
+    let start = Instant::now();
+    let deadlines = (start + NORMALIZE_BUDGET, start + bagsolver::BUDGET);
     for ics in attempts {
-        match rung2(l, r, ics, facts, deadline) {
+        match rung2(l, r, ics, facts, deadlines) {
             Some(true) => return Verdict::Eq { literal: false },
             Some(false) => {}
             None => too_large = true,
@@ -141,11 +149,13 @@ fn decide(l: &Query, r: &Query, ics: &Ics, facts: &Facts) -> Verdict {
 /// Normalize each side, then compare up to renaming of bound vars (rung 2), and failing that ask
 /// the set solver (rung 3), as `SqlSolver.proveEq` does, and then the bag congruence rung, which
 /// has no counterpart there. `None` when a side outgrows the size budget. The row facts hold on
-/// every database the claims are about, so they are given to the last rung on both attempts, which
-/// share its `deadline`.
-fn rung2(l: &Query, r: &Query, ics: &Ics, facts: &Facts, deadline: Instant) -> Option<bool> {
-    let mut nl = Normalizer::new(l.widths.clone(), MAX_TREE_SIZE).with_ics(ics.clone());
-    let mut nr = Normalizer::new(r.widths.clone(), MAX_TREE_SIZE).with_ics(ics.clone());
+/// every database the claims are about, so they are given to the last rung on both attempts. The
+/// two attempts share their deadlines: normalization's ([`NORMALIZE_BUDGET`]) and the last rung's.
+fn rung2(l: &Query, r: &Query, ics: &Ics, facts: &Facts, (normalize_by, deadline): (Instant, Instant)) -> Option<bool> {
+    let normalizer = |w: &std::collections::HashMap<u32, usize>| {
+        Normalizer::new(w.clone(), MAX_TREE_SIZE).with_ics(ics.clone()).with_deadline(normalize_by)
+    };
+    let (mut nl, mut nr) = (normalizer(&l.widths), normalizer(&r.widths));
     let tl = nl.normalize(&l.term).ok()?;
     let tr = nr.normalize(&r.term).ok()?;
     if alpha_eq(&tl, &nl.widths, &tr, &nr.widths) {

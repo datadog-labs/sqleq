@@ -282,25 +282,32 @@ impl Congruence<'_> {
 
     /// Pairs the value-position sums of the two sides, each left one with the first unused right
     /// one that reads the same columns and matches it; every sum gets a class, a pair one class.
+    /// Groups the value-position sums of both sides into classes: each joins the first class whose
+    /// representative it matches and reads the same columns as, or starts one. A class is one
+    /// function of those columns, every member equal to its representative. Copies of one sum on one
+    /// side share a class too, which a selection needs: `CASE WHEN S IS NULL … ELSE f(S)` reads `S`
+    /// twice, and its guards exclude each other only if both reads are one value.
     fn pair_value_sums(&mut self, bx: &[UTerm], by: &[UTerm]) -> ValueSums {
-        let (sa, sb) = (value_sums(bx), value_sums(by));
-        let mut out = ValueSums::new();
-        let mut used = vec![false; sb.len()];
-        for (i, s) in sa.iter().enumerate() {
-            let reads = free_columns(s, &self.widths);
-            let class = format!("a{i}");
-            let partner =
-                (0..sb.len()).find(|&k| !used[k] && free_columns(&sb[k], &self.widths) == reads && self.congruent(s, &sb[k]));
-            if let Some(k) = partner {
-                used[k] = true;
-                out.insert(sb[k].clone(), (class.clone(), reads.clone()));
+        let mut sums = value_sums(bx);
+        for s in value_sums(by) {
+            if !sums.contains(&s) {
+                sums.push(s);
             }
-            out.insert(s.clone(), (class, reads));
         }
-        for (k, s) in sb.iter().enumerate() {
-            if !used[k] {
-                out.entry(s.clone()).or_insert_with(|| (format!("b{k}"), free_columns(s, &self.widths)));
-            }
+        let mut classes: Vec<(UTerm, String, Vec<UTerm>)> = Vec::new();
+        let mut out = ValueSums::new();
+        for s in sums {
+            let reads = free_columns(&s, &self.widths);
+            let class = classes
+                .iter()
+                .find(|(rep, _, r)| *r == reads && self.congruent(rep, &s))
+                .map(|(_, name, _)| name.clone());
+            let name = class.unwrap_or_else(|| {
+                let name = format!("s{}", classes.len());
+                classes.push((s.clone(), name.clone(), reads.clone()));
+                name
+            });
+            out.insert(s, (name, reads));
         }
         out
     }

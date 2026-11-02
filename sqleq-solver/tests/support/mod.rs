@@ -8,8 +8,14 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
+use sqleq_solver::eval::{Db, Env};
+use sqleq_solver::ir::{Input, Type};
 use sqleq_solver::prove::{verify, Verdict};
+use sqleq_solver::translate::{translate_input, Query, OUT_VAR_ID};
+use sqleq_solver::uterm::UConst;
 
 /// A table: name, column types, which columns are nullable, and its unique keys.
 pub fn table(name: &str, types: &[&str], nullable: &[bool], key: &[&[usize]]) -> Value {
@@ -77,4 +83,63 @@ pub fn pair(schemas: Vec<Value>, a: Value, b: Value) -> Verdict {
 
 pub fn proved(v: &Verdict) -> bool {
     matches!(v, Verdict::Eq { .. })
+}
+
+/// The values a column of `ty` holds in the random databases [`agrees`] builds.
+fn domain(ty: Type) -> Vec<UConst> {
+    match ty {
+        Type::Varchar => vec![UConst::Null, UConst::Str("a".into()), UConst::Str("b".into())],
+        Type::Boolean => vec![UConst::Null, UConst::Int(0), UConst::Int(1)],
+        _ => vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2)],
+    }
+}
+
+/// Both sides return the same bag on random small databases that keep the schemas' NOT NULL
+/// columns, keys and BOOLEAN domain: the multiplicity of every output tuple over the universe.
+/// Panics, naming the tuple and the tables, on the first difference.
+pub fn agrees(schemas: &[Value], a: &Value, b: &Value) {
+    let input = Input::parse(&json!({ "schemas": schemas, "queries": [a, b] })).unwrap();
+    let [qa, qb] = translate_input(&input).unwrap();
+    let mut universe: Vec<UConst> = vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2)];
+    universe.extend([UConst::Str("a".into()), UConst::Str("b".into())]);
+    let mut seed: u64 = 11;
+    let mut next = |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as usize % m
+    };
+    for _ in 0..25 {
+        let mut tables: HashMap<String, Vec<Vec<UConst>>> = HashMap::new();
+        for s in &input.schemas {
+            let mut rows: Vec<Vec<UConst>> = Vec::new();
+            for _ in 0..next(4) {
+                let row: Vec<UConst> = s
+                    .types
+                    .iter()
+                    .enumerate()
+                    .map(|(c, ty)| {
+                        let d: Vec<UConst> = domain(*ty).into_iter().filter(|v| s.nullable[c] || *v != UConst::Null).collect();
+                        d[next(d.len())].clone()
+                    })
+                    .collect();
+                let clash = s.key.iter().any(|k| rows.iter().any(|r| k.iter().all(|c| r[*c] == row[*c])));
+                if !clash {
+                    rows.push(row);
+                }
+            }
+            tables.insert(s.name.clone(), rows);
+        }
+        let arity = qa.arity;
+        let mut tuple = vec![0usize; arity];
+        loop {
+            let out: Vec<UConst> = tuple.iter().map(|i| universe[*i].clone()).collect();
+            let count = |q: &Query| {
+                let db = Db::new(tables.clone(), universe.clone(), q.widths.clone());
+                db.count(&q.term, &mut Env::from([(OUT_VAR_ID, out.clone())])).unwrap()
+            };
+            assert_eq!(count(&qa), count(&qb), "{out:?} on {tables:?}");
+            let Some(i) = (0..arity).find(|i| tuple[*i] + 1 < universe.len()) else { break };
+            tuple[..i].iter_mut().for_each(|x| *x = 0);
+            tuple[i] += 1;
+        }
+    }
 }
