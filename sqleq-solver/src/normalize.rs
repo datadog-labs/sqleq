@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::ic::Ics;
 use crate::translate::{NUMERIC_EQ_KEY, OUT_VAR_ID};
@@ -52,6 +53,9 @@ pub struct Normalizer {
     /// a time: each sum's new body is charged its growth here, so many sums that each grow a little
     /// cannot together outgrow the budget unnoticed.
     size_now: std::cell::Cell<usize>,
+    /// Past this, [`Normalizer::normalize`] stops between rounds with the term it has, which is as
+    /// equivalent to the input as a fixpoint would be.
+    deadline: Option<Instant>,
 }
 
 impl Normalizer {
@@ -62,7 +66,14 @@ impl Normalizer {
             ics: Ics::default(),
             too_large: std::cell::Cell::new(false),
             size_now: std::cell::Cell::new(0),
+            deadline: None,
         }
+    }
+
+    /// Stops rewriting at `deadline`, keeping the rounds done so far.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// Whether `t`, read as a tree, is past the size budget -- and if so, remembers it. Checked after
@@ -103,6 +114,9 @@ impl Normalizer {
         }
         let mut cur = self.rename_apart(&t);
         for _ in 0..MAX_ROUNDS {
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(cur);
+            }
             let next = self.round(&cur);
             if self.over_budget(&next) {
                 return Err(NormalizeError::TooLarge);
@@ -128,8 +142,9 @@ impl Normalizer {
         }
         if !self.ics.keys.is_empty() {
             next = self.drop_key_squash(&next);
+            next = self.eliminate_by_outer_key(&next);
         }
-        let next = canonicalize_congruence(&next);
+        let next = canonicalize_congruence(&absorb(&next));
         if self.over_budget(&next) {
             return next;
         }
@@ -196,6 +211,79 @@ impl Normalizer {
                 })
             })
         })
+    }
+
+    /// [`Normalizer::same_key`] across a scope boundary. In a product holding a direct table atom
+    /// `T(x)` of a keyed table, a factor `‖Σ_Y b‖` or `¬Σ_Y b` whose body holds a direct `T(y)`,
+    /// `y ∈ Y`, with `y.K` tied to `x.K` for a key `K` of `T` -- by the body's equalities or the
+    /// product's -- counts at most one `y` wherever the product is non-zero: there `x` is a row of
+    /// `T`, and no other row of `T` agrees with it on `K`, so the only `y` the body can hold is `x`.
+    /// The sum is then `Σ_{Y∖y} b[y := x]`. This is how `k IN (SELECT k FROM t WHERE p)` over `t`
+    /// itself reads as `p`, and an `EXISTS` over the outer table's own key as its filter.
+    fn eliminate_by_outer_key(&self, t: &UTerm) -> UTerm {
+        match t {
+            UTerm::Mul(fs) => {
+                let factors: Vec<UTerm> = fs.iter().map(|f| self.eliminate_by_outer_key(f)).collect();
+                let outer = direct_tables(&UTerm::Mul(factors.iter().cloned().map(Rc::new).collect()));
+                let factors = if outer.iter().any(|(name, _)| self.ics.keys.contains_key(name)) {
+                    factors.iter().map(|f| self.collapse_by_outer_key(f, &outer, &factors)).collect()
+                } else {
+                    factors
+                };
+                UTerm::Mul(factors.into_iter().map(Rc::new).collect())
+            }
+            UTerm::Add(ts) => UTerm::Add(ts.iter().map(|c| Rc::new(self.eliminate_by_outer_key(c))).collect()),
+            UTerm::Squash(c) => UTerm::Squash(Rc::new(self.eliminate_by_outer_key(c))),
+            UTerm::Neg(c) => UTerm::Neg(Rc::new(self.eliminate_by_outer_key(c))),
+            UTerm::Sum { vars, body } => UTerm::Sum { vars: vars.clone(), body: Rc::new(self.eliminate_by_outer_key(body)) },
+            other => pass_args(other, &mut |x| self.eliminate_by_outer_key(x)),
+        }
+    }
+
+    /// One factor `f` of `product`, whose direct table atoms are `outer`, as
+    /// [`Normalizer::eliminate_by_outer_key`] reads it. Under the squash or negation, a sum of sums
+    /// (an `IN` list distributed over the subquery) is read one summand at a time: each equals its
+    /// collapsed form wherever the product is non-zero.
+    fn collapse_by_outer_key(&self, f: &UTerm, outer: &[(String, u32)], product: &[UTerm]) -> UTerm {
+        let (inner, rewrap): (&UTerm, fn(UTerm) -> UTerm) = match f {
+            UTerm::Squash(c) => (c, |t| UTerm::Squash(Rc::new(t))),
+            UTerm::Neg(c) => (c, |t| UTerm::Neg(Rc::new(t))),
+            _ => return f.clone(),
+        };
+        match inner {
+            UTerm::Sum { .. } => rewrap(self.collapse_sum(inner, outer, product)),
+            UTerm::Add(ts) => rewrap(UTerm::Add(ts.iter().map(|s| Rc::new(self.collapse_sum(s, outer, product))).collect())),
+            _ => f.clone(),
+        }
+    }
+
+    /// The sum `s` with its var `y` replaced by the outer row `x` that `y`'s key ties it to, as
+    /// [`Normalizer::eliminate_by_outer_key`] says; `s` unchanged when there is none.
+    fn collapse_sum(&self, s: &UTerm, outer: &[(String, u32)], product: &[UTerm]) -> UTerm {
+        let UTerm::Sum { vars, body } = s else { return s.clone() };
+        let bound = base_ids(vars);
+        // Candidates first: a bound var guarded by a keyed table the product also holds a row of.
+        let candidates: Vec<(String, u32)> = direct_tables(body)
+            .into_iter()
+            .filter(|(name, y)| bound.contains(y) && self.ics.keys.contains_key(name) && outer.iter().any(|(n, x)| n == name && !bound.contains(x)))
+            .collect();
+        if candidates.is_empty() {
+            return s.clone();
+        }
+        // The product's equalities hold wherever the product is non-zero, the only place the
+        // rewrite claims anything; none of them mentions a var of `Y`.
+        let mut known = factors_of(body);
+        known.extend(product.iter().filter(|p| matches!(p, UTerm::Pred { kind: PredKind::Eq, .. })).cloned());
+        let classes = Congruence::from_factors(&known);
+        let col = |i: u32, v: u32| UTerm::Var(UVar::proj(i, UVar::Base(v)));
+        for (name, y) in candidates {
+            let keys = &self.ics.keys[&name];
+            let tied = |x: u32| keys.iter().any(|k| k.iter().all(|&c| classes.same(&col(c, y), &col(c, x))));
+            let Some(&(_, x)) = outer.iter().find(|(n, x)| *n == name && !bound.contains(x) && tied(*x)) else { continue };
+            let rest: Vec<UVar> = vars.iter().filter(|v| **v != UVar::Base(y)).cloned().collect();
+            return mk_sum(rest, simplify(&body.rename_base(y, x)));
+        }
+        s.clone()
     }
 
     /// `applyNotNullRemoveNotNull`: in a product holding a table factor `T(x)` (directly, or inside a
@@ -595,6 +683,61 @@ fn table_names(factors: &[UTerm]) -> Vec<String> {
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// Drops, inside a product's squashed or negated factor, the factors its other factors already
+/// imply non-zero ([`implied_nonzero`]): `h·‖h·q‖` is `h·‖q‖` and `h·¬(h·q)` is `h·¬q`. Where `h` is 0
+/// both sides are; elsewhere `h ≥ 1`, and `h·q` is non-zero exactly when `q` is. Through a sum it
+/// applies to the body's factors that mention none of the sum's vars (`Σ_y h·q` is `h·Σ_y q`).
+fn absorb(t: &UTerm) -> UTerm {
+    match t {
+        UTerm::Mul(fs) => {
+            let factors: Vec<UTerm> = fs.iter().map(|f| absorb(f)).collect();
+            let wraps_a_product = |f: &UTerm| {
+                matches!(f, UTerm::Squash(c) | UTerm::Neg(c) if matches!(**c, UTerm::Mul(_) | UTerm::Sum { .. } | UTerm::Add(_)))
+            };
+            if !factors.iter().any(wraps_a_product) {
+                return UTerm::Mul(factors.into_iter().map(Rc::new).collect());
+            }
+            // A squashed factor is in `held` itself, which is harmless: no factor strictly inside
+            // it is it, or the squash of it.
+            let held: HashSet<&UTerm> = factors.iter().collect();
+            let classes = Congruence::from_factors(&factors);
+            let none = HashSet::new();
+            let out: Vec<UTerm> = factors
+                .iter()
+                .map(|f| match f {
+                    UTerm::Squash(c) if wraps_a_product(f) => UTerm::Squash(Rc::new(absorb_inside(c, &held, &classes, &none))),
+                    UTerm::Neg(c) if wraps_a_product(f) => UTerm::Neg(Rc::new(absorb_inside(c, &held, &classes, &none))),
+                    f => f.clone(),
+                })
+                .collect();
+            UTerm::Mul(out.into_iter().map(Rc::new).collect())
+        }
+        UTerm::Add(ts) => UTerm::Add(ts.iter().map(|c| Rc::new(absorb(c))).collect()),
+        UTerm::Squash(c) => UTerm::Squash(Rc::new(absorb(c))),
+        UTerm::Neg(c) => UTerm::Neg(Rc::new(absorb(c))),
+        UTerm::Sum { vars, body } => UTerm::Sum { vars: vars.clone(), body: Rc::new(absorb(body)) },
+        other => pass_args(other, &mut absorb),
+    }
+}
+
+/// `t`, the operand of a squash or negation, without the factors `held` (outside it) implies
+/// non-zero; `bound` are the vars of the sums crossed on the way in, which such a factor must not
+/// mention. A sum of terms is read summand by summand: only whether it is zero matters here, and
+/// with `h ≥ 1`, `h·q₁ + h·q₂` is zero exactly when `q₁ + q₂` is.
+fn absorb_inside(t: &UTerm, held: &HashSet<&UTerm>, classes: &Congruence, bound: &HashSet<u32>) -> UTerm {
+    let implied = |f: &UTerm| !mentions_any(f, bound) && implied_nonzero(f, held, classes);
+    match t {
+        UTerm::Mul(fs) => mk_mul(fs.iter().filter(|f| !implied(f)).map(|f| (**f).clone())),
+        UTerm::Add(ts) => UTerm::Add(ts.iter().map(|s| Rc::new(absorb_inside(s, held, classes, bound))).collect()),
+        UTerm::Sum { vars, body } => {
+            let mut inner = bound.clone();
+            inner.extend(base_ids(vars));
+            mk_sum(vars.clone(), absorb_inside(body, held, classes, &inner))
+        }
+        other => other.clone(),
+    }
 }
 
 /// Summands of one `Add` beyond which [`Normalizer::merge_complements`] does not look for pairs.

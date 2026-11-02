@@ -144,7 +144,13 @@ What it rewrites, in the order the ladder runs it:
   **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
   Normalization also merges a row's matched and unmatched summands (`Σ X·N + Σ X·¬N` is `Σ X`
   when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
-  LIA\* rung.
+  LIA\* rung. A correlated subquery reads the row of the query it sits in: its term is an ordinary
+  term with a free var, bound by the sum that encloses it, the way an uncorrelated `IN` already
+  puts its outer operand inside the inner sum. A table's key is used across that boundary too: a
+  subquery's row of a keyed table that agrees on the key with a row the outer query holds is that
+  row (`k IN (SELECT k FROM t WHERE p)` over `t` itself is `p`), and a factor the outer product
+  holds is dropped from inside its squashes. Normalization stops after 25 seconds, both attempts
+  together, with the term it has; every intermediate term is equivalent to the input.
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
   or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings,
   so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is

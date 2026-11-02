@@ -52,6 +52,8 @@
 //! other (see `dedup_by_identity`). So does `MAX`/`MIN`, which binds the extremum to an input by
 //! identity, and is refused the same way (see `extremum_by_identity`).
 
+use std::rc::Rc;
+
 use crate::card::{self, Slice};
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
 use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
@@ -333,39 +335,73 @@ fn pred_kind(op: &str) -> PredKind {
     }
 }
 
-/// Column-resolution scope: `local[i]` is the `UVar` standing for logical column `base + i`, and
-/// `types[i]` its [`EqType`]. `base` is constant across a non-subquery-crossing relation subtree and
-/// only advances when translation descends into a nested subquery.
-struct Scope {
+/// The row of a query a subquery sits in, as the subquery sees it: the vars standing for logical
+/// columns `base..base + local.len()`, and their [`EqType`]s.
+#[derive(Debug)]
+struct Frame {
     base: usize,
     local: Vec<UVar>,
     types: Vec<Option<EqType>>,
 }
 
+/// Column-resolution scope: `local[i]` is the `UVar` standing for logical column `base + i`, and
+/// `types[i]` its [`EqType`]. `base` is constant across a non-subquery-crossing relation subtree and
+/// only advances when translation descends into a nested subquery.
+///
+/// `outer` holds the rows of the queries a subquery sits in, innermost last. A column below `base`
+/// is one of theirs -- a correlated reference -- and resolves to the var their translation bound it
+/// to, with its [`EqType`]. That var is bound by a sum enclosing every place the subquery's term
+/// lands: a filter's condition, a projection's values, a join's `ON` (both of an outer join's
+/// branches) and a group all sit inside the sum over their source's vars, so a correlated term is
+/// an ordinary term with a free var its context binds, which every later stage already handles (an
+/// uncorrelated `IN` puts the outer operand inside the inner sum in just this way).
+struct Scope {
+    base: usize,
+    local: Vec<UVar>,
+    types: Vec<Option<EqType>>,
+    outer: Vec<Rc<Frame>>,
+}
+
 impl Scope {
-    /// The scope a relation's output makes for the expressions over it.
-    fn over(src: &Translated, base: usize) -> Scope {
-        Scope { base, local: src.local.clone(), types: src.types.clone() }
+    /// The scope a relation's output makes for the expressions over it, inside the enclosing rows
+    /// `outer` (the translator's frames, empty outside any subquery).
+    fn over(src: &Translated, base: usize, outer: &[Rc<Frame>]) -> Scope {
+        Scope { base, local: src.local.clone(), types: src.types.clone(), outer: outer.to_vec() }
     }
 
+    /// This scope's row, as a subquery inside it sees it.
+    fn frame(&self) -> Rc<Frame> {
+        Rc::new(Frame { base: self.base, local: self.local.clone(), types: self.types.clone() })
+    }
+
+    /// The enclosing frame holding column `index` (below `base`), and its position there.
+    fn outer_column(&self, index: usize) -> Option<(&Frame, usize)> {
+        self.outer.iter().rev().find_map(|f| (f.base <= index && index < f.base + f.local.len()).then(|| (&**f, index - f.base)))
+    }
+
+    /// A column no frame holds is still refused as `correlated`.
     fn resolve(&self, index: u32) -> Result<UVar, TranslateError> {
         let index = index as usize;
         if index < self.base {
-            return Err(TranslateError::Correlated);
+            return self.outer_column(index).map(|(f, i)| f.local[i].clone()).ok_or(TranslateError::Correlated);
         }
         self.local.get(index - self.base).cloned().ok_or(TranslateError::ColumnOutOfRange)
     }
 
-    /// The [`EqType`] of `e` here: a bare column reference has its column's, when the two agree on
-    /// the IR type; anything else has what its IR type says.
+    /// The [`EqType`] of `e` here: a bare column reference has its column's -- an enclosing
+    /// query's, for a correlated one -- when the two agree on the IR type; anything else has what
+    /// its IR type says.
     fn eq_type(&self, e: &Expr) -> EqType {
         let own = EqType::of(e.ty());
         match e {
-            Expr::Column { index, ty } => (*index as usize)
-                .checked_sub(self.base)
-                .and_then(|i| self.types.get(i).copied().flatten())
-                .filter(|t| t.ty == *ty)
-                .unwrap_or(own),
+            Expr::Column { index, ty } => {
+                let i = *index as usize;
+                let declared = match i.checked_sub(self.base) {
+                    Some(j) => self.types.get(j).copied().flatten(),
+                    None => self.outer_column(i).and_then(|(f, j)| f.types.get(j).copied().flatten()),
+                };
+                declared.filter(|t| t.ty == *ty).unwrap_or(own)
+            }
             _ => own,
         }
     }
@@ -386,11 +422,25 @@ pub struct Translator<'s> {
     schemas: &'s [Schema],
     /// `widths[i]` is the column count of `Base(i)`; its length is the next fresh id.
     widths: Vec<usize>,
+    /// The rows of the queries the subquery being translated sits in, innermost last (see
+    /// [`Scope`]); empty outside any subquery.
+    frames: Vec<Rc<Frame>>,
 }
 
 impl<'s> Translator<'s> {
     pub fn new(schemas: &'s [Schema]) -> Self {
-        Translator { schemas, widths: Vec::new() }
+        Translator { schemas, widths: Vec::new(), frames: Vec::new() }
+    }
+
+    /// Translates a subquery's relation inside `scope`: its own scopes see `scope`'s row, and the
+    /// rows of the queries around it, as enclosing frames.
+    fn subquery(&mut self, query: &Relation, scope: &Scope) -> Result<Translated, TranslateError> {
+        let mut frames = scope.outer.clone();
+        frames.push(scope.frame());
+        let saved = std::mem::replace(&mut self.frames, frames);
+        let inner = self.rel(query, scope.base + scope.local.len());
+        self.frames = saved;
+        inner
     }
 
     fn fresh_var(&mut self, width: usize) -> UVar {
@@ -457,7 +507,7 @@ impl<'s> Translator<'s> {
         }
         let var = self.fresh_var(schema.len());
         let local: Vec<UVar> = (0..schema.len() as u32).map(|idx| UVar::proj(idx, var.clone())).collect();
-        let no_columns = Scope { base, local: Vec::new(), types: Vec::new() };
+        let no_columns = Scope { base, local: Vec::new(), types: Vec::new(), outer: self.frames.clone() };
         let mut rows = Vec::with_capacity(content.len());
         for row in content {
             if row.len() != local.len() {
@@ -482,7 +532,7 @@ impl<'s> Translator<'s> {
 
     fn filter(&mut self, source: &Relation, condition: &Expr, base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base);
+        let scope = Scope::over(&src, base, &self.frames);
         let cond = self.translate_predicate(condition, &scope)?;
         Ok(Translated { term: mk_mul([src.term, cond]), local: src.local, types: src.types, exposed: src.exposed })
     }
@@ -503,7 +553,7 @@ impl<'s> Translator<'s> {
 
     fn project(&mut self, source: &Relation, target: &[Expr], base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base);
+        let scope = Scope::over(&src, base, &self.frames);
         let values: Vec<Value> = target.iter().map(|e| self.translate_value(e, &scope)).collect::<Result<_, _>>()?;
         let types = target.iter().map(|e| Some(scope.eq_type(e))).collect();
         Ok(self.project_values(src, values, types))
@@ -533,7 +583,7 @@ impl<'s> Translator<'s> {
         let r = self.rel(right, base)?;
         let local: Vec<UVar> = l.local.iter().chain(r.local.iter()).cloned().collect();
         let types: Vec<Option<EqType>> = l.types.iter().chain(r.types.iter()).copied().collect();
-        let scope = Scope { base, local: local.clone(), types: types.clone() };
+        let scope = Scope { base, local: local.clone(), types: types.clone(), outer: self.frames.clone() };
         let cond = self.translate_predicate(condition, &scope)?;
 
         let matched = mk_mul([l.term.clone(), r.term.clone(), cond.clone()]);
@@ -563,7 +613,7 @@ impl<'s> Translator<'s> {
         base: usize,
     ) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base);
+        let scope = Scope::over(&src, base, &self.frames);
 
         let mut key_vars = Vec::with_capacity(keys.len());
         for k in keys {
@@ -819,7 +869,7 @@ impl<'s> Translator<'s> {
     /// ([`card::strip_nonempty_slices`]).
     fn exists_predicate(&mut self, query: &Relation, scope: &Scope) -> Result<UTerm, TranslateError> {
         let stripped = card::strip_nonempty_slices(query);
-        let inner = self.rel(stripped.as_ref().unwrap_or(query), scope.base + scope.local.len())?;
+        let inner = self.subquery(stripped.as_ref().unwrap_or(query), scope)?;
         Ok(mk_squash(mk_sum(inner.exposed, inner.term)))
     }
 
@@ -829,7 +879,7 @@ impl<'s> Translator<'s> {
     /// yields a NULL, and why `NOT IN` is not `NOT EXISTS`.
     fn in_truth(&mut self, operand: &[Expr], query: &Relation, scope: &Scope) -> Result<Truth, TranslateError> {
         let lhs: Vec<Value> = operand.iter().map(|e| self.translate_value(e, scope)).collect::<Result<_, _>>()?;
-        let inner = self.rel(query, scope.base + scope.local.len())?;
+        let inner = self.subquery(query, scope)?;
         if inner.local.len() != lhs.len() {
             return Err(TranslateError::MalformedShape("IN operand arity does not match subquery width".into()));
         }
@@ -861,7 +911,7 @@ impl<'s> Translator<'s> {
     /// let a scalar aggregate (which always has its one row) be NULL, and turn `x = (SELECT …)`
     /// over a NULL value into FALSE where SQL says UNKNOWN -- which a `NOT` then makes TRUE.
     fn scalar_subquery_value(&mut self, query: &Relation, scope: &Scope) -> Result<Value, TranslateError> {
-        let inner = self.rel(query, scope.base + scope.local.len())?;
+        let inner = self.subquery(query, scope)?;
         if inner.local.len() != 1 {
             return Err(TranslateError::ScalarSubqueryArity);
         }
@@ -1228,7 +1278,7 @@ mod tests {
         let schemas = one_table(vec![Type::Integer]);
         let mut t = Translator::new(&schemas);
         let src = t.scan(0).unwrap();
-        let scope = Scope::over(&src, 0);
+        let scope = Scope::over(&src, 0, &[]);
         let e = Expr::Call {
             operator: "IS NULL".to_string(),
             ty: Type::Boolean,
@@ -1368,7 +1418,7 @@ mod tests {
             let e = Expr::parse(json, 1).unwrap();
             let mut t = Translator::new(&schemas);
             let src = t.scan(0).unwrap();
-            let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
+            let truth = t.translate_truth(&e, &Scope::over(&src, 0, &[])).unwrap();
             let db = Db::new(Default::default(), values.to_vec(), Default::default());
             for a in &values {
                 for b in &values {
@@ -1401,7 +1451,7 @@ mod tests {
         };
         let mut t = Translator::new(&schemas);
         let src = t.scan(0).unwrap();
-        let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
+        let truth = t.translate_truth(&e, &Scope::over(&src, 0, &[])).unwrap();
         let widths = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
         let (n, one, two, three) = (UConst::Null, UConst::Int(1), UConst::Int(2), UConst::Int(3));
         // (contents of s, the operand, expected (TRUE, UNKNOWN))
@@ -1467,7 +1517,7 @@ mod tests {
             let e = Expr::parse(&cond, 2).unwrap();
             let mut t = Translator::new(&schemas);
             let src = t.scan(0).unwrap();
-            let truth = t.translate_truth(&e, &Scope::over(&src, 0)).unwrap();
+            let truth = t.translate_truth(&e, &Scope::over(&src, 0, &[])).unwrap();
             let widths: std::collections::HashMap<u32, usize> = t.widths.iter().enumerate().map(|(i, w)| (i as u32, *w)).collect();
             let universe = vec![UConst::Null, UConst::Int(0), UConst::Int(1), UConst::Int(2), UConst::Int(5)];
             contents

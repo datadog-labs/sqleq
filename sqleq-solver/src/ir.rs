@@ -113,6 +113,9 @@ pub enum TranslateError {
     GroupKeyNonRef,
     AggArgNonRef,
     ExprNotObject,
+    /// A column below its scope's base that no enclosing query's row holds. A correlated subquery
+    /// reads its enclosing rows (`translate::Scope`), so on the frontend's IR, where those rows
+    /// tile every level below a subquery's own, this is a malformed plan rather than a construct.
     Correlated,
     ColumnOutOfRange,
     CastArity,
