@@ -1619,7 +1619,7 @@ impl VisitorMut for ReplaceCteRefs<'_> {
 /// Over-approximated, which only refuses more: compared lower-cased, though a quoted `"PG_CATALOG"`
 /// is a schema a user may create, and `information_schema` as a whole, though a superuser may add a
 /// table of their own to it.
-pub fn system_schema(schema: &str) -> bool {
+pub(crate) fn system_schema(schema: &str) -> bool {
     let s = schema.to_lowercase();
     s.starts_with("pg_") || s == "information_schema"
 }
@@ -1634,10 +1634,11 @@ pub fn system_schema(schema: &str) -> bool {
 ///   the prefix is the rule, not a list of one major's catalog: a list that misses a relation a newer
 ///   major adds would lower that relation against the DDL. A user table named `pg_*` is read
 ///   through its schema (`public.pg_x`), which this does not refuse.
-/// * **Any qualifier that is a [`system_schema`].** `pg_catalog.pg_attribute` is the catalog's even
+/// * **Any qualifier that is a system schema** (`system_schema`): `information_schema`, or any name
+///   under the `pg_` prefix Postgres reserves. `pg_catalog.pg_attribute` is the catalog's even
 ///   when the DDL "declares" it, since Postgres would not run that `CREATE TABLE`.
 ///
-/// Lower-cased, as [`safe_to_strip`] keys a bare name, so `"PG_X"` (not `pg_x` to Postgres) is
+/// Lower-cased, as `safe_to_strip` keys a bare name, so `"PG_X"` (not `pg_x` to Postgres) is
 /// refused too; that costs only a refusal. A part that is not an identifier counts as no name.
 pub fn system_relation(name: &ObjectName) -> bool {
     let parts: Vec<String> =
