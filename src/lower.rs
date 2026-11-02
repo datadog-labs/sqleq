@@ -1282,13 +1282,12 @@ fn lower_setexpr_ctx(
                     let u = json!({ "union": [lv, rv] });
                     if all { u } else { json!({ "distinct": u }) }
                 }
-                // The prover's Intersect/Except are set-semantics (squash); ALL = bag => refuse.
-                SetOperator::Intersect if all => return Err(unsupported("INTERSECT ALL (bag semantics)")),
+                // The prover's Intersect/Except are set-semantics (squash); the ALL forms keep
+                // multiplicities, their own nodes, which a prover without bags refuses.
+                SetOperator::Intersect if all => json!({ "intersectAll": [lv, rv] }),
                 SetOperator::Intersect => json!({ "intersect": [lv, rv] }),
                 // MINUS is a non-standard synonym for EXCEPT.
-                SetOperator::Except | SetOperator::Minus if all => {
-                    return Err(unsupported("EXCEPT/MINUS ALL (bag semantics)"))
-                }
+                SetOperator::Except | SetOperator::Minus if all => json!({ "exceptAll": [lv, rv] }),
                 SetOperator::Except | SetOperator::Minus => json!({ "except": [lv, rv] }),
             };
             Ok((rel, lcols, None))
@@ -1422,7 +1421,7 @@ fn branch_cells(rel: &Value, j: usize) -> Option<Vec<&Value>> {
         "project" => body["target"].as_array()?.get(j).map(|c| vec![c]),
         "values" => body["content"].as_array()?.iter().map(|row| row.get(j)).collect(),
         "distinct" => branch_cells(body, j),
-        "union" | "intersect" | "except" => {
+        "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
             let mut all = Vec::new();
             for r in body.as_array()? {
                 all.extend(branch_cells(r, j)?);
@@ -1454,7 +1453,7 @@ fn convert_branch_cells(rel: &mut Value, j: usize, ct: &str) {
             }
         }
         "distinct" => convert_branch_cells(body, j, ct),
-        "union" | "intersect" | "except" => {
+        "union" | "intersect" | "except" | "intersectAll" | "exceptAll" => {
             for r in body.as_array_mut().into_iter().flatten() {
                 convert_branch_cells(r, j, ct);
             }

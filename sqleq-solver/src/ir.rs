@@ -140,6 +140,8 @@ pub enum TranslateError {
     /// translated only where the same slice of an equal source stands on the other side (see
     /// `opaque`); real LIMIT/OFFSET semantics (SQLSolver's `OrderbySupport`) is not ported.
     UnsupportedSort,
+    /// `INTERSECT ALL` or `EXCEPT ALL`, which a prover over sets cannot state.
+    UnsupportedBagSetOp,
     /// Translation-stage-only: an aggregate call with `distinct: true` other than `COUNT`, `MAX`
     /// and `MIN`. `COUNT(DISTINCT x)` is SQLSolver's nested existential sum, and a `MAX`/`MIN`
     /// ignores `DISTINCT`; `SUM`/`AVG(DISTINCT)` would need a sum over values, which is refused.
@@ -186,6 +188,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::UnknownType(t) => write!(f, "unknown-type:{t}"),
             TranslateError::MalformedShape(msg) => write!(f, "malformed-shape:{msg}"),
             TranslateError::UnsupportedSort => write!(f, "unsupported-sort"),
+            TranslateError::UnsupportedBagSetOp => write!(f, "unsupported-bag-set-operation"),
             TranslateError::DistinctAggregateUnsupported => write!(f, "aggregate-distinct-unsupported"),
             TranslateError::ScalarSubqueryArity => write!(f, "scalar-subquery-arity"),
             TranslateError::DedupNotIdentity(ty) => write!(f, "dedup-not-identity:{ty}"),
@@ -296,6 +299,10 @@ pub enum Relation {
     Union([Box<Relation>; 2]),
     Except([Box<Relation>; 2]),
     Intersect([Box<Relation>; 2]),
+    /// `INTERSECT ALL`: each row as many times as the branch with fewer copies has it.
+    IntersectAll([Box<Relation>; 2]),
+    /// `EXCEPT ALL`: each row as many times as the first branch has it more than the second.
+    ExceptAll([Box<Relation>; 2]),
 }
 
 impl Relation {
@@ -399,6 +406,12 @@ impl Relation {
         if let Some(x) = o.get("intersect") {
             return set_op(x, schema_count, "intersect").map(Relation::Intersect);
         }
+        if let Some(x) = o.get("intersectAll") {
+            return set_op(x, schema_count, "intersectAll").map(Relation::IntersectAll);
+        }
+        if let Some(x) = o.get("exceptAll") {
+            return set_op(x, schema_count, "exceptAll").map(Relation::ExceptAll);
+        }
 
         let tag = o.keys().next().cloned().unwrap_or_default();
         Err(TranslateError::UnknownRelation(tag))
@@ -423,7 +436,11 @@ impl Relation {
                 keys.iter().map(|k| Some(k.ty())).chain(function.iter().map(|f| Some(f.ty))).collect()
             }
             Relation::Values { schema, .. } => schema.iter().copied().map(Some).collect(),
-            Relation::Union(sides) | Relation::Except(sides) | Relation::Intersect(sides) => {
+            Relation::Union(sides)
+            | Relation::Except(sides)
+            | Relation::Intersect(sides)
+            | Relation::IntersectAll(sides)
+            | Relation::ExceptAll(sides) => {
                 let (l, r) = (sides[0].output_types(schemas), sides[1].output_types(schemas));
                 l.iter().zip(r.iter()).map(|(a, b)| if a == b { *a } else { None }).collect()
             }

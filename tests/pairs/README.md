@@ -86,7 +86,7 @@ nothing and changing what is refused moves a pin.
 |---|---|
 | `frontend` | `emit`, `emit-reflexive` (the two sides lowered to the same IR), `reflexive` (refused, but the two sides normalize to the same tree: settled without a plan), `refuse:parse`, `refuse:unsupported`, `refuse:schema`, `refuse:parameter-misaligned` |
 | `fuzz` | `counterexample`, `no-counterexample`, `counterexample-gather`, `no-counterexample-gather` (the same two, for a pair it ran under the gather rule), `param-misaligned`, `not-comparable`, `nondet-skip`, `no-schema`, `no-tables`, `error` |
-| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed), `panic`, `error` |
+| `qed` | `proved`, `proved-literal` (proved, from the same IR on both sides), `no-proof`, `no-plan` (the frontend produced no plan: it refused, timed out or failed; or the plan has a node QED's IR cannot read, `INTERSECT ALL` or `EXCEPT ALL`, and was not handed to it), `panic`, `error` |
 | `sqleq-solver`, `sqlsolver-jvm` | `proved`, `proved-literal`, `no-proof`, `unsupported` (the bridge could not express the plan), `no-plan`, `error` |
 | `lean` | `proved-gather`, `no-witness` (proved, but possibly vacuously), `proved-gather-generated`, `no-witness-generated` (the same, under the weaker claim for generated cells), `unsupported`, `invalid-sql`, `error` — see [LEAN.md](../../docs/LEAN.md) |
 
