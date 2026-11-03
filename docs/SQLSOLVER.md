@@ -246,7 +246,10 @@ Each difference is there for soundness:
   The exception is an opaque column the schema lists in `opaque_identity`: the frontend lists
   those whose Postgres type has an identity `=` (`bytea`, `uuid`, `money`, the discrete ranges,
   arrays of integers or strings; `src/types.rs`, `opaque_identity`), and on a bare reference to one
-  `=` is identity again. Deduplication (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
+  `=` is identity again. So it is on a parameter the input lists in `identity_params`: the frontend
+  lists one that the pair compares only with columns of one such type (`param_types`,
+  `identity_params`), which Postgres then types as that column's type, so `fact.version = $1` and
+  `version.id = $1` give `fact.version = version.id`. Deduplication (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`)
   binds its output to its input by identity, so over a column whose `=` is not identity, where
   Postgres keeps one row of each class of `=`-equal values and a cast to text can tell which, it is
   refused (`dedup-not-identity`). So is a `MAX` or `MIN` over such a column

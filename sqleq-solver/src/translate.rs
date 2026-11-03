@@ -52,6 +52,7 @@
 //! other (see `dedup_by_identity`). So does `MAX`/`MIN`, which binds the extremum to an input by
 //! identity, and is refused the same way (see `extremum_by_identity`).
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::card::{self, Slice};
@@ -380,13 +381,15 @@ struct Scope {
     local: Vec<UVar>,
     types: Vec<Option<EqType>>,
     outer: Vec<Rc<Frame>>,
+    /// The parameter carriers whose `=` is identity ([`crate::ir::Input::identity_params`]).
+    params: Rc<BTreeSet<String>>,
 }
 
 impl Scope {
     /// The scope a relation's output makes for the expressions over it, inside the enclosing rows
     /// `outer` (the translator's frames, empty outside any subquery).
     fn over(src: &Translated, base: usize, outer: &[Rc<Frame>]) -> Scope {
-        Scope { base, local: src.local.clone(), types: src.types.clone(), outer: outer.to_vec() }
+        Scope { base, local: src.local.clone(), types: src.types.clone(), outer: outer.to_vec(), params: Rc::default() }
     }
 
     /// This scope's row, as a subquery inside it sees it.
@@ -422,6 +425,8 @@ impl Scope {
                 };
                 declared.filter(|t| t.ty == *ty).unwrap_or(own)
             }
+            // A parameter the frontend lists holds a value of an opaque type whose `=` is identity.
+            Expr::Call { operator, ty: Type::Varbinary, .. } if self.params.contains(operator) => EqType { ty: Type::Varbinary, identity: true },
             _ => own,
         }
     }
@@ -445,11 +450,24 @@ pub struct Translator<'s> {
     /// The rows of the queries the subquery being translated sits in, innermost last (see
     /// [`Scope`]); empty outside any subquery.
     frames: Vec<Rc<Frame>>,
+    /// The parameter carriers whose `=` is identity, which every scope this builds is given.
+    params: Rc<BTreeSet<String>>,
 }
 
 impl<'s> Translator<'s> {
     pub fn new(schemas: &'s [Schema]) -> Self {
-        Translator { schemas, widths: Vec::new(), frames: Vec::new() }
+        Translator { schemas, widths: Vec::new(), frames: Vec::new(), params: Rc::default() }
+    }
+
+    /// Reads `=` on the parameter carriers `params` names as identity.
+    pub fn with_identity_params(mut self, params: &BTreeSet<String>) -> Self {
+        self.params = Rc::new(params.clone());
+        self
+    }
+
+    /// The scope `src`'s output makes at `base`, inside this translator's frames.
+    fn scope_over(&self, src: &Translated, base: usize) -> Scope {
+        Scope { params: self.params.clone(), ..Scope::over(src, base, &self.frames) }
     }
 
     /// Translates a subquery's relation inside `scope`: its own scopes see `scope`'s row, and the
@@ -528,7 +546,7 @@ impl<'s> Translator<'s> {
         }
         let var = self.fresh_var(schema.len());
         let local: Vec<UVar> = (0..schema.len() as u32).map(|idx| UVar::proj(idx, var.clone())).collect();
-        let no_columns = Scope { base, local: Vec::new(), types: Vec::new(), outer: self.frames.clone() };
+        let no_columns = Scope { base, local: Vec::new(), types: Vec::new(), outer: self.frames.clone(), params: self.params.clone() };
         let mut rows = Vec::with_capacity(content.len());
         for row in content {
             if row.len() != local.len() {
@@ -553,7 +571,7 @@ impl<'s> Translator<'s> {
 
     fn filter(&mut self, source: &Relation, condition: &Expr, base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base, &self.frames);
+        let scope = self.scope_over(&src, base);
         let cond = self.translate_predicate(condition, &scope)?;
         Ok(Translated { term: mk_mul([src.term, cond]), local: src.local, types: src.types, exposed: src.exposed })
     }
@@ -574,7 +592,7 @@ impl<'s> Translator<'s> {
 
     fn project(&mut self, source: &Relation, target: &[Expr], base: usize) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base, &self.frames);
+        let scope = self.scope_over(&src, base);
         let values: Vec<Value> = target.iter().map(|e| self.translate_value(e, &scope)).collect::<Result<_, _>>()?;
         let types = target.iter().map(|e| Some(scope.eq_type(e))).collect();
         Ok(self.project_values(src, values, types))
@@ -604,7 +622,7 @@ impl<'s> Translator<'s> {
         let r = self.rel(right, base)?;
         let local: Vec<UVar> = l.local.iter().chain(r.local.iter()).cloned().collect();
         let types: Vec<Option<EqType>> = l.types.iter().chain(r.types.iter()).copied().collect();
-        let scope = Scope { base, local: local.clone(), types: types.clone(), outer: self.frames.clone() };
+        let scope = Scope { base, local: local.clone(), types: types.clone(), outer: self.frames.clone(), params: self.params.clone() };
         let cond = self.translate_predicate(condition, &scope)?;
 
         let matched = mk_mul([l.term.clone(), r.term.clone(), cond.clone()]);
@@ -634,7 +652,7 @@ impl<'s> Translator<'s> {
         base: usize,
     ) -> Result<Translated, TranslateError> {
         let src = self.rel(source, base)?;
-        let scope = Scope::over(&src, base, &self.frames);
+        let scope = self.scope_over(&src, base);
 
         let mut key_vars = Vec::with_capacity(keys.len());
         for k in keys {
@@ -1196,9 +1214,9 @@ fn close_output(t: Translated, widths: Vec<usize>, types: Vec<Option<Type>>) -> 
 /// share is the output var (see `close_output`).
 pub fn translate_input(input: &crate::ir::Input) -> Result<[Query; 2], TranslateError> {
     let types = |q: &Relation| q.output_types(&input.schemas);
-    let mut left = Translator::new(&input.schemas);
+    let mut left = Translator::new(&input.schemas).with_identity_params(&input.identity_params);
     let l = left.rel(&input.queries[0], 0)?;
-    let mut right = Translator::new(&input.schemas);
+    let mut right = Translator::new(&input.schemas).with_identity_params(&input.identity_params);
     let r = right.rel(&input.queries[1], 0)?;
     Ok([
         close_output(l, left.widths, types(&input.queries[0])),
