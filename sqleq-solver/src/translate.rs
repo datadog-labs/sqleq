@@ -56,7 +56,7 @@ use std::rc::Rc;
 
 use crate::card::{self, Slice};
 use crate::ir::{AggCall, Expr, JoinKind, Relation, Schema, TranslateError, Type};
-use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, PredKind, UConst, UTerm, UVar};
+use crate::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, Order, PredKind, UConst, UTerm, UVar};
 
 /// The key function SQL's `=` compares two numbers (INTEGER or REAL, in any mix) through: their
 /// exact numeric value, whatever their type or scale. Normalization and the evaluator interpret it
@@ -104,6 +104,26 @@ impl EqType {
             (Some(a), Some(b)) if a.ty == b.ty => Some(EqType { ty: a.ty, identity: a.identity && b.identity }),
             _ => None,
         }
+    }
+}
+
+/// The [`Order`] two operands are compared in: the order of their type when both have the same
+/// type, its `=` is identity on both, and the type is one whose order the encoding knows the laws of
+/// (INTEGER, VARCHAR, DATE, TIME, TIMESTAMP). Anything else is [`Order::Opaque`], an order nothing
+/// is assumed about: REAL, whose `=` is not identity, so `x <= y AND y <= x` makes them `=`-equal
+/// but not the same value; INTERVAL likewise; VARBINARY, which stands for many types; BOOLEAN; and
+/// two operands of different types.
+fn order_of(a: EqType, b: EqType) -> Order {
+    if a.ty != b.ty || !a.identity || !b.identity {
+        return Order::Opaque;
+    }
+    match a.ty {
+        Type::Integer => Order::Integer,
+        Type::Varchar => Order::Text,
+        Type::Date => Order::Date,
+        Type::Time => Order::Time,
+        Type::Timestamp => Order::Timestamp,
+        _ => Order::Opaque,
     }
 }
 
@@ -321,14 +341,14 @@ fn is_boolean_operator(op: &str, arity: usize) -> bool {
     }
 }
 
-fn pred_kind(op: &str) -> PredKind {
+fn pred_kind(op: &str, order: Order) -> PredKind {
     match op {
         "=" => PredKind::Eq,
         "<>" => PredKind::Ne,
-        "<" => PredKind::Lt,
-        "<=" => PredKind::Le,
-        ">" => PredKind::Gt,
-        ">=" => PredKind::Ge,
+        "<" => PredKind::Lt(order),
+        "<=" => PredKind::Le(order),
+        ">" => PredKind::Gt(order),
+        ">=" => PredKind::Ge(order),
         // Every call site matches one of these six strings in its own guard before calling this;
         // reaching here would be this module's own bug, not a possible shape of real input.
         other => unreachable!("pred_kind called with non-comparison operator {other:?}"),
@@ -718,11 +738,19 @@ impl<'s> Translator<'s> {
             // identity ([`extremum_by_identity`]).
             "MAX" | "MIN" => {
                 let x = Self::agg_arg(&call.operand, scope)?;
-                extremum_by_identity(scope.eq_type(&call.operand[0]))?;
+                let ex = scope.eq_type(&call.operand[0]);
+                extremum_by_identity(ex)?;
                 let notnull_x = mk_neg(x.is_null.clone());
                 let some_nonnull =
                     mk_squash(mk_sum(source_exposed.to_vec(), mk_mul([group_by_term.clone(), notnull_x.clone()])));
-                let beyond = if call.operator == "MAX" { PredKind::Gt } else { PredKind::Lt };
+                // In the column's own order, so that it is the predicate a written `u.x > t.x` is:
+                // an extremum and the anti-join that spells it out then match. Not over strings:
+                // `MIN` and `MAX` order them by the database's default collation, while a VARCHAR
+                // `<` reaches the IR only under `C` or `POSIX` (the frontend writes one under any
+                // other collation as an uninterpreted `q_str_lt` call), and the two orders differ:
+                // under `en_US.utf8` `MAX` of `'a'` and `'B'` is `'B'`, under `C` it is `'a'`.
+                let order = if ex.ty == Type::Varchar { Order::Opaque } else { order_of(ex, ex) };
+                let beyond = if call.operator == "MAX" { PredKind::Gt(order) } else { PredKind::Lt(order) };
                 let some_beyond = mk_squash(mk_sum(
                     source_exposed.to_vec(),
                     mk_mul([group_by_term.clone(), notnull_x.clone(), UTerm::Pred { kind: beyond, args: vec![x.value.clone(), outcol.clone()] }]),
@@ -815,11 +843,13 @@ impl<'s> Translator<'s> {
             "=" | "<>" | "<" | "<=" | ">" | ">=" => {
                 let a = self.translate_value(&operand[0], scope)?;
                 let b = self.translate_value(&operand[1], scope)?;
-                let (ta, tb) = (Some(scope.eq_type(&operand[0])), Some(scope.eq_type(&operand[1])));
-                let holds = match pred_kind(operator) {
+                let (ea, eb) = (scope.eq_type(&operand[0]), scope.eq_type(&operand[1]));
+                let (ta, tb) = (Some(ea), Some(eb));
+                let holds = match pred_kind(operator, order_of(ea, eb)) {
                     kind @ (PredKind::Eq | PredKind::Ne) => sql_equality(kind, a.value, ta, b.value, tb),
                     // An order comparison is never read as identity, so it needs no key: values
-                    // equal under `=` are simply neither less than the other.
+                    // equal under `=` are simply neither less than the other. Its domain says
+                    // what the encoding may assume about the order ([`order_of`]).
                     kind => UTerm::Pred { kind, args: vec![a.value, b.value] },
                 };
                 Ok(Truth::guarded(mk_or(a.is_null, b.is_null), holds))

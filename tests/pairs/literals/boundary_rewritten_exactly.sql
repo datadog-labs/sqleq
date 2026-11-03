@@ -7,7 +7,7 @@
 -- expect frontend: emit
 -- expect fuzz: no-counterexample
 -- expect qed: proved
--- expect sqleq-solver: no-proof
+-- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
 -- expect lean: unsupported
 -- origin: issue #187's control: a literal and its neighbours drawn into a column must not refute an

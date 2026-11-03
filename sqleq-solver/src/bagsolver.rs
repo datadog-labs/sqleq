@@ -43,7 +43,7 @@ use crate::normalize::is_zero_one;
 use crate::setsolver::TIMEOUT_MS;
 use crate::smt::{free_columns, Encoder, Facts, Side, ValueSums};
 use crate::translate::OUT_VAR_ID;
-use crate::uterm::{UTerm, UVar};
+use crate::uterm::{UConst, UTerm, UVar};
 
 /// Z3 calls one pair may make. Running out answers "not proved", which is sound.
 const MAX_CALLS: usize = 64;
@@ -168,6 +168,9 @@ fn value_sums(ts: &[UTerm]) -> Vec<UTerm> {
     out
 }
 
+/// The empty bag.
+const ZERO: UTerm = UTerm::Const(UConst::Int(0));
+
 struct Congruence<'f> {
     widths: HashMap<u32, usize>,
     facts: &'f Facts,
@@ -189,16 +192,65 @@ impl Congruence<'_> {
         if a == b {
             return true;
         }
+        if *b == ZERO {
+            return self.vanishes(a);
+        }
+        if *a == ZERO {
+            return self.vanishes(b);
+        }
         match (a, b) {
             (UTerm::Sum { vars: va, body: ba }, UTerm::Sum { vars: vb, body: bb }) => self.sum(va, ba, vb, bb),
             (UTerm::Add(xs), UTerm::Add(ys)) => self.summands(xs, ys),
+            (UTerm::Add(xs), _) => self.summands(xs, &[Rc::new(b.clone())]),
+            (_, UTerm::Add(ys)) => self.summands(&[Rc::new(a.clone())], ys),
             _ => self.product(&factors(a), &factors(b)),
         }
     }
 
+    /// Whether `t` is 0 on every database: a sum whose body is, a sum of terms each of which is, or
+    /// a product with such a factor, or whose 0/1 factors cannot all hold at once (as Z3 decides,
+    /// given its table atoms, as [`Congruence::product`] asks). An empty range is the usual case:
+    /// `x < 1 AND x > 1` holds of no row, so the rows it keeps sum to 0.
+    fn vanishes(&mut self, t: &UTerm) -> bool {
+        self.steps += 1;
+        if self.spent() {
+            return false;
+        }
+        match t {
+            UTerm::Const(UConst::Int(n)) => *n == 0,
+            UTerm::Sum { body, .. } => self.vanishes(body),
+            UTerm::Add(ts) => ts.iter().all(|s| self.vanishes(s)),
+            _ => {
+                let (bx, mx): (Vec<UTerm>, Vec<UTerm>) = factors(t).into_iter().partition(is_zero_one);
+                if mx.iter().any(|m| matches!(m, UTerm::Sum { .. } | UTerm::Add(_)) && self.vanishes(m)) {
+                    return true;
+                }
+                if bx.is_empty() {
+                    return false;
+                }
+                let ctx: Vec<UTerm> = mx.into_iter().filter(|m| matches!(m, UTerm::Table { .. })).collect();
+                self.equivalent(&ctx, &bx, &[ZERO])
+            }
+        }
+    }
+
     /// One to one, greedily: each summand of `xs` takes the first unused summand of `ys` it matches.
-    /// Greedy can miss a matching that exists, never invent one.
+    /// Greedy can miss a matching that exists, never invent one. Two sums of different lengths are
+    /// first rid of their summands that are 0 on every database ([`Congruence::vanishes`]).
     fn summands(&mut self, xs: &[Rc<UTerm>], ys: &[Rc<UTerm>]) -> bool {
+        if xs.len() != ys.len() {
+            let mut live = |ts: &[Rc<UTerm>]| -> Vec<Rc<UTerm>> { ts.iter().filter(|t| !self.vanishes(t)).cloned().collect() };
+            let (xs, ys) = (live(xs), live(ys));
+            return match (xs.len(), ys.len()) {
+                (0, 0) => true,
+                (n, m) if n == m => self.one_to_one(&xs, &ys),
+                _ => false,
+            };
+        }
+        self.one_to_one(xs, ys)
+    }
+
+    fn one_to_one(&mut self, xs: &[Rc<UTerm>], ys: &[Rc<UTerm>]) -> bool {
         if xs.len() != ys.len() {
             return false;
         }
@@ -350,7 +402,7 @@ impl Congruence<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uterm::{PredKind, UConst};
+    use crate::uterm::{Order, PredKind, UConst};
 
     fn col(i: u32, v: u32) -> UTerm {
         UTerm::Var(UVar::proj(i, UVar::Base(v)))
@@ -400,8 +452,8 @@ mod tests {
     #[test]
     fn a_different_condition_is_not() {
         let one = UTerm::Const(UConst::Int(1));
-        let lt = pred(PredKind::Lt, col(1, 0), one.clone());
-        let le = UTerm::Neg(Rc::new(pred(PredKind::Lt, one, col(1, 0))));
+        let lt = pred(PredKind::Lt(Order::Opaque), col(1, 0), one.clone());
+        let le = UTerm::Neg(Rc::new(pred(PredKind::Lt(Order::Opaque), one, col(1, 0))));
         assert!(!prove(&bag(lt), &widths(), &bag(le), &widths(), &Facts::default(), soon()));
     }
 

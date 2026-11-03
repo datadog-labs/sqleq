@@ -152,10 +152,39 @@ What it rewrites, in the order the ladder runs it:
   holds is dropped from inside its squashes. Normalization stops after 25 seconds, both attempts
   together, with the term it has; every intermediate term is equivalent to the input.
 * **The set solver** (`SetSolver`), asking Z3 about terms whose every summation is under a squash
-  or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings,
-  so the only order fact it is given is that `a <= b` is `NOT (b < a)`. That holds wherever it is
-  used: every order comparison sits under its operands' not-null guard, and the non-`NULL` values
-  of one type are totally ordered.
+  or negation. Its values are one uninterpreted sort, not the fork's integers, reals and strings.
+  Each order comparison carries the order its operands are compared in (`uterm::Order`, set by
+  `translate::order_of`), and the encoding reads that order's laws:
+  * **INTEGER** against INTEGER: each operand's rank is an exact integer, and an integer constant's
+    rank is itself. So `a > 10` is `a >= 11`, `5 <= a AND a <= 5` is `a = 5`, and `a < 1 AND a > 1`
+    holds of nothing. The IR's INTEGER also carries dates and timestamps, but those reach a
+    comparison only as opaque terms (`q_conv_*`, `q_arith_add_date_integer`), whose ranks are free,
+    so nothing discrete is concluded about them: `d >= $1 AND d < $1 + 1` stays apart from
+    `d = $1`.
+  * **VARCHAR, DATE, TIME, TIMESTAMP**: a total order whose `=` is identity, with ranks free and
+    constants unordered. That is antisymmetry, transitivity and totality, and nothing about which
+    of two constants is smaller, so it holds under any deterministic collation. A VARCHAR `<`
+    reaches the IR only under `C` or `POSIX`; under another collation the frontend writes an
+    uninterpreted `q_str_lt` call.
+  * **Anything else**: REAL, whose `=` ties `2.0` and `2.00`; INTERVAL; VARBINARY; BOOLEAN; and two
+    operands of different types. Here the only order fact is that `a <= b` is `NOT (b < a)`. That
+    holds wherever it is used: every order comparison sits under its operands' not-null guard, and
+    the non-`NULL` values of one type are totally ordered.
+
+  Ranked comparisons are false when an operand is `NULL`, as the evaluator reads them. Free ranks
+  assume no more than a total order, because a quantifier-free formula over `<` and `=` is
+  satisfiable in a total order iff it is satisfiable over the integers, and nothing does arithmetic
+  on a rank.
+
+  `MAX` and `MIN` compare in their column's order too, so an extremum meets the anti-join that
+  spells it out. Over strings they do not: they read the database's default collation, a VARCHAR
+  `<` reads `C`, and under `en_US.utf8` the `MAX` of `'a'` and `'B'` is `'B'` while under `C` it is
+  `'a'`. Before this distinction, sqleq-solver proved such a pair
+  (`tests/pairs/comparisons/max_default_vs_c_collation.sql`).
+
+  Normalization reads two order facts directly. `a <= a` is `a IS NOT NULL`. `c <= x AND x <= c`
+  for a non-`NULL` constant `c` is `x = c`: the span an index lookup writes for an equality, which
+  then substitutes and eliminates as a written one does.
 * **Bag congruence** (`bagsolver`), a rung the fork does not have, after the set solver. A query
   without `DISTINCT` keeps a sum at the top, so no rung above hands it to Z3, and two such queries
   that say the same thing in two ways (`x IS NULL OR x IS NULL`, an `IN` list a disjunction already
@@ -165,7 +194,9 @@ What it rewrites, in the order the ladder runs it:
   must match exactly. Only the 0/1 factors go to Z3, as `ctx ⇒ (A ⇔ B)` with `ctx` saying each matched
   table holds its row. Matched products are then equal wherever their shared factors are non-zero,
   so the claim is pointwise; a different number of tables, or a predicate that changes how often a
-  row counts, is not matched and not proved. Its encoding (`smt`, shared with the set solver) also
+  row counts, is not matched and not proved. A term that is 0 on every database matches 0. Such a
+  term is a sum or product whose 0/1 factors Z3 shows cannot hold together, given its tables, as
+  in a contradictory range. Two sums of terms of different lengths are first rid of such summands. Its encoding (`smt`, shared with the set solver) also
   reads `CASE`, `COALESCE` and NULL sentinels as selections, with the exclusivity of their guards a
   proof obligation; gives every row its table's NOT NULL columns and the BOOLEAN domain; and pairs
   aggregates and scalar subqueries across the sides by the same matching. It gives up five seconds

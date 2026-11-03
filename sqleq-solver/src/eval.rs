@@ -100,10 +100,10 @@ impl Db {
                 let holds = match kind {
                     PredKind::Eq => identical(&a, &b),
                     PredKind::Ne => !identical(&a, &b),
-                    PredKind::Lt => less(&a, &b),
-                    PredKind::Le => less(&a, &b) || (ordered(&a, &b) && identical(&a, &b)),
-                    PredKind::Gt => less(&b, &a),
-                    PredKind::Ge => less(&b, &a) || (ordered(&a, &b) && identical(&a, &b)),
+                    PredKind::Lt(_) => less(&a, &b),
+                    PredKind::Le(_) => less(&a, &b) || (ordered(&a, &b) && identical(&a, &b)),
+                    PredKind::Gt(_) => less(&b, &a),
+                    PredKind::Ge(_) => less(&b, &a) || (ordered(&a, &b) && identical(&a, &b)),
                 };
                 UConst::Int(holds as i64)
             }

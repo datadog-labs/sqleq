@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use crate::ic::Ics;
 use crate::translate::{NUMERIC_EQ_KEY, OUT_VAR_ID};
-use crate::uterm::{mk_mul, mk_sum, PredKind, UConst, UTerm, UVar};
+use crate::uterm::{mk_mul, mk_sum, Order, PredKind, UConst, UTerm, UVar};
 
 /// Rounds of (simplify, eliminate bound vars, rename apart) before giving up on a fixpoint. Stopping
 /// early is sound -- every intermediate term is equivalent to the input -- it only costs proofs.
@@ -898,8 +898,8 @@ fn numeric_key_operand(t: &UTerm) -> Option<crate::uterm::Number> {
 /// identity of their numeric-key images, which do fold, by exact value.
 fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
     let (kind, a, b) = match (kind, args) {
-        (PredKind::Gt, [a, b]) => (PredKind::Lt, b, a),
-        (PredKind::Ge, [a, b]) => (PredKind::Le, b, a),
+        (PredKind::Gt(o), [a, b]) => (PredKind::Lt(o), b, a),
+        (PredKind::Ge(o), [a, b]) => (PredKind::Le(o), b, a),
         (k, [a, b]) => (k, a, b),
         _ => return UTerm::Pred { kind, args: args.to_vec() },
     };
@@ -907,13 +907,13 @@ fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
         let folded = match kind {
             PredKind::Eq => x.same_value(y),
             PredKind::Ne => x.same_value(y).map(|same| !same),
-            PredKind::Lt | PredKind::Le => match (x.number(), y.number()) {
-                (Some(p), Some(q)) => Some(if kind == PredKind::Lt { p < q } else { p <= q }),
+            PredKind::Lt(_) | PredKind::Le(_) => match (x.number(), y.number()) {
+                (Some(p), Some(q)) => Some(if matches!(kind, PredKind::Lt(_)) { p < q } else { p <= q }),
                 _ if matches!((x, y), (UConst::Str(_), UConst::Str(_))) => None,
                 // NULL, or a number against a string: never ordered.
                 _ => Some(false),
             },
-            PredKind::Gt | PredKind::Ge => unreachable!("oriented above"),
+            PredKind::Gt(_) | PredKind::Ge(_) => unreachable!("oriented above"),
         };
         if let Some(holds) = folded {
             return int(holds as i64);
@@ -925,7 +925,12 @@ fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
     if a == b {
         match kind {
             PredKind::Eq => return int(1),
-            PredKind::Ne | PredKind::Lt => return int(0),
+            PredKind::Ne | PredKind::Lt(_) => return int(0),
+            // Every value but `Null` is ordered, and equal to itself: `a <= a` is `a` not being
+            // `Null` (`eval` reads `Null <= Null` as false, `Null = Null` as true).
+            PredKind::Le(_) if !matches!(a, UTerm::Const(_)) => {
+                return UTerm::Neg(Rc::new(UTerm::Pred { kind: PredKind::Eq, args: vec![a.clone(), UTerm::Const(UConst::Null)] }));
+            }
             _ => {}
         }
     }
@@ -1130,6 +1135,37 @@ fn simplify_add(parts: impl Iterator<Item = UTerm>) -> UTerm {
     }
 }
 
+/// Rewrites each pair of factors `[c <= x]` and `[x <= c]` (as [`simplify_pred`] orients them) into
+/// `[x = c]`, where `c` is a constant other than `Null` and the order is one whose `=` is identity
+/// ([`Order`] other than `Opaque`). That is antisymmetry, and it is the shape an index span gives
+/// `x = c`. Returns whether it rewrote any.
+///
+/// Exactly: for `x` a number or a string, both sides hold iff `x` is `c`; for `x` `Null`, neither
+/// does. A closed term in `c`'s place is left alone, since it may be `Null` itself, where `[x = c]`
+/// would hold for a `Null` `x` and the span does not. As an equality, the span then substitutes and
+/// eliminates as a written `x = c` does.
+fn point_spans(flat: &mut Vec<UTerm>) -> bool {
+    let le = |t: &UTerm| match t {
+        UTerm::Pred { kind: PredKind::Le(o), args } if *o != Order::Opaque && args.len() == 2 => Some((args[0].clone(), args[1].clone())),
+        _ => None,
+    };
+    let point = |t: &UTerm| matches!(t, UTerm::Const(c) if *c != UConst::Null);
+    for i in 0..flat.len() {
+        let Some((lo, hi)) = le(&flat[i]) else { continue };
+        let (c, x) = if point(&lo) && !point(&hi) { (lo, hi) } else { continue };
+        let UTerm::Pred { kind, .. } = &flat[i] else { unreachable!() };
+        let upper = UTerm::Pred { kind: *kind, args: vec![x.clone(), c.clone()] };
+        if let Some(j) = flat.iter().position(|f| *f == upper) {
+            let eq = simplify_pred(PredKind::Eq, &[x, c]);
+            let (first, second) = (i.min(j), i.max(j));
+            flat.remove(second);
+            flat[first] = eq;
+            return true;
+        }
+    }
+    false
+}
+
 fn simplify_mul(parts: Vec<UTerm>) -> UTerm {
     let mut flat: Vec<UTerm> = Vec::new();
     let mut constant: i64 = 1;
@@ -1144,6 +1180,9 @@ fn simplify_mul(parts: Vec<UTerm>) -> UTerm {
     flat.sort_by_key(key);
     // A 0/1 factor is idempotent (x·x = x); anything else keeps its multiplicity.
     dedup_zero_one(&mut flat);
+    if point_spans(&mut flat) {
+        return simplify_mul(flat);
+    }
     // Distribute over the first sum among the factors: Π·(a + b) → Π·a + Π·b.
     if let Some(pos) = flat.iter().position(|f| matches!(f, UTerm::Add(_))) {
         let UTerm::Add(summands) = flat.remove(pos) else { unreachable!() };

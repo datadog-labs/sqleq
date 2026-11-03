@@ -11,7 +11,8 @@
 //! such value, so each pair below was proved although Postgres separates it: over
 //! `t = {(1, 1, 2.0), (2, 1, 2.00)}` the extremum's side has one row and the anti-join's two, and a
 //! cast to text tells them apart. Over these types the extremum is now refused; over a type whose
-//! `=` is identity it is proved as before.
+//! `=` is identity it is proved as before, except over strings, which `MAX` and `MIN` order by a
+//! collation the anti-join's VARCHAR `<` (a `C` one) need not share.
 
 mod support;
 
@@ -103,7 +104,7 @@ fn an_extremum_over_a_type_whose_equality_is_identity_is_still_proved() {
     // The control: the same pairs, which are equivalent when `=` is identity, a VARBINARY column
     // the schema vouches for (`bytea`) included.
     let mut wrong = Vec::new();
-    for (ty, vouched) in [("INTEGER", false), ("VARCHAR", false), ("DATE", false), ("TIMESTAMP", false), ("VARBINARY", true)] {
+    for (ty, vouched) in [("INTEGER", false), ("DATE", false), ("TIMESTAMP", false), ("VARBINARY", true)] {
         for (op, v) in pairs(ty, vouched) {
             if v != (Verdict::Eq { literal: false }) {
                 wrong.push(format!("{op} over {ty}: {v}"));
@@ -111,6 +112,21 @@ fn an_extremum_over_a_type_whose_equality_is_identity_is_still_proved() {
         }
     }
     assert!(wrong.is_empty(), "not proved:\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_string_extremum_is_not_an_anti_join_on_a_string_comparison() {
+    // `MAX` and `MIN` order strings by the database's default collation; a VARCHAR `<` reaches the
+    // IR only under `C` or `POSIX` (the frontend writes one under any other collation as an
+    // uninterpreted `q_str_lt` call). Over `t = {(1, 1, 'a'), (2, 1, 'B')}` under `en_US.utf8`, `MAX`
+    // is `'B'` and the row with no `C`-greater row is `'a'`.
+    let mut wrong = Vec::new();
+    for (op, v) in pairs("VARCHAR", false) {
+        if v == (Verdict::Eq { literal: false }) {
+            wrong.push(format!("{op} over VARCHAR: {v}"));
+        }
+    }
+    assert!(wrong.is_empty(), "proved:\n{}", wrong.join("\n"));
 }
 
 #[test]
