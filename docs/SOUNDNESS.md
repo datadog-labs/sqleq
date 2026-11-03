@@ -286,6 +286,13 @@ the order of `C` and `POSIX` and of no other collation Postgres guarantees.
   LIMIT 1` takes two different rows when `c` is `COLLATE "C"` and `d` is not. A comparison whose
   operand is neither a column nor a constant (`(c || 'x') < 'y'`) takes its collation from the
   columns it reads, which the frontend does not trace, so in such a pair it is refused too.
+- **What `sqleq-solver` assumes about a native string order** is only that it is a total order
+  whose `=` is identity. That holds under `C`, `POSIX` and every other deterministic collation. It
+  does not order the constants, although under `C` it could. It does not take `min` and `max` over
+  strings to share that order: they read the database's default collation, which an operand's
+  `COLLATE "C"` does not change. A pair that compares an extremum with an anti-join ordered under
+  `C` is therefore not proved (`tests/pairs/comparisons/max_default_vs_c_collation.sql`, which
+  `sqleq-solver` proved before; `sqleq-fuzz` cannot refute it, since its cluster runs `C`).
 
 `sqleq-fuzz` compares strings by code point — its cluster has the `C` collation, and DuckDB
 compares so too — so it cannot refute a pair whose two sides differ only under another collation;

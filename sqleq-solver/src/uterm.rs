@@ -242,14 +242,47 @@ impl PartialOrd for Number {
     }
 }
 
+/// A comparison predicate. The order kinds carry the [`Order`] their operands are compared in, so
+/// that the SMT encoding can read an order it knows the laws of; two comparisons in different
+/// domains are different predicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PredKind {
     Eq,
     Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
+    Lt(Order),
+    Le(Order),
+    Gt(Order),
+    Ge(Order),
+}
+
+impl PredKind {
+    /// The domain of an order kind; `None` for `Eq` and `Ne`.
+    pub fn order(self) -> Option<Order> {
+        match self {
+            PredKind::Lt(o) | PredKind::Le(o) | PredKind::Gt(o) | PredKind::Ge(o) => Some(o),
+            PredKind::Eq | PredKind::Ne => None,
+        }
+    }
+}
+
+/// The order an order comparison's operands are compared in: what the SMT encoding may assume about
+/// `<` on them (`smt::Encoder::pred`).
+///
+/// * `Integer`: exact integers. Integer constants are ordered by value.
+/// * `Text`, `Date`, `Time`, `Timestamp`: a total order whose `=` is identity, with constants left
+///   unordered. Text's order is its collation's, which the IR does not carry, but under a
+///   deterministic collation -- the only kind the frontend lowers -- it is a total order whose
+///   equal elements are identical. The IR has no temporal literals.
+/// * `Opaque`: nothing is assumed; `<` is an uninterpreted relation. REAL (whose `=` is not
+///   identity: `2.0 = 2.00`), INTERVAL, VARBINARY, BOOLEAN and comparisons across types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Order {
+    Opaque,
+    Integer,
+    Text,
+    Date,
+    Time,
+    Timestamp,
 }
 
 /// One U-expression term. `Add`/`Mul` are n-ary and flat by construction (via `mk_add`/`mk_mul`,

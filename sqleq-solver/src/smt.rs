@@ -11,14 +11,30 @@
 //!   Two constants that are certainly different values are asserted distinct: two different
 //!   numbers, two different strings, a number and a string, `Null` and anything else. Equal numbers
 //!   of different types or scales are left free to be one value or two, since neither holds in
-//!   every place they meet. `Eq` is identity, `Ne` its negation, `Lt` an uninterpreted relation,
-//!   and `Le` its complement with the operands swapped (`a <= b` is `¬(b < a)`). That is the one
-//!   order fact encoded, and it holds wherever it is used: the translator puts every order
-//!   comparison under its operands' not-null guard, and the non-NULL values of one type are totally
-//!   ordered (preordered, under a collation that ties distinct strings, or a type whose `=` ties
-//!   distinct values, as `numeric`'s does `2.0` and `2.00`).
-//!   Functions and value-position arithmetic are uninterpreted `Val` functions -- sound, since the
-//!   real ones are among their interpretations, and ours already take (null flag, value) pairs.
+//!   every place they meet. `Eq` is identity and `Ne` its negation.
+//! * **An order comparison** is read by its [`Order`]:
+//!   * In an `Opaque` one, `Lt` is an uninterpreted relation and `Le` its complement with the
+//!     operands swapped (`a <= b` is `¬(b < a)`). That is the one order fact encoded there, and it
+//!     holds wherever it is used: the translator puts every order comparison under its operands'
+//!     not-null guard, and the non-NULL values of one type are totally ordered (preordered, under
+//!     a collation that ties distinct strings, or a type whose `=` ties distinct values, as
+//!     `numeric`'s does `2.0` and `2.00`).
+//!   * In an `Integer`, `Text`, `Date`, `Time` or `Timestamp` one, each operand has a rank
+//!     `ord:<order>: Val → Int`, and the comparison is the ranks' comparison, false when either
+//!     operand is `Null` (as `eval` reads it). Every ranked term `t` gets the ground fact
+//!     `ord⁻¹(ord(t)) = t`, so ranks are injective on them: a value that is neither less nor more
+//!     than another is that value, which is antisymmetry under an `=` that is identity, the only
+//!     kind these orders are given to (`translate::order_of`).
+//!   * Only `Integer` ranks of integer constants are fixed, to the integer itself, so integers are
+//!     compared exactly, and discretely. Unbounded `Int` is a superset of SQL's integers, so what
+//!     holds over it holds over them. Every other rank is free, the INTEGER ranks of the dates and
+//!     timestamps the IR also types INTEGER included (they reach a comparison as opaque terms, not
+//!     integer constants), so text constants are not ordered: the collation decides that.
+//!   * Free ranks assume no more than a total order. A quantifier-free formula over `<` and `=` is
+//!     satisfiable in a total order iff it is in `Int`, since each finite configuration embeds,
+//!     and nothing does arithmetic on a rank.
+//! * **Functions and value-position arithmetic** are uninterpreted `Val` functions -- sound, since
+//!   the real ones are among their interpretations, and ours already take (null flag, value) pairs.
 //! * **A table** `T` of width `w` is an uninterpreted `Val^w → Int`: its value at a tuple is the
 //!   tuple's multiplicity, read as `> 0` in set positions.
 //! * **A base var** of width `w` is `w` `Val` constants: bound by an `∃` where its sum is in a set
@@ -53,7 +69,7 @@ use z3::{FuncDecl, Sort, Symbol};
 use crate::ir::{Schema, Type};
 use crate::normalize::is_zero_one;
 use crate::translate::OUT_VAR_ID;
-use crate::uterm::{Number, PredKind, UConst, UTerm, UVar};
+use crate::uterm::{Number, Order, PredKind, UConst, UTerm, UVar};
 
 /// Which side of a pair a term comes from: their bound vars are distinct constants, the output var
 /// is shared.
@@ -130,6 +146,10 @@ pub struct Encoder {
     obligations: Vec<Bool>,
     /// The integers a multiplicity was used as a value for, to link to their constants.
     ints: BTreeSet<i64>,
+    /// The terms an interpreted order comparison ranked, for their injectivity facts, and the
+    /// integer constants an `Integer` one ranked, for their fixed ranks (see [`Encoder::pred`]).
+    ranked: Vec<(Order, Dynamic)>,
+    ranked_ints: BTreeSet<i64>,
 }
 
 impl Default for Encoder {
@@ -150,6 +170,8 @@ impl Encoder {
             value_sums: HashMap::new(),
             obligations: Vec::new(),
             ints: BTreeSet::new(),
+            ranked: Vec::new(),
+            ranked_ints: BTreeSet::new(),
         }
     }
 
@@ -179,7 +201,7 @@ impl Encoder {
     /// of one class free. With values interpreted, also that each integer a multiplicity was used as
     /// is that integer's constant.
     pub fn background(&mut self) -> Vec<Bool> {
-        let mut facts = Vec::new();
+        let mut facts = self.order_facts();
         if self.interpret {
             let int_sort = Sort::int();
             let val = self.val.clone();
@@ -391,9 +413,51 @@ impl Encoder {
         Some(self.apply(format!("{name}/{}", vals.len()), &refs, &range, &args))
     }
 
+    /// `t`'s rank in `order` (see the module doc), recording it for [`Encoder::order_facts`].
+    fn rank(&mut self, order: Order, t: &UTerm, v: &Dynamic) -> Option<Int> {
+        if let (Order::Integer, UTerm::Const(UConst::Int(n))) = (order, t) {
+            self.ranked_ints.insert(*n);
+        }
+        if !self.ranked.iter().any(|(o, r)| *o == order && r == v) {
+            self.ranked.push((order, v.clone()));
+        }
+        let val = self.val.clone();
+        self.apply(format!("ord:{order:?}"), &[&val], &Sort::int(), &[v]).as_int()
+    }
+
+    /// Injectivity of every rank taken, as `ord⁻¹(ord(t)) = t` for each ranked term `t`, and each
+    /// ranked integer constant's rank, the integer itself.
+    fn order_facts(&mut self) -> Vec<Bool> {
+        let (val, int) = (self.val.clone(), Sort::int());
+        let mut facts = Vec::new();
+        for (order, t) in self.ranked.clone() {
+            let rank = self.apply(format!("ord:{order:?}"), &[&val], &int, &[&t]);
+            facts.push(self.apply(format!("ord-inverse:{order:?}"), &[&int], &val, &[&rank]).eq(&t));
+        }
+        for n in self.ranked_ints.clone() {
+            let k = self.constant(&UConst::Int(n));
+            if let Some(rank) = self.apply("ord:Integer".to_string(), &[&val], &int, &[&k]).as_int() {
+                facts.push(rank.eq(Int::from_i64(n)));
+            }
+        }
+        facts
+    }
+
     pub fn pred(&mut self, kind: PredKind, args: &[UTerm], side: Side, widths: &HashMap<u32, usize>) -> Option<Bool> {
         let [a, b] = args else { return None };
         let (va, vb) = (self.value(a, side, widths)?, self.value(b, side, widths)?);
+        if let Some(order) = kind.order().filter(|o| *o != Order::Opaque) {
+            let (ra, rb) = (self.rank(order, a, &va)?, self.rank(order, b, &vb)?);
+            let null = self.constant(&UConst::Null);
+            let holds = match kind {
+                PredKind::Lt(_) => ra.lt(&rb),
+                PredKind::Le(_) => ra.le(&rb),
+                PredKind::Gt(_) => ra.gt(&rb),
+                PredKind::Ge(_) => ra.ge(&rb),
+                PredKind::Eq | PredKind::Ne => unreachable!("an order kind"),
+            };
+            return Some(Bool::and(&[va.eq(&null).not(), vb.eq(&null).not(), holds]));
+        }
         let rel = |enc: &mut Self, name: &str, x: &Dynamic, y: &Dynamic| -> Option<Bool> {
             let (val, boolean) = (enc.val.clone(), Sort::bool());
             enc.apply(name.to_string(), &[&val, &val], &boolean, &[x, y]).as_bool()
@@ -401,10 +465,10 @@ impl Encoder {
         match kind {
             PredKind::Eq => Some(va.eq(&vb)),
             PredKind::Ne => Some(va.eq(&vb).not()),
-            PredKind::Lt => rel(self, "lt", &va, &vb),
-            PredKind::Le => rel(self, "lt", &vb, &va).map(|lt| lt.not()),
-            PredKind::Gt => rel(self, "lt", &vb, &va),
-            PredKind::Ge => rel(self, "lt", &va, &vb).map(|lt| lt.not()),
+            PredKind::Lt(_) => rel(self, "lt", &va, &vb),
+            PredKind::Le(_) => rel(self, "lt", &vb, &va).map(|lt| lt.not()),
+            PredKind::Gt(_) => rel(self, "lt", &vb, &va),
+            PredKind::Ge(_) => rel(self, "lt", &va, &vb).map(|lt| lt.not()),
         }
     }
 }
