@@ -20,6 +20,7 @@ use crate::opaque;
 use crate::setsolver;
 use crate::smt::Facts;
 use crate::translate::{translate_input, Query};
+use crate::uterm::UTerm;
 
 /// Terms bigger than this (read as trees, see [`crate::uterm::UTerm::tree_size`]) are not rewritten.
 /// Rewriting passes recurse over the tree, so their cost is its size, not the shared size, and one
@@ -33,6 +34,12 @@ pub const MAX_TREE_SIZE: usize = 1_000_000;
 /// The proofs found on the benchmark corpus take well under half of it; the pairs that outgrow it
 /// are long chains of outer joins, some under a correlated subquery.
 pub const NORMALIZE_BUDGET: Duration = Duration::from_secs(25);
+
+/// How long the attempts with the squash lift may normalize, both together, within
+/// [`NORMALIZE_BUDGET`]. The terms the lift proves (a filtered `GROUP BY`, a key filter moved past
+/// an aggregate) normalize in a fraction of it; a term that takes longer is one whose plain
+/// normalization was long already, and doing it again with the lift is all the extra time costs.
+pub const LIFT_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -135,36 +142,79 @@ fn decide(l: &Query, r: &Query, ics: &Ics, facts: &Facts) -> Verdict {
     let none = Ics::default();
     let attempts: Vec<&Ics> = if ics.is_empty() { vec![&none] } else { vec![ics, &none] };
     let start = Instant::now();
-    let deadlines = (start + NORMALIZE_BUDGET, start + bagsolver::BUDGET);
-    for ics in attempts {
-        match rung2(l, r, ics, facts, deadlines) {
-            Some(true) => return Verdict::Eq { literal: false },
-            Some(false) => {}
-            None => too_large = true,
+    let normalize_by = start + NORMALIZE_BUDGET;
+    let mut plain = Vec::with_capacity(attempts.len());
+    for ics in &attempts {
+        let Some(sides) = normalize_pair(l, r, ics, normalize_by, false) else {
+            too_large = true;
+            plain.push(None);
+            continue;
+        };
+        if rungs(&sides, facts, Some(start + bagsolver::BUDGET)) {
+            return Verdict::Eq { literal: false };
+        }
+        plain.push(Some(sides));
+    }
+    // Then the same attempts with the factors every summand of a squash holds lifted out of it
+    // (`normalize::lift_squashes`), which is what lets a `GROUP BY` key a filter holds constant pin
+    // the group's output column. Only after the normal form without it has failed: it moves factors
+    // in ways the other side may not follow, so it is tried beside that form, never instead of it,
+    // and a pair proved without it is proved as before. Only where it changed a side, and only the
+    // rungs that compare normal forms (alpha-equivalence and the set solver), not the bag rung's
+    // search: a lifted key that pins a group's column makes the two sides one normal form, which
+    // is what those rungs see, and the bag rung has already had its time on the forms above.
+    let lift_by = normalize_by.min(Instant::now() + LIFT_BUDGET);
+    for (ics, plain) in attempts.iter().zip(&plain) {
+        let Some(sides) = normalize_pair(l, r, ics, lift_by, true) else {
+            too_large = true;
+            continue;
+        };
+        // A lift of closed factors alone pins nothing, so it is not worth the rungs' time.
+        if !sides.lifted_open || plain.as_ref().is_some_and(|p| p.terms() == sides.terms()) {
+            continue;
+        }
+        if rungs(&sides, facts, None) {
+            return Verdict::Eq { literal: false };
         }
     }
     Verdict::NotProved(if too_large { NotProvedReason::TooLarge } else { NotProvedReason::Exhausted })
 }
 
-/// Normalize each side, then compare up to renaming of bound vars (rung 2), and failing that ask
-/// the set solver (rung 3), as `SqlSolver.proveEq` does, and then the bag congruence rung, which
-/// has no counterpart there. `None` when a side outgrows the size budget. The row facts hold on
-/// every database the claims are about, so they are given to the last rung on both attempts. The
-/// two attempts share their deadlines: normalization's ([`NORMALIZE_BUDGET`]) and the last rung's.
-fn rung2(l: &Query, r: &Query, ics: &Ics, facts: &Facts, (normalize_by, deadline): (Instant, Instant)) -> Option<bool> {
-    let normalizer = |w: &std::collections::HashMap<u32, usize>| {
-        Normalizer::new(w.clone(), MAX_TREE_SIZE).with_ics(ics.clone()).with_deadline(normalize_by)
+/// Both sides normalized with `ics`, and with the squash lift when `lift`, with the widths each
+/// normalizer ended with. `None` when a side outgrows the size budget.
+struct Sides {
+    l: (UTerm, std::collections::HashMap<u32, usize>),
+    r: (UTerm, std::collections::HashMap<u32, usize>),
+    /// Whether a squash lift moved a factor that mentions a var, on either side.
+    lifted_open: bool,
+}
+
+impl Sides {
+    fn terms(&self) -> (&UTerm, &UTerm) {
+        (&self.l.0, &self.r.0)
+    }
+}
+
+fn normalize_pair(l: &Query, r: &Query, ics: &Ics, normalize_by: Instant, lift: bool) -> Option<Sides> {
+    let side = |q: &Query| {
+        let n = Normalizer::new(q.widths.clone(), MAX_TREE_SIZE).with_ics(ics.clone()).with_deadline(normalize_by);
+        let mut n = if lift { n.with_squash_lift() } else { n };
+        let t = n.normalize(&q.term).ok()?;
+        Some((t, n.lifted_open(), n.widths))
     };
-    let (mut nl, mut nr) = (normalizer(&l.widths), normalizer(&r.widths));
-    let tl = nl.normalize(&l.term).ok()?;
-    let tr = nr.normalize(&r.term).ok()?;
-    if alpha_eq(&tl, &nl.widths, &tr, &nr.widths) {
-        return Some(true);
-    }
-    if setsolver::prove(&tl, &nl.widths, &tr, &nr.widths) == Some(true) {
-        return Some(true);
-    }
-    Some(bagsolver::prove(&tl, &nl.widths, &tr, &nr.widths, facts, deadline))
+    let ((tl, ol, wl), (tr, or, wr)) = (side(l)?, side(r)?);
+    Some(Sides { l: (tl, wl), r: (tr, wr), lifted_open: ol || or })
+}
+
+/// Compare two normalized sides up to renaming of bound vars (rung 2), and failing that ask the set
+/// solver (rung 3), as `SqlSolver.proveEq` does, and then the bag congruence rung, which has no
+/// counterpart there, until `bag_by` (not at all when `None`). The row facts hold on every database
+/// the claims are about, so they are given to the last rung on every attempt.
+fn rungs(s: &Sides, facts: &Facts, bag_by: Option<Instant>) -> bool {
+    let ((tl, wl), (tr, wr)) = (&s.l, &s.r);
+    alpha_eq(tl, wl, tr, wr)
+        || setsolver::prove(tl, wl, tr, wr) == Some(true)
+        || bag_by.is_some_and(|by| bagsolver::prove(tl, wl, tr, wr, facts, by))
 }
 
 #[cfg(test)]
