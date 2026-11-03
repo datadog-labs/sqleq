@@ -637,11 +637,18 @@ impl Schema {
 }
 
 /// The top-level `Input`: `{"schemas": [...], "queries": [Relation, Relation], "help": [String,
-/// String]}`. `help` is dropped entirely (see the module doc) rather than modeled and ignored.
+/// String]}`, with an optional `"identity_params"`. `help` is dropped entirely (see the module doc)
+/// rather than modeled and ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub schemas: Vec<Schema>,
     pub queries: [Relation; 2],
+    /// The parameter carriers (`QP<n>`) whose `=` is identity, as [`Schema::opaque_identity`] is a
+    /// column's: the frontend lists a parameter that the pair compares only with columns of one
+    /// opaque type whose `=` is identity, a `uuid` or a `bytea` (its `param_types::identity_params`).
+    /// Postgres types such a parameter as that column's type, so it holds a value of it. Absent
+    /// means none.
+    pub identity_params: std::collections::BTreeSet<String>,
 }
 
 /// The deepest an `Input` may nest, counting every JSON object and array. Real plans stay far below
@@ -693,7 +700,12 @@ impl Input {
         }
         let q0 = Relation::parse(&queries[0], n)?;
         let q1 = Relation::parse(&queries[1], n)?;
-        Ok(Input { schemas, queries: [q0, q1] })
+        let identity_params = v
+            .get("identity_params")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        Ok(Input { schemas, queries: [q0, q1], identity_params })
     }
 }
 

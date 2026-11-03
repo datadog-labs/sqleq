@@ -98,3 +98,53 @@ fn only_a_bare_reference_to_a_vouched_column_is_vouched_for() {
     let v = pair(vec![real], distinct(x.clone(), &["REAL"]), x);
     assert_eq!(v.to_string(), "NOTRANS dedup-not-identity:REAL");
 }
+
+/// The pair, with the parameter carriers `params` listed as ones whose `=` is identity.
+fn pair_with(schemas: Vec<Value>, a: Value, b: Value, params: &[&str]) -> Verdict {
+    sqleq_solver::prove::verify(&json!({ "schemas": schemas, "queries": [a, b], "identity_params": params }))
+}
+
+fn param() -> Value {
+    call("QP1", "VARBINARY", vec![lit("0", "INTEGER")])
+}
+
+/// `SELECT t.id FROM t JOIN u ON t.h = u.h WHERE t.h = $1`, with `AND u.h = $1` when `both`.
+fn joined_at_param(both: bool) -> Value {
+    let on = pred("=", vec![col(1, "VARBINARY"), col(3, "VARBINARY")]);
+    let join = json!({ "join": { "left": scan(0), "right": scan(1), "kind": "INNER", "condition": on } });
+    let mut cond = vec![pred("=", vec![col(1, "VARBINARY"), param()])];
+    if both {
+        cond.push(pred("=", vec![col(3, "VARBINARY"), param()]));
+    }
+    project(filter(join, pred("AND", cond)), vec![col(0, "INTEGER")])
+}
+
+/// `SELECT CAST(<x> AS TEXT) FROM t WHERE t.h = $1`, `x` the column (`side` 0) or the parameter.
+fn cast_at_param(side: u32) -> Value {
+    let x = if side == 0 { col(1, "VARBINARY") } else { param() };
+    project(filter(scan(0), pred("=", vec![col(1, "VARBINARY"), param()])), vec![text(x)])
+}
+
+#[test]
+fn a_listed_parameter_equal_to_a_vouched_column_substitutes_for_it() {
+    // `uuid`: `t.h = $1` makes them the same value, so either may be cast to text.
+    let v = pair_with(vec![table_h("t", true)], cast_at_param(0), cast_at_param(1), &["QP1"]);
+    assert_eq!(v, Verdict::Eq { literal: false }, "{v:?}");
+    // And through a join on the column: `t.h = $1` and `t.h = u.h` give `u.h = $1`.
+    let tables = || vec![table_h("t", true), table_h("u", true)];
+    let v = pair_with(tables(), joined_at_param(false), joined_at_param(true), &["QP1"]);
+    assert_eq!(v, Verdict::Eq { literal: false }, "{v:?}");
+}
+
+#[test]
+fn an_unlisted_parameter_or_an_unvouched_column_is_still_read_through_a_key() {
+    // Unlisted, `$1` may be a `jsonb` (`{"a": 1.0} = {"a": 1.00}`), and its text then differs.
+    let v = pair_with(vec![table_h("t", true)], cast_at_param(0), cast_at_param(1), &[]);
+    assert!(!proved(&v), "unlisted: {v:?}");
+    // Listed, against a column the schema does not vouch for, `=` is still the column's key.
+    let v = pair_with(vec![table_h("t", false)], cast_at_param(0), cast_at_param(1), &["QP1"]);
+    assert!(!proved(&v), "unvouched: {v:?}");
+    // Another parameter's listing says nothing about `$1`.
+    let v = pair_with(vec![table_h("t", true)], cast_at_param(0), cast_at_param(1), &["QP2"]);
+    assert!(!proved(&v), "QP2 listed: {v:?}");
+}

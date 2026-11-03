@@ -423,6 +423,13 @@ fn emit(
     // Nothing downstream re-checks the variable numbering, and getting it wrong yields a proof about
     // the wrong query rather than an error. See [`verify`].
     verify::check_levels(&input)?;
+    // The parameters whose `=` is identity, for `sqleq-solver`, read before the declared types the
+    // columns carry are erased. Only where there is one, as `opaque_identity` is; free for the qed
+    // axis and the JVM bridge, which read no such key.
+    let identity = param_types::identity_params(&input);
+    if !identity.is_empty() {
+        input["identity_params"] = json!(identity);
+    }
     types::rename_emitted_types(&mut input);
     Ok(input)
 }

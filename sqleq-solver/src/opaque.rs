@@ -28,6 +28,8 @@
 //! row to the next), and so is a pair in which any refused node finds no partner: translation then
 //! refuses it as before. Matching is one to one, so two nodes on one side never share a table.
 
+use std::collections::BTreeSet;
+
 use crate::card::{self, Slice};
 use crate::ir::{AggCall, Expr, Input, Relation, Schema};
 use crate::prove::{prove_at, Verdict};
@@ -64,7 +66,7 @@ pub fn abstract_opaque(input: &Input, depth: usize) -> Option<Input> {
     // `partner[j]`: the left node right node `j` is matched with.
     let mut partner: Vec<Option<usize>> = vec![None; right.len()];
     for (i, l) in left.iter().enumerate() {
-        let j = (0..right.len()).find(|&j| partner[j].is_none() && congruent(l, &right[j], schemas, depth))?;
+        let j = (0..right.len()).find(|&j| partner[j].is_none() && congruent(l, &right[j], schemas, &input.identity_params, depth))?;
         partner[j] = Some(i);
     }
 
@@ -90,7 +92,7 @@ pub fn abstract_opaque(input: &Input, depth: usize) -> Option<Input> {
     };
     let l = replace(&input.queries[0], &|i| i);
     let r = replace(&input.queries[1], &|j| partner[j].expect("every right node was matched above"));
-    Some(Input { schemas, queries: [l, r] })
+    Some(Input { schemas, queries: [l, r], identity_params: input.identity_params.clone() })
 }
 
 /// Whether translation refuses `r`, at level `base`, for being a node it cannot read.
@@ -131,7 +133,7 @@ fn rebased(r: &Relation, base: usize) -> Option<Relation> {
 
 /// Whether two refused nodes, each standing alone at level 0, return the same rows: the same kind
 /// and specification, output types known and equal, and sources proved to return the same bag.
-fn congruent(l: &Relation, r: &Relation, schemas: &[Schema], depth: usize) -> bool {
+fn congruent(l: &Relation, r: &Relation, schemas: &[Schema], params: &BTreeSet<String>, depth: usize) -> bool {
     let (ls, rs) = match (l, r) {
         (
             Relation::Sort { source: ls, offset: lo, limit: ll, keys: lk },
@@ -163,7 +165,10 @@ fn congruent(l: &Relation, r: &Relation, schemas: &[Schema], depth: usize) -> bo
     ls == rs
         || (depth < MAX_DEPTH
             && matches!(
-                prove_at(&Input { schemas: schemas.to_vec(), queries: [(**ls).clone(), (**rs).clone()] }, depth + 1),
+                prove_at(
+                    &Input { schemas: schemas.to_vec(), queries: [(**ls).clone(), (**rs).clone()], identity_params: params.clone() },
+                    depth + 1
+                ),
                 Verdict::Eq { .. }
             ))
 }

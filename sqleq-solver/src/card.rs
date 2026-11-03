@@ -534,7 +534,7 @@ mod tests {
             for v in &rels {
                 let r = rel(v.clone());
                 let claimed = shape(&r, 0, &s).max_one();
-                let [q, _] = translate_input(&Input { schemas: s.clone(), queries: [r.clone(), r] }).unwrap();
+                let [q, _] = translate_input(&Input { schemas: s.clone(), queries: [r.clone(), r], identity_params: Default::default() }).unwrap();
                 let db = Db::new(tables.clone(), universe.clone(), q.widths.clone());
                 let rows = db.count(&mk_sum(vec![UVar::Base(OUT_VAR_ID)], q.term.clone()), &mut Env::new()).unwrap();
                 assert!(!claimed || rows <= 1, "{v} has {rows} rows on {tables:?}");

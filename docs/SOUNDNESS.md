@@ -213,8 +213,12 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   `numeric[]`, where they need not be (`0 = -0`, `2.0 = 2.00`). The schema lists the columns of the
   first kind in `opaque_identity`, from an allowlist checked on Postgres 17 (`src/types.rs`,
   `opaque_identity`); a type not on it, an enum or an extension's type included, is of the second
-  kind. `sqleq-solver` reads `=` on a listed column as identity and on any other opaque value
-  through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) and
+  kind. A parameter is listed too, in the input's `identity_params`, when every column the pair
+  compares it with (`=`, `<>`, `IS [NOT] DISTINCT FROM`) is a listed column of one declared type.
+  Postgres types an untyped parameter at the column it is compared with, and one compared with a
+  column of a type that has no `=` against it is an error, so such a parameter holds a value of
+  that type (`src/param_types.rs`, `identity_params`). `sqleq-solver` reads `=` on a listed column
+  or parameter as identity and on any other opaque value through a key, and deduplicates (`DISTINCT`, `GROUP BY`, `UNION`, `INTERSECT`, `EXCEPT`) and
   takes a `MAX` or `MIN` only over columns whose `=` is identity, refusing the rest. The QED prover
   reads no such list: it reads `=` and deduplication as identity on every type, so the frontend
   reads the same list for it ([below](#values-that--calls-equal-and-that-are-still-two-values)).
