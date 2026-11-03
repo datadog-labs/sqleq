@@ -4,16 +4,15 @@
 -- Copyright 2026-Present Datadog, Inc.
 
 -- truth: not-equivalent
--- expect frontend: refuse:unsupported
+-- expect frontend: emit
 -- expect fuzz: counterexample
 -- expect qed: no-plan
--- expect sqleq-solver: no-plan
+-- expect sqleq-solver: unsupported
 -- expect lean: unsupported
--- origin: EXCEPT ALL is refused, not lowered (docs/SOUNDNESS.md); a pin for each documented refusal
---   (#68)
--- witness: t = {(1), (1)}; u = {(1)}: A removes one copy and returns 1, B removes both and returns
---   no rows
+-- origin: INTERSECT ALL, once refused (#68), is its own IR node (docs/SOUNDNESS.md): set provers
+--   refuse it, a bag prover can state it
+-- witness: t = {(1), (1)}; u = {(1), (1)}: A keeps both copies, B one
 create table "t" ("a" INTEGER);
 create table "u" ("a" INTEGER);
-SELECT a FROM t EXCEPT ALL SELECT a FROM u;
-SELECT a FROM t EXCEPT SELECT a FROM u;
+SELECT a FROM t INTERSECT ALL SELECT a FROM u;
+SELECT a FROM t INTERSECT SELECT a FROM u;

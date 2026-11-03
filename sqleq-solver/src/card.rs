@@ -370,7 +370,7 @@ pub fn shape(r: &Relation, base: usize, schemas: &[Schema]) -> Shape {
             let ident = schema.iter().map(|t| identity_type(*t)).collect();
             Shape::collapsed(schema.len(), Vec::new(), content.len() <= 1, BTreeSet::new(), ident)
         }
-        Relation::Union(_) => Shape::unknown(Relation::output_types(r, schemas).iter().map(|t| t.is_some_and(identity_type)).collect()),
+        Relation::Union(_) | Relation::IntersectAll(_) | Relation::ExceptAll(_) => Shape::unknown(Relation::output_types(r, schemas).iter().map(|t| t.is_some_and(identity_type)).collect()),
         // Deduplicated rows of the left side, or some of them.
         Relation::Except(sides) | Relation::Intersect(sides) => {
             let src = shape(&sides[0], base, schemas);

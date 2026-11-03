@@ -158,13 +158,12 @@ statement reductions in `src/dml.rs`).
 | **grouping** | `GROUP BY` (including `(a, b)` row constructors), aggregates, aggregate `FILTER (WHERE …)`, `HAVING`, and Postgres **functional dependence** — a non-grouped column, or a whole expression, accepted because a declared key it reads is grouped on |
 | **ordering** | `ORDER BY` with `LIMIT`, `OFFSET` and `FETCH FIRST`, as a slice of the sorted input ([`docs/SOUNDNESS.md`](docs/SOUNDNESS.md) states the assumption this rests on); past a `GROUP BY`, a `DISTINCT` or a set operation, only when every `ORDER BY` key is an output column |
 | **subqueries** | non-correlated, correlated, and scalar |
-| **set operations** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` |
+| **set operations** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`; `INTERSECT ALL` and `EXCEPT ALL`, which keep multiplicities, lower to nodes of their own that the set provers refuse ([`docs/SOUNDNESS.md`](docs/SOUNDNESS.md)) |
 | **expressions** | `CASE`, `IN`-lists, row-`IN`, row-constructor comparison, `LIKE`/`ILIKE`/`SIMILAR TO` (as uninterpreted predicates), `BETWEEN`, `CAST`, `IS [NOT] DISTINCT FROM`, the `IS TRUE/FALSE/UNKNOWN` family, comparison type coercion |
 | **schema** | keys and per-column nullability read from the DDL: `PRIMARY KEY`, `UNIQUE` (unless `DEFERRABLE`), `NOT NULL` |
 | **statements** | a pair of `SELECT`s; also a pair of `DELETE`s, of `UPDATE`s, or of `INSERT`s into one table under one explicit column list, each reduced to the query computing its effect |
 
-What it does **not** support, it refuses by name — window functions, `INTERSECT`/`EXCEPT ALL`,
-`LATERAL`, set-returning functions in scalar position, `FETCH … WITH TIES`, `DISTINCT ON` over an
+What it does **not** support, it refuses by name — window functions, `LATERAL`, set-returning functions in scalar position, `FETCH … WITH TIES`, `DISTINCT ON` over an
 aggregate query, and others — rather than lowering something it cannot lower faithfully. That trade
 is the whole soundness argument, and [`docs/SOUNDNESS.md`](docs/SOUNDNESS.md) makes it.
 

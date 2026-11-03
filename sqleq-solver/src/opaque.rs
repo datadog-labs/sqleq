@@ -228,6 +228,9 @@ fn each_node(r: &mut Relation, base: usize, schemas: &[Schema], f: &mut dyn FnMu
         Relation::Union(sides) | Relation::Except(sides) | Relation::Intersect(sides) => {
             sides.iter_mut().for_each(|s| each_node(s, base, schemas, f));
         }
+        Relation::IntersectAll(sides) | Relation::ExceptAll(sides) => {
+            sides.iter_mut().for_each(|s| each_node(s, base, schemas, f));
+        }
     }
 }
 
@@ -272,6 +275,9 @@ fn each_expr(r: &mut Relation, f: &mut dyn FnMut(&mut Expr)) {
             offset.iter_mut().chain(limit.iter_mut()).for_each(|e| each_subexpr(e, f));
         }
         Relation::Union(sides) | Relation::Except(sides) | Relation::Intersect(sides) => {
+            sides.iter_mut().for_each(|s| each_expr(s, f));
+        }
+        Relation::IntersectAll(sides) | Relation::ExceptAll(sides) => {
             sides.iter_mut().for_each(|s| each_expr(s, f));
         }
     }

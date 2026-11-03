@@ -63,6 +63,11 @@ pub struct Case {
     pub stats: Value,
     /// Error detail when not provable/unprovable.
     pub message: String,
+    /// Why QED was not handed the plan although there is one: a node its IR has no reading of
+    /// (`intersectAll`, `exceptAll`), on which it would fail to deserialize the plan. Its answer is
+    /// then `no-plan`, as for a pair that never lowered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qed_unasked: Option<String>,
     // The second opinion, only when one was asked for. `s_verdict` is that prover's raw label, kept
     // beside the bucket purely for audit: nothing may branch on it, because `NEQ` is not a
     // refutation.
@@ -146,6 +151,7 @@ impl Case {
             l_raw: None,
             q_tail: String::new(),
             q_rc: None,
+            qed_unasked: None,
             row: None,
         }
     }
@@ -603,6 +609,14 @@ pub fn prove(
     smt_timeout_ms: Option<u64>,
     mem_bytes: Option<u64>,
 ) {
+    // A plan with a node QED's IR has no reading of is not handed to it: it would panic on the
+    // deserialization, and a panic says nothing about the pair. The bag set operations are nodes of
+    // this frontend's own (docs/SOUNDNESS.md), which a set-semantics prover has no answer to.
+    if let Some(node) = bag_set_op(&workdir.join(json_name)) {
+        case.status = s(LOWERED);
+        case.qed_unasked = Some(format!("the plan has an {node} node, which QED's IR cannot read"));
+        return;
+    }
     let env: Vec<(String, String)> =
         smt_timeout_ms.map(|ms| vec![(s("QED_SMT_TIMEOUT"), ms.to_string())]).unwrap_or_default();
     let argv = [prover.to_string(), json_name.to_string()];
@@ -615,6 +629,37 @@ pub fn prove(
     }
     let stem = json_name.strip_suffix(".json").unwrap_or(json_name);
     read_result(case, &workdir.join(format!("{stem}.result")), &qr);
+}
+
+/// The IR nodes QED's IR has no reading of: the bag set operations.
+const BAG_SET_OPS: [&str; 2] = ["intersectAll", "exceptAll"];
+
+/// The first of the plan's `intersectAll` and `exceptAll` nodes, in the plan at `path`.
+fn bag_set_op(path: &Path) -> Option<&'static str> {
+    bag_set_op_in_text(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The first bag set operation of a plan's text. A node is an object key, and a string value can
+/// spell the same name, as a literal `'exceptAll'` or a table named `exceptAll` does, so the plan is
+/// read as JSON and only its keys are matched. A plan `serde_json` will not read, past its nesting
+/// limit, is matched on the quoted name anywhere in the text instead: that can only withhold from
+/// QED a plan it could have read, never hand it one it cannot.
+fn bag_set_op_in_text(text: &str) -> Option<&'static str> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(plan) => bag_set_op_in(&plan),
+        Err(_) => BAG_SET_OPS.into_iter().find(|node| text.contains(&format!("\"{node}\""))),
+    }
+}
+
+/// The first bag set operation among the object keys of `v`, depth first.
+fn bag_set_op_in(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Object(fields) => fields.iter().find_map(|(key, value)| {
+            BAG_SET_OPS.into_iter().find(|node| key == node).or_else(|| bag_set_op_in(value))
+        }),
+        Value::Array(items) => items.iter().find_map(bag_set_op_in),
+        _ => None,
+    }
 }
 
 /// The last 600 characters of the prover's stdout and of its stderr: what tells one crash from
@@ -684,5 +729,18 @@ mod tests {
         assert_eq!(ss_slug("dir/a b.sql"), "dir_a_b.sql");
         assert_eq!(ss_slug("a//b"), "a_b");
         assert_eq!(ss_slug(""), "case");
+    }
+
+    #[test]
+    fn a_bag_set_op_is_an_object_key_not_a_string_value() {
+        let node = r#"{"queries":[{"project":{"source":{"exceptAll":[{"scan":0},{"scan":1}]}}}]}"#;
+        assert_eq!(bag_set_op_in_text(node), Some("exceptAll"));
+        let nested = r#"{"queries":[{"filter":{"source":{"distinct":{"intersectAll":[{"scan":0},{"scan":0}]}}}}]}"#;
+        assert_eq!(bag_set_op_in_text(nested), Some("intersectAll"));
+        // `WHERE s = 'exceptAll'`: the literal is a string value, and the plan is QED's to read
+        let literal = r#"{"queries":[{"filter":{"condition":{"operator":"=","operand":[{"column":0},{"operator":"exceptAll","operand":[],"type":"VARCHAR"}]},"source":{"scan":0}}}],"schemas":[{"name":"intersectAll"}]}"#;
+        assert_eq!(bag_set_op_in_text(literal), None);
+        // a plan that does not parse falls back to the text, which withholds it
+        assert_eq!(bag_set_op_in_text(r#"{"exceptAll": ["#), Some("exceptAll"));
     }
 }
