@@ -256,6 +256,9 @@ fn a_run_without_the_portfolio_writes_no_portfolio_fields() {
         &f.frontend.to_string_lossy(),
         "--prover",
         &f.prover.to_string_lossy(),
+        // A plain run asks sqleq-solver by default; CI's frontend job builds none.
+        "--sqleq-solver-bin",
+        &f.solver.to_string_lossy(),
         "--json",
         &out.to_string_lossy(),
         &f.case.to_string_lossy(),
