@@ -6,8 +6,8 @@
 //! `sqleq-check` -- the command-line entry point, which runs SQL equivalence pairs past the axes
 //! asked for.
 //!
-//! It takes `.sql` pair files (or directories of them), runs each through the frontend (SQL ->
-//! the QED prover's `Input` JSON) and then the QED prover, and produces a consolidated,
+//! It takes `.sql` pair files (or directories of them), runs each through the frontend (SQL -> the
+//! lowered `Input` JSON) and then sqleq-solver, this repo's prover, and produces a consolidated,
 //! CI-friendly report. Each input `.sql` file may declare table schemas and functions, and holds
 //! **exactly two** statements; the question is whether the two are equivalent under bag semantics.
 //!
@@ -23,16 +23,19 @@
 //! summary prints `capability` -- proved among the pairs that actually differ -- directly beneath
 //! the raw `proved` count.
 //!
-//! `--sqleq-solver` adds a **second opinion** on the same cases, run over the very `Input` JSON the
-//! QED prover is handed: sqleq-solver, this repo's Rust rewrite of SQLSolver's proof engine, or with
-//! `--sqlsolver-jvm` instead the original SQLSolver through the bridge in `tools/sqlsolver/`, kept
-//! as a deprecated backup cross-check of sqleq-solver. Outside `--portfolio` and `--expect pinned`
-//! it never changes the exit code -- the qed axis decides that policy -- because it answers a
-//! different question. Two things must be read off it carefully, and the summary says both:
+//! sqleq-solver is a Rust rewrite of SQLSolver's proof engine, and the prover the default
+//! `--expect equivalent` policy reads. `--qed` adds the QED prover as a **second opinion** on the
+//! same cases, over the very `Input` JSON sqleq-solver is handed; with `--axes` leaving sqleq-solver
+//! out, the QED prover is the run's prover instead. `--sqlsolver-jvm` asks the original SQLSolver
+//! through the bridge in `tools/sqlsolver/` in sqleq-solver's place, a deprecated backup cross-check
+//! that never decides the policy. Outside `--portfolio` and `--expect pinned` a second opinion never
+//! changes the exit code, because it answers a different question. Two things must be read off the
+//! provers carefully, and the summary says both:
 //!
-//! * **That prover never disproves.** Its `NEQ` means "no proof found", exactly like its `UNKNOWN`;
-//!   only its `EQ` is a claim. A case we prove and it calls `NEQ` is not a contradiction, and
-//!   nothing here may treat it as one. sqleq-fuzz is the only disprover in this project.
+//! * **A prover's no-proof is not a disproof.** sqleq-solver's `NEQ` means "no proof found",
+//!   exactly like its `UNKNOWN`, and the QED prover's `unprovable` is the same; only a proof is a
+//!   claim. A case one proves and the other does not is not a contradiction, and nothing here may
+//!   treat it as one. sqleq-fuzz is the only disprover in this project.
 //! * **The two opinions share a frontend, so they are not independent.** A lowering bug yields the
 //!   same wrong plan on both axes; agreement corroborates the provers, not the frontend.
 //!

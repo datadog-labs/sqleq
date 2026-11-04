@@ -319,8 +319,8 @@ pub fn print_portfolio(c: Color, cases: &[Case], backends: &[&str], deadline: f6
     );
 }
 
-/// Counts by (status, trivial). `capability` is the headline: how many pairs that actually differ
-/// were proved.
+/// Counts by (proved, trivial), for the run's prover. `capability` is the headline: how many pairs
+/// that actually differ were proved.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Triviality {
     pub trivial: usize,
@@ -332,24 +332,25 @@ pub struct Triviality {
     pub capability_of: usize,
 }
 
-pub fn triviality_split(cases: &[Case]) -> Triviality {
+pub fn triviality_split(cases: &[Case], prover: Option<&str>) -> Triviality {
     let nontrivial: Vec<&Case> = cases.iter().filter(|x| x.trivial == Some(false)).collect();
     let trivial: Vec<&Case> = cases.iter().filter(|x| x.trivial == Some(true)).collect();
+    let proved = |x: &Case| prover.is_some_and(|p| x.proved_by(p));
     Triviality {
         trivial: trivial.len(),
         nontrivial: nontrivial.len(),
         undetermined: cases.iter().filter(|x| x.trivial.is_none()).count(),
         by_text: cases.iter().filter(|x| x.trivial_basis == "text").count(),
-        trivial_proved: trivial.iter().filter(|x| x.status == PROVABLE).count(),
-        capability: nontrivial.iter().filter(|x| x.status == PROVABLE).count(),
+        trivial_proved: trivial.iter().filter(|x| proved(x)).count(),
+        capability: nontrivial.iter().filter(|x| proved(x)).count(),
         capability_of: nontrivial.len(),
     }
 }
 
 /// The proved/total line counts reflexive pairs, which the prover did not earn. Print what it did
 /// earn, right underneath, so the two numbers are never seen apart.
-fn print_capability(c: Color, cases: &[Case]) {
-    let s = triviality_split(cases);
+fn print_capability(c: Color, cases: &[Case], prover: Option<&str>) {
+    let s = triviality_split(cases, prover);
     if s.capability_of == 0 && s.trivial == 0 {
         return;
     }
@@ -372,7 +373,10 @@ fn print_capability(c: Color, cases: &[Case]) {
     println!("{}", c.dim(&format!("  {:<13} {detail}", "")));
 }
 
-pub fn print_summary(c: Color, cases: &[Case], wall: f64, qed: bool) {
+/// The frontend's statuses (and the QED prover's, when asked), the proved line when the QED prover
+/// is the run's prover (`primary`), and the run's timing. sqleq-solver's proved line is in its own
+/// section ([`print_sqlsolver`]).
+pub fn print_summary(c: Color, cases: &[Case], wall: f64, primary: Option<&str>) {
     let count = |s: &str| cases.iter().filter(|x| x.status == s).count();
     let total = cases.len();
     println!();
@@ -396,13 +400,13 @@ pub fn print_summary(c: Color, cases: &[Case], wall: f64, qed: bool) {
         }
     }
     println!("{}", rule(c));
-    // Without the qed axis nothing was proved or left unproved, and a `proved 0/N` line would read
-    // as a prover that failed everything.
-    if qed {
+    // Without the qed axis as the run's prover these statuses are not its verdicts, and a
+    // `proved 0/N` line would read as a prover that failed everything.
+    if primary == Some("qed") {
         let provable = count(PROVABLE);
         let pct = if total > 0 { 100.0 * provable as f64 / total as f64 } else { 0.0 };
         println!("  {:<13} {provable}/{total}  ({pct:.1}%)", c.bold("proved"));
-        print_capability(c, cases);
+        print_capability(c, cases, primary);
     }
     println!("  {:<13} {wall:.2}s", c.dim("wall time"));
     if !cases.is_empty() {
@@ -419,10 +423,14 @@ pub fn print_summary(c: Color, cases: &[Case], wall: f64, qed: bool) {
     }
 }
 
-/// The SQLSolver axis, and the warnings that have to travel with it. With the qed axis asked (`qed`)
-/// it is a second opinion, set against the QED prover's proofs on the same pairs; without it there
-/// is nothing to set it against, and its proofs are counted on their own.
-pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp: &str, qed: bool) {
+/// The SQLSolver axis, and the warnings that have to travel with it.
+///
+/// With sqleq-solver as the run's prover (`primary`), it is the prover's own section: its buckets,
+/// what it proved, and, when the QED prover was asked too (`qed`), the QED prover as a second
+/// opinion set against it. With the QED prover as the run's prover, the SQLSolver (sqleq-solver, or
+/// the JVM fork) is the second opinion, set against QED's proofs. With neither, the JVM fork's proofs
+/// are counted on their own.
+pub fn print_sqlsolver(c: Color, cases: &[Case], stats: &solver::Stats, imp: &str, primary: Option<&str>, qed: bool) {
     let who = solver::name(imp);
     let scored: Vec<&Case> = cases.iter().filter(|x| x.s_bucket.is_some()).collect();
     if scored.is_empty() {
@@ -432,8 +440,11 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
     for x in &scored {
         *counts.entry(x.s_bucket.as_deref().unwrap_or("")).or_default() += 1;
     }
+    let solver_primary = primary == Some("sqleq-solver");
     println!();
-    if qed {
+    if solver_primary {
+        println!("{}{}", c.bold("  Prover"), c.dim(&format!("  — {who}, over the lowered IR")));
+    } else if qed {
         println!("{}{}", c.bold("  Second opinion"), c.dim(&format!("  — {who}, over the same lowered IR")));
     } else {
         println!("{}{}", c.bold("  SQLSolver axis"), c.dim(&format!("  — {who}, over the lowered IR")));
@@ -451,57 +462,56 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
     // answered by neither -- their `proved-literal` is this harness's `trivial` seen from the
     // other side -- so counting it would inflate both columns and the agreement between them.
     let diff: Vec<&&Case> = scored.iter().filter(|x| x.trivial == Some(false)).collect();
-    if qed {
-        let ours: BTreeSet<&str> = diff.iter().filter(|x| x.status == PROVABLE).map(|x| x.name.as_str()).collect();
-        let theirs: BTreeSet<&str> =
-            diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).map(|x| x.name.as_str()).collect();
-        let both = ours.intersection(&theirs).count();
-        let only_p = ours.difference(&theirs).count();
-        let only_s: Vec<&str> = theirs.difference(&ours).copied().collect();
-        let union = ours.union(&theirs).count();
-        println!("  {:<22} {:>5}", "of pairs that differ", diff.len());
-        println!("  {:<22} {both:>5}", "both provers");
-        println!("  {:<22} {only_p:>5}", "only the QED prover");
-        println!(
-            "  {:<22} {}   {}",
-            format!("only {who}"),
-            c.bold(&format!("{:>5}", only_s.len())),
-            c.dim("what the second opinion adds")
-        );
-        for name in only_s.iter().take(10) {
-            println!("{}", c.dim(&format!("  {:<22}       {name}", "")));
+    let qed_proved: BTreeSet<&str> = diff.iter().filter(|x| x.status == PROVABLE).map(|x| x.name.as_str()).collect();
+    let solver_proved: BTreeSet<&str> =
+        diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).map(|x| x.name.as_str()).collect();
+    // This axis's own cost, printed inside its section, before any second opinion's table.
+    let cost = || {
+        if let Some(w) = stats.wall_s {
+            let mut detail = format!("{w:.2}s over {} row(s)", stats.answered.unwrap_or(0));
+            if stats.halts > 0 {
+                detail += &format!(", {} driver self-halt(s) in {} pass(es)", stats.halts, stats.passes);
+            }
+            println!("{}", c.dim(&format!("  {:<22} {detail}", "wall time")));
         }
-        if only_s.len() > 10 {
-            println!("{}", c.dim(&format!("  {:<22}       … and {} more", "", only_s.len() - 10)));
+        if let Some(st) = &stats.stalled {
+            let reason = if st.reason.is_empty() { "no message" } else { &st.reason };
+            println!("{}", c.red(&format!("  stalled: IrDriver exited {} without answering a row — {reason}", st.exit)));
         }
-        println!("  {:<22} {:>5}", "neither", diff.len() - union);
-    } else if diff.is_empty() {
-        println!("  {:<13} n/a           {}", c.bold("proved"), c.dim("no pair here has two differing queries"));
+    };
+    if solver_primary {
+        let proved = cases.iter().filter(|x| x.proved_by("sqleq-solver")).count();
+        let pct = if cases.is_empty() { 0.0 } else { 100.0 * proved as f64 / cases.len() as f64 };
+        println!("  {:<13} {proved}/{}  ({pct:.1}%)", c.bold("proved"), cases.len());
+        print_capability(c, cases, primary);
+        cost();
+        if qed {
+            println!();
+            println!("{}{}", c.bold("  Second opinion"), c.dim("  — the QED prover, over the same lowered IR"));
+            println!("{}", rule(c));
+            print_agreement(c, diff.len(), (who, &solver_proved), ("the QED prover", &qed_proved));
+        }
     } else {
-        let n = diff.iter().filter(|x| x.s_bucket.as_deref() == Some(solver::PROVED)).count();
-        let pct = 100.0 * n as f64 / diff.len() as f64;
-        println!(
-            "  {:<13} {n}/{}  ({pct:.1}%)   {}",
-            c.bold("proved"),
-            diff.len(),
-            c.dim("pairs whose two queries differ")
-        );
-    }
-    if let Some(w) = stats.wall_s {
-        let mut detail = format!("{w:.2}s over {} row(s)", stats.answered.unwrap_or(0));
-        if stats.halts > 0 {
-            detail += &format!(", {} driver self-halt(s) in {} pass(es)", stats.halts, stats.passes);
+        if qed {
+            print_agreement(c, diff.len(), ("the QED prover", &qed_proved), (who, &solver_proved));
+        } else if diff.is_empty() {
+            println!("  {:<13} n/a           {}", c.bold("proved"), c.dim("no pair here has two differing queries"));
+        } else {
+            let pct = 100.0 * solver_proved.len() as f64 / diff.len() as f64;
+            println!(
+                "  {:<13} {}/{}  ({pct:.1}%)   {}",
+                c.bold("proved"),
+                solver_proved.len(),
+                diff.len(),
+                c.dim("pairs whose two queries differ")
+            );
         }
-        println!("{}", c.dim(&format!("  {:<22} {detail}", "wall time")));
-    }
-    if let Some(st) = &stats.stalled {
-        let reason = if st.reason.is_empty() { "no message" } else { &st.reason };
-        println!("{}", c.red(&format!("  stalled: IrDriver exited {} without answering a row — {reason}", st.exit)));
+        cost();
     }
     println!(
         "{}",
         c.dim(
-            "  note  `no-proof` is not a refutation. That prover's NEQ means \"no proof\n        found\", exactly \
+            "  note  `no-proof` is not a refutation. A prover's NEQ means \"no proof\n        found\", exactly \
              like its UNKNOWN; only its EQ is a claim, and\n        sqleq-fuzz remains the only disprover here."
         )
     );
@@ -514,6 +524,55 @@ pub fn print_second_opinion(c: Color, cases: &[Case], stats: &solver::Stats, imp
             )
         );
     }
+}
+
+/// The run's prover (`first`) set against the second opinion (`second`) over the `of` pairs that
+/// differ: what both proved, what each proved alone, and the second's own proofs by name, which is
+/// what asking it adds.
+fn print_agreement(c: Color, of: usize, first: (&str, &BTreeSet<&str>), second: (&str, &BTreeSet<&str>)) {
+    let (first_name, ours) = first;
+    let (second_name, theirs) = second;
+    let both = ours.intersection(theirs).count();
+    let only_first = ours.difference(theirs).count();
+    let only_second: Vec<&str> = theirs.difference(ours).copied().collect();
+    let union = ours.union(theirs).count();
+    println!("  {:<22} {:>5}", "of pairs that differ", of);
+    println!("  {:<22} {both:>5}", "both provers");
+    println!("  {:<22} {only_first:>5}", format!("only {first_name}"));
+    println!(
+        "  {:<22} {}   {}",
+        format!("only {second_name}"),
+        c.bold(&format!("{:>5}", only_second.len())),
+        c.dim("what the second opinion adds")
+    );
+    for name in only_second.iter().take(10) {
+        println!("{}", c.dim(&format!("  {:<22}       {name}", "")));
+    }
+    if only_second.len() > 10 {
+        println!("{}", c.dim(&format!("  {:<22}       … and {} more", "", only_second.len() - 10)));
+    }
+    println!("  {:<22} {:>5}", "neither", of - union);
+}
+
+/// A case's line from the SQLSolver axis, when sqleq-solver is the run's prover: its bucket where
+/// the frontend pass's line has the QED prover's status.
+pub fn print_solver_line(c: Color, case: &Case, name_w: usize) {
+    let bucket = case.s_bucket.as_deref().unwrap_or("");
+    let glyph = match bucket {
+        solver::PROVED | solver::PROVED_LITERAL => "✓",
+        solver::NO_PROOF => "✗",
+        solver::UNSUPPORTED => "⚠",
+        solver::TIMEOUT => "⏱",
+        _ => "?",
+    };
+    let s = format!("{glyph} {bucket}");
+    let s = match bucket {
+        solver::PROVED | solver::PROVED_LITERAL => c.green(&s),
+        solver::NO_PROOF | solver::UNSUPPORTED | solver::TIMEOUT => c.yellow(&s),
+        _ => c.red(&s),
+    };
+    let note = if case.s_note.is_empty() { String::new() } else { format!("  {}", c.dim(&format!("— {}", case.s_note))) };
+    println!("  {:<22} {:<name_w$}{note}", s, case.name);
 }
 
 pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
@@ -755,6 +814,10 @@ pub enum Finding {
 #[derive(Serialize)]
 pub struct Meta {
     pub axes: Vec<String>,
+    /// Whose verdict `--expect equivalent` and the `triviality` counts read: `sqleq-solver`, `qed`,
+    /// or `portfolio` (the combined verdict). Absent when no prover was asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
     pub frontend: Option<String>,
     pub prover: Option<String>,
     pub jobs: usize,

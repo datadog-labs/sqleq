@@ -59,7 +59,8 @@ lost outright: when a refused pair's two sides normalize to one query, the front
 (`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
 many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
 `--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
-asks whether the QED prover proved the pair, still counts it as refused. The claim needs every
+asks whether the run's prover (`sqleq-solver`, unless the axes leave it out) proved the pair, still
+counts it as refused. The claim needs every
 normalization to keep the number of times a call is evaluated, and `WITH` inlining does not: it
 evaluates a binding read twice twice, where Postgres evaluates it once. So the check declines a pair
 in which inlining would copy a volatile call such as `random()`.

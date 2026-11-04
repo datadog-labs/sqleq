@@ -1,6 +1,8 @@
 # Design decisions behind the Rust frontend
 
-**Status:** history, kept for the reasoning.
+**Status:** history, kept for the reasoning. It predates `sqleq-solver`: where it speaks of *the
+prover*, it means the QED prover, which is now an optional second opinion beside `sqleq-solver`, the
+default prover.
 
 A premise and four decisions shaped `sqleq-frontend`, and this is the only place the *arguments* for
 them are written down. That is the whole reason this file still exists. It does **not** describe the

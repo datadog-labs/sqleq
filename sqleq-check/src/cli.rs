@@ -75,7 +75,7 @@ fn default_jobs() -> usize {
 #[command(
     name = "sqleq-check",
     about = "Batch SQL equivalence checking: run each pair past the axes asked for -- by default \
-             the frontend and the QED prover -- and report or judge the answers.",
+             the frontend and sqleq-solver -- and report or judge the answers.",
     after_help = EPILOG,
     infer_long_args = true
 )]
@@ -181,8 +181,8 @@ pub struct Args {
     pub expect: Expect,
 
     /// Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, lean
-    /// (default: frontend,qed). A prover axis brings in frontend; at most one SQLSolver per run.
-    /// sqlsolver-rust is the old name of sqleq-solver.
+    /// (default: frontend,sqleq-solver). A prover axis brings in frontend; at most one SQLSolver
+    /// per run. sqlsolver-rust is the old name of sqleq-solver.
     #[arg(long, value_name = "LIST")]
     pub axes: Option<String>,
 
@@ -237,21 +237,29 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub prover: Option<String>,
 
-    /// Also ask sqleq-solver (a Rust rewrite of SQLSolver) about every case that lowered, over the
-    /// same Input JSON the QED prover gets. Outside --portfolio and --expect pinned it never
-    /// changes the exit code, unless its proof meets a fuzz counterexample (an alarm), and its NEQ
-    /// is never a refutation. See docs/SQLSOLVER.md.
+    /// Ask sqleq-solver, this repo's prover, about every case that lowered. It is the default prover,
+    /// asked unless --axes leaves it out, so the flag only matters beside an --axes list. Its NEQ is
+    /// never a refutation. See docs/SQLSOLVER.md.
     #[arg(long, conflicts_with = "sqlsolver_jvm")]
     pub sqleq_solver: bool,
+
+    /// Also ask the QED prover about every case that lowered, over the same Input JSON
+    /// sqleq-solver gets: a second opinion. Outside --portfolio and --expect pinned it never changes
+    /// the exit code while sqleq-solver is asked, unless its proof meets a fuzz counterexample (an
+    /// alarm); with --axes leaving sqleq-solver out, the policy reads QED instead.
+    #[arg(long)]
+    pub qed: bool,
 
     /// The sqleq-solver binary, whenever a run asks it (else --bin-dir / $SQLEQ_SOLVER_BIN / PATH /
     /// the newer of this repo's target/{release,debug} builds).
     #[arg(long, value_name = "PATH")]
     pub sqleq_solver_bin: Option<String>,
 
-    /// Ask the original SQLSolver instead, as a JVM fork through tools/sqlsolver/IrDriver:
-    /// sqleq-solver's backup cross-check, and deprecated. Same jobs, same result rows, same
-    /// buckets; needs a JDK and the fork tree. Not with --sqleq-solver or --portfolio.
+    /// Ask the original SQLSolver in sqleq-solver's place, as a JVM fork through
+    /// tools/sqlsolver/IrDriver: sqleq-solver's backup cross-check, and deprecated. Same jobs, same
+    /// result rows, same buckets; needs a JDK and the fork tree. It never decides --expect
+    /// equivalent (it has known false proofs): with it, ask --qed for that policy, or use --expect
+    /// report-only or pinned. Not with --sqleq-solver or --portfolio.
     #[arg(long)]
     pub sqlsolver_jvm: bool,
 
@@ -273,15 +281,15 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub lean_bin: Option<String>,
 
-    /// Per-row cap for the second opinion (sqleq-solver, or the fork with --sqlsolver-jvm), in ms
+    /// Per-row cap for the SQLSolver axis (sqleq-solver, or the fork with --sqlsolver-jvm), in ms
     /// (default: --timeout): a budget for each row, not a share of one. Under --portfolio it is
     /// also capped by what is left of the case's deadline.
     #[arg(long, value_name = "MS")]
     pub sqleq_solver_timeout: Option<u64>,
 }
 
-/// Which prover gives the second opinion: `sqleq-solver`, `jvm` for the JVM fork, or `None`.
-pub fn second_opinion(args: &Args) -> Option<&'static str> {
+/// Which SQLSolver the flags name: `sqleq-solver`, `jvm` for the JVM fork, or `None`.
+pub fn sqlsolver_flag(args: &Args) -> Option<&'static str> {
     if args.sqlsolver_jvm {
         Some("jvm")
     } else if args.sqleq_solver {
@@ -291,13 +299,15 @@ pub fn second_opinion(args: &Args) -> Option<&'static str> {
     }
 }
 
-/// The axes this run asks, in canonical order. `--sqleq-solver` and `--sqlsolver-jvm` add the
-/// SQLSolver axis they name, and `sqlsolver-rust`, sqleq-solver's axis before it was renamed, still
-/// names it. A prover is handed the frontend's plan, so asking one asks the frontend.
+/// The axes this run asks, in canonical order. By default the frontend and sqleq-solver, the
+/// prover, or the JVM fork in its place with `--sqlsolver-jvm`; `--portfolio` asks every backend
+/// that needs no extra toolchain. `--sqleq-solver` and `--sqlsolver-jvm` add the SQLSolver axis they
+/// name, `--qed` adds the QED prover, and `sqlsolver-rust`, sqleq-solver's axis before it was
+/// renamed, still names it. A prover is handed the frontend's plan, so asking one asks the frontend.
 pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
     let mut axes: Vec<String> = match &args.axes {
         None if args.portfolio => ["frontend", "qed", "sqleq-solver", "fuzz"].map(String::from).to_vec(),
-        None => vec!["frontend".into(), "qed".into()],
+        None => vec!["frontend".into(), if args.sqlsolver_jvm { "sqlsolver-jvm" } else { "sqleq-solver" }.into()],
         Some(list) => {
             let named: Vec<String> = list
                 .split(',')
@@ -319,8 +329,11 @@ pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
             named
         }
     };
-    if let Some(second) = second_opinion(args) {
-        axes.push(if second == "sqleq-solver" { "sqleq-solver".into() } else { "sqlsolver-jvm".into() });
+    if let Some(solver) = sqlsolver_flag(args) {
+        axes.push(if solver == "sqleq-solver" { "sqleq-solver".into() } else { "sqlsolver-jvm".into() });
+    }
+    if args.qed {
+        axes.push("qed".into());
     }
     if args.lean {
         axes.push("lean".into());
@@ -339,6 +352,13 @@ pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
     Ok(suite::AXES.iter().copied().filter(|a| has(a)).collect())
 }
 
+/// The prover whose verdict `--expect equivalent` reads outside `--portfolio`: sqleq-solver when
+/// the run asks it, else the QED prover when asked, else none. The JVM fork never is: it has known
+/// false proofs. Any other prover the run asks is a second opinion, reported beside it.
+pub fn primary_prover(axes: &[&str]) -> Option<&'static str> {
+    ["sqleq-solver", "qed"].into_iter().find(|p| axes.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +368,7 @@ mod tests {
     }
 
     fn asks(argv: &[&str]) -> Option<&'static str> {
-        second_opinion(&parse(argv).unwrap())
+        sqlsolver_flag(&parse(argv).unwrap())
     }
 
     #[test]
@@ -369,10 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn sqleq_solver_is_the_default_prover() {
+        let axes = |argv: &[&str]| resolve_axes(&parse(argv).unwrap()).unwrap();
+        assert_eq!(axes(&[]), ["frontend", "sqleq-solver"]);
+        // `--qed` adds the QED prover beside it; an explicit list keeps what it names.
+        assert_eq!(axes(&["--qed"]), ["frontend", "qed", "sqleq-solver"]);
+        assert_eq!(axes(&["--axes", "frontend,qed"]), ["frontend", "qed"]);
+        assert_eq!(axes(&["--axes", "fuzz", "--qed"]), ["frontend", "fuzz", "qed"]);
+    }
+
+    #[test]
+    fn the_policy_reads_sqleq_solver_else_qed_never_the_fork() {
+        assert_eq!(primary_prover(&["frontend", "sqleq-solver"]), Some("sqleq-solver"));
+        assert_eq!(primary_prover(&["frontend", "qed", "sqleq-solver"]), Some("sqleq-solver"));
+        assert_eq!(primary_prover(&["frontend", "qed"]), Some("qed"));
+        assert_eq!(primary_prover(&["frontend", "qed", "sqlsolver-jvm"]), Some("qed"));
+        assert_eq!(primary_prover(&["frontend", "sqlsolver-jvm"]), None);
+        assert_eq!(primary_prover(&["fuzz"]), None);
+    }
+
+    #[test]
     fn the_switches_and_the_old_axis_name_choose_the_axis() {
         let axes = |argv: &[&str]| resolve_axes(&parse(argv).unwrap());
-        assert_eq!(axes(&["--sqleq-solver"]).unwrap(), ["frontend", "qed", "sqleq-solver"]);
-        assert_eq!(axes(&["--sqlsolver-jvm"]).unwrap(), ["frontend", "qed", "sqlsolver-jvm"]);
+        assert_eq!(axes(&["--sqleq-solver"]).unwrap(), ["frontend", "sqleq-solver"]);
+        // The fork takes sqleq-solver's place: one SQLSolver per run.
+        assert_eq!(axes(&["--sqlsolver-jvm"]).unwrap(), ["frontend", "sqlsolver-jvm"]);
+        assert_eq!(axes(&["--sqlsolver-jvm", "--qed"]).unwrap(), ["frontend", "qed", "sqlsolver-jvm"]);
         assert_eq!(axes(&["--axes", "sqlsolver-rust"]).unwrap(), ["frontend", "sqleq-solver"]);
         assert!(axes(&["--axes", "sqleq-solver", "--sqlsolver-jvm"]).is_err());
         assert!(axes(&["--axes", "frontend,qd"]).unwrap_err().contains("unknown axis qd"));

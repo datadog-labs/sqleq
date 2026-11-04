@@ -5,8 +5,8 @@ return a **proof** when they are equivalent or a **concrete counterexample** whe
 Turns query rewrites, optimizer changes, and migrations into something you verify rather than trust.
 
 ```
-                              ┌─▶ sqleq-frontend ──▶ IR ───┬─▶ qed-prover ────▶ proof?
-                              │   parse·resolve·type·lower └─▶ sqleq-solver ──▶ proof?
+                              ┌─▶ sqleq-frontend ──▶ IR ───┬─▶ sqleq-solver ──▶ proof?
+                              │   parse·resolve·type·lower └─▶ qed-prover ────▶ proof? (optional)
 SQL pair + DDL ─▶ sqleq-check ┼─▶ sqleq-fuzz ──▶ generated tables in Postgres ▶ counterexample?
                               └─▶ sqleq-lean ──▶ Lean kernel ─────────────────▶ proof? (INSERTs)
 ```
@@ -20,13 +20,14 @@ independent — which is what lets them check each other. Any pair a prover call
 `sqleq-fuzz` refutes is a bug in one of them: `sqleq-check` reports it as an `alarm` and fails the
 run, with or without `--portfolio`. See [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
-The provers are the [QED](https://github.com/qed-solver/prover) prover, an external binary, and
-**`sqleq-solver`**, a Rust rewrite of [SQLSolver](https://github.com/SJTU-IPADS/SQLSolver)'s proof
-engine that reads the same IR and builds with Cargo alone, Z3 included (compiled from source). Asked
-with `--sqleq-solver`, it is a second opinion reported beside the QED prover's, and the default
-`--expect equivalent` policy ignores it; in a portfolio its proof counts like any other. The
-original Java SQLSolver can be asked instead (`--sqlsolver-jvm`), as a backup cross-check that is
-being retired, but it needs a fork that is not published. See
+The prover is **`sqleq-solver`**, a Rust rewrite of
+[SQLSolver](https://github.com/SJTU-IPADS/SQLSolver)'s proof engine that reads the frontend's IR and
+builds with Cargo alone, Z3 included (compiled from source); the default `--expect equivalent`
+policy reads its proofs. The [QED](https://github.com/qed-solver/prover) prover, an external binary
+that reads the same IR, is optional: `--qed` asks it as a second opinion, reported beside
+sqleq-solver's and never changing the exit code, and in a portfolio its proof counts like any other.
+The original Java SQLSolver can be asked in sqleq-solver's place (`--sqlsolver-jvm`), as a backup
+cross-check that is being retired, but it needs a fork that is not published. See
 [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
 
 The **Lean axis** (`sqleq-lean`) covers one class of `INSERT` pair the other axes cannot even state:
@@ -42,7 +43,7 @@ Build `sqleq-check` and the two backends Cargo builds by itself:
 
 ```sh
 cargo build --release                               # sqleq-frontend and sqleq-check
-cargo build --release -p sqleq-fuzz -p sqleq-solver # the refuter and the in-repo prover
+cargo build --release -p sqleq-fuzz -p sqleq-solver # the refuter and the prover
 ```
 
 The first build of `sqleq-fuzz` downloads DuckDB's release library (~40 MB) and the PostgreSQL 17 it
@@ -74,9 +75,9 @@ The second is proved, on every instance the schema admits. (Output is cut here: 
 naming the binary it found for each backend and the axes it asks, and `…` stands for the summary and
 per-axis tables.)
 
-**Adding the QED prover.** It is not vendored here; see [Building](#building) for getting it with
-Nix. Once it is on `PATH`, drop `--axes`: by default a portfolio asks the frontend, the QED prover,
-`sqleq-solver` and `sqleq-fuzz` (`--lean` adds the Lean axis).
+**Adding the QED prover (optional).** It is not vendored here; see [Building](#building) for
+getting it with Nix. Once it is on `PATH`, drop `--axes`: by default a portfolio asks the frontend,
+`sqleq-solver`, the QED prover and `sqleq-fuzz` (`--lean` adds the Lean axis).
 
 ```sh
 $CHECK --portfolio --expect report-only -v examples/
@@ -89,44 +90,47 @@ $CHECK --portfolio --expect report-only -v examples/
   proved by     qed alone 0 · sqleq-solver alone 0 · both 1
 ```
 
-**In CI.** Without `--portfolio`, `sqleq-check` asks the frontend and the QED prover, and by default
-exits nonzero unless every pair is proved — so a directory of rewrites you expect to be safe is a
-test:
+**In CI.** Without `--portfolio`, `sqleq-check` asks the frontend and `sqleq-solver`, and by
+default exits nonzero unless sqleq-solver proves every pair — so a directory of rewrites you expect
+to be safe is a test, and it needs nothing beyond the two Cargo builds above:
 
 ```sh
 $CHECK examples/
 ```
 
 ```
-  ✗ unprovable           dropped_filter.sql    0.09s  complete-frag
-
-  Summary
+  asking sqleq-solver about 2 case(s), sequentially, 60000ms/row…
+  ✗ no-proof             dropped_filter.sql
+  …
+  Prover  — sqleq-solver, over the lowered IR
   ────────────────────────────────────────
-  ✓ provable                 1
-  ✗ unprovable               1
+  proved                     1
+  no-proof                   1
   ────────────────────────────────────────
   proved        1/2  (50.0%)
   …
 ```
 
-The exit code is 1 here because `dropped_filter.sql` is unprovable — correctly, since it is not
-equivalent. `--json
-out.json` writes every case's answers as one machine-readable document.
+The exit code is 1 here because `dropped_filter.sql` has no proof — correctly, since it is not
+equivalent. `--qed` adds the QED prover's answers as a second opinion, set against sqleq-solver's,
+that never changes the exit code; `--axes frontend,qed` makes the QED prover the run's prover
+instead, as it was before sqleq-solver was the default. `--json out.json` writes every case's
+answers as one machine-readable document.
 
 ## What a verdict means
 
-These are the words `sqleq-check` reports: a status per pair in the default mode, an answer per
-axis, and under `--portfolio` one verdict per pair.
+These are the words `sqleq-check` reports: an answer per axis for each pair, and under
+`--portfolio` one verdict per pair.
 
 | you get | from | it means | it does not mean |
 |---|---|---|---|
-| `provable`, `proved` | the QED prover (the default mode's status), any prover | equivalent on **every** instance the schema admits | — (but see [Parameters](#parameters-n) and [what a proof assumes](docs/SOUNDNESS.md)) |
+| `proved`, `provable` | any prover (`provable` is the QED prover's word) | equivalent on **every** instance the schema admits | — (but see [Parameters](#parameters-n) and [what a proof assumes](docs/SOUNDNESS.md)) |
 | `proved-literal`, `emit-reflexive`, `reflexive` | a prover, the frontend | the two sides are one query once normalized, so equivalent without a proof search | — |
 | `proved-gather` | Lean | equivalent under the gather rule for parameters, a different binding from the others' ([`docs/LEAN.md`](docs/LEAN.md)) | equivalent under index binding |
 | `counterexample` | `sqleq-fuzz` | not equivalent, and here is the instance that shows it | — |
 | `counterexample-gather` | `sqleq-fuzz` | not equivalent under the gather rule, the binding Lean proves under, and here is the instance | not equivalent under index binding |
 | `no-counterexample`, `no-counterexample-gather` | `sqleq-fuzz` | no divergence on the instances it tried | **not** a proof |
-| `unprovable`, `no-proof` | the QED prover, any prover | this prover did not get there | **not** "not equivalent" |
+| `no-proof`, `unprovable` | any prover (`unprovable` is the QED prover's word) | this prover did not get there | **not** "not equivalent" |
 | `timeout` | any axis | it ran out of time | **not** a claim about the pair |
 | `refused`, `no-plan`, `unsupported` | the frontend, a prover | it declined to lower the pair rather than guess | **not** a claim about the pair |
 
@@ -183,14 +187,17 @@ know. It detects and reports what it can (`parameter-misaligned`) and assumes th
 ```sh
 CHECK=./target/release/sqleq-check
 
-# One pair, or a directory of them (recursed): the frontend and the QED prover, and a CI exit code.
+# One pair, or a directory of them (recursed): the frontend and sqleq-solver, and a CI exit code.
 $CHECK pair.sql
 $CHECK rewrites/
 
-# Name the axes to ask: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, lean.
-$CHECK --axes frontend,qed,sqleq-solver --expect report-only rewrites/
+# Also the QED prover, as a second opinion beside sqleq-solver; the exit code stays sqleq-solver's.
+$CHECK --qed rewrites/
 
-# The frontend, QED prover, sqleq-solver and sqleq-fuzz at once on each pair, one combined
+# Name the axes to ask: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, lean.
+$CHECK --axes frontend,sqleq-solver,qed --expect report-only rewrites/
+
+# The frontend, sqleq-solver, the QED prover and sqleq-fuzz at once on each pair, one combined
 # verdict per pair, under a shared 60-second deadline (--lean adds the Lean axis).
 $CHECK --portfolio -t 60 rewrites/
 
@@ -207,11 +214,11 @@ one.
 
 Each backend is also a binary of its own, documented with its crate. `sqleq-check` takes each from
 its flag, `--bin-dir`, its environment variable, `PATH` or this repository's `target/`, in that
-order (the manual has the details). The frontend alone lowers a pair to the prover's Input JSON
+order (the manual has the details). The frontend alone lowers a pair to the provers' Input JSON
 (`sqleq-frontend pair.sql out.json`), and is a library too:
 
 ```rust
-let input_json = sqleq_frontend::lower_sql(sql_text)?; // serde_json::Value, the prover's Input
+let input_json = sqleq_frontend::lower_sql(sql_text)?; // serde_json::Value, the provers' Input
 ```
 
 ## Input format
@@ -234,7 +241,8 @@ answers.
 Recent stable Rust (edition 2021; MSRV 1.88, set by the locked dependency tree). A bare
 `cargo build --release` builds the frontend and `sqleq-check`; the frontend depends only on
 `sqlparser`, `serde_json` and `csv`. `sqleq-check` builds no backend: it runs each one as a
-subprocess, and the heavier ones are opt-in workspace members, each built with `-p`:
+subprocess, and the heavier ones are opt-in workspace members, each built with `-p` — including
+`sqleq-solver`, which a default `sqleq-check` run asks:
 
 * **`sqleq-fuzz`** — `cargo build --release -p sqleq-fuzz`. Its first build downloads DuckDB's
   release library (~40 MB) and a prebuilt PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS
@@ -244,16 +252,16 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   `SQLEQ_PG_DOWNLOAD=0` to skip the download. On Linux the fetched PostgreSQL uses the system's
   OpenSSL 3, libxml2, Kerberos, zstd and lz4 libraries; where one is missing it cannot start, and
   `sqleq-fuzz` uses the `postgres` on `PATH` instead.
-* **`sqleq-solver`** — `cargo build --release -p sqleq-solver`. Its first build compiles Z3 from
-  source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in statically, so
-  the binary needs nothing at run time.
+* **`sqleq-solver`**, the default prover — `cargo build --release -p sqleq-solver`. Its first build
+  compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in
+  statically, so the binary needs nothing at run time.
 * **`sqleq-lean`** — `cargo build --release -p sqleq-lean`. At run time it needs `lake` (from a Lean
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and
   builds the [`lean/`](lean/) package on first use; that package pins its own Lean version and
   needs no Mathlib.
 
-The QED prover is external (the upstream [`qed-solver`](https://github.com/qed-solver/prover)
-project) and is not vendored here. It needs the native `z3` and `cvc5` solvers, and its Nix flake
+The QED prover, which `--qed` and the default portfolio ask, is external (the upstream
+[`qed-solver`](https://github.com/qed-solver/prover) project) and is not vendored here. It needs the native `z3` and `cvc5` solvers, and its Nix flake
 bundles them, so Nix is the most reliable way to get a working prover without installing solvers
 yourself:
 
@@ -275,7 +283,7 @@ and failing those the newest Nix-built `qed-prover` it can find.
 | [`docs/SOUNDNESS.md`](docs/SOUNDNESS.md) | what a verdict rests on: what is refused, and what is assumed |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | how the tool is validated, and the defects that validation has caught |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | why the frontend is built this way |
-| [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | `sqleq-solver` on the same IR as the QED prover, and the Java SQLSolver that cross-checks it |
+| [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | `sqleq-solver`, the default prover, on the IR the QED prover reads too, and the Java SQLSolver that cross-checks it |
 | [`docs/LEAN.md`](docs/LEAN.md) | the Lean axis: which `INSERT` pairs it proves, and under what rule |
 | [`docs/INTERNALS.md`](docs/INTERNALS.md) | module map, for reading or changing the code |
 | [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |

@@ -3,7 +3,9 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! One case through the frontend and the QED prover.
+//! One case through the frontend and, when asked, the QED prover. The SQLSolver axis
+//! (sqleq-solver, the default prover) answers in a pass of its own (`axes::solver`), into the
+//! `s_*` fields.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -15,14 +17,14 @@ use crate::inputs::{first_row_name, suffix, triviality_from_ir, triviality_from_
 use crate::proc::run_cmd;
 use crate::util::{tail, truthy};
 
-// Status taxonomy.
-/// The prover proved the two queries equivalent.
+// Status taxonomy: the frontend's and, when asked, the QED prover's.
+/// The QED prover proved the two queries equivalent.
 pub const PROVABLE: &str = "provable";
-/// The prover ran but could not prove equivalence.
+/// The QED prover ran but could not prove equivalence.
 pub const UNPROVABLE: &str = "unprovable";
 /// The frontend would not lower the SQL (see `refuse_kind`).
 pub const REFUSED: &str = "refused";
-/// The prover panicked / crashed on the case.
+/// The QED prover panicked / crashed on the case.
 pub const PANIC: &str = "panic";
 /// Exceeded the per-case wall-clock budget.
 pub const TIMEOUT: &str = "timeout";
@@ -68,7 +70,7 @@ pub struct Case {
     /// then `no-plan`, as for a pair that never lowered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qed_unasked: Option<String>,
-    // The second opinion, only when one was asked for. `s_verdict` is that prover's raw label, kept
+    // The SQLSolver axis, only when it was asked. `s_verdict` is that prover's raw label, kept
     // beside the bucket purely for audit: nothing may branch on it, because `NEQ` is not a
     // refutation.
     pub s_bucket: Option<String>,
@@ -116,6 +118,18 @@ pub struct Case {
 }
 
 impl Case {
+    /// Whether `prover` (`qed` or `sqleq-solver`) proved the case: `provable`, or sqleq-solver's
+    /// `proved` / `proved-literal`. Both count a pair whose two plans are one, as each prover reads it.
+    pub fn proved_by(&self, prover: &str) -> bool {
+        match prover {
+            "qed" => self.status == PROVABLE,
+            "sqleq-solver" => {
+                matches!(self.s_bucket.as_deref(), Some(crate::axes::solver::PROVED | crate::axes::solver::PROVED_LITERAL))
+            }
+            _ => false,
+        }
+    }
+
     pub fn new(name: &str, path: &str) -> Case {
         Case {
             name: name.to_string(),
@@ -371,7 +385,7 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
             return case;
         }
     };
-    // The second opinion asks about every job in its directory, so a job this run of the case does
+    // The SQLSolver axis asks about every job in its directory, so a job this run of the case does
     // not package -- the retry pass re-runs a case, and its frontend may fail the second time -- must
     // not be left there from the first.
     let job = st.ss_dir.as_ref().map(|d| d.join(format!("{}.job.jsonl", ss_slug(name))));
@@ -383,8 +397,8 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
         return case;
     };
 
-    // 1b) Package the plan for the second opinion, while the workdir still exists. Built before the
-    // prover runs, so a prover timeout does not also cost the second opinion; its own cost is
+    // 1b) Package the plan for the SQLSolver axis, while the workdir still exists. Built before the
+    // QED prover runs, so a QED timeout does not also cost the SQLSolver axis; its own cost is
     // discounted from `case.wall` so a second-opinion run's timings stay comparable to one without
     // it.
     if let Some(job) = &job {
@@ -560,7 +574,7 @@ fn lower_row(
     }
 }
 
-/// Package the lowered plan as the second opinion's job at `job`: `{name, ir, schema}` built from
+/// Package the lowered plan as the SQLSolver axis's job at `job`: `{name, ir, schema}` built from
 /// *this* JSON -- the same bytes the prover reads -- so nothing re-lowers the case and the two axes
 /// cannot drift apart. A plan the bridge cannot express is `unsupported` on the case; a frontend
 /// that could not read the plan back, write the job or run at all is an `error`, because the bridge

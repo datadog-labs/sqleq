@@ -138,7 +138,7 @@ pub fn discover_lean(flag: Option<&str>, bin_dir: Option<&str>) -> Result<String
         .to_string())
 }
 
-/// How to run the second opinion's driver: the command up to its positional arguments, where to
+/// How to run the SQLSolver axis's driver: the command up to its positional arguments, where to
 /// run it, and with what environment laid over ours. Both implementations take the same
 /// `<jobs> <results> --timeout-ms=N` and write the same rows, so everything after the command is
 /// shared.

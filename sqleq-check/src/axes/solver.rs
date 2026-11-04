@@ -3,13 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! The SQLSolver axes, `sqleq-solver` and `sqlsolver-jvm` -- the second opinion.
+//! The SQLSolver axes: `sqleq-solver`, the default prover, and `sqlsolver-jvm`, its deprecated
+//! backup cross-check.
 //!
-//! SQLSolver is a second equivalence prover, an independent implementation rather than a variant
-//! of the QED prover. sqleq-solver rewrites its proof engine in Rust and reads our lowered `Input`
-//! directly; the original is reachable through the bridge in `tools/sqlsolver/`, which hands it
-//! the `Input` too. Either way the question asked here is literally the one the QED prover is
-//! asked. `docs/SQLSOLVER.md` describes both implementations and where they differ.
+//! SQLSolver is an equivalence prover independent of the QED prover, not a variant of it.
+//! sqleq-solver rewrites its proof engine in Rust and reads our lowered `Input` directly; the
+//! original is reachable through the bridge in `tools/sqlsolver/`, which hands it the `Input` too.
+//! Either way the question asked here is literally the one the QED prover is asked, when it is.
+//! `docs/SQLSOLVER.md` describes both implementations and where they differ.
 //!
 //! Three properties of that prover shape the code below, and together they are why this is one
 //! batched pass at the end rather than a call inside `run_case`:
@@ -17,10 +18,10 @@
 //! * the original is a JVM, so per-case startup would swamp the cases themselves;
 //! * `Verification.verify` can hang in a way interrupts do not reach, so the driver halts its own
 //!   process after writing the offending row and expects the harness to resume on a fresh one --
-//!   the loop in [`run_second_opinion`];
+//!   the loop in [`run_pass`];
 //! * its per-row cap is load-sensitive, so by default the rows go through one driver, sequentially,
-//!   even when the prover pass ran them `-j` wide; `--sqleq-solver-jobs` trades that for speed. A
-//!   second opinion that changes under load is not one.
+//!   even when the frontend pass ran them `-j` wide; `--sqleq-solver-jobs` trades that for speed.
+//!   A verdict that changes under load is not one.
 //!
 //! Under `--portfolio` none of this applies: [`crate::portfolio`] asks sqleq-solver once per case,
 //! inside that case's deadline.
@@ -140,7 +141,7 @@ pub struct Stats {
 /// One is the default and the reproducible choice: the per-row cap is load-sensitive, so a row near
 /// it can decide differently with other drivers running. `mem_bytes` caps each driver's address
 /// space.
-pub fn run_second_opinion(
+pub fn run_pass(
     cases: &mut [Case],
     ss_dir: &Path,
     driver: &SsDriver,

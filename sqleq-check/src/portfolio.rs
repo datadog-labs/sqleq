@@ -316,7 +316,7 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                 };
                 done.insert("frontend".into(), since(t0));
                 if let Some(json) = json {
-                    // The second opinion's job, packaged from the very plan the prover reads.
+                    // The SQLSolver axis's job, packaged from the very plan the QED prover reads.
                     let ss = ctx.ss.and_then(|d| {
                         let job = workdir.join("ss.job.jsonl");
                         let out = workdir.join("ss.results.jsonl");

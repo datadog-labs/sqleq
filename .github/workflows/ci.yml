@@ -368,12 +368,12 @@ jobs:
           cargo doc --no-deps -p sqleq-solver --document-private-items
 
       # The frontend job runs the harness tests too, but without this binary the ones that drive the
-      # second opinion through it skip. Here they must run: `$SQLEQ_SOLVER_BIN` makes a missing
+      # real prover skip. Here they must run: `$SQLEQ_SOLVER_BIN` makes a missing
       # binary a failure instead of a skip, and the tests are named. The portfolio's test lowers its
       # pairs, so the frontend is built first.
       - run: cargo build -p sqleq-solver --bin sqleq-solver
       - run: cargo build --bin sqleq-frontend --bin sqleq-check
-      - name: second opinion through sqleq-solver
+      - name: sqleq-check through the real sqleq-solver
         env:
           SQLEQ_SOLVER_BIN: target/debug/sqleq-solver
         run: cargo test -p sqleq-check --test real_solver -- --nocapture

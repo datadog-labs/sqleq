@@ -173,7 +173,7 @@ that lowered alike — comes with that pair under [`tests/pairs/`](tests/pairs/R
 1. Minimize it on an invented schema. Nothing in it may come from a corpus that is not public.
 2. Write its `truth`, its `origin`, and a `witness` (not equivalent) or an `argument` (equivalent).
 3. Rebuild every binary, then run `sqleq-check --expect pinned --bless --axes <list> <pair.sql>`
-   naming every axis you have: `--axes` defaults to `frontend,qed`, and a run takes one SQLSolver,
+   naming every axis you have: `--axes` defaults to `frontend,sqleq-solver`, and a run takes one SQLSolver,
    so `sqlsolver-jvm` is blessed in a second run beside `sqleq-solver`.
 4. Read the diff against `truth`, and show the pair fails on a build from before the fix.
 5. In the pull request, say why every pin that moved, moved.

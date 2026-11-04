@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crate::axes::{fuzz, lean, solver};
 use crate::case::{run_case, status_rank, Case, Stage, ERROR, LOWERED, PANIC, PROVABLE, TIMEOUT};
-use crate::cli::{resolve_axes, Args, Expect};
+use crate::cli::{primary_prover, resolve_axes, Args, Expect};
 use crate::discover::{self, SsDriver};
 use crate::inputs::{collect_inputs, common_root, corpus_items, display_name, read_names, suffix, Item};
 use crate::pinned;
@@ -61,9 +61,10 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     if pinned && args.corpus.is_some() {
         return Err("error: --expect pinned reads each case's header, and a corpus row has none; pin pair files".into());
     }
-    if args.expect == Expect::Equivalent && !args.portfolio && !axes.contains(&"qed") {
-        return Err("error: --expect equivalent is a policy on the qed axis, which --axes leaves out; use \
-                    --expect pinned or report-only"
+    if args.expect == Expect::Equivalent && !args.portfolio && primary_prover(&axes).is_none() {
+        return Err("error: --expect equivalent is a policy on the run's prover, sqleq-solver (or qed when \
+                    sqleq-solver is not asked), and this run asks neither (sqlsolver-jvm never decides it); \
+                    add --qed, or use --expect pinned or report-only"
             .into());
     }
     let has = |a: &str| axes.contains(&a);
@@ -537,8 +538,9 @@ pub fn main(args: Args) -> i32 {
 
     let wall = t0.elapsed().as_secs_f64();
 
-    // After the prover pass and its retries, and timed apart from them: the second opinion is a
-    // separate question and must not be able to move the numbers above, nor they it.
+    // After the frontend's pass (and the QED prover's, when asked) and its retries, and timed
+    // apart from them: the SQLSolver axis is a question of its own, and the two must not be able to
+    // move each other's numbers.
     let mut ss_stats = solver::Stats::default();
     if args.portfolio {
         // Every axis answered inside the case already; what is left is to count.
@@ -562,8 +564,17 @@ pub fn main(args: Args) -> i32 {
         }
         let t1 = Instant::now();
         let mem = gib(args.sqleq_solver_mem_gib);
-        ss_stats = solver::run_second_opinion(&mut cases, dir, driver, ss_timeout_ms, args.sqleq_solver_jobs, mem);
+        ss_stats = solver::run_pass(&mut cases, dir, driver, ss_timeout_ms, args.sqleq_solver_jobs, mem);
         ss_stats.wall_s = Some(round(t1.elapsed().as_secs_f64(), 3));
+        // sqleq-solver is the run's prover: its lines are the ones the frontend pass's would have
+        // been, the cases it did not prove (all of them under --verbose).
+        if primary_prover(&axes) == Some("sqleq-solver") && !pinned_mode && !args.quiet {
+            for x in cases.iter().filter(|x| x.s_bucket.is_some()) {
+                if args.verbose || !x.proved_by("sqleq-solver") {
+                    report::print_solver_line(c, x, name_w);
+                }
+            }
+        }
         if last_pass == "solver" {
             cases.iter().for_each(|x| stream.emit(x));
         }
@@ -612,6 +623,12 @@ pub fn main(args: Args) -> i32 {
         let rank = |x: &Case| {
             let v = x.portfolio.as_ref().map_or("", |o| o.verdict.as_str());
             portfolio::ORDER.iter().position(|o| *o == v).unwrap_or(99)
+        };
+        cases.sort_by(|a, b| (rank(a), &a.name).cmp(&(rank(b), &b.name)));
+    } else if primary_prover(&axes) == Some("sqleq-solver") {
+        let rank = |x: &Case| match &x.s_bucket {
+            Some(b) => solver::ORDER.iter().position(|o| o == b).unwrap_or(98),
+            None => 99 + status_rank(&x.status),
         };
         cases.sort_by(|a, b| (rank(a), &a.name).cmp(&(rank(b), &b.name)));
     } else {
@@ -668,11 +685,12 @@ pub fn main(args: Args) -> i32 {
         }
         report::print_alarms(c, &cases, &alarms);
     } else {
+        let primary = primary_prover(&axes);
         if env.frontend.is_some() {
-            report::print_summary(c, &cases, wall, axes.contains(&"qed"));
+            report::print_summary(c, &cases, wall, primary);
         }
         let imp = env.ss.as_ref().map_or("sqleq-solver", |d| d.imp.as_str());
-        report::print_second_opinion(c, &cases, &ss_stats, imp, axes.contains(&"qed"));
+        report::print_sqlsolver(c, &cases, &ss_stats, imp, primary, axes.contains(&"qed"));
         if let Some(st) = &fuzz_stats {
             report::print_fuzz(c, &cases, st);
         }
@@ -695,7 +713,8 @@ pub fn main(args: Args) -> i32 {
         smt_timeout_ms: args.smt_timeout,
         total: cases.len(),
         wall_s: round(wall, 3),
-        triviality: report::triviality_split(&cases),
+        decided_by: if args.portfolio { Some("portfolio".into()) } else { primary_prover(&axes).map(str::to_string) },
+        triviality: report::triviality_split(&cases, primary_prover(&axes)),
         sqlsolver: env.ss.as_ref().map(|d| SsMeta {
             stats: ss_stats.clone(),
             imp: d.imp.clone(),
@@ -775,10 +794,14 @@ pub fn main(args: Args) -> i32 {
         // Blessing never clears an invariant, a timeout or a lint error, so a bless run that leaves
         // one of those behind still fails.
         Expect::Pinned => i32::from(!pinned.iter().all(|p| p.passed())),
-        // Every case must be provable -- by *our* prover. The second opinion is deliberately not
-        // part of the policy: adding an axis must not be able to turn a red CI run green, and its
-        // `no-proof` is not a failure to begin with. (Its proof can still be half of an alarm,
-        // above, which turns a green run red.)
-        Expect::Equivalent => i32::from(!cases.iter().all(|x| x.status == PROVABLE)),
+        // Every case must be proved -- by the run's prover: sqleq-solver, or the QED prover when
+        // sqleq-solver is not asked. The second opinion is deliberately not part of the policy:
+        // adding an axis must not be able to turn a red CI run green, and its `no-proof` is not a
+        // failure to begin with. (Its proof can still be half of an alarm, above, which turns a
+        // green run red.)
+        Expect::Equivalent => {
+            let primary = primary_prover(&axes).expect("checked at setup");
+            i32::from(!cases.iter().all(|x| x.proved_by(primary)))
+        }
     }
 }
