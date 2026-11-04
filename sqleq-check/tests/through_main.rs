@@ -215,6 +215,8 @@ fn setup_errors_exit_2() {
         (vec!["--expect", "report-only", "--bless"], &f.case),
         (vec!["--expect", "pinned", "--axes", "frontend"], &plan),
         (vec!["--sqleq-solver", "--sqlsolver-jvm"], &f.case),
+        // The JVM fork takes sqleq-solver's place, and never decides `--expect equivalent`.
+        (vec!["--sqlsolver-jvm"], &f.case),
         (vec!["--jobs", "many"], &f.case),
     ];
     for (argv, path) in rows {

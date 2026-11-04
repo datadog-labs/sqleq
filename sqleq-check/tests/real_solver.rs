@@ -10,7 +10,7 @@
 //! `$SQLEQ_SOLVER_BIN` names one, when a missing binary is a failure. CI's solver job sets it.
 
 use serde_json::{json, Value};
-use sqleq_check::axes::solver::{self, run_second_opinion};
+use sqleq_check::axes::solver::{self, run_pass};
 use sqleq_check::portfolio;
 use sqleq_check::case::{ss_slug, Case};
 use sqleq_check::discover::{repo, SsDriver};
@@ -62,7 +62,7 @@ fn rows_are_bucketed_like_the_jvm_drivers() {
         job(d, "refused", Value::Null, Some("unknown table t")),
         Case::new("no-job", "no-job"),
     ];
-    let stats = run_second_opinion(&mut cases, d, &driver, 10_000, 1, None);
+    let stats = run_pass(&mut cases, d, &driver, 10_000, 1, None);
     let got: Vec<(&str, &str)> =
         cases.iter().map(|c| (c.name.as_str(), c.s_bucket.as_deref().unwrap_or("-"))).collect();
     assert_eq!(

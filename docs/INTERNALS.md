@@ -5,8 +5,8 @@ start at the [README](../README.md).
 
 `sqleq-check` sits on top and runs every backend as a subprocess. `src/` is the frontend: it parses
 a SQL pair, resolves names and types, and lowers it to the `Relation`/`Expr` IR the provers read —
-the QED prover directly, and `sqleq-solver`, a Rust rewrite of SQLSolver, through the jobs
-`src/sqlsolver.rs` packages that IR into. The other backends read the pair themselves:
+`sqleq-solver`, a Rust rewrite of SQLSolver and the default prover, through the jobs
+`src/sqlsolver.rs` packages that IR into, and the QED prover directly. The other backends read the pair themselves:
 `sqleq-fuzz` runs the two statements on PostgreSQL looking for a counterexample and uses no part
 of the frontend, and `sqleq-lean` parses with the frontend's parser but builds its own Lean terms.
 See [DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
@@ -55,8 +55,8 @@ building it builds none of them.
 | `sqleq-check/src/app.rs` | setup, the passes, `--jsonl` streaming and `--resume`, and the exit-code policy |
 | `sqleq-check/src/discover.rs` | finding each backend binary, and noticing one built from older sources |
 | `sqleq-check/src/inputs.rs` | which files are cases, what each is called, and whether a pair is `x` against `x` |
-| `sqleq-check/src/case.rs` | one case through the frontend and the QED prover |
-| `sqleq-check/src/axes/{fuzz,solver,lean}.rs` | the axes that run after the prover pass: `sqleq-fuzz`, the SQLSolver second opinion (`sqleq-solver` or the JVM fork), and `sqleq-lean` |
+| `sqleq-check/src/case.rs` | one case through the frontend and, when asked, the QED prover, and its SQLSolver job packaged |
+| `sqleq-check/src/axes/{fuzz,solver,lean}.rs` | the axes that run after the frontend's pass: `sqleq-fuzz`, the SQLSolver axis (`sqleq-solver`, the default prover, or the JVM fork), and `sqleq-lean` |
 | `sqleq-check/src/portfolio.rs` | `--portfolio`: every backend at once on each case, under one deadline, and one combined verdict |
 | `sqleq-check/src/suite.rs` | the pinned-pair header grammar, lint, judgement and `--bless` behind `--expect pinned` |
 | `sqleq-check/src/pinned.rs` | each axis's answer reduced to the one word a pin records |
@@ -66,7 +66,7 @@ building it builds none of them.
 | `sqleq-check/tests/through_main.rs` | the binary end to end over stand-in backends, including the controls a fake prover must fail |
 | `sqleq-check/tests/{portfolio,corpus}.rs` | `--portfolio` and `--corpus` end to end, over stand-in backends |
 | `sqleq-check/tests/real_cases.rs` | the hygiene gate over every committed pair: it lints, carries the licence, and names nothing from a corpus or a machine |
-| `sqleq-check/tests/real_solver.rs` | the second opinion against the real `sqleq-solver`; skips without a build unless `$SQLEQ_SOLVER_BIN` is set |
+| `sqleq-check/tests/real_solver.rs` | the SQLSolver pass against the real `sqleq-solver`; skips without a build unless `$SQLEQ_SOLVER_BIN` is set |
 | `tools/sqlsolver/` | our side of the IR bridge to the JVM SQLSolver, `sqleq-solver`'s backup cross-check: `IrToRel.java` builds the plan pair, `IrDriver.java` runs it; `sqleq-check --sqlsolver-jvm` compiles both ([SQLSOLVER.md](SQLSOLVER.md)) |
 
 Running the provers and `sqleq-fuzz` over one corpus and cross-tabulating the answers is what
@@ -76,8 +76,9 @@ the run; `--corpus` points it, or any other run, at a corpus CSV instead of pair
 
 ## The SQLSolver rewrite (`sqleq-solver/`)
 
-A Rust rewrite of SQLSolver's proof engine, opt-in because its first build compiles Z3 from source:
-`cargo build -p sqleq-solver`. It reads the same `Input` JSON the QED prover gets and answers in the
+A Rust rewrite of SQLSolver's proof engine, and the prover `sqleq-check` asks by default. It is an
+opt-in workspace member because its first build compiles Z3 from source: `cargo build -p
+sqleq-solver`. It reads the same `Input` JSON the QED prover gets and answers in the
 JVM driver's row format, so the original SQLSolver, kept as its backup cross-check, can be swapped
 in. What it rewrites, and where it deliberately differs from the original, is in
 [SQLSOLVER.md](SQLSOLVER.md).

@@ -1,20 +1,25 @@
-# SQLSolver: `sqleq-solver`, with the JVM fork as a cross-check
+# SQLSolver: `sqleq-solver`, the default prover, with the JVM fork as a cross-check
 
 [SQLSolver](https://github.com/SJTU-IPADS/SQLSolver) (SIGMOD 2024, Apache 2.0) is a SQL equivalence
 prover built independently of QED. **`sqleq-solver`** is a Rust rewrite of its proof engine
-([below](#sqleq-solver)) and the axis of the same name: it reads the same `Input` JSON the QED
-prover gets, needs no JVM, and is what `sqleq-check --sqleq-solver` asks. The original, run as a JVM
-fork through `tools/sqlsolver/`, is kept as a **backup cross-check** and is being deprecated
-([below](#the-jvm-fork)): `--sqlsolver-jvm` asks it instead, as the axis `sqlsolver-jvm`. A run asks
-one of the two, so comparing them takes two runs over the same pairs.
+([below](#sqleq-solver)) and the axis of the same name: it reads the `Input` JSON the frontend
+lowers to, the same the QED prover gets, needs no JVM, and is the prover `sqleq-check` asks by
+default. The original, run as a JVM fork through `tools/sqlsolver/`, is kept as a **backup
+cross-check** and is being deprecated ([below](#the-jvm-fork)): `--sqlsolver-jvm` asks it in
+sqleq-solver's place, as the axis `sqlsolver-jvm`. A run asks one of the two, so comparing them
+takes two runs over the same pairs.
 
-Outside `--portfolio`, either one is a **second opinion**: its answer is reported beside QED's, and
-neither a case's status nor the exit code of `--expect equivalent` or `report-only` depends on it,
-except that its proof against a `sqleq-fuzz` counterexample on the same pair is an alarm, which
-fails every run. Two modes do count it. Under `--portfolio`, a `sqleq-solver` proof is evidence like any other: it
-can make a case `equivalent`, and the combined verdict decides the exit code. Under `--expect
-pinned`, its pin is checked like every axis's, so a moved answer fails the run. The point of having
-it is that provers of different construction, reading the same IR, check each other — see
+Outside `--portfolio`, `sqleq-solver` is the **run's prover**: the default `--expect equivalent`
+policy passes only when it proves every case. The QED prover, asked with `--qed`, is then a
+**second opinion**, reported beside it in a table of its own, and the exit code of `--expect
+equivalent` or `report-only` does not depend on it. The JVM fork never decides the policy: beside
+the QED prover (`--sqlsolver-jvm --qed`) it is the second opinion, and alone it needs `--expect
+report-only` or `pinned`. A second opinion's proof against a `sqleq-fuzz` counterexample on the same
+pair is still an alarm, which fails every run. Two modes count every prover alike. Under
+`--portfolio`, a proof from `sqleq-solver` or the QED prover is evidence like any other: it can make
+a case `equivalent`, and the combined verdict decides the exit code. Under `--expect pinned`, every
+axis's pin is checked, so a moved answer fails the run. The point of having more than one prover is
+that provers of different construction, reading the same IR, check each other — see
 [VALIDATION.md](VALIDATION.md).
 
 The fork is the backup rather than the primary SQLSolver axis because it proves some pairs that
@@ -45,7 +50,7 @@ to check against `sqleq-fuzz`.
 ## Reproducing this
 
 `sqleq-solver` is reproducible from this repository alone, Z3 included: `cargo build --release -p
-sqleq-solver`, and `--sqleq-solver` in `sqleq-check` finds it. The JVM fork is **not reproducible
+sqleq-solver`, and `sqleq-check` finds it. The JVM fork is **not reproducible
 from this repository alone.** `sqleq-check --sqlsolver-jvm` needs `$SQLEQ_SQLSOLVER` (or
 `--sqlsolver-tree DIR`), a hand-modified fork with Calcite removed, its classes compiled into
 `build/classes-javac`; `$SQLEQ_SQLSOLVER_DEPS`, the upstream fat jar exploded with
@@ -101,12 +106,12 @@ means the two sides were identical and no solving happened. An `EQ` with no labe
 rather than being quietly downgraded, so the inflation this guards against cannot come back as an
 undercount.
 
-## The second opinion in `sqleq-check`
+## The SQLSolver pass in `sqleq-check`
 
-`sqleq-check --sqleq-solver` asks `sqleq-solver` about every pair in a run, or
-`--sqlsolver-jvm` the fork, and reports the answer beside the qed one. Three design constraints
-shaped it, all from the fork, and the pass keeps them for both so that the two implementations'
-answers stay comparable:
+Without `--portfolio`, `sqleq-check` asks `sqleq-solver` (or, with `--sqlsolver-jvm`, the fork)
+about every pair in a run in a pass of its own, after the frontend's and, when asked, the QED
+prover's. Three design constraints shaped it, all from the fork, and the pass keeps them for both
+so that the two implementations' answers stay comparable:
 
 1. **One pass, at the end, by one driver process.** A JVM start is a large fraction of what a
    `.sql` pair costs, so paying it per case would swamp the run. `--sqleq-solver-jobs N` runs N
@@ -114,12 +119,12 @@ answers stay comparable:
 2. **The JVM self-halts** rather than unwinding, so something has to notice the missing answers and
    resume. A per-case call has nowhere to put that loop.
 3. **The per-row cap is load-sensitive.** Under `-j 8` a row near the cap decides differently than
-   it does alone, and a second opinion that changes with `-j` is not a second opinion.
+   it does alone, and a verdict that changes with `-j` is not one.
 
 So `run_case` does one SQLSolver-axis thing — it packages the plan, while the case's working
 directory still exists — and a single pass at the end asks the driver about every job.
-The packaging cost is discounted from the case wall time, so a second-opinion run's timings stay
-comparable to one without it.
+The packaging cost is discounted from the case wall time, so a run's frontend and QED timings stay
+comparable to one without the SQLSolver axis.
 
 `sqleq-check --portfolio` is the one exception, and gives up the third constraint on purpose: it
 asks `sqleq-solver` about each case beside the other backends, inside that case's deadline, because
@@ -291,7 +296,7 @@ where it runs out of time, and plans the bridge refuses: a `FROM`-less query, lo
 What gates a change in CI is the crate's tests and the pinned pairs. `cargo test -p sqleq-solver`
 runs the unit tests, which pin the three-valued truth tables against a reference evaluator and the
 ladder's answers on hand-written plans. The `sqleq-solver` job then drives the built binary through
-`sqleq-check`: its tests of the second opinion (`sqleq-check/tests/real_solver.rs`), and every pair
+`sqleq-check`: its tests of the SQLSolver pass (`sqleq-check/tests/real_solver.rs`), and every pair
 under [`tests/pairs`](../tests/pairs/README.md) on the `sqleq-solver` axis, which fails on any pin
 that moves, a proof of a pair pinned `not-equivalent` included.
 

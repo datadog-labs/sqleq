@@ -28,8 +28,8 @@ pair does not need to be minimized: the fix minimizes it and pins it under tests
 ## What was reported
 
 <!--
-Which axis claimed equivalence, and the command you ran. The claim can come from a prover (`qed`,
-`sqleq-solver` or `sqlsolver-jvm`) or from the frontend alone: `emit-reflexive` (both queries lowered
+Which axis claimed equivalence, and the command you ran. The claim can come from a prover (`sqleq-solver`,
+`qed` or `sqlsolver-jvm`) or from the frontend alone: `emit-reflexive` (both queries lowered
 to the same plan) or `reflexive` (refused, but both normalize to the same query). Under `--portfolio`,
 sqleq-check names the axes its verdict rests on. A Lean proof (`proved-gather`) is a claim too, under
 its own rule for parameters. The `--json` output for the case, if you have it, carries every axis's

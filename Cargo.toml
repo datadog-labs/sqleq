@@ -31,7 +31,7 @@ name = "sqleq-frontend"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Analyze SQL equivalence pairs and lower them to prover IR (QED, SQLSolver)"
+description = "Analyze SQL equivalence pairs and lower them to prover IR (sqleq-solver, QED)"
 license = "Apache-2.0"
 publish = false
 

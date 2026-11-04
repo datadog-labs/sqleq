@@ -8,7 +8,7 @@
 //! sqleq-lean decides one class the frontend refuses outright, `INSERT … VALUES` against
 //! `INSERT … SELECT * FROM unnest(…)`, under the gather rule (see docs/LEAN.md). It parses the pair
 //! file itself, so it runs over every `.sql` case regardless of what the frontend made of it, and
-//! like the second opinion it never moves the exit code outside `--expect pinned`.
+//! like a second opinion it never moves the exit code outside `--expect pinned`.
 
 use std::path::Path;
 use std::time::Instant;
