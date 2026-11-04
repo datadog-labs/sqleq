@@ -103,10 +103,11 @@ fn main() {
         let normalized: Vec<Vec<(UTerm, HashMap<u32, usize>)>> = sides
             .iter()
             .map(|q| {
-                [Ics::default(), ics.clone()]
+                [(Ics::default(), false), (ics.clone(), false), (ics.clone(), true)]
                     .into_iter()
-                    .filter_map(|c| {
-                        let mut n = Normalizer::new(q.widths.clone(), prove::MAX_TREE_SIZE).with_ics(c);
+                    .filter_map(|(c, lift)| {
+                        let n = Normalizer::new(q.widths.clone(), prove::MAX_TREE_SIZE).with_ics(c);
+                        let mut n = if lift { n.with_squash_lift() } else { n };
                         n.normalize(&q.term).ok().map(|t| (t, n.widths))
                     })
                     .collect()
@@ -163,7 +164,7 @@ fn main() {
                         (Ok(b), Ok(a)) => {
                             compared += 1;
                             if a != *b {
-                                let how = if k == 0 { "normalized" } else { "normalized with ICs" };
+                                let how = ["normalized", "normalized with ICs", "normalized with ICs and the squash lift"][k.min(2)];
                                 mismatches.push(format!("{name} side {i} trial {trial}: translated {b}, {how} {a}"));
                             }
                         }

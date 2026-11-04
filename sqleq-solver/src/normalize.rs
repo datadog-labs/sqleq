@@ -56,6 +56,13 @@ pub struct Normalizer {
     /// Past this, [`Normalizer::normalize`] stops between rounds with the term it has, which is as
     /// equivalent to the input as a fixpoint would be.
     deadline: Option<Instant>,
+    /// Whether each round also moves the factors every summand of a squash holds out of it
+    /// ([`lift_squashes`]). Off by default: the ladder asks for it only after the normal form
+    /// without it has failed (`prove::decide`), since it changes where factors sit and so which
+    /// terms the rungs see as alike.
+    lift: bool,
+    /// Whether a lift has moved a factor that mentions a var ([`Normalizer::lifted_open`]).
+    lifted_open: std::cell::Cell<bool>,
 }
 
 impl Normalizer {
@@ -67,6 +74,8 @@ impl Normalizer {
             too_large: std::cell::Cell::new(false),
             size_now: std::cell::Cell::new(0),
             deadline: None,
+            lift: false,
+            lifted_open: std::cell::Cell::new(false),
         }
     }
 
@@ -74,6 +83,19 @@ impl Normalizer {
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Also lift out of each squash the 0/1 factors every summand holds ([`lift_squashes`]).
+    pub fn with_squash_lift(mut self) -> Self {
+        self.lift = true;
+        self
+    }
+
+    /// Whether a lift has moved a factor that mentions a var: the kind that can pin one, as a
+    /// filtered `GROUP BY` key's `[out.k = 1]` does. A lift of closed factors alone (a parameter's
+    /// NULL flag) pins nothing.
+    pub fn lifted_open(&self) -> bool {
+        self.lifted_open.get()
     }
 
     /// Whether `t`, read as a tree, is past the size budget -- and if so, remembers it. Checked after
@@ -134,6 +156,13 @@ impl Normalizer {
     /// the size budget ends the round early, with that result, which is still equivalent to `t`.
     pub fn round(&mut self, t: &UTerm) -> UTerm {
         let mut next = simplify(t);
+        if self.lift {
+            let mut open = false;
+            next = simplify(&lift_squashes(&next, &mut open));
+            if open {
+                self.lifted_open.set(true);
+            }
+        }
         if self.over_budget(&next) {
             return next;
         }
@@ -1021,6 +1050,80 @@ pub fn simplify(t: &UTerm) -> UTerm {
         UTerm::Mul(ts) => simplify_mul(ts.iter().map(|c| simplify(c)).collect()),
         UTerm::Sum { vars, body } => simplify_sum(vars.clone(), simplify(body)),
     }
+}
+
+/// `t` with `lift_from_squash` applied to every squash of a sum or of a sum of terms, inner ones
+/// first.
+/// `open` is set when a lifted factor mentions a var.
+pub fn lift_squashes(t: &UTerm, open: &mut bool) -> UTerm {
+    match t {
+        UTerm::Const(_) | UTerm::Var(_) | UTerm::Table { .. } => t.clone(),
+        UTerm::Pred { kind, args } => UTerm::Pred { kind: *kind, args: args.iter().map(|a| lift_squashes(a, open)).collect() },
+        UTerm::Func { name, args } => UTerm::Func { name: name.clone(), args: args.iter().map(|a| lift_squashes(a, open)).collect() },
+        UTerm::Add(ts) => UTerm::Add(ts.iter().map(|c| Rc::new(lift_squashes(c, open))).collect()),
+        UTerm::Mul(ts) => UTerm::Mul(ts.iter().map(|c| Rc::new(lift_squashes(c, open))).collect()),
+        UTerm::Neg(c) => UTerm::Neg(Rc::new(lift_squashes(c, open))),
+        UTerm::Sum { vars, body } => UTerm::Sum { vars: vars.clone(), body: Rc::new(lift_squashes(body, open)) },
+        UTerm::Squash(c) => match lift_squashes(c, open) {
+            inner @ (UTerm::Sum { .. } | UTerm::Add(_)) => lift_from_squash(inner, open),
+            inner => UTerm::Squash(Rc::new(inner)),
+        },
+    }
+}
+
+/// `‖c‖`, with the 0/1 factors that every summand of `c` holds moved out of the squash:
+/// `‖Σ_i f·x_i‖ = f·‖Σ_i x_i‖`, where a summand is a sum `Σ_V b` (and `f` a factor of `b` that
+/// mentions no var of `V`) or a product. Exact over the naturals: `f` is constant in each summand's
+/// own vars, so it leaves each sum and then the addition, and `‖f·x‖ = f·‖x‖` when `f` is 0 or 1.
+///
+/// It is what lets a `GROUP BY` key that a filter holds constant be eliminated: the group's
+/// presence is `‖Σ_src src·[src.k = out.k]‖`, and once `src.k` is the constant, `[out.k = 1]` is a
+/// factor of the group's own product, where it pins the output column and eliminates a var
+/// projected away. Reading a squash of several sums the same way as a squash of one keeps the two
+/// spellings of one condition, a disjunction split into summands or not, in one normal form. Left
+/// alone when a summand would keep no factor.
+fn lift_from_squash(c: UTerm, open: &mut bool) -> UTerm {
+    let summands: Vec<UTerm> = match &c {
+        UTerm::Add(ts) => ts.iter().map(|t| (**t).clone()).collect(),
+        other => vec![other.clone()],
+    };
+    let parts: Vec<(Vec<UVar>, Vec<UTerm>)> = summands
+        .iter()
+        .map(|s| match s {
+            UTerm::Sum { vars, body } => (vars.clone(), factors_of(body)),
+            other => (Vec::new(), factors_of(other)),
+        })
+        .collect();
+    let liftable = |(vars, fs): &(Vec<UVar>, Vec<UTerm>)| -> Vec<UTerm> {
+        let bound = base_ids(vars);
+        fs.iter().filter(|f| is_zero_one(f) && !mentions_any(f, &bound)).cloned().collect()
+    };
+    let mut common = liftable(&parts[0]);
+    for p in &parts[1..] {
+        let l = liftable(p);
+        common.retain(|f| l.contains(f));
+    }
+    common.dedup();
+    if common.is_empty() || parts.iter().any(|(_, fs)| fs.iter().all(|f| common.contains(f))) {
+        return UTerm::Squash(Rc::new(c));
+    }
+    let rest: Vec<UTerm> = parts
+        .into_iter()
+        .map(|(vars, fs)| {
+            let body = mk_mul(fs.into_iter().filter(|f| !common.contains(f)));
+            if vars.is_empty() {
+                body
+            } else {
+                mk_sum(vars, body)
+            }
+        })
+        .collect();
+    let inner = match rest.len() {
+        1 => rest.into_iter().next().expect("one summand"),
+        _ => UTerm::Add(rest.into_iter().map(Rc::new).collect()),
+    };
+    *open |= common.iter().any(|f| !is_closed(f));
+    simplify_mul(common.into_iter().chain([UTerm::Squash(Rc::new(inner))]).collect())
 }
 
 /// A multiplicity by construction: built only from table atoms, predicates, squashes, negations and

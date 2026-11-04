@@ -144,7 +144,22 @@ What it rewrites, in the order the ladder runs it:
   **alpha-equivalence** — the rung that answers most of SQLSolver's proofs.
   Normalization also merges a row's matched and unmatched summands (`Σ X·N + Σ X·¬N` is `Σ X`
   when `N` is 0/1, and has its zero-ness under a squash), which the fork reaches only through its
-  LIA\* rung. A correlated subquery reads the row of the query it sits in: its term is an ordinary
+  LIA\* rung.
+
+  When those normal forms are not proved equal, the ladder tries them once more with **a squash
+  lift**. The 0/1 factors that every summand of a squash holds, each mentioning none of its
+  summand's own vars, move out of it (`‖Σ_V c·b‖ = c·‖Σ_V b‖`).
+  * **What it proves.** A group's presence is such a squash, so a `GROUP BY` key that a filter holds
+    to a constant or a parameter becomes an equality on the group's output column, which then pins
+    it. So `GROUP BY a, b WHERE a = 1` has the groups of `GROUP BY b WHERE a = 1`.
+  * **Why it is an extra attempt.** The lift moves factors in ways the other side's normal form may
+    not follow, so it is tried beside the plain form, never instead of it, and nothing proved
+    without it is lost.
+  * **What the attempt costs.** It runs only where it moved a factor that mentions a var. Its
+    normalization gets a second of its own (`prove::LIFT_BUDGET`), and only the rungs that compare
+    normal forms, not the bag rung's search.
+
+  A correlated subquery reads the row of the query it sits in: its term is an ordinary
   term with a free var, bound by the sum that encloses it, the way an uncorrelated `IN` already
   puts its outer operand inside the inner sum. A table's key is used across that boundary too: a
   subquery's row of a keyed table that agrees on the key with a row the outer query holds is that
