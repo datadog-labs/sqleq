@@ -781,6 +781,38 @@ pub fn coerce_literal_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
     operand.into_iter().map(|v| if literal(&v) { cast_into(v, ret, &like) } else { v }).collect()
 }
 
+/// The arguments of the call `name`, one that returns one of them (`COALESCE`, `NULLIF`, `GREATEST`,
+/// `LEAST`; [`crate::equality::returns_an_argument`]), brought to the call's type `ret`, as Postgres
+/// brings them to the one type it resolves for the call. Over a builtin type each is cast to it
+/// ([`cast_to`], which reads a string literal as the type says: `'00'` beside an INTEGER is the
+/// integer 0, not a string the provers would keep apart from `'0'`); over an opaque one the literals
+/// are converted as a comparison with the opaque argument converts them ([`coerce_literal_args`]).
+///
+/// `NULLIF` is typed as its first argument ([`crate::equality::call_type`]), and its second is cast
+/// to that type only where the cast loses nothing: a string literal, a bare NULL, or a value whose
+/// common type with the first ([`common_type`]) is the first's, as an INTEGER beside a `numeric`.
+/// Postgres compares the two as `=` would, at their common type, and returns the first argument as
+/// that `=` read it: `NULLIF(i, 1.5)` over an INTEGER `i` compares two numerics and is a numeric,
+/// `NULLIF(i, 1.5::integer)` compares two integers. Cast to INTEGER, `1.5` would be `2`, and the
+/// two would be one plan. So a second argument of a wider type than the first's is refused, as is
+/// one of another type than the first's, which Postgres rejects.
+pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<Vec<Value>> {
+    if is_builtin(ret) {
+        if name == "NULLIF" {
+            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v);
+            if let Some(v) = operand.iter().skip(1).find(|v| !untyped(v) && common_type(ret, &ty_of(v)) != ret) {
+                return Err(unsupported(format!(
+                    "NULLIF of a value of type {ret} against one of type {}, which Postgres compares at their \
+                     common type",
+                    ty_of(v)
+                )));
+            }
+        }
+        return Ok(operand.into_iter().map(|v| cast_to(v, ret)).collect());
+    }
+    Ok(coerce_literal_args(operand, ret))
+}
+
 /// [`cast_to`] `ct`, where `ct` is the type `like` gave the comparison or the expression `v` is
 /// coerced for. A coercion of a value that is not opaque into an opaque `ct` is the cast function
 /// [`opaque_cast_name`]`(like)`, not a `CAST`: the provers read every opaque type as one sort, and a
@@ -1136,6 +1168,17 @@ pub(crate) fn is_null_lit(v: &Value) -> bool {
         && v.get("operand").and_then(|o| o.as_array()).is_some_and(|a| a.is_empty())
 }
 
+/// Whether `v` is a NULL the input wrote bare, with no type of its own: the lowering spells such a
+/// NULL INTEGER ([`lower_value`](crate::lower)), and keeps it a nullary `NULL`. A NULL the input gave
+/// a type, `NULL::numeric` or `NULL::integer` alike, is a `CAST` over that constant
+/// ([`lower_cast`]), not a nullary `NULL`, and votes for its type as a value of that type would; so
+/// does the NULL that stands for a typed column (`__sqleq_null_of` in `lower`), which is typed as
+/// the column is. Only a NULL a coercion relabelled ([`cast_to`]) is a nullary `NULL` of another
+/// type, and the resolutions that ask here run before any.
+pub(crate) fn is_bare_null(v: &Value) -> bool {
+    is_null_lit(v) && ty_of(v) == "INTEGER"
+}
+
 /// Wrap `v` in a CAST to `ct` unless it already has that type. A crossing that involves a temporal
 /// type is a [`convert`] call instead; see the module docs. A string literal cast to INTEGER or
 /// BOOLEAN is read as one ([`read_literal`]).
@@ -1362,9 +1405,13 @@ pub fn make_case(mut ops: Vec<Value>) -> Value {
         res.push(n - 1);
     }
     // A string literal branch takes the type of the others, as in a comparison ([`common_type_of`]),
-    // unless every other branch is a literal or a NULL, where Postgres makes the CASE text.
-    let voters: Vec<usize> = res.iter().copied().filter(|&i| !is_string_literal(&ops[i])).collect();
-    let voters = if voters.iter().all(|&i| is_null_lit(&ops[i])) { res.clone() } else { voters };
+    // unless every other branch is a literal or a NULL, where Postgres makes the CASE text. A bare
+    // NULL has no type of its own in Postgres either ([`is_bare_null`]): it takes the others', so
+    // `CASE WHEN c THEN FALSE ELSE NULL END` is a boolean. A NULL of another type was cast to it,
+    // and votes for it as a value of that type would.
+    let typed: Vec<usize> =
+        res.iter().copied().filter(|&i| !is_string_literal(&ops[i]) && !is_bare_null(&ops[i])).collect();
+    let voters = if typed.is_empty() { res.clone() } else { typed };
     let ct = voters
         .iter()
         .map(|&i| ty_of(&ops[i]))
