@@ -426,7 +426,11 @@ what it is or refused:
   its other uses say, unless the pair casts it wherever it appears; and a cast over a parameter is
   dropped only when it is the parameter's own type, since otherwise it is a conversion Postgres runs
   (`$1::int` rounds a `numeric`). A parameter in arithmetic takes its partner's type when it is
-  known, as Postgres gives it.
+  known, as Postgres gives it. One function reads an untyped parameter as a text instead:
+  `substring(s from $1)` is Postgres's regular-expression form, `substring(text, text)`, and only
+  `substring(s from $1::integer)` the position form. So a parameter inference typed as an integer
+  that is the position or the length of a `substring` is refused as well, and so is any other
+  argument there that is not an integer, a string literal included.
 - **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
   where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
   it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.

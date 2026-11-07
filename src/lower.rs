@@ -3055,8 +3055,11 @@ impl AggCtx<'_> {
                 let operand =
                     scalar_args(f, &name)?.into_iter().map(|e| self.lower_post(e)).collect::<Result<Vec<_>>>()?;
                 let ret = crate::equality::call_type(&name, &operand, fn_ret(self.fns, &name, &bare));
-                let operand =
-                    if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
+                let operand = if crate::equality::returns_an_argument(&name) {
+                    coerce_select_args(&name, operand, &ret)?
+                } else {
+                    operand
+                };
                 Ok(json!({ "operator": name, "operand": operand, "type": ret }))
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -3575,8 +3578,11 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
                 .map(|e| lower_expr(cat, scope, fns, e))
                 .collect::<Result<Vec<_>>>()?;
             let ret = crate::equality::call_type(&name, &operand, fn_ret(fns, &name, &bare));
-            let operand =
-                if crate::equality::returns_an_argument(&name) { coerce_select_args(operand, &ret) } else { operand };
+            let operand = if crate::equality::returns_an_argument(&name) {
+                coerce_select_args(&name, operand, &ret)?
+            } else {
+                operand
+            };
             Ok(json!({ "operator": name, "operand": operand, "type": ret }))
         }
         // Row-constructor comparison: `(a, b) = (x, y)`. The standard defines row `=` as the
@@ -3840,6 +3846,15 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         // the strict functions `SUBSTRING` and `TRIM_BOTH`/`TRIM_LEADING`/`TRIM_TRAILING` over
         // their arguments, which the provers do not interpret, of their first argument's type
         // ([`string_function_type`]).
+        //
+        // `SUBSTRING` here is Postgres's position form, `substring(text, integer [, integer])`, and
+        // only an argument typed INTEGER selects it. Postgres has a regular-expression form too,
+        // `substring(text, text [, text])`, and resolves an argument of unknown type, a bare
+        // parameter or a string literal, to it: `substring(s from $1)` is the match of the pattern
+        // `$1`, and `substring(s from 'a' for '#')` the SQL99 form. An argument of any other type
+        // (a `bigint`, a `numeric`) is an error. So an argument that is not INTEGER is refused. A
+        // parameter typed INTEGER by inference is refused too ([`crate::param_types`]): Postgres
+        // types it where it first meets it, which may be here, as a text.
         Expr::Substring { expr, substring_from, substring_for, .. } => {
             let mut operand = vec![lower_expr(cat, scope, fns, expr)?];
             operand.push(match substring_from {
@@ -3849,6 +3864,14 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             });
             if let Some(n) = substring_for {
                 operand.push(lower_expr(cat, scope, fns, n)?);
+            }
+            if let Some(a) = operand[1..].iter().find(|a| ty_of(a) != "INTEGER") {
+                return Err(unsupported(format!(
+                    "SUBSTRING with a position or length of type {}: Postgres has the position form \
+                     over an integer only, and reads an untyped one as the pattern of its \
+                     regular-expression form",
+                    ty_of(a)
+                )));
             }
             let ty = string_function_type("SUBSTRING", &operand[0])?;
             Ok(json!({ "operator": "SUBSTRING", "operand": operand, "type": ty }))

@@ -148,8 +148,9 @@ pub fn call_type(name: &str, operand: &[Value], ret: String) -> String {
     }
     if SELECTS.contains(&name) {
         // Postgres resolves these as it resolves a CASE: one common type for the arguments, a bare
-        // NULL taking the others' (NULLIF: its first argument's). Over builtin types that is a
-        // builtin type, and the value is one of the arguments, so it is that type here too.
+        // NULL taking the others'. Over builtin types that is a builtin type, and the value is one of
+        // the arguments, so it is that type here too. NULLIF is typed as its first argument, and
+        // `coerce_select_args` refuses a second one that does not coerce to that type.
         // A string literal has no type of its own in Postgres either (it is `unknown`): it takes the
         // others', unless every argument is one. `COALESCE(i, '00')` over an INTEGER `i` is an
         // INTEGER, and `coerce_select_args` then reads the literal as the integer 0. A NULL of a type

@@ -781,17 +781,36 @@ pub fn coerce_literal_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
     operand.into_iter().map(|v| if literal(&v) { cast_into(v, ret, &like) } else { v }).collect()
 }
 
-/// The arguments of a call that returns one of them (`COALESCE`, `NULLIF`, `GREATEST`, `LEAST`;
-/// [`crate::equality::returns_an_argument`]) brought to the call's type `ret`, as Postgres brings
-/// them to the one type it resolves for the call. Over a builtin type each is cast to it
+/// The arguments of the call `name`, one that returns one of them (`COALESCE`, `NULLIF`, `GREATEST`,
+/// `LEAST`; [`crate::equality::returns_an_argument`]), brought to the call's type `ret`, as Postgres
+/// brings them to the one type it resolves for the call. Over a builtin type each is cast to it
 /// ([`cast_to`], which reads a string literal as the type says: `'00'` beside an INTEGER is the
 /// integer 0, not a string the provers would keep apart from `'0'`); over an opaque one the literals
 /// are converted as a comparison with the opaque argument converts them ([`coerce_literal_args`]).
-pub fn coerce_select_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
+///
+/// `NULLIF` is typed as its first argument ([`crate::equality::call_type`]), and its second is cast
+/// to that type only where the cast loses nothing: a string literal, a bare NULL, or a value whose
+/// common type with the first ([`common_type`]) is the first's, as an INTEGER beside a `numeric`.
+/// Postgres compares the two as `=` would, at their common type, and returns the first argument as
+/// that `=` read it: `NULLIF(i, 1.5)` over an INTEGER `i` compares two numerics and is a numeric,
+/// `NULLIF(i, 1.5::integer)` compares two integers. Cast to INTEGER, `1.5` would be `2`, and the
+/// two would be one plan. So a second argument of a wider type than the first's is refused, as is
+/// one of another type than the first's, which Postgres rejects.
+pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<Vec<Value>> {
     if is_builtin(ret) {
-        return operand.into_iter().map(|v| cast_to(v, ret)).collect();
+        if name == "NULLIF" {
+            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v);
+            if let Some(v) = operand.iter().skip(1).find(|v| !untyped(v) && common_type(ret, &ty_of(v)) != ret) {
+                return Err(unsupported(format!(
+                    "NULLIF of a value of type {ret} against one of type {}, which Postgres compares at their \
+                     common type",
+                    ty_of(v)
+                )));
+            }
+        }
+        return Ok(operand.into_iter().map(|v| cast_to(v, ret)).collect());
     }
-    coerce_literal_args(operand, ret)
+    Ok(coerce_literal_args(operand, ret))
 }
 
 /// [`cast_to`] `ct`, where `ct` is the type `like` gave the comparison or the expression `v` is
@@ -1150,10 +1169,12 @@ pub(crate) fn is_null_lit(v: &Value) -> bool {
 }
 
 /// Whether `v` is a NULL the input wrote bare, with no type of its own: the lowering spells such a
-/// NULL INTEGER, and a NULL of any other type came through a cast (`NULL::numeric`), or stands for a
-/// typed column (`__sqleq_null_of` in `lower`), and has that type as Postgres gives it. A
-/// `NULL::integer` is read as bare too, which the type resolutions get right wherever its company
-/// is integer-compatible.
+/// NULL INTEGER ([`lower_value`](crate::lower)), and keeps it a nullary `NULL`. A NULL the input gave
+/// a type, `NULL::numeric` or `NULL::integer` alike, is a `CAST` over that constant
+/// ([`lower_cast`]), not a nullary `NULL`, and votes for its type as a value of that type would; so
+/// does the NULL that stands for a typed column (`__sqleq_null_of` in `lower`), which is typed as
+/// the column is. Only a NULL a coercion relabelled ([`cast_to`]) is a nullary `NULL` of another
+/// type, and the resolutions that ask here run before any.
 pub(crate) fn is_bare_null(v: &Value) -> bool {
     is_null_lit(v) && ty_of(v) == "INTEGER"
 }
