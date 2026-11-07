@@ -133,6 +133,14 @@ const ACCEPTED: &[Row] = &[
         "GROUP BY position 1", "prepares"),
     row(Unsupported, r#"SELECT DISTINCT ON ("a") "a" FROM "t" ORDER BY "a", "b" LIMIT 1"#, r#"SELECT "a" FROM "t""#,
         "ORDER BY key is not an output column", "prepares"),
+    // Postgres compares the two at their common type, numeric, and returns a numeric; cast to the
+    // first argument's type, `1.5` would be the integer `2`.
+    row(Unsupported, r#"SELECT NULLIF("a", 1.5) FROM "t""#, r#"SELECT NULLIF("a", 2) FROM "t""#,
+        "NULLIF of a value of type INTEGER against one of type REAL", "prepares: nullif(integer, numeric) is a numeric"),
+    // An argument of unknown type selects Postgres's regular-expression form, `substring(text, text)`.
+    row(Unsupported, r#"SELECT SUBSTRING(CAST("a" AS TEXT) FROM '1') FROM "t""#,
+        r#"SELECT SUBSTRING(CAST("a" AS TEXT) FROM 1) FROM "t""#, "SUBSTRING with a position or length of type VARCHAR",
+        "prepares: the match of the pattern '1'"),
 ];
 
 /// Tie-breaks: the input shown fails in Postgres, but the same refusal meets valid input too.
@@ -188,6 +196,12 @@ fn a_refusal_of_input_postgres_accepts_is_unsupported() {
     let conflict = row(Unsupported, r#"SELECT "a" FROM "t" WHERE "a" = $1 AND "b" = $2"#,
         r#"SELECT "a" FROM "t" WHERE "a" = $2 AND "b" = $1"#, "type conflict", "both sides prepare");
     assert_refused(typed, &conflict, &[CatalogSource::InferredSeeded]);
+    // Postgres types `$1` at its first use: a text on the left, the regular-expression form of
+    // `substring`, and an integer on the right. Inference gives it one type, the integer.
+    let position = row(Unsupported, r#"SELECT SUBSTRING("b" FROM $1) FROM "t""#,
+        r#"SELECT SUBSTRING("b" FROM $1::integer) FROM "t""#, "is the position or length of a SUBSTRING",
+        "both sides prepare");
+    assert_refused(typed, &position, &[CatalogSource::InferredSeeded]);
     // A name `JOIN ... USING` merged is one column to Postgres.
     let two = r#"create table "t" ("id" INTEGER, "x" INTEGER, unique ("id"));
 create table "u" ("id" INTEGER, "x" INTEGER, unique ("id"));"#;

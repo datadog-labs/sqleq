@@ -23,6 +23,12 @@
 //! a `numeric` or a float. Where an integer use comes first, the integer is right, but the order is
 //! not one the frontend follows, so it refuses then too: `$1 < 1 AND n * 2 = $1` is the price.
 //!
+//! One function reads an untyped parameter as a text rather than at its company's type:
+//! `substring(s from $1)` is Postgres's regular-expression form, `substring(text, text)`, since an
+//! unknown argument resolves to the string category where a candidate accepts one, and only
+//! `substring(s from $1::integer)` is the position form. So an inferred INTEGER parameter that is
+//! the position or the length of a `SUBSTRING` is refused as well, whatever its other uses.
+//!
 //! Only parameters whose type inference gave are checked. A `declare` line that types `QP<n>` stands
 //! for a client that declared the parameter's type, which Postgres takes as given.
 
@@ -64,6 +70,17 @@ fn walk(v: &Value, inferred: &BTreeSet<String>) -> Result<()> {
                         if let Some(class) = operand.iter().find_map(wide_class) {
                             return Err(refusal(&p, class));
                         }
+                    }
+                } else if op == "SUBSTRING" {
+                    // The position form only: `lower` refuses every other argument type, and the
+                    // parameter here is typed INTEGER. Postgres types it as a text if this is its
+                    // first use, and takes the regular-expression form.
+                    if let Some(p) = operand.iter().skip(1).find_map(|o| narrow_param(o, inferred)) {
+                        return Err(unsupported(format!(
+                            "{p}, inferred as an integer, is the position or length of a SUBSTRING: Postgres \
+                             types an untyped parameter there as a text, and takes the regular-expression \
+                             form of substring"
+                        )));
                     }
                 } else if op == "CAST" || op.starts_with("q_cast_") {
                     // A coercion into an opaque type is a named cast (`types::cast_into`), and so is a
