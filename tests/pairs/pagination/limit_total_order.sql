@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #65: under a literal LIMIT sqleq-fuzz compared only row counts, even when ORDER BY is a total order
 -- witness: t = {(1, 0), (2, 1)}, u = {(1, 1), (2, 0)}: A yields (1, 2), B yields (2, 1)

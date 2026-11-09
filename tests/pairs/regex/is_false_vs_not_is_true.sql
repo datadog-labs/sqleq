@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #186: `NOT` over a demoted regex operator was emitted applied to a VARBINARY term, which
 --   panicked the QED prover

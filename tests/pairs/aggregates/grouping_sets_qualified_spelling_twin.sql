@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review, the twin of grouping_sets_qualified_spelling_is_one_column: a and t.a are
 --   one grouping column, so the select list keeps a in both sets

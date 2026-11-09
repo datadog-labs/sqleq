@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: a t.* function argument was dropped, so both calls were nullary
 -- witness: t = {(1, 10)}, u = {(1, 20)}: A yields {"id":1,"a":10}, B yields {"id":1,"b":20}

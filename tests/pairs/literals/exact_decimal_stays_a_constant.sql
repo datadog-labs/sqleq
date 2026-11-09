@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #56 (control): a decimal that is exactly an f32 with a numerator and denominator
 --   that fit an i32 stays a constant, here at the smallest such power of two, so the QED prover

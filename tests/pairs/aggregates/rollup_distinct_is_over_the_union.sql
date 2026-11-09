@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: a DISTINCT over grouping sets was kept on every branch of the expansion, merging
 --   each set's rows alone; it is over the whole result, the UNION of the branches

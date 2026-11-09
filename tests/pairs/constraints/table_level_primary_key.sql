@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz did not make the columns of a table-level PRIMARY KEY NOT NULL
 -- argument: a PRIMARY KEY column is NOT NULL, so the filter keeps every row

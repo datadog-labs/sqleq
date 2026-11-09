@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: `$N` is bound by index across the pair, so a pair that renumbers its parameters compares statements nobody wrote

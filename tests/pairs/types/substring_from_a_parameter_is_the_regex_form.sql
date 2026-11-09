@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: PR #249 review: SUBSTRING read its second argument as a position whatever its type, so

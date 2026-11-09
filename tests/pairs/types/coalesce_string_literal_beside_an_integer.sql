@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review: a string literal voted for the type of a COALESCE, so COALESCE(i, '00') over an
 --   INTEGER i was a string; a literal has no type of its own, and is read as the integer 0

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 4: an IN subquery whose operand is the result of a function nobody declared was refused against an integer column
 -- argument: the two queries differ only in their aliases

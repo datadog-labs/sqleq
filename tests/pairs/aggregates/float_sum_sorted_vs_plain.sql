@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #85: a double precision SUM over a sorted subquery against the same SUM in scan order
 -- witness: t = {(1, 1e20), (3, 1), (2, -1e20)}, stored in that order: A sums in y order and yields 1, B sums in scan order and yields 0

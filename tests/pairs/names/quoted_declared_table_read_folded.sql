@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #203: the declared catalog stored a quoted "T" lower-cased, so an unquoted t, which
 --   Postgres reads as another table, was read as "T", key and all

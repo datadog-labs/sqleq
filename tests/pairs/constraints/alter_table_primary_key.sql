@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz ignored constraints added by ALTER TABLE, and its file mode rejected the ALTER
 -- argument: ALTER TABLE ... ADD PRIMARY KEY makes id unique, so DISTINCT removes nothing

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #88: Postgres names a VALUES column column1, which the frontend left unnamed, so a bare
 --   column1 missed the derived table and resolved to the enclosing u.column1

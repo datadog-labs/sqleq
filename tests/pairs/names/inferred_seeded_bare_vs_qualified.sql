@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #111: the seeded mode refused the pair as table without referenced columns: t,

@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: sqleq-fuzz compared only table state after an UPDATE, not what RETURNING returned
 -- witness: t = {(1, 0)}: both leave t unchanged, but A returns one row and B none

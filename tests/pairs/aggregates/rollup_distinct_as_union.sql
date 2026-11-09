@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review: DISTINCT over grouping sets, written out as the UNION of the branches
 -- argument: SELECT DISTINCT over the union of the grouping sets' rows is their UNION, which merges

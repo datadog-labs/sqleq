@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: PR #209 review: SUBSTRING and TRIM were typed VARCHAR whatever their argument; over a bytea they
 --   return a bytea, and are typed as their argument is (src/lower.rs, string_function_type)

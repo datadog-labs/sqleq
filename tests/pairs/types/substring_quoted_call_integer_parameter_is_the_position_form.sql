@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #250, the negative side: a parameter cast to integer selects Postgres's position form

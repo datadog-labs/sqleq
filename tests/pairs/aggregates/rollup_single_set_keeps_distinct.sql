@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: the expansion kept DISTINCT only where it joined two or more branches with
 --   UNION, so a single grouping set lost it

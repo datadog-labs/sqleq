@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #203, the negative: a quoted table name read as written is the declared table
 -- argument: both sides read the one table "T", whose key a makes the DISTINCT redundant

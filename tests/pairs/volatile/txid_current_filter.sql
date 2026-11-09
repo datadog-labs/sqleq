@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #63: txid_current() was missing from sqleq-fuzz's list of nondeterministic functions
 -- argument: the WHERE clause is true on every row of a NOT NULL column, and in one transaction txid_current() is the same value on both sides

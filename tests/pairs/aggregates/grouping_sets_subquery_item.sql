@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: the expansion matches grouping columns by text with no scope, so a subquery in a
 --   select item, whose own columns the match could take for grouping columns, is refused

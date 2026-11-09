@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: canonical_aliases collected table and derived-table aliases only, so an UNNEST
 --   aliased like a table escaped its duplicate check while a qualifier naming it was renamed, and

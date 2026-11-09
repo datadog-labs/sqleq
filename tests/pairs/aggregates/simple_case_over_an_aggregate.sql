@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a simple CASE over an aggregate is refused (`lower_post`); with its operand dropped, both
 --   sides would lower to CASE WHEN 1. No test reached that refusal until this pair

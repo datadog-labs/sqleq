@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: the NULL of a left-out INTEGER column was a bare nullary NULL, which counts as
 --   untyped, so the string literal beside it decided the type of its COALESCE

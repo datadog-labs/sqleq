@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: the empty grouping set of a ROLLUP was expanded as an empty GROUP BY, a plain
 --   SELECT where no aggregate made the branch group, so one row per input row; it is GROUP BY (),

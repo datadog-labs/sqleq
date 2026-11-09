@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #96: DISTINCT over an opaque column is refused by sqleq-solver unless the column's = is identity (issue #86); int[] compares its bounds and its elements with integer =, which is identity, and the emitted schema says so
 -- argument: two int[] values = calls equal have the same dimensions, bounds and elements, so they cast to the same

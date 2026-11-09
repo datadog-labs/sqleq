@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: the control beside booleans/projected_null_guard.sql

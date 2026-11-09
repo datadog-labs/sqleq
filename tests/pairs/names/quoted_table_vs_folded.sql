@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #203: the declared catalog found a table by its lower-cased name, so "T" was read as
 --   the declared t

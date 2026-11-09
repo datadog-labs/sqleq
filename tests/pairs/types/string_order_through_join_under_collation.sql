@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #87: a string comparison was decided by code point after substituting through a join, but the columns compare under en_US.utf8
 -- witness: t = {(1, 'B')}, u = {('B')}: under en_US.utf8 'B' < 'a' is false, so A returns nothing and B returns 1

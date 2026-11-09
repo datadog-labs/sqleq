@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #23: a parenthesized join in FROM was refused as an unsupported FROM factor (#31)
 -- argument: parentheses around the whole FROM list group nothing

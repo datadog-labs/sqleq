@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a join rewritten through a parameter: ON fact.version = version.id becomes ON version.id = $1 beside WHERE fact.version = $1. $1 meets only

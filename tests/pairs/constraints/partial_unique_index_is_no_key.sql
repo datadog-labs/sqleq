@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #92: a partial unique index is unique over the rows it covers alone, so it gives no key
 -- witness: t = {(1, 0), (1, 0)}: the index covers neither row, so A yields 1 twice and B once

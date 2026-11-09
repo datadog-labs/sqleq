@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz shimmed jsonb_build_object with DuckDB json_object, which keeps key order and duplicate keys
 -- argument: jsonb stores an object's keys in its own order, so the order they were built in is not observable

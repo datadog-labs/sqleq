@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz loaded s1.t and s2.t from one generated table, so two different tables always held the same rows
 -- witness: s1.t = {(1)}, s2.t = {(2)}: A yields 1, B yields 2

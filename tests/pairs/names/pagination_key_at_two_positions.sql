@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #74: strip_identical_pagination dropped an identical ORDER BY ... LIMIT once each
 --   side's key was determined by its own projection, without checking it was the same output

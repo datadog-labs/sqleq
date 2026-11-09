@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #50: a data-modifying WITH binding the query never reads was dropped with its
 --   effect, so the two statements lowered to one query

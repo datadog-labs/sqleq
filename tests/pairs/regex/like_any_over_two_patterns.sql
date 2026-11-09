@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: LIKE ANY is refused (`lower_expr`), as LIKE ALL is (refusals/like_all.sql): ANY over two
 --   patterns is not its first pattern alone. No test reached that refusal until this pair

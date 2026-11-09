@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #88: the frontend's placeholder name for an unnamed column, $col0, could be spelled as
 --   a quoted identifier and read that column

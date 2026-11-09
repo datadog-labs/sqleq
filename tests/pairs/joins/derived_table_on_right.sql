@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #22: a derived table on the right of a join was refused as correlated by both
 --   SQLSolver bridges, though QED proved the pair (#29)

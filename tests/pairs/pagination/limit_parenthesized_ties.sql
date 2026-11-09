@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #63: `LIMIT (1)` escaped sqleq-fuzz's literal-LIMIT guard, so DuckDB's arbitrary choice among tied rows was compared as a bag
 -- witness: t = {(0, 2, 2), (NULL, 1, 0), (1, 2, 0)}, inserted in that order: among the rows tied on b = 0,

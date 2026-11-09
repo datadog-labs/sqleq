@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: a grouping element that names the output alias of a constant is that
 --   constant; the select list's copy of it was never recognized, so the total row kept the 5 where

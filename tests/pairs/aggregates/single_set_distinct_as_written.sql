@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review, the twin of rollup_single_set_keeps_distinct: a single grouping set with
 --   DISTINCT, as the plain GROUP BY with DISTINCT it is

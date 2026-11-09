@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #92 item 5: a literal path under #> is read into its elements, and only the
 --   operator's literal is: the call's '{a}' is one key spelled with braces

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #123: range_agg keeps one member of a class of equal ranges, the order a sorted subquery hands
 --   on decides which, and the two queries lowered to one plan, which lifted the refusal of the cast to text

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #57: output column names are lower-cased whatever their quoting, so the
 --   unquoted key A (input column a) matches the output alias "A"

@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #203: a bare name resolved to the one declared name ending in ".t", which the
 --   one-part "s.t" does, so FROM t read "s.t", key and all

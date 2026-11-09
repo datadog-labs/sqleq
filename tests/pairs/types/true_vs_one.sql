@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #61: TRUE was the integer 1 in sqleq-solver, and the two sides' output types were never compared
 -- witness: t = {(1, 2)}: A yields the boolean true, B the integer 1

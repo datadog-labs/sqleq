@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz ran a LIKE with no ESCAPE clause on DuckDB, whose LIKE has no escape
 --   character; Postgres escapes with a backslash

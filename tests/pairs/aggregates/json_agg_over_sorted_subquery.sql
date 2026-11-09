@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #59: the same, for json_agg
 -- witness: t = {(1, 'b'), (2, 'a'), (3, 'c')}: on Postgres 17, A returns ["a", "b", "c"] and B ["c", "b", "a"]

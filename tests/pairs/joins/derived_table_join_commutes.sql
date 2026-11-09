@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: the control beside joins/derived_table_right_numbered_from_base.sql (#29)
 -- argument: the inputs of an inner join commute, and both sides project s.id

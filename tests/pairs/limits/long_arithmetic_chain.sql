@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #67: a long + chain parses into a tree as deep as it is long, and the frontend
 --   aborted with a stack overflow lowering it; it is refused now

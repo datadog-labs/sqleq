@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: no-witness
 -- binding: gather
 -- origin: a proof that may be vacuous is not credited: no constraint backs the arbiter

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 (canonical_aliases): two queries that differ only in their table aliases' names
 --   normalize to one query, so a pair the lowering refuses (here for its window) is still credited

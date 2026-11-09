@@ -6,10 +6,11 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 219 + 9 + 3 + 7 + 13 + 10 + 6 + 24 + 7 + 2 + 23 + 2 + 25 + 14 + 12 + 18 + 190 + 16 + 4 + 5 + 12 + 6 + 20 + 4 + 3 + 13 + 11 + 11 + 25 + 7 + 3 + 2; sqleq-check: 63 + 17 + 13 + 5 + 2 + 7 + 12 + 13
+cargo test                 # the frontend: 219 + 9 + 3 + 7 + 13 + 10 + 6 + 24 + 7 + 2 + 23 + 2 + 25 + 14 + 12 + 18 + 190 + 16 + 4 + 5 + 12 + 6 + 20 + 4 + 3 + 13 + 11 + 11 + 25 + 7 + 3 + 2; sqleq-check: 69 + 17 + 14 + 5 + 1 + 2 + 11 + 12 + 16
 cargo test -p sqleq-fuzz   # the disprover: 62 + 2 + 5 + 5 + 15 + 8 + 40 + 3 + 7 + 60
 cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 3 + 4 + 4 + 11 (compiles Z3, see below)
 cargo test -p sqleq-lean   # the Lean axis: 51 + 1 + 7 (needs Lean, see below)
+cargo test -p sqleq-cvc5   # the cvc5 axis: 6 + 19 (after `sh tools/build_cvc5.sh`, see docs/CVC5.md)
 cargo build -p sqleq-fuzz -p sqleq-solver
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
@@ -21,8 +22,8 @@ resolves to nothing; among `sqleq-check`'s is the hygiene gate over every commit
 [pinned pairs](tests/pairs/README.md) on the frontend, fuzz and sqleq-solver axes, the ones CI runs
 through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries;
 the `cargo build` line before it makes sure of both opt-in ones. The Lean pins are checked by
-`cargo test -p sqleq-lean`, and the `qed` and `sqlsolver-jvm` pins only where those tools are
-installed.
+`cargo test -p sqleq-lean`, and the `qed`, `sqlsolver-jvm` and `cvc5` pins only where those tools
+are installed.
 
 `sqleq-fuzz` runs pairs on a PostgreSQL 17: the one `SQLEQ_PG_BIN` names, else the one its build
 fetched (for Linux and macOS on x86_64 and arm64; `SQLEQ_PG_DOWNLOAD=0` skips the download), else

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: RANK() over one table is lowered as one more than the rows of its partition sorting
 --   strictly before the row (src/normalize.rs, lower_rank_windows); with no ORDER BY every row is its

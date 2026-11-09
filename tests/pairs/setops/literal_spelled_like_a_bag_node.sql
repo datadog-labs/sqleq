@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: PR #222 review: sqleq-check withheld from QED a plan whose text spelled a bag set
 --   operation's node, and the literal 'exceptAll' is the same characters as the node's key, so

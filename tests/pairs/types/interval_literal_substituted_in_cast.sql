@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: a filter x = INTERVAL '1 day' let the literal stand in for x inside a cast to text
 -- witness: t = {('24 hours')}: A yields '24:00:00', B yields '1 day'

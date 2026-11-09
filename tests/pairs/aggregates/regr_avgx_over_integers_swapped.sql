@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #85: regr_avgx is declared over double precision only, so it converts its integer arguments and adds them in floating point
 -- witness: t = {(9007199254740993), (1)}, u = {(-9007199254740992)}, rows in that order: A yields 0, B yields 0.3333333333333333

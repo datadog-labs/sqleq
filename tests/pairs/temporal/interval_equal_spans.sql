@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz compared interval cells by their fields, so '1 day' and '24 hours' differed
 -- argument: INTERVAL '1 day' = INTERVAL '24 hours' in Postgres (interval_cmp compares the whole span, a day

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: an ALTER TABLE after the CREATE TABLE was not read, so a NOT NULL a later DROP NOT NULL
 --   dropped was still believed

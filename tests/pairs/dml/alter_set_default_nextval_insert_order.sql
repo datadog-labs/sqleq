@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: an ALTER TABLE after the CREATE TABLE was not read, so a sequence default set there, as
 --   pg_dump writes a serial column, left the INSERT reduction taking the column for row-determined

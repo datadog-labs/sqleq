@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: no-witness-generated
 -- binding: gather-generated
 -- origin: a possibly vacuous generated proof is not credited: DEFAULT on a NOT NULL column

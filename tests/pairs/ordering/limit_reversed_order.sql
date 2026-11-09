@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: a row slice is lowered as a sort, not refused (docs/SOUNDNESS.md), so a pair that slices
 --   in two orders must not be proved (#68)

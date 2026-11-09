@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: an optimizer folds a contradictory range to an empty result; sqleq-solver's bag rung asks Z3 whether a summand's conditions can hold together
 -- argument: no integer is both below 1 and above 1, so A keeps no row, and neither does B

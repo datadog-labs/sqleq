@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #58: a string literal compared with a BOOLEAN column cast the column to text, where Postgres reads the literal as a boolean
 -- witness: t = {(true)}: A yields no rows ('t' and 'true' both read as true), B yields (true)

@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #88: a qualified s.x that the nearest s does not have resolved to an enclosing binding
 --   also named s, where Postgres stops at the nearest one

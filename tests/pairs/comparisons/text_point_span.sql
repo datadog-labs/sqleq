@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: an index span over text, ['foo', 'foo'], on a C-collated column, where the frontend lowers <= natively; antisymmetry needs no order between
 --   the constants, only an = that is identity

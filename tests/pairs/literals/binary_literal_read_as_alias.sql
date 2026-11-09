@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #80: sqlparser split the binary literal 0b101 into the number 0 and the alias
 --   b101, so the two queries lowered to one plan

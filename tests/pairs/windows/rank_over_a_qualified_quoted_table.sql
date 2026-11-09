@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: RANK() over one table (src/normalize.rs, lower_rank_windows): the rewrite writes the table's
 --   own name, quoting and schema included, in its inner count, so the inner and outer references

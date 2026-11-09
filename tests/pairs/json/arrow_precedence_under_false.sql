@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: DuckDB binds ->> looser than AND, so sqleq-fuzz once ran a different predicate than Postgres
 -- argument: in Postgres ->> binds tighter than IS NULL and AND, so both predicates are `false AND ...`, false for every row

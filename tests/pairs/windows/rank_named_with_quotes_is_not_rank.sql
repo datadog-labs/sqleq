@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: RANK() over one table (src/normalize.rs, lower_rank_windows): a quoted "RANK" is a function
 --   of that name, which Postgres does not have, and not the window function

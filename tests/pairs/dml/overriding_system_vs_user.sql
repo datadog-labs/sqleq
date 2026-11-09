@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: an INSERT clause sqlparser reads only from apache/datafusion-sqlparser-rs#2626; the
 --   frontend's INSERT reduction replaces the statement by its source, so it must refuse the clause

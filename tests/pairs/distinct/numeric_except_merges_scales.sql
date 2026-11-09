@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver deduplicated numeric values by identity in EXCEPT, though Postgres deduplicates by = and 2.0 = 2.00
 -- witness: t = {(1, 2.0), (2, 2.00)}: the right side of EXCEPT is empty and EXCEPT keeps one of the two, so A returns one row; B returns two, 1 and 2

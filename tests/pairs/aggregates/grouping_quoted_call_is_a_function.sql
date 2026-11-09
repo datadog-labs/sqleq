@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: PR #209 review: a quoted "grouping"(a) is a call of a function, but was read as GROUPING and
 --   replaced by its mask, so the pair was one plan

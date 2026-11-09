@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #55: integer / reached the QED prover as z3's Euclidean div, which rounds -1 / 2 to
 --   -1 where Postgres truncates it to 0

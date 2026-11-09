@@ -8,6 +8,7 @@
 -- expect fuzz: not-comparable
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #87: under a non-deterministic collation = is not identity, but the column's COLLATE was dropped
 -- witness: t = {(1, 'a')}: under ci 'a' = 'A', so A returns nothing and B returns 1

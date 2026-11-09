@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #187: no generated row equals a literal outside the value domain, so a pair that
 --   differs only at the literal's boundary agreed on every trial

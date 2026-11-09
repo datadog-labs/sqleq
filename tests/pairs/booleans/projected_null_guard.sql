@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: proved !known-unsound
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: a boolean in the SELECT list was read two-valued, as if NULL were false

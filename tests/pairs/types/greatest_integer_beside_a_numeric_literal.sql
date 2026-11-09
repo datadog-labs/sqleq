@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #249 review: a guard on the type of GREATEST and LEAST over two types. Postgres brings an
 --   INTEGER beside a numeric to numeric, and so does the lowering (src/equality.rs, call_type;

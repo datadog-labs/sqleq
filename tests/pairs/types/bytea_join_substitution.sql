@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #96: sqleq-solver read = on every opaque (VARBINARY) column through a key, so t.h = u.h no longer let it project either side; bytea's = is byte identity, and the emitted schema now says so
 -- argument: bytea equality is byte-for-byte, so t.h = u.h means t.h and u.h are the same value; the two

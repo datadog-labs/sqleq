@@ -10,6 +10,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #174: $2 in COALESCE(<boolean>, $2) was typed opaque, and NOT over the COALESCE
 --   reached the QED prover applied to a non-boolean term, which panicked it

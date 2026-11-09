@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: an unaliased cast had no output name, so the bare key x reached the input
 --   column t.x; Postgres names the column after what it casts, so A sorts by the cast

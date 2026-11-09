@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #48: strip_schema guarded each query on its own, so s1.t on one side and s2.t on the
 --   other both became t, and the reflexivity check found one query

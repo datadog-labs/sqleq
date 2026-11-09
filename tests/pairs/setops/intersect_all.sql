@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: unsupported
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: INTERSECT ALL, once refused (#68), is its own IR node (docs/SOUNDNESS.md): set provers
 --   refuse it, a bag prover can state it

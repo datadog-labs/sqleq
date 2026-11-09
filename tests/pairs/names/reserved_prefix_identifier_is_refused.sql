@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209: the frontend's rewrites write identifiers beginning __sqleq_ (the aliases
 --   canonical_aliases gives), so an identifier of the input spelled so is refused before any rewrite

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: a column named like the expansion's aggregate placeholder made the frontend panic
 --   (index out of bounds); every identifier beginning with __sqleq_ is refused before any rewrite

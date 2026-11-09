@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #203: the DML reduction compared two targets by their lower-cased names, so DELETE
 --   FROM "T" and DELETE FROM t were read as one table

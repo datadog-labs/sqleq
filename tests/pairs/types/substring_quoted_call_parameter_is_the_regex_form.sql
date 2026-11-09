@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #250: the quoted, ordinary-call spelling "substring"(s, $1) lowered to SUBSTRING with

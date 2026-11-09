@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #122: the integer-only rewrite against an avg, which makes $1 a numeric

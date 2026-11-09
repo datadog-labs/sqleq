@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #61: sqleq-solver compared constants through f64, which cannot tell 2^53 + 1 from 2^53
 -- witness: t = {(1, 2)}: the two integers differ, so A returns nothing and B returns 1

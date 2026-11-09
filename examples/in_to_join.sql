@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: the README's quick start: an IN subquery unnested into a join
 -- argument: `teams.id` is a key, so each user joins at most one team and the join repeats no user;

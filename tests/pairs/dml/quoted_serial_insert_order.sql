@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a SERIAL spelled quoted, "serial", which Postgres reads as SERIAL, was not seen to be one,
 --   so the INSERT reduction took the column for row-determined

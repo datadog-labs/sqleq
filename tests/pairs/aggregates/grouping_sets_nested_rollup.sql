@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: a ROLLUP nested in GROUPING SETS was read as a call of a function named rollup and
 --   grouped by; it is refused

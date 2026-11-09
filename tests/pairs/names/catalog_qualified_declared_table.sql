@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #202: a DDL that declares a table under pg_catalog was read as that table, though
 --   Postgres refuses to create it and the queries read the catalog's relation

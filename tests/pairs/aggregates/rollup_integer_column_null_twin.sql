@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review, the twin of rollup_integer_column_null_beside_a_string_literal: the left-out
 --   column's NULL, written as the typed NULL it is

@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: the control beside joins/using_after_right_join.sql: after a LEFT join the first binding
 --   is the merged column, so this shape still lowers (#31)

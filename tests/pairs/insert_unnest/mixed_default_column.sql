@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather-generated
 -- binding: gather-generated
 -- origin: one column holding DEFAULT in some rows and a parameter in another

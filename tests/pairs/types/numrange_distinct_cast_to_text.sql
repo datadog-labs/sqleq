@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #108: DISTINCT over numrange keeps one of two equal ranges, which was read as identity
 -- witness: t = {(1, '[1.0,2.0)'), (2, '[1.00,2.00)')}: A yields one row, B yields [1.0,2.0) and [1.00,2.00)

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #121: count is a bigint, so a sum over it is a numeric and its division a numeric one
 -- witness: t = {(1, 0)}: the one count is 1, so sum(c) / 2 = 0.5; A returns no row and B returns 1

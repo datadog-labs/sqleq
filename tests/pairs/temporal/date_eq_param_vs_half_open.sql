@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: date arithmetic was integer arithmetic, which is wrong at infinity (64af5bf)

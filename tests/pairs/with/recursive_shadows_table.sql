@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #50: lowering ignored a WITH RECURSIVE that inline_ctes leaves in place, so the
 --   binding's name resolved to the base table it shadows

@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather-generated
 -- origin: a stored generated column takes DEFAULT, and rejects any other value
