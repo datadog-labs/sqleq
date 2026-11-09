@@ -40,6 +40,28 @@ from a long chain such as `a + a + … + a`, is refused before any pass recurses
 sets refuses them (`sqleq-solver` answers unsupported; QED is not handed such a plan, and answers
 `no-plan`).
 
+`GROUPING SETS`, `ROLLUP` and `CUBE` are rewritten into constructs the IR has, under guards that keep
+the rewrite exactly what SQL defines them as, and refused outside them
+(`lower::expand_grouping_sets`). The query becomes the union of one plain `GROUP BY` per grouping
+set; the empty set is `GROUP BY ()`, one group and so exactly one row, of an empty table too; the
+columns a set leaves out are NULL of their type in its rows (a typed NULL for every type, an
+INTEGER's spelled as `NULL::integer` is, so that a string literal beside it does not decide the
+type of its call); and `GROUPING(..)` is the bit mask of its arguments the set leaves out. A
+`DISTINCT` is over the whole result, so several branches are joined by `UNION`, and a single set
+keeps it. An expression is a grouping expression when it *lowers* to the value one lowers to in
+the `FROM` scope, the way `GROUP BY` and `ORDER BY` keys are matched, so `a` and `t.a` are one
+column and `s = 'A'` and `s = 'a'` are two expressions; two spellings that lower alike are
+accepted as one only if both are column references, and otherwise refused, since the lowering can
+identify expressions Postgres keeps apart. Each expression is matched from the top down, so the
+`a / 10` kept by a set is not entered to null the `a` inside it. Refused: a grouping expression
+that reads no column of the query's own tables (a constant, an output alias of one), a wildcard, a
+subquery in the select list or `HAVING`, `DISTINCT ON`, a grouping construct nested in another, and
+a `GROUPING` inside an aggregate. A `GROUPING` over more than 31 arguments, or over one that is not a
+grouping expression, is what Postgres rejects, and is refused as input it rejects. Only the
+grammar's own constructs count: a quoted `"rollup"(a)` or `"grouping"(a)` is a call of a function.
+The expansion writes placeholders and a marker of its own, all of them reserved names: every
+identifier of the input that begins with `__sqleq_` is refused before any rewrite runs.
+
 Two constructs that turn on an ordering are lowered rather than refused. A row slice — `LIMIT`,
 `OFFSET`, `FETCH FIRST` — becomes the prover's `Sort` node, carrying the whole `ORDER BY` in clause
 order (`src/lower.rs`, `apply_pagination`). `DISTINCT ON` becomes a group whose every output column
