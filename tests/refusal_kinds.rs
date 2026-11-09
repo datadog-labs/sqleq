@@ -107,6 +107,15 @@ const REJECTED: &[Row] = &[
         "missing FROM-clause entry for table q", r#"42P01 missing FROM-clause entry for table "q""#),
     row(Schema, r#"UPDATE "t" SET "a" = 1 RETURNING "old"."a""#, r#"UPDATE "t" SET "a" = 2 - 1 RETURNING "old"."a""#,
         "missing FROM-clause entry for table old", r#"42P01 missing FROM-clause entry for table "old" (Postgres 18 adds old and new)"#),
+    // `GROUPING` over what is not a grouping expression, over too many, and inside an aggregate.
+    row(Schema, r#"SELECT GROUPING("b") FROM "t" GROUP BY ROLLUP("a")"#, r#"SELECT "a" FROM "t""#,
+        "arguments to GROUPING must be grouping expressions",
+        "42803 arguments to GROUPING must be grouping expressions of the associated query level"),
+    row(Schema, r#"SELECT GROUPING("a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a") FROM "t" GROUP BY ROLLUP("a")"#,
+        r#"SELECT "a" FROM "t""#, "GROUPING must have between one and 31 arguments",
+        "54023 GROUPING must have fewer than 32 arguments"),
+    row(Schema, r#"SELECT count(GROUPING("a")) FROM "t" GROUP BY ROLLUP("a")"#, r#"SELECT "a" FROM "t""#,
+        "aggregate function calls cannot be nested", "42803 aggregate function calls cannot be nested"),
 ];
 
 /// Input Postgres accepts.
@@ -117,6 +126,19 @@ const ACCEPTED: &[Row] = &[
     // A catalog relation Postgres reads and the frontend does not model, not an unknown table (#202).
     row(Unsupported, r#"SELECT "relname" FROM "pg_class""#, r#"SELECT "relname" FROM "pg_class" WHERE true"#,
         "system relation", "prepares: reads pg_catalog.pg_class"),
+    // Grouping sets the expansion declines (src/lower.rs, `expand_grouping_sets`): Postgres accepts each.
+    row(Unsupported, r#"SELECT "a", count(*) FROM "t" GROUP BY GROUPING SETS (ROLLUP("a"), ("b"))"#,
+        r#"SELECT "a" FROM "t""#, "nested in GROUPING SETS", "prepares"),
+    row(Unsupported, r#"SELECT DISTINCT ON ("a") "a", count(*) FROM "t" GROUP BY ROLLUP("a")"#,
+        r#"SELECT "a" FROM "t""#, "DISTINCT ON beside grouping sets", "prepares"),
+    row(Unsupported, r#"SELECT * FROM "t" GROUP BY ROLLUP("a", "b")"#, r#"SELECT "a" FROM "t""#,
+        "a wildcard beside grouping sets", "prepares: every column is grouped"),
+    row(Unsupported, r#"SELECT (SELECT 1), count(*) FROM "t" GROUP BY ROLLUP("a")"#, r#"SELECT "a" FROM "t""#,
+        "a subquery in the select list or HAVING", "prepares"),
+    row(Unsupported, r#"SELECT 5 AS "x", count(*) FROM "t" GROUP BY ROLLUP("x")"#, r#"SELECT "a" FROM "t""#,
+        "reads no column of the query's own tables", "prepares: x is the constant, NULL in the total row"),
+    row(Unsupported, r#"SELECT count(*) FROM "t" GROUP BY GROUPING SETS ((NOT "a" = 1), ("a" <> 1))"#,
+        r#"SELECT "a" FROM "t""#, "spelled differently, that lower alike", "prepares"),
     // An identifier spelled like one the frontend's own rewrites write.
     row(Unsupported, r#"SELECT 1 AS "__sqleq_x" FROM "t""#, r#"SELECT 1 AS "x" FROM "t""#,
         "reserves for its own rewrites", "prepares"),
