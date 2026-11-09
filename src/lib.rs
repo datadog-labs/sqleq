@@ -1015,6 +1015,10 @@ fn parse_input(
     // Before `strip_schema`, which would otherwise turn `part_16.c` into something a CTE named `c`
     // captures.
     normalize::inline_ctes(&mut queries);
+    // After `inline_ctes`, so a `RANK()` in a binding is rewritten where it now sits, over the
+    // table the binding read. Before `strip_schema`: the rewrite writes the table's own name, which
+    // `strip_schema` then treats like any other.
+    normalize::lower_rank_windows(&mut queries);
     // After `inline_ctes`, so a lock clause inside a `WITH` binding sits on the derived table that
     // replaced it and is compared in the position lowering will see it.
     normalize::strip_identical_locks(&mut queries);

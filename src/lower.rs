@@ -519,14 +519,16 @@ pub(crate) fn refuse_reserved_call_names(statements: &[sqlparser::ast::Statement
     Ok(())
 }
 
-/// The prefix of every identifier the frontend's own rewrites write, such as the aliases
-/// `__sqleq_alias_N` of [`crate::normalize::canonical_aliases`]. No identifier of the input may begin
-/// with it ([`refuse_reserved_identifiers`]).
+/// The prefix of every identifier the frontend's own rewrites write: the aliases
+/// `__sqleq_alias_N` of [`crate::normalize::canonical_aliases`] and the `__sqleq_window` of
+/// [`crate::normalize::lower_rank_windows`]. No identifier of the input may begin with it
+/// ([`refuse_reserved_identifiers`]).
 pub(crate) const RESERVED_PREFIX: &str = "__sqleq_";
 
 /// SOUNDNESS GUARD: an identifier of the input that a rewrite's own symbol could be taken for. A
-/// table the input aliases `__sqleq_alias_0` would be indistinguishable from the alias
-/// [`crate::normalize::canonical_aliases`] gives another table. Read off the tokens of each
+/// table the input aliases `__sqleq_window` would be the `RANK()` rewrite's own alias, compared with
+/// itself and never before itself, so every rank 1; one aliased `__sqleq_alias_0` would be
+/// indistinguishable from the alias [`crate::normalize::canonical_aliases`] gives another table. Read off the tokens of each
 /// statement's text, so that every position an identifier can take is covered -- alias, column,
 /// table, function, binding, qualifier, quoted or not, in any case. No name a query could otherwise
 /// mean begins with the prefix.

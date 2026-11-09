@@ -27,7 +27,7 @@ The provers are taken to be sound: each proves only genuinely equivalent pairs *
 (the JVM SQLSolver has known exceptions, listed in [SQLSOLVER.md](SQLSOLVER.md)). So, short of the
 two assumptions below, a false positive can only come from unfaithful lowering. The frontend
 therefore **refuses** (returns an error) any construct it cannot lower faithfully — window
-functions, `HAVING` it can't express, correlated columns it can't resolve,
+functions (but for the one `RANK()` shape described below), `HAVING` it can't express, correlated columns it can't resolve,
 `LIKE ... ESCAPE`, set-returning functions (they expand one row into many, so modelling the call as
 a scalar understates cardinality), `LATERAL`, `TABLESAMPLE`/`WITH ORDINALITY`, `FETCH ... WITH
 TIES`, a `WITH` it cannot inline (`RECURSIVE`, or one with a data-modifying binding, at any level),
@@ -75,6 +75,27 @@ qualifier naming the alias of an `UNNEST`, a function or a parenthesized join, n
 renaming reaches. The frontend's rewrites write identifiers of their own, these aliases among them,
 so every identifier of the input that begins with `__sqleq_` is refused before any rewrite runs
 (`lower::refuse_reserved_identifiers`), and none can be taken for one of them.
+
+One window function is lowered rather than refused: `normalize::lower_rank_windows` writes `RANK() OVER (PARTITION BY p.. ORDER BY o..)` in the select list
+of a query that reads one table and nothing else as what it is: one more than the number of the table's
+rows in the row's partition that sort strictly before it,
+
+```sql
+1 + (SELECT COUNT(*) FROM t AS __sqleq_window
+     WHERE __sqleq_window.p IS NOT DISTINCT FROM t.p AND <__sqleq_window sorts before t by o..>)
+```
+
+with each key in its direction and its nulls where the clause puts them (Postgres's default is last
+ascending and first descending). Rows that tie on every key are peers and share a rank, which the
+strict comparison gives them, and a frame clause does not change a rank. The window must see exactly
+the table's rows, so the rewrite applies only to a select with one table in `FROM` (no join, no
+table function, no alias column list) and no `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `QUALIFY` or
+named window, whose partition and order keys are columns of that table, and whose `RANK()` takes no
+argument and no `FILTER`. A select item with a subquery in it is left alone, since the walk would
+otherwise reach a `RANK()` that ranks the subquery's rows, not this table's; the subquery, taken as a
+query of its own, is rewritten against its own table under the same guard. Every other window call is
+refused as before. The rewrite writes the identifier `__sqleq_window`, which no input spells (see
+above).
 
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a

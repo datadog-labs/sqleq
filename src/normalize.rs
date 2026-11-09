@@ -3393,3 +3393,220 @@ impl VisitorMut for RenameAliases<'_> {
         ControlFlow::Continue(())
     }
 }
+
+/// Whether `e` has a subquery anywhere in it.
+pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    struct Subquery;
+    impl Visitor for Subquery {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+    }
+    Visit::visit(e, &mut Subquery).is_break()
+}
+
+/// `RANK() OVER (PARTITION BY p.. ORDER BY o..)` in the select list of a query that reads one table
+/// and nothing else, as what it is: one more than the number of the table's rows in the row's
+/// partition that sort strictly before it,
+///
+/// ```sql
+/// 1 + (SELECT COUNT(*) FROM t AS __sqleq_window
+///      WHERE __sqleq_window.p IS NOT DISTINCT FROM a.p AND <__sqleq_window sorts before a by o..>)
+/// ```
+///
+/// with `a` the table's alias (or its name), each key in its direction and with its nulls where the
+/// clause puts them (Postgres's default: last ascending, first descending). Rows that tie on every
+/// key are peers and share a rank, which the strict comparison gives them; a frame clause does not
+/// change a rank.
+///
+/// SOUNDNESS GUARD. Only where the window sees exactly the table's rows: one table in `FROM`, with no
+/// join, and no `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `QUALIFY` or named window; partition and
+/// order keys that are columns of that table; `RANK()` with no argument and no `FILTER`; and only in
+/// a select item with no subquery in it, since the walk over an item enters every expression of it,
+/// and a `RANK()` inside a subquery is over that subquery's rows, not this table's (the visit of the
+/// subquery itself rewrites it against its own table, under the same guard). Any other window
+/// call is left alone, and lowering refuses it as before. The alias the rewrite writes,
+/// `__sqleq_window`, is a name no input spells ([`crate::lower::refuse_reserved_identifiers`]), so a
+/// table the input aliases so cannot be taken for it.
+pub fn lower_rank_windows(queries: &mut [Query]) {
+    for q in queries {
+        let _ = VisitMut::visit(q, &mut RankWindows);
+    }
+}
+
+struct RankWindows;
+
+impl VisitorMut for RankWindows {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<Self::Break> {
+        if let SetExpr::Select(s) = q.body.as_mut() {
+            rank_windows_in(s);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn rank_windows_in(s: &mut sqlparser::ast::Select) {
+    use sqlparser::ast::{OrderBySort, WindowType};
+    if s.from.len() != 1
+        || !s.from[0].joins.is_empty()
+        || s.selection.is_some()
+        || s.having.is_some()
+        || s.qualify.is_some()
+        || s.distinct.is_some()
+        || !s.named_window.is_empty()
+        || !matches!(&s.group_by, GroupByExpr::Expressions(v, m) if v.is_empty() && m.is_empty())
+    {
+        return;
+    }
+    let TableFactor::Table { name, alias, args: None, .. } = &s.from[0].relation else { return };
+    if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+        return;
+    }
+    let Some(outer) = alias.as_ref().map(|a| a.name.clone()).or_else(|| name.0.last().and_then(|p| p.as_ident()).cloned())
+    else {
+        return;
+    };
+    let table = name.to_string();
+    // a key as a column of the table: `c` or `a.c`
+    let column = |e: &Expr| -> Option<Ident> {
+        match e {
+            Expr::Identifier(id) => Some(id.clone()),
+            Expr::CompoundIdentifier(ids) if ids.len() == 2 && crate::dml::fold_ident(&ids[0]) == crate::dml::fold_ident(&outer) => {
+                Some(ids[1].clone())
+            }
+            _ => None,
+        }
+    };
+    let rank = |f: &Function| -> Option<Expr> {
+        if !obj_name_is(&f.name, "rank")
+            || f.uses_odbc_syntax
+            || !matches!(f.parameters, FunctionArguments::None)
+            || !matches!(&f.args, FunctionArguments::List(l) if l.args.is_empty() && l.clauses.is_empty() && l.duplicate_treatment.is_none())
+            || f.filter.is_some()
+            || f.null_treatment.is_some()
+            || !f.within_group.is_empty()
+        {
+            return None;
+        }
+        let Some(WindowType::WindowSpec(spec)) = &f.over else { return None };
+        if spec.window_name.is_some() {
+            return None;
+        }
+        let w = "__sqleq_window";
+        let mut conds = Vec::new();
+        for p in &spec.partition_by {
+            let c = column(p)?;
+            conds.push(format!("{w}.{c} IS NOT DISTINCT FROM {outer}.{c}"));
+        }
+        // w sorts before the row: lexicographically, from the last key
+        let mut before = "FALSE".to_string();
+        for o in spec.order_by.iter().rev() {
+            if o.with_fill.is_some() {
+                return None;
+            }
+            let c = column(&o.expr)?;
+            let desc = match &o.options.sort {
+                None | Some(OrderBySort::Asc) => false,
+                Some(OrderBySort::Desc) => true,
+                Some(OrderBySort::Using(_)) => return None,
+            };
+            let nulls_first = o.options.nulls_first.unwrap_or(desc);
+            let (a, b) = (format!("{w}.{c}"), format!("{outer}.{c}"));
+            let values = if desc { format!("{a} > {b}") } else { format!("{a} < {b}") };
+            let nulls = if nulls_first {
+                format!("({a} IS NULL AND {b} IS NOT NULL)")
+            } else {
+                format!("({b} IS NULL AND {a} IS NOT NULL)")
+            };
+            before = format!("(({values}) OR {nulls} OR ({a} IS NOT DISTINCT FROM {b} AND {before}))");
+        }
+        conds.push(before);
+        let text = format!("(1 + (SELECT COUNT(*) FROM {table} AS {w} WHERE {}))", conds.join(" AND "));
+        sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(&text)
+            .ok()?
+            .parse_expr()
+            .ok()
+    };
+    for item in s.projection.iter_mut() {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        // SOUNDNESS GUARD: see above. A `RANK()` in the item's subquery is that query's own: the
+        // visit of it rewrites it against its own table if the guard admits it there, and lowering
+        // refuses it otherwise.
+        if contains_subquery(e) {
+            continue;
+        }
+        let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+            if let Expr::Function(f) = x {
+                if let Some(r) = rank(f) {
+                    *x = r;
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+}
+
+/// Whether `name` is the unqualified function `want`, folded as Postgres folds an identifier: a
+/// quoted `"RANK"` is a function of that name, not `rank`, and Postgres rejects it.
+fn obj_name_is(name: &ObjectName, want: &str) -> bool {
+    name.0.len() == 1 && name.0[0].as_ident().is_some_and(|id| crate::dml::fold_ident(id) == want)
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use sqlparser::parser::Parser;
+
+    use super::*;
+
+    fn ranked(sql: &str) -> String {
+        let mut st = Parser::parse_sql(&crate::DIALECT, sql).expect("parses");
+        let Statement::Query(q) = &mut st[0] else { panic!("query") };
+        lower_rank_windows(std::slice::from_mut(&mut **q));
+        st[0].to_string()
+    }
+
+    /// The text the rewrite writes, pinned: the pins under `tests/pairs/windows` write the other
+    /// side independently, so nothing else holds this formula's shape.
+    #[test]
+    fn a_partitioned_rank_is_one_plus_the_count_of_rows_sorting_before() {
+        assert_eq!(
+            ranked("SELECT a, RANK() OVER (PARTITION BY a ORDER BY b DESC NULLS LAST) AS r FROM t"),
+            "SELECT a, (1 + (SELECT COUNT(*) FROM t AS __sqleq_window WHERE __sqleq_window.a IS NOT DISTINCT FROM t.a \
+             AND ((__sqleq_window.b > t.b) OR (t.b IS NULL AND __sqleq_window.b IS NOT NULL) OR \
+             (__sqleq_window.b IS NOT DISTINCT FROM t.b AND false)))) AS r FROM t"
+        );
+    }
+
+    /// A `RANK()` in a subquery ranks the subquery's rows: the outer item is left alone, and the
+    /// subquery, visited as a query of its own, counts over `u`, never over the outer `t`.
+    #[test]
+    fn a_rank_in_a_subquery_is_counted_over_the_subquerys_table() {
+        assert_eq!(
+            ranked("SELECT (SELECT RANK() OVER (ORDER BY b) FROM u) FROM t"),
+            "SELECT (SELECT (1 + (SELECT COUNT(*) FROM u AS __sqleq_window WHERE ((__sqleq_window.b < u.b) OR \
+             (u.b IS NULL AND __sqleq_window.b IS NOT NULL) OR (__sqleq_window.b IS NOT DISTINCT FROM u.b AND false)))) \
+             FROM u) FROM t"
+        );
+    }
+
+    #[test]
+    fn what_the_guard_refuses_is_left_as_it_was() {
+        for sql in [
+            "SELECT RANK() OVER (ORDER BY b) FROM t WHERE b > 0",
+            "SELECT RANK() OVER (ORDER BY b) FROM t GROUP BY b",
+            "SELECT RANK() OVER (ORDER BY b) FROM t JOIN u ON true",
+            "SELECT RANK() OVER (ORDER BY b) + (SELECT 1) FROM t",
+            "SELECT \"RANK\"() OVER (ORDER BY b) FROM t",
+            "SELECT RANK() OVER (ORDER BY b + 1) FROM t",
+        ] {
+            assert_eq!(ranked(sql), Parser::parse_sql(&crate::DIALECT, sql).unwrap()[0].to_string(), "{sql}");
+        }
+    }
+}
