@@ -4,7 +4,7 @@
 # Copyright 2026-Present Datadog, Inc.
 
 [workspace]
-members = ["sqleq-check", "sqleq-fuzz", "sqleq-lean", "sqleq-solver"]
+members = ["sqleq-check", "sqleq-cvc5", "sqleq-fuzz", "sqleq-lean", "sqleq-solver"]
 # Bare `cargo build` / `cargo test` stay on the light crates: the frontend, and sqleq-check, the
 # batch harness, which runs every other crate's binary as a subprocess and so builds none of them.
 # sqleq-fuzz links DuckDB, whose release library its first build downloads, so it is opt-in:
@@ -12,6 +12,8 @@ members = ["sqleq-check", "sqleq-fuzz", "sqleq-lean", "sqleq-solver"]
 # sqleq-lean needs a Lean toolchain at run time, so it is opt-in too: `cargo build -p sqleq-lean`.
 # sqleq-solver compiles Z3 from source on its first build, so it is opt-in the same way:
 # `cargo build -p sqleq-solver`.
+# sqleq-cvc5 links a cvc5 library (`CVC5_LIB_DIR`) and reads the IR through sqleq-solver, so it is
+# opt-in too: `CVC5_LIB_DIR=... cargo build -p sqleq-cvc5`.
 default-members = [".", "sqleq-check"]
 resolver = "2"
 
