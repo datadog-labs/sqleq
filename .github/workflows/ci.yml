@@ -154,7 +154,10 @@ jobs:
 
   fuzz:
     name: sqleq-fuzz
-    runs-on: ubuntu-latest
+    # Not `ubuntu-latest`: the PostgreSQL the build fetches links `libxml2.so.2`, which Ubuntu 26.04
+    # (what `ubuntu-latest` became in November 2026) does not ship, so there it cannot start and
+    # every Postgres test fails. Move this on once the fetched PostgreSQL runs on the newer image.
+    runs-on: ubuntu-24.04
     # The frontend job's build settings, for the same reasons: full debug info and incremental state
     # are most of this `target/`, which the cache archives and restores on every run.
     env:
