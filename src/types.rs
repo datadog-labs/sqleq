@@ -1179,6 +1179,20 @@ pub(crate) fn is_bare_null(v: &Value) -> bool {
     is_null_lit(v) && ty_of(v) == "INTEGER"
 }
 
+/// The NULL that stands for a value of type `t` the frontend itself writes, as opposed to one the
+/// input wrote. A NULL of type INTEGER is spelled as the input's own `NULL::integer` is, a `CAST`
+/// over the nullary constant, so that [`is_bare_null`] does not take it for an untyped NULL and a
+/// string literal beside it does not decide the type of its call. Of any other type it is the
+/// nullary `NULL` relabelled, which is what [`cast_to`] makes of one: a `CAST` of the INTEGER NULL
+/// would stop testing as null.
+pub(crate) fn typed_null(t: &str) -> Value {
+    let nullary = json!({ "operator": "NULL", "operand": [], "type": t });
+    if t == "INTEGER" {
+        return json!({ "operator": "CAST", "operand": [nullary], "type": "INTEGER" });
+    }
+    nullary
+}
+
 /// Wrap `v` in a CAST to `ct` unless it already has that type. A crossing that involves a temporal
 /// type is a [`convert`] call instead; see the module docs. A string literal cast to INTEGER or
 /// BOOLEAN is read as one ([`read_literal`]).

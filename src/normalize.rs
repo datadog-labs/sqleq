@@ -3305,6 +3305,18 @@ fn names_remain(q: &Query, map: &HashMap<String, String>) -> bool {
     })
 }
 
+/// Whether `e` has a subquery anywhere in it.
+pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    struct Subquery;
+    impl Visitor for Subquery {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+    }
+    Visit::visit(e, &mut Subquery).is_break()
+}
+
 /// The aliases a query declares, folded, in order, and the bare names of the tables it reads without
 /// one, for [`canonical_aliases`].
 #[derive(Default)]
@@ -3392,18 +3404,6 @@ impl VisitorMut for RenameAliases<'_> {
         items(&mut q.body, self);
         ControlFlow::Continue(())
     }
-}
-
-/// Whether `e` has a subquery anywhere in it.
-pub(crate) fn contains_subquery(e: &Expr) -> bool {
-    struct Subquery;
-    impl Visitor for Subquery {
-        type Break = ();
-        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
-            ControlFlow::Break(())
-        }
-    }
-    Visit::visit(e, &mut Subquery).is_break()
 }
 
 /// `RANK() OVER (PARTITION BY p.. ORDER BY o..)` in the select list of a query that reads one table

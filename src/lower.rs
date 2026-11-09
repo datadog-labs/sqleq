@@ -519,9 +519,10 @@ pub(crate) fn refuse_reserved_call_names(statements: &[sqlparser::ast::Statement
     Ok(())
 }
 
-/// The prefix of every identifier the frontend's own rewrites write: the aliases
-/// `__sqleq_alias_N` of [`crate::normalize::canonical_aliases`] and the `__sqleq_window` of
-/// [`crate::normalize::lower_rank_windows`]. No identifier of the input may begin with it
+/// The prefix of every identifier the frontend's own rewrites write: the aliases `__sqleq_alias_N` of
+/// [`crate::normalize::canonical_aliases`], the `__sqleq_window` of
+/// [`crate::normalize::lower_rank_windows`], and the placeholders and the [`NULL_OF`] marker of
+/// [`expand_grouping_sets`]. No identifier of the input may begin with it
 /// ([`refuse_reserved_identifiers`]).
 pub(crate) const RESERVED_PREFIX: &str = "__sqleq_";
 
@@ -1288,7 +1289,12 @@ fn lower_setexpr_ctx(
     ord: OrderCtx,
 ) -> Result<(Value, OutCols, Option<SortScope>)> {
     match body {
-        SetExpr::Select(s) => lower_select_ctx(cat, fns, s, outer, ord),
+        SetExpr::Select(s) => {
+            if let Some(expanded) = expand_grouping_sets(cat, fns, s, outer)? {
+                return lower_setexpr_ctx(cat, fns, &expanded, outer, ord);
+            }
+            lower_select_ctx(cat, fns, s, outer, ord)
+        }
         // A parenthesized query carries its own ORDER BY; `ord` belongs to the enclosing one, and
         // its own `Sort` (if any) is already in place, so there is nothing left to widen.
         SetExpr::Query(q) => lower_query_ctx(cat, fns, q, outer).map(|(v, c)| (v, c, None)),
@@ -2597,6 +2603,11 @@ fn call_or_column_name(e: &Expr) -> Option<String> {
         Expr::Function(f) => {
             let [.., last] = &f.name.0[..] else { return None };
             let name = fold_name(last.as_ident()?);
+            // The typed NULL of a grouping column a grouping set leaves out ([`NULL_OF`]): named as
+            // the column is, like the NULL that stands in it.
+            if name == NULL_OF {
+                return null_of_arg(f).and_then(call_or_column_name);
+            }
             // Cast rule 5b's wrapper (`casts.rs`): the cast it stands for, over its one operand.
             if name.strip_prefix("qcast").is_some_and(|n| n.parse::<u32>().is_ok()) {
                 let FunctionArguments::List(l) = &f.args else { return None };
@@ -2614,6 +2625,475 @@ fn call_or_column_name(e: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether `f` is a call of one of `names` written as the grammar's own keyword: one unquoted name
+/// part, in any case. A quoted `"rollup"(a)`, or `s.rollup(a)`, is a function of the schema, not the
+/// construct, so it is read as the call it is.
+fn is_unquoted_call(f: &Function, names: &[&str]) -> bool {
+    match &f.name.0[..] {
+        [sqlparser::ast::ObjectNamePart::Identifier(id)] => {
+            id.quote_style.is_none() && names.iter().any(|n| id.value.eq_ignore_ascii_case(n))
+        }
+        _ => false,
+    }
+}
+
+/// A `GROUP BY` item that is one of the grammar's grouping constructs, as the parser read it.
+fn is_grouping_construct(e: &Expr) -> bool {
+    matches!(e, Expr::GroupingSets(_) | Expr::Rollup(_) | Expr::Cube(_))
+}
+
+/// A grouping construct nested in another. sqlparser reads the inner `ROLLUP(..)` of
+/// `GROUPING SETS (ROLLUP(a, b), c)` as a call, so the call counts when it is one unquoted name.
+fn is_nested_construct(e: &Expr) -> bool {
+    is_grouping_construct(e) || matches!(e, Expr::Function(f) if is_unquoted_call(f, &["rollup", "cube"]))
+}
+
+/// Whether [`expand_grouping_sets`] has anything to do to `s`: a grouping construct in its `GROUP BY`,
+/// or a plain `GROUP BY` that reads `GROUPING(..)`, which is its one grouping set.
+fn needs_grouping_expansion(s: &Select) -> bool {
+    let GroupByExpr::Expressions(items, _) = &s.group_by else { return false };
+    items.iter().any(is_grouping_construct) || (!items.is_empty() && reads_grouping(s))
+}
+
+/// `GROUP BY` with `GROUPING SETS`, `ROLLUP` or `CUBE`, written as the union of one plain `GROUP BY`
+/// per grouping set, which is what SQL defines them as: each grouping set groups the rows by its own
+/// columns, the grouping columns it leaves out are NULL in its rows, and `GROUPING(a, ..)` is the bit
+/// mask of the arguments it leaves out (the last argument the lowest bit). Outside the aggregates
+/// only: an aggregate's arguments read the input rows, where every column has its value. `None`
+/// when the `GROUP BY` has no grouping sets.
+///
+/// SOUNDNESS GUARDS, each a way the expansion gave, or could give, rows Postgres does not:
+///
+/// * The empty grouping set is `GROUP BY ()`: one group of all the rows, and so exactly one row,
+///   of an empty table too. Written as an empty `GROUP BY`, it was a plain `SELECT` wherever no
+///   aggregate made the branch group, one row per input row.
+/// * `DISTINCT` is over the whole result. With several sets the branches carry none and are joined
+///   by `UNION` instead of `UNION ALL`; with one set the lone branch keeps it. Dropped from a lone
+///   branch, nothing restored it. `DISTINCT ON` is refused.
+/// * A grouping column the set leaves out is NULL *of its type* ([`NULL_OF`], lowered through
+///   [`typed_null`]), for every type: a bare NULL is an INTEGER, and `COALESCE(NULL, 1) / 2` divides
+///   integers where `COALESCE(a, 1) / 2` over a `numeric` `a` does not, and a NULL taken for untyped
+///   lets a string literal beside it decide the type of its call.
+/// * The grouping expressions are matched from the top of each expression down, so that in a set
+///   keeping `a / 10` and not `a` the whole `a / 10` is kept before the `a` inside it could be
+///   nulled.
+/// * An expression is a grouping expression when it *lowers* to the value one lowers to, in the
+///   `FROM` scope, as `GROUP BY` and `ORDER BY` keys are matched, not when it is spelled like one:
+///   `a` and `t.a` are one column, and `s = 'A'` and `s = 'a'` are two expressions. Two spellings
+///   that lower alike are told apart where Postgres might (`NOT a = 1` and `a <> 1`), so the match is
+///   refused unless both are bare column references. A grouping expression that reads no column of
+///   the query's own tables (a constant, an output alias of one, an enclosing query's column) is
+///   refused: a branch's `GROUP BY` would not group by it, where the select list's copy of it is
+///   never recognized.
+/// * A subquery in the select list or `HAVING` is refused, since the match has no scope inside it; so
+///   is a wildcard, which names columns the match does not see.
+/// * Only the grammar's own constructs are one: a quoted `"rollup"(a)` is a call of a function, and
+///   a `ROLLUP`, `CUBE` or `GROUPING SETS` nested in another is refused. So is a `GROUPING` that
+///   no branch can rewrite (inside an aggregate, which Postgres rejects), which would be expanded
+///   again without end.
+/// * `GROUPING` over more than 31 arguments, or over one that is not a grouping expression, is what
+///   Postgres rejects, and is refused as such.
+/// * The placeholders this writes are reserved names ([`RESERVED_PREFIX`]), which no input spells,
+///   so no column of the input can be taken for one.
+fn expand_grouping_sets(cat: &Catalog, fns: &Fns, s: &Select, outer: &[Binding]) -> Result<Option<SetExpr>> {
+    if !needs_grouping_expansion(s) {
+        return Ok(None);
+    }
+    let GroupByExpr::Expressions(items, modifiers) = &s.group_by else { return Ok(None) };
+    if !modifiers.is_empty() {
+        return Err(unsupported("GROUP BY modifiers beside grouping sets"));
+    }
+    if s.from.is_empty() {
+        return Err(unsupported("grouping sets without a FROM clause"));
+    }
+    let distinct = match &s.distinct {
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct) => true,
+        Some(Distinct::On(_)) => return Err(unsupported("DISTINCT ON beside grouping sets")),
+    };
+    let exprs: Vec<&Expr> = s
+        .projection
+        .iter()
+        .map(|it| item_expr(it).ok_or_else(|| unsupported("a wildcard beside grouping sets")))
+        .collect::<Result<_>>()?;
+    if exprs.iter().copied().chain(s.having.as_ref()).any(crate::normalize::contains_subquery) {
+        return Err(unsupported("a subquery in the select list or HAVING beside grouping sets"));
+    }
+    // the grouping sets: one alternative of every item, all combinations
+    let nested = |lists: &[Vec<Expr>]| lists.iter().flatten().any(is_nested_construct);
+    let mut sets: Vec<Vec<Expr>> = vec![Vec::new()];
+    for item in items {
+        let alternatives: Vec<Vec<Expr>> = match item {
+            Expr::GroupingSets(gs) if nested(gs) => {
+                return Err(unsupported("a ROLLUP, CUBE or GROUPING SETS nested in GROUPING SETS"))
+            }
+            Expr::Rollup(r) | Expr::Cube(r) if nested(r) => {
+                return Err(unsupported("a grouping set nested in ROLLUP or CUBE"))
+            }
+            Expr::GroupingSets(gs) => gs.clone(),
+            Expr::Rollup(r) => (0..=r.len()).rev().map(|k| r[..k].concat()).collect(),
+            Expr::Cube(c) => {
+                if c.len() > 6 {
+                    return Err(unsupported("CUBE over more than six columns"));
+                }
+                (0..(1u32 << c.len()))
+                    .rev()
+                    .map(|mask| {
+                        (0..c.len()).filter(|i| mask & (1 << (c.len() - 1 - i)) != 0).flat_map(|i| c[i].clone()).collect()
+                    })
+                    .collect()
+            }
+            Expr::Tuple(t) => vec![t.clone()],
+            other => vec![vec![other.clone()]],
+        };
+        sets = sets
+            .iter()
+            .flat_map(|prefix| {
+                alternatives.iter().map(move |a| {
+                    let mut v = prefix.clone();
+                    v.extend(a.iter().cloned());
+                    v
+                })
+            })
+            .collect();
+    }
+    // Each grouping expression lowered in the FROM scope, as the branches' own `GROUP BY` will read
+    // it: the one value every spelling of it is matched by.
+    let (scope, _) = build_from_clause(cat, fns, &s.from, outer)?;
+    let mut all: Vec<(Value, Expr)> = Vec::new();
+    let mut set_ix: Vec<Vec<usize>> = Vec::new();
+    for set in &sets {
+        let mut ix = Vec::new();
+        for e in set {
+            let v = lower_group_key(cat, &scope, fns, s, e)?;
+            if !reads_own_column(&scope, &v) {
+                return Err(unsupported(
+                    "a grouping expression that reads no column of the query's own tables",
+                ));
+            }
+            let i = match all.iter().position(|(g, _)| *g == v) {
+                Some(i) => {
+                    require_same_spelling(&all[i].1, e)?;
+                    i
+                }
+                None => {
+                    all.push((v, e.clone()));
+                    all.len() - 1
+                }
+            };
+            ix.push(i);
+        }
+        set_ix.push(ix);
+    }
+    let mut branches: Vec<SetExpr> = Vec::new();
+    for (set, ix) in sets.iter().zip(&set_ix) {
+        let mut b = s.clone();
+        b.distinct = if sets.len() == 1 { s.distinct.clone() } else { None };
+        // `GROUP BY ()` for the empty set: one group, which `group_by_exprs` reads as no key
+        b.group_by = GroupByExpr::Expressions(
+            if set.is_empty() { vec![Expr::Tuple(Vec::new())] } else { set.clone() },
+            Vec::new(),
+        );
+        for item in b.projection.iter_mut() {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    // a column the set leaves out keeps its name: an enclosing query reads it by name
+                    let name = match e {
+                        Expr::Identifier(id) => Some(id.clone()),
+                        Expr::CompoundIdentifier(ids) => ids.last().cloned(),
+                        _ => None,
+                    };
+                    let before = e.clone();
+                    rewrite_for_grouping_set(cat, &scope, fns, &all, ix, e)?;
+                    if let (Some(alias), true) = (name, *e != before) {
+                        *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, .. } => rewrite_for_grouping_set(cat, &scope, fns, &all, ix, expr)?,
+                _ => return Err(unsupported("a wildcard beside grouping sets")),
+            }
+        }
+        if let Some(h) = b.having.as_mut() {
+            rewrite_for_grouping_set(cat, &scope, fns, &all, ix, h)?;
+        }
+        // Each branch is a plain `GROUP BY`. One that would be expanded again, a `GROUPING` the
+        // rewrite did not reach (inside an aggregate, which Postgres rejects), would never end.
+        if needs_grouping_expansion(&b) {
+            return Err(schema("aggregate function calls cannot be nested (a GROUPING inside an aggregate)"));
+        }
+        branches.push(SetExpr::Select(Box::new(b)));
+    }
+    let mut it = branches.into_iter();
+    let mut out = it.next().expect("one grouping set at least");
+    for b in it {
+        out = SetExpr::SetOperation {
+            left: Box::new(out),
+            op: SetOperator::Union,
+            // `SELECT DISTINCT` over the union of the branches is their `UNION`
+            set_quantifier: if distinct { SetQuantifier::None } else { SetQuantifier::All },
+            right: Box::new(b),
+        };
+    }
+    Ok(Some(out))
+}
+
+/// Whether the lowered `v` reads a column of the query's own tables: a level within one of the
+/// scope's own bindings, as [`reads_only_enclosing_columns`] counts one.
+fn reads_own_column(scope: &Scope, v: &Value) -> bool {
+    let mut levels = Vec::new();
+    ir_levels(v, &mut levels);
+    levels.iter().any(|&l| scope.inner().iter().any(|b| l >= b.offset && l < b.offset + b.cols.len()))
+}
+
+/// Whether `e` is a column reference as written: a name, or a qualified one.
+fn is_column_ref(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) => is_column_ref(x),
+        e => matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)),
+    }
+}
+
+/// `e` without the parentheses around it.
+fn unparenthesized(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(x) => unparenthesized(x),
+        e => e,
+    }
+}
+
+/// SOUNDNESS GUARD: two expressions that lower to one value are taken to be one grouping expression,
+/// as Postgres takes two that are `equal()`. The lowering can identify two that Postgres tells apart
+/// (`NOT a = 1` and `a <> 1` lower alike), so they are the same only when written alike, parentheses
+/// aside, or when both are column references, which Postgres resolves to one variable however they
+/// are qualified.
+fn same_grouping_expression(a: &Expr, b: &Expr) -> bool {
+    (is_column_ref(a) && is_column_ref(b)) || unparenthesized(a).to_string() == unparenthesized(b).to_string()
+}
+
+fn require_same_spelling(a: &Expr, b: &Expr) -> Result<()> {
+    if same_grouping_expression(a, b) {
+        Ok(())
+    } else {
+        Err(unsupported(format!("grouping expressions {a} and {b}, spelled differently, that lower alike")))
+    }
+}
+
+/// One select item or the `HAVING` of a grouping set's branch, rewritten for that set: each
+/// aggregate as written, `GROUPING(..)` as its mask, each grouping expression the set keeps as
+/// itself and each it leaves out as [`NULL_OF`] it. Top-down ([`GroupingSetRewrite`]), with a
+/// placeholder standing in for whatever the walk must not descend into, put back at the end.
+fn rewrite_for_grouping_set(
+    cat: &Catalog,
+    scope: &Scope,
+    fns: &Fns,
+    all: &[(Value, Expr)],
+    set: &[usize],
+    e: &mut Expr,
+) -> Result<()> {
+    let mut pass = GroupingSetRewrite { cat, scope, fns, all, set, saved: Vec::new(), error: None };
+    let _ = sqlparser::ast::VisitMut::visit(e, &mut pass);
+    if let Some(err) = pass.error {
+        return Err(err);
+    }
+    let saved = pass.saved;
+    let mut unwritten = false;
+    let _ = sqlparser::ast::visit_expressions_mut(e, |x: &mut Expr| {
+        if let Expr::Identifier(id) = x {
+            if let Some(n) = id.value.strip_prefix(PLACEHOLDER).and_then(|n| n.parse::<usize>().ok()) {
+                match saved.get(n) {
+                    Some(v) => *x = v.clone(),
+                    None => unwritten = true,
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if unwritten {
+        // Unreachable while `refuse_reserved_identifiers` holds; refused rather than indexed.
+        return Err(unsupported("a grouping-set placeholder the rewrite did not write"));
+    }
+    Ok(())
+}
+
+/// The placeholders of [`rewrite_for_grouping_set`], `__sqleq_gs_N`, N an index into its `saved`.
+const PLACEHOLDER: &str = "__sqleq_gs_";
+
+/// `__sqleq_null_of(x)`: NULL, of `x`'s type. Written by [`expand_grouping_sets`] for a grouping
+/// column a set leaves out, and lowered by [`lower_expr`] and [`AggCtx::lower_post`] ([`typed_null`])
+/// from `x` lowered in the FROM scope, where `x` is a column whatever the branch groups by.
+const NULL_OF: &str = "__sqleq_null_of";
+
+/// The argument of a [`NULL_OF`] call, or `None` for any other call.
+fn null_of_arg(f: &Function) -> Option<&Expr> {
+    if !obj_name(&f.name).eq_ignore_ascii_case(NULL_OF) {
+        return None;
+    }
+    match &f.args {
+        FunctionArguments::List(l) => match &l.args[..] {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))] => Some(x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`NULL_OF`] over `x`.
+fn null_of(x: Expr) -> Expr {
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(NULL_OF))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(x))],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
+/// The rewrite of one expression for one grouping set; see [`rewrite_for_grouping_set`].
+struct GroupingSetRewrite<'a> {
+    cat: &'a Catalog,
+    /// The FROM scope, which every expression is matched in.
+    scope: &'a Scope,
+    fns: &'a Fns,
+    /// Every grouping expression of the query, lowered in `scope`, with the spelling it first had.
+    all: &'a [(Value, Expr)],
+    /// The ones this set groups by, as indices into `all`.
+    set: &'a [usize],
+    /// What each placeholder stands for: an aggregate call as written, a grouping expression the set
+    /// keeps, or the [`NULL_OF`] of one it leaves out.
+    saved: Vec<Expr>,
+    error: Option<crate::error::FrontendError>,
+}
+
+impl GroupingSetRewrite<'_> {
+    fn placeholder(&mut self, stands_for: Expr) -> Expr {
+        let n = self.saved.len();
+        self.saved.push(stands_for);
+        Expr::Identifier(sqlparser::ast::Ident::new(format!("{PLACEHOLDER}{n}")))
+    }
+
+    /// The grouping expression `e` is, if it lowers, in the FROM scope, to the value one lowers to.
+    /// An expression that does not lower here is not one: a real error in it is the branch's to raise.
+    fn grouping_index(&self, e: &Expr) -> Result<Option<usize>> {
+        if contains_agg(self.fns, e) {
+            return Ok(None);
+        }
+        let Ok(v) = lower_expr(self.cat, self.scope, self.fns, e) else { return Ok(None) };
+        let Some(i) = self.all.iter().position(|(g, _)| *g == v) else { return Ok(None) };
+        require_same_spelling(&self.all[i].1, e)?;
+        Ok(Some(i))
+    }
+
+    /// `GROUPING(args)` for this set: the bit mask of the arguments the set leaves out.
+    fn grouping_mask(&self, f: &Function) -> Result<u32> {
+        let args: Vec<&Expr> = match &f.args {
+            FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let n = args.len();
+        if n == 0 || n > 31 {
+            return Err(schema("GROUPING must have between one and 31 arguments"));
+        }
+        let mut mask: u32 = 0;
+        for (i, a) in args.iter().enumerate() {
+            let Some(g) = self.grouping_index(a)? else {
+                return Err(schema("arguments to GROUPING must be grouping expressions of the associated query level"));
+            };
+            if !self.set.contains(&g) {
+                mask |= 1 << (n - 1 - i);
+            }
+        }
+        Ok(mask)
+    }
+}
+
+impl sqlparser::ast::VisitorMut for GroupingSetRewrite<'_> {
+    type Break = ();
+
+    /// Before anything inside the expression is looked at; what a placeholder replaces has no inside
+    /// left to look at, so the walk never reaches into an aggregate's arguments or a kept grouping
+    /// expression.
+    fn pre_visit_expr(&mut self, x: &mut Expr) -> ControlFlow<()> {
+        if self.error.is_some() {
+            return ControlFlow::Break(());
+        }
+        // 1. aggregates aside: their arguments read the rows, not the grouping
+        if is_agg_call(self.fns, x) {
+            *x = self.placeholder(x.clone());
+            return ControlFlow::Continue(());
+        }
+        // 2. GROUPING(..) as its mask, read off its arguments as written
+        let mask = match &*x {
+            Expr::Function(f) if is_unquoted_call(f, &["grouping"]) => Some(self.grouping_mask(f)),
+            _ => None,
+        };
+        match mask {
+            Some(Ok(mask)) => {
+                *x = Expr::value(sqlparser::ast::Value::Number(mask.to_string(), false));
+                return ControlFlow::Continue(());
+            }
+            Some(Err(e)) => {
+                self.error = Some(e);
+                return ControlFlow::Break(());
+            }
+            None => {}
+        }
+        // 3. a grouping expression: kept as it is, or NULL of its type where the set leaves it out
+        match self.grouping_index(x) {
+            Ok(Some(g)) => {
+                let stands_for = if self.set.contains(&g) { x.clone() } else { null_of(x.clone()) };
+                *x = self.placeholder(stands_for);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.error = Some(e);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether the projection or the `HAVING` of `s` calls `GROUPING(..)` as the grammar's own
+/// operation, not a function of the schema that is named so.
+fn reads_grouping(s: &Select) -> bool {
+    let mut found = false;
+    let mut look = |e: &Expr| {
+        let _ = sqlparser::ast::visit_expressions(e, |x: &Expr| {
+            if let Expr::Function(f) = x {
+                if is_unquoted_call(f, &["grouping"]) {
+                    found = true;
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    };
+    for item in &s.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => look(e),
+            _ => {}
+        }
+    }
+    if let Some(h) = &s.having {
+        look(h);
+    }
+    found
 }
 
 fn group_by_empty(s: &Select) -> bool {
@@ -3075,6 +3555,12 @@ impl AggCtx<'_> {
                 Ok(make_case(ops))
             }
             Expr::Function(f) => {
+                // NULL of a grouping column's type, for a grouping set that leaves it out
+                // ([`NULL_OF`]): the column is read in the FROM scope, whatever this branch groups by.
+                if let Some(x) = null_of_arg(f) {
+                    let v = lower_expr(self.cat, self.scope, self.fns, x)?;
+                    return Ok(typed_null(&ty_of(&v)));
+                }
                 // a scalar function over keys/aggregates (is_agg_call already returned false)
                 let (name, bare) = fn_names(f);
                 reject_quantifier_call(&name, &bare)?;
@@ -3585,6 +4071,11 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         }
         Expr::Value(v) => lower_value(&v.value),
         Expr::Function(f) => {
+            // NULL of a grouping column's type, for a grouping set that leaves it out ([`NULL_OF`]).
+            if let Some(x) = null_of_arg(f) {
+                let v = lower_expr(cat, scope, fns, x)?;
+                return Ok(typed_null(&ty_of(&v)));
+            }
             if f.over.is_some() {
                 return Err(unsupported("window function (OVER)"));
             }
