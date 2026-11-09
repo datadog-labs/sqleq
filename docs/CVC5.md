@@ -251,9 +251,10 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
   as `sqleq-solver` does, for a caller to resume.
 * **A model that fails `check-models` aborts cvc5**, and the driver with it (cvc5 raises an
   internal error through the C API). The harness records the case as an `error`; what it says is
-  that cvc5 found a model its own checker rejects, which is the checker doing its job. Lambdas
-  over an uninterpreted function are where it has been seen: `set.filter` under set semantics,
-  and a `bag.map` whose body applies the uninterpreted string order to two constants under bags.
+  that cvc5 found a model its own checker rejects, which is the checker doing its job. It has
+  been seen on `set.filter` lambdas under set semantics, and under bags on a `bag.map` whose
+  lambda ignores its argument: a constant row, as `SELECT DISTINCT 0 ... GROUP BY a` maps every
+  group to, or one computed from constants alone. The pinned pairs that meet it are pinned `error`.
 * **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
   without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
   duplicate removal or bare sorts of those), an aggregate other than

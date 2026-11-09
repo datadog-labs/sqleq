@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: avg over numeric divides, and the scale of the quotient follows the scale of the sum
 -- witness: t = {(1.0), (0), (0)}, u = {(1.000000000000000000000), (0)}: A yields 0.33333333333333333333, B yields 0.333333333333333333333

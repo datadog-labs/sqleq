@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #48: the per-query strip_schema guard, on the lowering path: under an inferred

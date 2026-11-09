@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather-generated
 -- origin: a CHECK calls a function that reads the sequence the generated cells draw from (#178)

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #92: an unnamed unique index is dropped by the name Postgres generated for it, which
 --   the reader does not work out, so any DROP INDEX drops its key

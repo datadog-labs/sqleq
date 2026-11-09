@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather
 -- binding: gather
 -- origin: the Lean axis compared the two sides' tails as written, so the same conflict clause and

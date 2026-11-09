@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: proved-gather
 -- binding: gather
 -- origin: the gather rule itself: VALUES rows against one unnest of their columns

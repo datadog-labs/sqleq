@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #202: Postgres searches pg_catalog before the search path, so a bare pg_attribute
 --   read the catalog's relation while the frontend lowered the DDL's table and its key

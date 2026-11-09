@@ -8,6 +8,7 @@
 -- expect fuzz: no-schema
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred
 -- origin: issue #112: once type inference keeps a quoted name's case, "A" and a are two

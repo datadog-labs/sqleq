@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #124: the pair the issue reported, a LIMIT that leaves ties under a filter, which sqleq-fuzz
 --   refuted by comparing the filtered rows' cardinality

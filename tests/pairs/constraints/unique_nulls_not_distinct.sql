@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #64: sqleq-fuzz read UNIQUE NULLS NOT DISTINCT as a plain UNIQUE, which admits many NULLs
 -- argument: under NULLS NOT DISTINCT at most one row has a NULL a, so every value of a, NULL included, occurs once and DISTINCT removes nothing

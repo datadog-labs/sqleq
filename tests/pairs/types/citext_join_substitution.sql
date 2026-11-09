@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #58: why citext is refused rather than made opaque: an opaque type's = is the prover's equality, which
 --   substitutes u.c for t.c under the join, and two citext values can be equal while their text differs

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: PR #209 review, split: a bare NULL branch voted for the type of a CASE as an INTEGER would, so
 --   CASE WHEN a > 1 THEN TRUE ELSE NULL END was an INTEGER beside a BOOLEAN, and no prover could

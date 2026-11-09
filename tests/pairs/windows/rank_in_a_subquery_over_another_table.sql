@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: the RANK() rewrite walked into the subqueries of a select item and rewrote a RANK()
 --   over another table against the outer one, so this pair was one plan; an item with a subquery in

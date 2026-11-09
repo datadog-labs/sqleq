@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: the integer bound tightening of int_bound_discrete.sql is wrong for numeric, whose order sqleq-solver leaves uninterpreted
 -- witness: t = {(1, 10.5)}: A keeps the row, B drops it

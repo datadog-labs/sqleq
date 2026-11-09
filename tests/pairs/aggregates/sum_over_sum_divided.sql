@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #121: a sum over a sum of integers (a bigint) is a numeric, a sum over the same cast to integer a bigint
 -- witness: t = {(1, 1)}: A yields 0.50000000000000000000, B yields 0

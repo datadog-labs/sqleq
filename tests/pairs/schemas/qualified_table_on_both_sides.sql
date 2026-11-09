@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #91 item 4: a table declared under a schema was not found under that name, since the qualifier was stripped from the queries and not from the catalog
 -- argument: both queries read s.t and keep the rows with a > 1

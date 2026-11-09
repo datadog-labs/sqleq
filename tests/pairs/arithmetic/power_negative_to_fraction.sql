@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz let DuckDB answer NaN for power(-1, 0.5), where Postgres raises, and NaN >= 0
 --   holds in DuckDB; 0.5 is a numeric, so this is numeric power, which DuckDB computes in a DOUBLE and

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #84: an interval literal added to a timestamp is read through its spelling, and two queries that add the same one still compare
 -- argument: the two filters are one conjunction written in two orders

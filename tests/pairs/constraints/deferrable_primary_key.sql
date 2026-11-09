@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #95: a DEFERRABLE primary key was read as a key, though Postgres checks it only at
 --   commit, so DISTINCT over it was taken to be a no-op

@@ -190,9 +190,11 @@ drift between reviews. The last time every axis was blessed together:
 * **cvc5** — `sqleq-cvc5` of this tree on the `bags-algebra` branch of cvc5 at the commit
   `tools/build_cvc5.sh` pins (`249a95c0`), under bag semantics, 60 s per case with 8 cases at a
   time. A pair cvc5 answers only past that budget carries no cvc5 pin: a timeout is never pinned,
-  and a pin blessed with a longer budget would fail wherever the budget is the default one. So a
-  run of `--expect pinned --axes cvc5` on a slower machine, or under load, may leave a few pairs
-  unanswered (`⏱`): those are cvc5 running out of its budget, not answers that moved.
+  and a pin blessed with a longer budget would fail wherever the budget is the default one. Such a
+  pair shows `⏱` in every run of `--expect pinned --axes cvc5`, which therefore exits 1 even when
+  every pin holds; on a slower machine, or under load, a few more may join it. Neither is an
+  answer that moved, so read the cvc5 column for `✗` and `‼`, not the exit code, while the axis
+  is experimental and outside CI.
 
 The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared
 statement, the `unnest` side under the gather binding of the `VALUES` side's parameters, once on an

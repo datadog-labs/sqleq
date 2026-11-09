@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: the SQL/JSON ABSENT ON NULL / NULL ON NULL clause was dropped
 -- witness: t = {(NULL)}: A yields [], B yields [null]

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #111: type inference also synthesized a catalog of its own, which the seeded mode

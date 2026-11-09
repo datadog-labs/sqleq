@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #203: the DDL reader found an ALTER TABLE's target by its lower-cased name, so a
 --   primary key added to "T" was put on t

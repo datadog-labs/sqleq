@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #249 review: NULLIF was typed as its first argument and its second argument cast to that
 --   type, so NULLIF(i, 1.5) over an INTEGER i compared i with the integer 2 and was one plan with

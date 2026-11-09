@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #92: a key declared by CREATE UNIQUE INDEX was not read
 -- argument: the unique index makes the NOT NULL id unique, so DISTINCT removes nothing

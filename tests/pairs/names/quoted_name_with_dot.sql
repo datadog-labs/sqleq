@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #203: the declared catalog joined a name's parts with dots, so the one-part "s.t" and
 --   the table t of schema s were one name, and s.t was read with "s.t"'s key

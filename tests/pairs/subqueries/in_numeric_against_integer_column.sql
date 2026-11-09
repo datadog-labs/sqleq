@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 4: an IN subquery whose column is of a lower type than its operand was refused, though both sides lower to one plan
 -- argument: the two queries differ only in their aliases; Postgres compares r = u.id::numeric in both

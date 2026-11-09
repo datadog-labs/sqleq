@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #203, the negative: a table renamed to "U" is read by "U"
 -- argument: both sides read the renamed table, whose key a makes the DISTINCT redundant

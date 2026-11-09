@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #84: a filter that makes two interval literals equal does not make a date plus one the date plus the other
 -- witness: t = {('2024-01-31', '1 mon')}: A yields 2024-02-29 00:00:00, B yields 2024-03-01 00:00:00

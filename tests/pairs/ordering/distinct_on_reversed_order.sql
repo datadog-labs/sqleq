@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: DISTINCT ON is lowered, not refused (docs/SOUNDNESS.md), so a pair that keeps a different
 --   row per key must not be proved (#68)

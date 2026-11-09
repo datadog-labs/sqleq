@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #58: a string literal CASE branch made an integer CASE text, so its comparisons with literals were string comparisons
 -- witness: t = {(1, 1, true)}: the CASE is the integer 1, and '1' and '01' both read as 1, so A yields no rows and B yields (1)

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review: GROUPING(a) under a ROLLUP, written out as the constant each set gives it
 -- argument: GROUPING(a) is 0 in a set that groups by a and 1 in one that leaves it out

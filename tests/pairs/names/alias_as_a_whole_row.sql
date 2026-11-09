@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: PR #209 review: canonical_aliases never renamed a whole-row reference, so renaming the declarations
 --   made two queries Postgres tells apart one tree, credited reflexive; a query whose text still names

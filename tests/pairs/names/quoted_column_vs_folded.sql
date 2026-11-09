@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #57: the catalog folded a quoted column "A" to a, so A, which folds to t's a, read m."A"
 -- witness: m = {(1, 10)}, t = {(1, 1)}: A returns 10, B returns 1

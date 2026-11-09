@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #47: in FROM a, b JOIN c USING (x) the USING name is looked up on every earlier
 --   FROM item and found on a first; Postgres joins b and c only, on b.x = c.x

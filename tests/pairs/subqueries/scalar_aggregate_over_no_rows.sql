@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #60: a scalar aggregate subquery always has its one row, and sqleq-solver read it as never NULL
 -- witness: t = {(1)}, s = {}: sum over no rows is NULL, so A returns nothing and B returns 1

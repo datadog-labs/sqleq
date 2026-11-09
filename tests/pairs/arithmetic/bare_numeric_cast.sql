@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #62: a bare `numeric` cast target reached DuckDB, which reads it as DECIMAL(18,3)
 -- argument: a Postgres numeric with no typmod keeps every digit, so a * 0.0001 > 0 exactly when a > 0

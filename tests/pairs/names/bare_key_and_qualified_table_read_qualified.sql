@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: a qualified reference was stripped to the bare name whenever the pair used one qualifier, so with both t and s.t declared, FROM s.t read the keyed t
 -- witness: s.t = {(1), (1)}: A returns 1 once and B returns it twice

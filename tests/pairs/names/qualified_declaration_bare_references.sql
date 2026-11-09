@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: a table declared only under a schema, read by its bare name on both sides, as a dump and its queries spell it; resolved to the one declared table of that name
 -- argument: both queries read the one table named t and keep the rows with a > 1

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #106: AVG over an integer column was typed INTEGER in the IR, though Postgres returns numeric
 -- witness: t = {(1, 0), (2, 1)}: avg(a) = 0.5, so A yields true and B yields false

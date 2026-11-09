@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #203, the negative: a quoted part already in lower case is the name an unquoted one
 --   folds to, so "s"."t" and s.t are one table

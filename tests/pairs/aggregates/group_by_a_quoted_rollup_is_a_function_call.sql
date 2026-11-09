@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: PR #209 review: a quoted "rollup"(a) is a call of a function, but was read as ROLLUP, then
 --   expanded again for ever until the frontend overflowed its stack

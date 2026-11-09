@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #84: a UNION ALL column takes its first branch's type, so a numeric in the second branch was read as an integer
 -- witness: t = {(5, 2.0)}, u = {(6, 2.00)}: A yields '2.0', B yields '2.00'

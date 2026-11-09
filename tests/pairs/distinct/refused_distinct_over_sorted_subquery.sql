@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #123: the same pair with a call lowering refuses, which the reflexivity check credited because
 --   it stripped both subquery ORDER BYs

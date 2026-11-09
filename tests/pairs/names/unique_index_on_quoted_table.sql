@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #203: the DDL reader found a CREATE INDEX's table by its lower-cased name, so a
 --   unique index on "T" was read as a key of t

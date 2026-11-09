@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #62: sqleq-fuzz materialized NUMERIC columns as DOUBLE, so decimal arithmetic rounded
 -- argument: numeric addition is exact, so x + 0.1 + 0.2 = x + 0.3 holds for every non-NULL x and is NULL for a NULL x

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review: a ROLLUP over an expression and the column it reads, written out
 -- argument: the sets are (a / 10, a), (a / 10) and (); a / 10 is kept whole in the second, and is

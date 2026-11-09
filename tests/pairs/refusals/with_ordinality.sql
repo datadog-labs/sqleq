@@ -8,6 +8,7 @@
 -- expect fuzz: no-tables
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: WITH ORDINALITY (and with it every table function in FROM) is refused, not lowered
 --   (docs/SOUNDNESS.md); a pin for each documented refusal (#68)

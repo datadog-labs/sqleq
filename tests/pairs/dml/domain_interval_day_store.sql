@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a pair file kept a column's declared type as its domain's name, so an assignment to a domain over interval day was not seen to truncate, where raw DDL resolved the domain and refused
 -- witness: t = {(1, NULL, '24 hours')}: '24 hours' = '1 day' holds, and A stores it truncated to the day field, 00:00:00, where B stores 1 day

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #54: a nullable UNIQUE column was sent to the QED prover as a key, which admits one
 --   row per key value, NULL included

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a table aliased __sqleq_window, the RANK() rewrite's own alias, was compared with
 --   itself and never sorted before itself, so every rank was 1; the reserved name is refused

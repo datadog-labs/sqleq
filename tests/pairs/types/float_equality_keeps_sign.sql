@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver read = on two double precision values as identity, though 0 = -0 holds and the two cast differently
 -- witness: t = {(1, 0, -0)}: a = b holds, A yields '0' and B yields '-0'

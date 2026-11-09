@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #86: sqleq-solver read = on two arrays (VARBINARY) as identity, but array = compares elements with numeric =, and 2.0 = 2.00
 -- witness: t = {(1, '{2.0}', '{2.00}')}: a = b holds, A yields '{2.0}' and B yields '{2.00}'

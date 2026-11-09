@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: proved
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #92 item 1 (control): a float is opaque, and a NOT over a comparison of opaque values is not put through, so the pair stays unproved
 --   by the frontend's rewrite. sqleq-solver's bag congruence rung proves it from the one order fact its set solver already reads, that a >= b is NOT (a < b)

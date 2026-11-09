@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #67: the QED prover panicked on an IN subquery whose column (REAL, from a / 2.0) has another type than the
 --   INTEGER operand, because the frontend coerced only temporal mismatches; the operand is now converted to REAL

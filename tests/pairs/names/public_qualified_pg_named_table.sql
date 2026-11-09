@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #202: the control for the refusal of a bare pg_* name: a pg_* table read through
 --   the schema the DDL declares it in is that table

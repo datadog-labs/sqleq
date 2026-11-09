@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #46: a DISTINCT ON key is resolved in the FROM scope only; Postgres resolves
 --   it like an ORDER BY key, output names first, so A's key a is the output column a (t.b)

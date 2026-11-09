@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #51: bit_or, an aggregate on no list, was lowered as a per-row scalar under IN
 -- witness: t = {(1), (2)}, s = {(3)}: A yields 3 (bit_or over all of t), B yields nothing (the

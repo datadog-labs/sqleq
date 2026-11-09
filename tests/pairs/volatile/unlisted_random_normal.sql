@@ -8,6 +8,7 @@
 -- expect fuzz: nondet-skip
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #49: random_normal() is volatile but was missing from the frontend's list, so it
 --   was an uninterpreted function and two calls were one value

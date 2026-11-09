@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: unsupported
+-- expect cvc5: unsupported
 -- expect lean: unsupported
 -- origin: issue #65: sqleq-fuzz bound a pure LIMIT parameter so that it never cut, so a LIMIT on one side only was never seen
 -- witness: t = {(1, 0)}, $1 = 0: A yields (1, 0), B yields no rows

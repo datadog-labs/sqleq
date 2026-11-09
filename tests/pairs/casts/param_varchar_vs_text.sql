@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: the length on a cast over a parameter was dropped (4df30d8)

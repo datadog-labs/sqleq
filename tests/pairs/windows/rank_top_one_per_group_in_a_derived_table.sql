@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: a RANK() in a derived table, filtered to the first of each group outside it. The outer
 --   select reads a derived table, which the guard of the RANK() rewrite leaves alone; the derived

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: issue #92 item 4: an IN subquery over a date column, against a timestamp operand, was refused; Postgres converts the column
 -- argument: the two queries differ only in their aliases; Postgres compares ts = u.d::timestamp in both

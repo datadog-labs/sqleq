@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: the RANK() rewrite's guard: a window over a join sees the joined rows, so the window
 --   call is left to the lowering, which refuses it

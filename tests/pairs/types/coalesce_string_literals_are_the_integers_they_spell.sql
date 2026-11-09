@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: with '00' and '0' kept as strings, a prover could tell COALESCE(i, '00') from
 --   COALESCE(i, '0') where i is NULL, which Postgres cannot: both are the integer 0

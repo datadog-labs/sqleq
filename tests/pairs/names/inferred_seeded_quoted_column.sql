@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #112: type inference matched the quoted "A" against declared columns up to

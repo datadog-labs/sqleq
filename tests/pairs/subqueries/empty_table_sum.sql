@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: issue #65: sqleq-fuzz filled every table with exactly --rows rows, so a witness that needs an empty table was never drawn
 -- witness: t = {(1)}, s = {}: A yields no rows (sum over no rows is NULL), B yields (1)

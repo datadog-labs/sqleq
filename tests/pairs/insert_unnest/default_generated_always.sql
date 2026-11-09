@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather-generated
 -- origin: Postgres accepts DEFAULT in a GENERATED ALWAYS identity, but not an explicit value

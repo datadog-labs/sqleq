@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather
 -- origin: an INSERT clause sqlparser reads only from apache/datafusion-sqlparser-rs#2626; Lean's

@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #87: max() orders by its argument's collation, C for c and the database's default for d, and the column's COLLATE was dropped, so c = d made the two maxima one
 -- witness: in a database created with LC_COLLATE 'en_US.utf8', t = {(1, 'a', 'a'), (2, 'B', 'B')}: under C max is 'a' and under en_US.utf8 'B', so A returns 'a' and B returns 'B'

@@ -8,6 +8,7 @@
 -- expect fuzz: error
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #202: only pg_catalog, information_schema and pg_temp stopped the schema strip, so
 --   pg_temp_3.t was stripped to t and read as the DDL's table and its key

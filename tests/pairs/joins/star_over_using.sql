@@ -9,6 +9,7 @@
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a bare `*` over JOIN ... USING lowered as the ON form, which has one more column (#31)
 -- witness: t = {(1, 2)}: A returns (1, 2, 2), with a once; B returns (1, 2, 1, 2)

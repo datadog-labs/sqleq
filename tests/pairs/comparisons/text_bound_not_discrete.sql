@@ -9,6 +9,7 @@
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
 -- expect sqlsolver-jvm: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: the integer bound tightening of int_bound_discrete.sql is wrong for text, which sqleq-solver ranks without ordering its constants (a
 --   C-collated column, so that the frontend lowers > natively)

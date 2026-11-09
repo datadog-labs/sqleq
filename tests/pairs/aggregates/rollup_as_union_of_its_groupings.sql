@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: PR #209 review: the expansion of a ROLLUP, written out: one GROUP BY per grouping set, the empty
 --   set as GROUP BY ()

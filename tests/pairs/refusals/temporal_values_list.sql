@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: a VALUES list that holds a DATE and a TIMESTAMP in one column is refused, not lowered
 --   (docs/SOUNDNESS.md); a pin for each documented refusal (#68)

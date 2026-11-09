@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #108: box = compares areas, and box was read as a type whose = is identity; now refused as a type whose = is not transitive
 -- witness: t = {(1, '((0,0),(1,1))', '((0,0),(2,0.5))')}: a = b holds (both areas are 1), A yields (1,1),(0,0) and B yields (2,0.5),(0,0)

@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #52: WITHIN GROUP was never read, so both calls were percentile_cont(0.5)
 -- witness: t = {(1, 10)}: A yields 1, B yields 10

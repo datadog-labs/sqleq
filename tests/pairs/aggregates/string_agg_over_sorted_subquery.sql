@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #59: the reflexivity check stripped the ORDER BY of a sorted subquery feeding string_agg,
 --   so ASC and DESC normalized to one query; the order a sorted subquery hands on is observable

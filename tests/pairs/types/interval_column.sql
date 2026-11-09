@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz materialized an interval column as INTEGER (its type name contains INT),
 --   so under integer_division x / 2 truncated

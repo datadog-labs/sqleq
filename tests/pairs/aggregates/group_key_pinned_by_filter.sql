@@ -9,6 +9,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: proved
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: a GROUP BY key that the WHERE holds to one value is dropped; sqleq-solver lifts the pinned key's equality out of the group's presence
 --   squash, so the projected-away key column is eliminated

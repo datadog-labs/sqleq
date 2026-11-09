@@ -9,6 +9,7 @@
 -- expect qed: proved-literal
 -- expect sqleq-solver: proved-literal
 -- expect sqlsolver-jvm: proved-literal
+-- expect cvc5: proved-literal
 -- expect lean: unsupported
 -- origin: an IN-list against the OR of equalities it abbreviates, which the frontend rewrites to
 --   one query before any prover runs

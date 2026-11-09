@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #64: SIMILAR TO reached DuckDB, which reads its pattern as a regular expression with no % or _ wildcards
 -- argument: in SIMILAR TO, % matches any string and the match is anchored at both ends, so 'a%' means the same as in LIKE

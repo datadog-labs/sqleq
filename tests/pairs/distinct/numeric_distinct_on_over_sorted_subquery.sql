@@ -8,6 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
+-- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #123: a subquery ORDER BY the lowering drops decides which of two values = calls equal a
 --   DISTINCT, GROUP BY, UNION, DISTINCT ON or max keeps, and the two queries lowered to one plan, which lifted
