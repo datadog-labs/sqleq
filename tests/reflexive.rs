@@ -131,6 +131,27 @@ fn a_special_form_and_its_general_form_are_reflexive() {
     assert!(!reflexive_with(&p, Rewrites::ALL.without(Rewrites::DESUGAR_SPECIAL_FORMS)));
 }
 
+/// Two queries that differ only in what they call their table aliases are one query; a different
+/// binding of the qualifiers is not, and an alias that is also a table read without one is left
+/// alone (its renaming would rename that table's qualifiers too), so such a pair stays unsettled.
+/// Nor is a query whose text still names an alias after the renaming: a whole-row reference, or a
+/// qualifier naming an `UNNEST`'s alias, which the renaming does not reach.
+#[test]
+fn queries_differing_only_in_alias_names_are_reflexive() {
+    let p = pair("SELECT e.a FROM t AS e, u AS f WHERE e.b = f.c",
+                 "SELECT e0.a FROM t AS e0, u AS f1 WHERE e0.b = f1.c");
+    assert!(reflexive_with(&p, Rewrites::ALL));
+    assert!(!reflexive_with(&p, Rewrites::ALL.without(Rewrites::CANONICAL_ALIASES)));
+    assert!(!reflexive(&pair("SELECT x.a FROM t AS x, t AS y WHERE x.b = y.c",
+                             "SELECT y.a FROM t AS x, t AS y WHERE x.b = y.c")));
+    assert!(!reflexive(&pair("SELECT u.a FROM t AS u WHERE EXISTS (SELECT 1 FROM u WHERE u.c = 1)",
+                             "SELECT w.a FROM t AS w WHERE EXISTS (SELECT 1 FROM u WHERE u.c = 1)")));
+    assert!(!reflexive(&pair("SELECT row_to_json(e) AS j FROM emp AS e JOIN dept AS d ON e.dept_id = d.id",
+                             "SELECT row_to_json(e) AS j FROM emp AS d JOIN dept AS e ON d.dept_id = e.id")));
+    assert!(!reflexive(&pair("SELECT (SELECT x.a FROM unnest(ARRAY[5]) AS x(a)) AS r FROM t AS x",
+                             "SELECT (SELECT y.a FROM unnest(ARRAY[5]) AS x(a)) AS r FROM t AS y")));
+}
+
 /// A cast to the type its operand already has is the identity, so `$1::uuid::uuid` is `$1::uuid`.
 #[test]
 fn a_repeated_cast_to_one_type_is_reflexive() {
@@ -183,7 +204,7 @@ fn clearing_a_rewrite_disables_exactly_that_rewrite() {
 /// rewrite missing from `EACH` would be reported as "no rewrite was necessary" for every row it closes.
 #[test]
 fn every_rewrite_is_reachable_from_all() {
-    assert_eq!(Rewrites::EACH.len(), 12);
+    assert_eq!(Rewrites::EACH.len(), 13);
     let rebuilt = Rewrites::EACH.iter().fold(Rewrites::NONE, |acc, (_, b)| acc.with(*b));
     assert_eq!(rebuilt, Rewrites::ALL);
     for (_, bit) in Rewrites::EACH {
