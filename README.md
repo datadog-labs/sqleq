@@ -251,7 +251,8 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   pairs on a PostgreSQL 17 of your own, set `SQLEQ_PG_BIN` to its `bin` directory, and
   `SQLEQ_PG_DOWNLOAD=0` to skip the download. On Linux the fetched PostgreSQL uses the system's
   OpenSSL 3, libxml2, Kerberos, zstd and lz4 libraries; where one is missing it cannot start, and
-  `sqleq-fuzz` uses the `postgres` on `PATH` instead.
+  `sqleq-fuzz` uses the `postgres` on `PATH` instead. Its libxml2 is `libxml2.so.2`, which Ubuntu
+  26.04 does not ship; there, point `SQLEQ_PG_BIN` at a PostgreSQL 17 of the system's own.
 * **`sqleq-solver`**, the default prover — `cargo build --release -p sqleq-solver`. Its first build
   compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in
   statically, so the binary needs nothing at run time.
