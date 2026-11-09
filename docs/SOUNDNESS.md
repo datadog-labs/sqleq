@@ -65,6 +65,17 @@ normalization to keep the number of times a call is evaluated, and `WITH` inlini
 evaluates a binding read twice twice, where Postgres evaluates it once. So the check declines a pair
 in which inlining would copy a volatile call such as `random()`.
 
+Two queries that differ only in the names they give their table aliases normalize to one query too:
+`normalize::canonical_aliases` renames each query's aliases, in the order it declares them, to
+`__sqleq_alias_0`, `__sqleq_alias_1`, …, and every qualifier that names one with them. The renaming
+goes by name, not by scope, so it has to leave the query's meaning alone, and it is skipped for a
+query that declares one alias name twice, that reads a table of an alias's name without an alias, or
+whose text, once renamed, still names an alias: a whole-row reference (`row_to_json(e)`), or a
+qualifier naming the alias of an `UNNEST`, a function or a parenthesized join, none of which the
+renaming reaches. The frontend's rewrites write identifiers of their own, these aliases among them,
+so every identifier of the input that begins with `__sqleq_` is refused before any rewrite runs
+(`lower::refuse_reserved_identifiers`), and none can be taken for one of them.
+
 The same reasoning sets the direction of schema inference. A key or a `NOT NULL` *shrinks* the space
 of instances the prover quantifies over, so inventing one could turn a non-equivalence into a
 `provable`. Constraints are therefore only ever read off the DDL, never guessed; a missed one costs

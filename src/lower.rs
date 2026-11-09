@@ -519,6 +519,40 @@ pub(crate) fn refuse_reserved_call_names(statements: &[sqlparser::ast::Statement
     Ok(())
 }
 
+/// The prefix of every identifier the frontend's own rewrites write, such as the aliases
+/// `__sqleq_alias_N` of [`crate::normalize::canonical_aliases`]. No identifier of the input may begin
+/// with it ([`refuse_reserved_identifiers`]).
+pub(crate) const RESERVED_PREFIX: &str = "__sqleq_";
+
+/// SOUNDNESS GUARD: an identifier of the input that a rewrite's own symbol could be taken for. A
+/// table the input aliases `__sqleq_alias_0` would be indistinguishable from the alias
+/// [`crate::normalize::canonical_aliases`] gives another table. Read off the tokens of each
+/// statement's text, so that every position an identifier can take is covered -- alias, column,
+/// table, function, binding, qualifier, quoted or not, in any case. No name a query could otherwise
+/// mean begins with the prefix.
+pub(crate) fn refuse_reserved_identifiers(statements: &[sqlparser::ast::Statement]) -> Result<()> {
+    for st in statements {
+        if let Some(name) = reserved_identifier(&st.to_string())? {
+            return Err(unsupported(format!(
+                "an identifier named {name}, which the frontend reserves for its own rewrites"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first identifier of `sql` that begins with [`RESERVED_PREFIX`], case aside, or `None`.
+pub(crate) fn reserved_identifier(sql: &str) -> Result<Option<String>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+        .tokenize()
+        .map_err(|e| unsupported(format!("a statement whose text does not tokenize: {e}")))?;
+    Ok(tokens.into_iter().find_map(|t| match t {
+        Token::Word(w) if w.value.to_ascii_lowercase().starts_with(RESERVED_PREFIX) => Some(w.value),
+        _ => None,
+    }))
+}
+
 /// SOUNDNESS GUARD: see [`VOLATILE_FUNCTIONS`]. Matched on the *bare* name, because
 /// `pg_catalog.random` is still `random` and widening a refusal can only ever cost completeness.
 fn reject_nondeterministic(full: &str, bare: &str) -> Result<()> {

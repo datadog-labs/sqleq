@@ -117,6 +117,9 @@ const ACCEPTED: &[Row] = &[
     // A catalog relation Postgres reads and the frontend does not model, not an unknown table (#202).
     row(Unsupported, r#"SELECT "relname" FROM "pg_class""#, r#"SELECT "relname" FROM "pg_class" WHERE true"#,
         "system relation", "prepares: reads pg_catalog.pg_class"),
+    // An identifier spelled like one the frontend's own rewrites write.
+    row(Unsupported, r#"SELECT 1 AS "__sqleq_x" FROM "t""#, r#"SELECT 1 AS "x" FROM "t""#,
+        "reserves for its own rewrites", "prepares"),
     row(Unsupported, r#"TABLE "t""#, r#"SELECT * FROM "t""#, "parser does not read", "prepares"),
     row(Unsupported, r#"DELETE FROM "t""#, r#"SELECT "a" FROM "t""#, "DELETE paired with non-DELETE", "prepares"),
     row(Unsupported, r#"MERGE INTO "t" USING "u" ON "t"."a" = "u"."a" WHEN MATCHED THEN DELETE"#,

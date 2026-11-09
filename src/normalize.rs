@@ -3240,3 +3240,156 @@ mod tests {
         assert_eq!(distributed(&once), once);
     }
 }
+
+/// Every table alias a query declares renamed to `__sqleq_alias_N`, N counting the aliases in the
+/// order they are declared, and every qualifier that names one with it: two queries that differ only
+/// in what they call their aliases (`FROM emp AS e` and `FROM emp AS e0`, each read as `e.x` and
+/// `e0.x`) become one tree, for [`crate::reflexive`] alone.
+///
+/// SOUNDNESS GUARD. The renaming is by name, not by scope, so it must be a consistent renaming of the
+/// query to keep its meaning: it is skipped for a query that declares one alias name twice, or one
+/// that is also a table it reads without an alias (whose implicit qualifier it would rename too), or
+/// one that is already of the canonical form. Canonical names are distinct, so the renaming is
+/// injective, and two queries renamed to one tree differ by a renaming of their aliases only -- as
+/// long as every way the query names an alias was renamed. The renaming reaches a declaration, a
+/// qualifier `a.x` and a qualified wildcard `a.*` in a select list, and nothing else that can name
+/// one: not a whole-row reference (`row_to_json(e)`, `(e).x`, `e.*` as an argument), not the alias
+/// of an `UNNEST`, a function or a parenthesized join (which the collection does not see either, so
+/// a duplicate of one escapes the clash check), not a three-part name. Each would leave the name in
+/// place while its declaration, or another alias's, was renamed, and two queries Postgres tells
+/// apart could become one tree. So a query in whose text an alias's name is still an identifier
+/// after the renaming is put back as it was ([`names_remain`]).
+pub fn canonical_aliases(queries: &mut [Query]) {
+    for q in queries {
+        let mut seen = CollectAliases::default();
+        let _ = Visit::visit(&*q, &mut seen);
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut clash = false;
+        for a in &seen.aliases {
+            let n = map.len();
+            match map.entry(a.clone()) {
+                Entry::Occupied(_) => clash = true,
+                Entry::Vacant(v) => {
+                    v.insert(format!("__sqleq_alias_{n}"));
+                }
+            }
+        }
+        clash = clash
+            || seen.aliases.iter().any(|a| a.starts_with("__sqleq_alias_"))
+            || seen.unaliased.iter().any(|t| map.contains_key(t));
+        if map.is_empty() || clash {
+            continue;
+        }
+        let before = q.clone();
+        let _ = VisitMut::visit(q, &mut RenameAliases { map: &map });
+        if names_remain(q, &map) {
+            *q = before;
+        }
+    }
+}
+
+/// Whether an identifier token of `q`'s text, folded as [`crate::dml::fold_ident`] folds one, is a
+/// key of `map`: an alias name the renaming left in place. `true` as well when the text does not
+/// tokenize, which keeps the renaming out.
+fn names_remain(q: &Query, map: &HashMap<String, String>) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, &q.to_string()).tokenize() else {
+        return true;
+    };
+    tokens.iter().any(|t| match t {
+        Token::Word(w) => map.contains_key(&match w.quote_style {
+            Some(_) => w.value.clone(),
+            None => w.value.to_ascii_lowercase(),
+        }),
+        _ => false,
+    })
+}
+
+/// The aliases a query declares, folded, in order, and the bare names of the tables it reads without
+/// one, for [`canonical_aliases`].
+#[derive(Default)]
+struct CollectAliases {
+    aliases: Vec<String>,
+    unaliased: Vec<String>,
+}
+
+impl Visitor for CollectAliases {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<Self::Break> {
+        match t {
+            TableFactor::Table { name, alias, .. } => match alias {
+                Some(a) => self.aliases.push(crate::dml::fold_ident(&a.name)),
+                None => {
+                    if let Some(id) = name.0.last().and_then(|p| p.as_ident()) {
+                        self.unaliased.push(crate::dml::fold_ident(id));
+                    }
+                }
+            },
+            TableFactor::Derived { alias: Some(a), .. } => self.aliases.push(crate::dml::fold_ident(&a.name)),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+struct RenameAliases<'a> {
+    map: &'a HashMap<String, String>,
+}
+
+impl RenameAliases<'_> {
+    fn rename(&self, id: &mut Ident) {
+        if let Some(n) = self.map.get(&crate::dml::fold_ident(id)) {
+            *id = Ident::new(n.clone());
+        }
+    }
+}
+
+impl VisitorMut for RenameAliases<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
+        match t {
+            TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => {
+                self.rename(&mut a.name)
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::CompoundIdentifier(ids) = e {
+            if ids.len() >= 2 {
+                self.rename(&mut ids[0]);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<Self::Break> {
+        // `t.*` is a select item, not an expression
+        fn items(body: &mut SetExpr, this: &RenameAliases<'_>) {
+            match body {
+                SetExpr::Select(s) => {
+                    for item in s.projection.iter_mut() {
+                        if let SelectItem::QualifiedWildcard(sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n), _) = item {
+                            if n.0.len() == 1 {
+                                if let ObjectNamePart::Identifier(id) = &mut n.0[0] {
+                                    this.rename(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                SetExpr::SetOperation { left, right, .. } => {
+                    items(left, this);
+                    items(right, this);
+                }
+                _ => {}
+            }
+        }
+        items(&mut q.body, self);
+        ControlFlow::Continue(())
+    }
+}
