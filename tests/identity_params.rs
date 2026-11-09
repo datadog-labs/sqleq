@@ -10,7 +10,7 @@
 //! `tests/pairs/types/` run them.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource};
+use sqleq::{lower_with, CatalogSource};
 
 const T: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "u" uuid, "b" bytea, "j" jsonb, "f" DOUBLE PRECISION, "v" uuid);"#;
 

@@ -19,7 +19,7 @@
 //! lower to IR a prover proves equal. They do not run a prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_sql, lower_with, lower_with_ddl, CatalogSource, FrontendError};
+use sqleq::{lower_sql, lower_with, lower_with_ddl, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "p" BOOLEAN, "s" VARCHAR, "j" JSONB, "n" NUMERIC, unique ("id"));"#;
 

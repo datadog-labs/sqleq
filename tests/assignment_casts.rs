@@ -15,7 +15,7 @@
 //! They do not run a prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
+use sqleq::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
 
 /// A table with most kinds of column a value can be stored in, a source table, and two more: a
 /// `char(n)` column is refused wherever an `UPDATE` projects it, and `x` is the shape of `t (id, s)`.

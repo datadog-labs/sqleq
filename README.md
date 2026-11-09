@@ -53,8 +53,7 @@ parameters correspond, and has the Lean kernel check the proof. It needs a Lean 
 Build `sqleq-check` and the two backends Cargo builds by itself:
 
 ```sh
-cargo build --release                               # sqleq-frontend and sqleq-check
-cargo build --release -p sqleq-fuzz -p sqleq-solver # the refuter and the prover
+cargo build --release   # sqleq-frontend and sqleq-check, the refuter sqleq-fuzz and the prover sqleq-solver
 ```
 
 The first build of `sqleq-fuzz` downloads DuckDB's release library (~40 MB) and the PostgreSQL 17 it
@@ -221,15 +220,15 @@ $CHECK --portfolio --expect report-only --corpus corpus.csv --catalog inferred-s
 `--catalog inferred-seeded` reads tables and columns from the DDL but *infers* parameter types,
 which is what lets a bare `$N` lower against a declared schema; the default, `declared`, refuses
 one.
-`sqleq-check` has its own manual: [`sqleq-check/README.md`](sqleq-check/README.md).
+`sqleq-check` has its own manual: [`docs/check.md`](docs/check.md).
 
-Each backend is also a binary of its own, documented with its crate. `sqleq-check` takes each from
+Each backend is also a binary of its own, documented with its module. `sqleq-check` takes each from
 its flag, `--bin-dir`, its environment variable, `PATH` or this repository's `target/`, in that
 order (the manual has the details). The frontend alone lowers a pair to the provers' Input JSON
 (`sqleq-frontend pair.sql out.json`), and is a library too:
 
 ```rust
-let input_json = sqleq_frontend::lower_sql(sql_text)?; // serde_json::Value, the provers' Input
+let input_json = sqleq::lower_sql(sql_text)?; // serde_json::Value, the provers' Input
 ```
 
 ## Input format
@@ -249,13 +248,13 @@ answers.
 
 ## Building
 
-Recent stable Rust (edition 2021; MSRV 1.88, set by the locked dependency tree). A bare
-`cargo build --release` builds the frontend and `sqleq-check`; the frontend depends only on
-`sqlparser`, `serde_json` and `csv`. `sqleq-check` builds no backend: it runs each one as a
-subprocess, and the heavier ones are opt-in workspace members, each built with `-p` — including
-`sqleq-solver`, which a default `sqleq-check` run asks:
+Recent stable Rust (edition 2021; MSRV 1.88, set by the locked dependency tree). sqleq is one
+crate, with a binary for each axis and a cargo feature for each axis whose build is heavy. A bare
+`cargo build --release` builds the frontend and `sqleq-check` with the default features, `fuzz`
+and `solver`; `--no-default-features` builds the frontend and `sqleq-check` alone. `sqleq-check`
+needs no feature: it runs each backend as a subprocess.
 
-* **`sqleq-fuzz`** — `cargo build --release -p sqleq-fuzz`. Its first build downloads DuckDB's
+* **`sqleq-fuzz`** — the `fuzz` feature, on by default. Its first build downloads DuckDB's
   release library (~40 MB) and a prebuilt PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS
   on x86_64 and arm64, which it runs pairs on. To link a libduckdb you already have instead, set
   `DUCKDB_LIB_DIR`; the build script checks it before it considers downloading anything. To run
@@ -264,10 +263,10 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   OpenSSL 3, libxml2, Kerberos, zstd and lz4 libraries; where one is missing it cannot start, and
   `sqleq-fuzz` uses the `postgres` on `PATH` instead. Its libxml2 is `libxml2.so.2`, which Ubuntu
   26.04 does not ship; there, point `SQLEQ_PG_BIN` at a PostgreSQL 17 of the system's own.
-* **`sqleq-solver`**, the default prover — `cargo build --release -p sqleq-solver`. Its first build
+* **`sqleq-solver`**, the default prover — the `solver` feature, on by default. Its first build
   compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in
   statically, so the binary needs nothing at run time.
-* **`sqleq-lean`** — `cargo build --release -p sqleq-lean`. At run time it needs `lake` (from a Lean
+* **`sqleq-lean`** — `cargo build --release --features lean`. At run time it needs `lake` (from a Lean
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and
   builds the [`lean/`](lean/) package on first use; that package pins its own Lean version and
   needs no Mathlib.
@@ -275,10 +274,11 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   that no release has yet ([`bags-algebra`](https://github.com/mudathirmahgoub/cvc5/pull/27)), so
   the script fetches that branch at a pinned commit, builds and installs it under `target/cvc5/`
   (5 to 15 minutes the first time, by the cores; git, cmake, a C++17 compiler and Python 3), and then runs
-  `cargo build --release -p sqleq-cvc5`. After that, `cargo build -p sqleq-cvc5` and `cargo test
-  -p sqleq-cvc5` work like the other crates': `.cargo/config.toml` points `CVC5_LIB_DIR` at the
-  install. The bindings need `libclang`, and the first build compiles Z3 too, since the crate reads
-  the IR through `sqleq-solver`. See [`docs/CVC5.md`](docs/CVC5.md).
+  `cargo build --release --features cvc5`. After that, `cargo build --features cvc5` and
+  `cargo test --features cvc5` work like the other features: `.cargo/config.toml` points
+  `CVC5_LIB_DIR` at the install. The bindings need `libclang`. It reads the IR through `sqleq::ir`,
+  not through the solver, so `--no-default-features --features cvc5` compiles no Z3. See
+  [`docs/CVC5.md`](docs/CVC5.md).
 
 The QED prover, which `--qed` and the default portfolio ask, is external (the upstream
 [`qed-solver`](https://github.com/qed-solver/prover) project) and is not vendored here. It needs the native `z3` and `cvc5` solvers, and its Nix flake
@@ -299,7 +299,7 @@ and failing those the newest Nix-built `qed-prover` it can find.
 | doc | what |
 |---|---|
 | [`docs/`](docs/README.md) | the index — start here if you don't know which of the below you want |
-| [`sqleq-check/README.md`](sqleq-check/README.md) | the `sqleq-check` manual: every flag, the portfolio, corpus runs, the output |
+| [`docs/check.md`](docs/check.md) | the `sqleq-check` manual: every flag, the portfolio, corpus runs, the output |
 | [`docs/SOUNDNESS.md`](docs/SOUNDNESS.md) | what a verdict rests on: what is refused, and what is assumed |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | how the tool is validated, and the defects that validation has caught |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | why the frontend is built this way |
@@ -308,8 +308,8 @@ and failing those the newest Nix-built `qed-prover` it can find.
 | [`docs/LEAN.md`](docs/LEAN.md) | the Lean axis: which `INSERT` pairs it proves, and under what rule |
 | [`docs/INTERNALS.md`](docs/INTERNALS.md) | module map, for reading or changing the code |
 | [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |
-| [`sqleq-fuzz/README.md`](sqleq-fuzz/README.md) | the disproving axis, and its own soundness rules |
-| [`tools/README.md`](tools/README.md) | the scripts that are not part of any crate |
+| [`docs/fuzz.md`](docs/fuzz.md) | the disproving axis, and its own soundness rules |
+| [`tools/README.md`](tools/README.md) | the scripts that are not part of the crate |
 
 ## Contributing
 

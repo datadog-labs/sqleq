@@ -13,7 +13,7 @@
 -- origin: PR #209 review: the cvc5 axis ordered strings by code point for MIN, MAX and row slices, which
 --   carry no collation and are in the database's default one, which no input states; it proved
 --   this pair, which en_US.utf8 contradicts. The order is uninterpreted there now
---   (sqleq-cvc5/src/translate.rs, less)
+--   (src/cvc5/translate.rs, less)
 -- witness: in a database created with LC_COLLATE 'en_US.utf8': A returns 'a', B returns 'B' (in a C
 --   database both return 'B')
 SELECT MIN(x) AS m FROM (VALUES ('a'), ('B')) AS v(x);

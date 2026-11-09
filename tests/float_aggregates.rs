@@ -13,7 +13,7 @@
 //! to IR a prover proves equal. Over `numeric` and the integers the sums are exact, and `min`, `max`
 //! and `count` do not add, so those still lower.
 
-use sqleq_frontend::{lower_sql, FrontendError};
+use sqleq::{lower_sql, FrontendError};
 
 const T: &str = r#"create table "t" ("y" INTEGER, "x" DOUBLE PRECISION, "r" REAL, "n" NUMERIC, "i" INTEGER);
 create table "u" ("y" INTEGER, "x" DOUBLE PRECISION, "r" REAL, "n" NUMERIC, "i" INTEGER);"#;

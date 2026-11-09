@@ -10,7 +10,7 @@
 //! used to exceed it. The parser accepts nesting well past its default limit of 50.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource};
+use sqleq::{lower_with, CatalogSource};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" VARCHAR, "k" VARCHAR, unique ("id"));"#;
 

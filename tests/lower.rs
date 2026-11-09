@@ -6,7 +6,7 @@
 //! Integration tests for the public `lower_sql` API. These check parsing/lowering shape and the
 //! soundness refusals; they do not run the prover.
 
-use sqleq_frontend::{lower_sql, lower_with, lower_with_ddl, CatalogSource, FrontendError};
+use sqleq::{lower_sql, lower_with, lower_with_ddl, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("a" INTEGER, "b" VARCHAR, "c" VARBINARY, unique ("a"));"#;
 
@@ -1416,7 +1416,7 @@ fn the_raw_ddl_wins_over_the_create_tables_in_the_input() {
         "create table \"t\" (\"alpha\" VARCHAR);\n{q};\n{q};",
         q = "SELECT \"alpha\" FROM \"t\""
     );
-    let v = sqleq_frontend::lower_with_ddl(&src, RAW, sqleq_frontend::CatalogSource::Declared)
+    let v = sqleq::lower_with_ddl(&src, RAW, sqleq::CatalogSource::Declared)
         .expect("lowers against the raw DDL");
     assert_eq!(v["schemas"].as_array().unwrap().len(), 1);
     assert_eq!(v["schemas"][0]["types"], serde_json::json!(["VARCHAR", "INTEGER", "VARBINARY"]));
@@ -1428,7 +1428,7 @@ fn not_null_survives_into_the_emitted_schema() {
     // counterpart to compare against: it discards every `NOT NULL`. `zeta` is declared NOT NULL and
     // `alpha` is a PRIMARY KEY, which implies it; `beta` is neither.
     let src = format!("{q};\n{q};", q = "SELECT \"alpha\" FROM \"t\"");
-    let v = sqleq_frontend::lower_with_ddl(&src, RAW, sqleq_frontend::CatalogSource::Declared).unwrap();
+    let v = sqleq::lower_with_ddl(&src, RAW, sqleq::CatalogSource::Declared).unwrap();
     assert_eq!(v["schemas"][0]["nullable"], serde_json::json!([false, false, true]));
     assert_eq!(v["schemas"][0]["key"], serde_json::json!([[1]]));
 }
@@ -1442,7 +1442,7 @@ fn columns_are_numbered_in_ddl_order_not_alphabetical_order() {
     // order down is the explicit list. The DDL says zeta, alpha, beta — so *that* list is the
     // identity permutation, and the alphabetical one is not.
     let src = "SELECT *  FROM \"t\";\nSELECT \"zeta\", \"alpha\", \"beta\" FROM \"t\";";
-    let v = sqleq_frontend::lower_with_ddl(src, RAW, sqleq_frontend::CatalogSource::Declared).unwrap();
+    let v = sqleq::lower_with_ddl(src, RAW, sqleq::CatalogSource::Declared).unwrap();
     assert_eq!(v["queries"][0], serde_json::json!({"scan": 0}), "`*` is the identity");
     let cols: Vec<_> = v["queries"][1]["project"]["target"]
         .as_array()
@@ -1455,7 +1455,7 @@ fn columns_are_numbered_in_ddl_order_not_alphabetical_order() {
     // Alphabetical order is a different question, and the frontend must not silently answer it.
     let alpha = "SELECT *  FROM \"t\";\nSELECT \"alpha\", \"beta\", \"zeta\" FROM \"t\";";
     let v =
-        sqleq_frontend::lower_with_ddl(alpha, RAW, sqleq_frontend::CatalogSource::Declared).unwrap();
+        sqleq::lower_with_ddl(alpha, RAW, sqleq::CatalogSource::Declared).unwrap();
     let cols: Vec<_> = v["queries"][1]["project"]["target"]
         .as_array()
         .expect("a projection")

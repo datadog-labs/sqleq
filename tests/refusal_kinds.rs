@@ -11,7 +11,7 @@
 //! Postgres, because the same refusal also meets input Postgres accepts and the syntax in front of
 //! the frontend cannot tell the two apart. The controls are the valid neighbours, which still lower.
 
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("a" INTEGER, "b" INTEGER, unique ("a"));
 create table "u" ("a" INTEGER, "c" INTEGER);"#;

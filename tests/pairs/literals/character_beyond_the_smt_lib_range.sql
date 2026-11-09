@@ -12,7 +12,7 @@
 -- expect lean: unsupported
 -- origin: PR #209 review: the cvc5 axis wrote a character above U+2FFFF as the escape \u{30000}, which is
 --   outside SMT-LIB's string range and which cvc5 keeps as that text, the same string as the
---   nine-character literal on side B; such a character is refused (sqleq-cvc5/src/translate.rs)
+--   nine-character literal on side B; such a character is refused (src/cvc5/translate.rs)
 -- witness: t = {('𰀀')}: A returns the row, B returns none
 create table t (s varchar);
 SELECT s FROM t WHERE s = '𰀀';

@@ -6,42 +6,45 @@ conventions are not the ones you would guess from the code — this file is the 
 ## Build and test
 
 ```sh
-cargo test                 # the frontend: 219 + 9 + 3 + 7 + 13 + 10 + 6 + 24 + 7 + 2 + 23 + 2 + 25 + 14 + 12 + 18 + 190 + 16 + 4 + 5 + 12 + 6 + 20 + 4 + 3 + 13 + 11 + 11 + 25 + 7 + 3 + 2; sqleq-check: 69 + 17 + 14 + 5 + 1 + 2 + 11 + 12 + 16
-cargo test -p sqleq-fuzz   # the disprover: 62 + 2 + 5 + 5 + 15 + 8 + 40 + 3 + 7 + 60
-cargo test -p sqleq-solver # sqleq-solver, a Rust rewrite of SQLSolver: 69 + 4 + 2 + 3 + 4 + 4 + 11 (compiles Z3, see below)
-cargo test -p sqleq-lean   # the Lean axis: 51 + 1 + 7 (needs Lean, see below)
-cargo test -p sqleq-cvc5   # the cvc5 axis: 6 + 19 (after `sh tools/build_cvc5.sh`, see docs/CVC5.md)
-cargo build -p sqleq-fuzz -p sqleq-solver
+cargo test --no-default-features   # the frontend and sqleq-check: no Z3, DuckDB or PostgreSQL to build
+cargo test                         # adds sqleq-fuzz and sqleq-solver, the default features (see below)
+cargo test --features lean         # adds the Lean axis (needs Lean, see below)
+cargo test --features cvc5         # adds the cvc5 axis (after `sh tools/build_cvc5.sh`, see docs/CVC5.md)
+cargo build
 target/debug/sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
-`cargo test` covers the frontend and `sqleq-check`, the command that runs every backend. Among the
+`cargo test --no-default-features` covers the frontend and `sqleq-check`, the command that runs
+every backend. Among the
 frontend's suites is `tests/doc_links.rs`, which fails on any relative link in a Markdown file that
 resolves to nothing; among `sqleq-check`'s is the hygiene gate over every committed pair
-(`sqleq-check/tests/real_cases.rs`). The last line runs the
+(`tests/check/real_cases.rs`). The last line runs the
 [pinned pairs](tests/pairs/README.md) on the frontend, fuzz and sqleq-solver axes, the ones CI runs
-through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries;
-the `cargo build` line before it makes sure of both opt-in ones. The Lean pins are checked by
-`cargo test -p sqleq-lean`, and the `qed`, `sqlsolver-jvm` and `cvc5` pins only where those tools
-are installed.
+through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries,
+which the `cargo build` line before it builds: `fuzz` and `solver` are default features. The Lean
+pins are checked by `cargo test --features lean`, and the `qed`, `sqlsolver-jvm` and `cvc5` pins
+only where those tools are installed.
 
 `sqleq-fuzz` runs pairs on a PostgreSQL 17: the one `SQLEQ_PG_BIN` names, else the one its build
 fetched (for Linux and macOS on x86_64 and arm64; `SQLEQ_PG_DOWNLOAD=0` skips the download), else
 the `postgres` on `PATH`. Its pinned pairs need one, as does `sqleq-check --axes fuzz`, and
-`cargo test -p sqleq-fuzz` tests the Postgres engine against it, skipping those tests without one
+`cargo test` tests the Postgres engine against it, skipping those tests without one
 unless `SQLEQ_PG_REQUIRED` is set, as CI sets it. CI uses the fetched one. The engine builds a template cluster on its first run, in
 `~/.cache/sqleq` unless `SQLEQ_PG_CACHE` says otherwise.
 
-`cargo test` deliberately does not build `sqleq-fuzz` or `sqleq-solver`. The first build of
-`sqleq-fuzz` downloads DuckDB's release library (~40 MB, cached in `target/`), and the first build
-of `sqleq-solver` compiles Z3 from source, which takes minutes and needs cmake and a C++20
-compiler — so the root manifest sets `default-members = [".", "sqleq-check"]` and both are
-opt-in. `sqleq-lean` is opt-in too: it runs the Lean 4 toolchain that `lean/lean-toolchain` names,
-with `lake` on `PATH` (elan installs it, or put a release's `bin` there yourself), and its
-integration test fails rather than skips without it. `cd lean && lake build Sqleq SqleqTest`
-builds the Lean library and checks its controls. CI splits its jobs along the same lines — the
-frontend and `sqleq-check` share one, and each opt-in crate has its own — and fetches Lean from a
-digest-pinned release archive.
+sqleq is one crate, with a cargo feature for each axis whose build is heavy. The defaults, `fuzz`
+and `solver`, make a bare `cargo build` or `cargo test` slow the first time: the `fuzz` feature
+downloads DuckDB's release library (~40 MB, cached in `target/`) and the PostgreSQL it runs on, and
+the `solver` feature compiles Z3 from source, which takes minutes and needs cmake and a C++20
+compiler. `--no-default-features` builds neither, and is the quick loop for the frontend and
+`sqleq-check`. The `lean` feature is off by default: it runs the Lean 4 toolchain that
+`lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a release's `bin`
+there yourself), and its integration test fails rather than skips without it.
+`cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks its controls. The `cvc5`
+feature is off by default too; it links a cvc5 library ([docs/CVC5.md](docs/CVC5.md)). CI splits
+its jobs along the same lines — the frontend and `sqleq-check` share one, with
+`--no-default-features`, and each feature has its own — and fetches Lean from a digest-pinned
+release archive.
 
 ### Licensing
 
@@ -55,7 +58,7 @@ sh tools/update_license_3rdparty.sh
 
 Components that are not crates (the DuckDB and Z3 libraries, and what the SQLSolver bridge compiles
 against) are listed by hand in [`tools/license-3rdparty-extra.csv`](tools/license-3rdparty-extra.csv).
-Dependencies must be under a permissive licence: `cargo deny --workspace check licenses` enforces
+Dependencies must be under a permissive licence: `cargo deny check licenses` enforces
 the allow-list in [`deny.toml`](deny.toml), and a licence outside it needs a discussion first.
 
 Every `.rs`, `.py`, `.java`, `.toml`, `.yml`, `.sql` and `.sh` file opens with this header (after
@@ -88,7 +91,7 @@ editing (most are 100 columns; a few are a little wider) and leave the rest alon
 
 Where a lint is deliberately wrong for the code, annotate it with `#[allow(...)]` and one line
 saying why, rather than rewriting the code to satisfy it. `src/types.rs` and
-`sqleq-fuzz/src/duck.rs` have worked examples.
+`src/fuzz/duck.rs` have worked examples.
 
 ## Two rules that are not negotiable
 

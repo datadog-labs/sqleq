@@ -15,7 +15,7 @@
 //! keeps the equivalent shapes provable.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "ts" TIMESTAMP, "d" DATE, "tz" TIMESTAMPTZ, "s" VARCHAR, "dur" INTERVAL, unique ("id"));"#;
 

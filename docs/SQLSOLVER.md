@@ -66,7 +66,7 @@ without the fork.
 ## Verdicts are not symmetric
 
 Both drivers answer each row with one raw verdict, and `sqleq-check` buckets it
-(`sqleq-check/src/axes/solver.rs`). Only `EQ` is a claim:
+(`src/check/axes/solver.rs`). Only `EQ` is a claim:
 
 | raw | means | bucket |
 |---|---|---|
@@ -134,7 +134,7 @@ sequential pass stays the one to compare the two implementations in, or to pin.
 
 ## `sqleq-solver`
 
-`sqleq-solver/` is a Rust rewrite of the part of SQLSolver that the IR bridge reaches: from the
+`sqleq-solver` (`src/solver/`) is a Rust rewrite of the part of SQLSolver that the IR bridge reaches: from the
 `Input` JSON to a verdict, without Calcite, without SQL text, and without a JVM. Its binary takes
 `IrDriver`'s arguments and writes `IrDriver`'s rows, so `sqleq-check` drives either
 implementation with the same buckets, the same resume loop and the same report.
@@ -293,14 +293,14 @@ where it runs out of time, and plans the bridge refuses: a `FROM`-less query, lo
 
 ### How it is checked
 
-What gates a change in CI is the crate's tests and the pinned pairs. `cargo test -p sqleq-solver`
+What gates a change in CI is the module's tests and the pinned pairs. `cargo test --features solver`
 runs the unit tests, which pin the three-valued truth tables against a reference evaluator and the
 ladder's answers on hand-written plans. The `sqleq-solver` job then drives the built binary through
-`sqleq-check`: its tests of the SQLSolver pass (`sqleq-check/tests/real_solver.rs`), and every pair
+`sqleq-check`: its tests of the SQLSolver pass (`tests/check/real_solver.rs`), and every pair
 under [`tests/pairs`](../tests/pairs/README.md) on the `sqleq-solver` axis, which fails on any pin
 that moves, a proof of a pair pinned `not-equivalent` included.
 
-The examples under `sqleq-solver/examples/` are manual tools, not gates. CI compiles them and runs
+The examples under `examples/solver/` are manual tools, not gates. CI compiles them and runs
 none, because each needs inputs that are not in this repository: a job file (the `{name, ir,
 schema}` lines `sqleq-frontend --sqlsolver --ir` writes, one per pair), and for `phase2_gate` also
 results from the fork and from the fuzz axis. `phase2_gate.rs` runs the ladder over a job file and
@@ -308,11 +308,11 @@ joins it row by row against `IrDriver`'s results and a file of fuzz verdicts (on
 {verdict}}` per line), failing on any `EQ` over a pair the fuzz axis refutes.
 `normalize_check.rs` evaluates each side before and after normalization, and both sides of every
 proved pair, on small random databases that respect the schemas' column types and constraints,
-using the crate's concrete evaluator.
+using the module's concrete evaluator.
 
 ### Building
 
-`cargo build --release -p sqleq-solver` compiles Z3 from source and links it statically, so the
+The `solver` feature, on by default, compiles Z3 from source and links it statically, so the
 binary needs nothing at run time; the first build takes minutes and needs cmake and a C++20
 compiler.
 

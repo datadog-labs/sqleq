@@ -8,7 +8,7 @@
 | `build_cvc5.sh` | fetches the cvc5 branch the cvc5 axis needs at a pinned commit, builds and installs it under `target/cvc5/`, and builds `sqleq-cvc5` against it; run once, then cargo builds the crate like the others — see [`../docs/CVC5.md`](../docs/CVC5.md) |
 | `lean_replay.py` | re-runs the Lean axis's proved `INSERT` pairs on a real Postgres, as an independent check — see [`../docs/LEAN.md`](../docs/LEAN.md). Python 3 (standard library only) and `psql`; never run by CI |
 
-There is no harness script here. Pairs are run by [`sqleq-check`](../sqleq-check/README.md): a
+There is no harness script here. Pairs are run by [`sqleq-check`](../docs/check.md): a
 directory of `.sql` pairs or a corpus CSV (`--corpus`) in, verdicts and a CI exit code out, and the
 pinned-pair suite behind `--expect pinned`. The link check is `tests/doc_links.rs`, which
 `cargo test` runs.

@@ -19,7 +19,7 @@
 //! ordering keys every column it returns is not decided by the order of its input.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_sql, reflexive, FrontendError};
+use sqleq::{lower_sql, reflexive, FrontendError};
 
 fn pair(ddl: &str, q0: &str, q1: &str) -> String {
     format!("{ddl}\n{q0};\n{q1};")

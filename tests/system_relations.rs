@@ -13,16 +13,16 @@
 //! schema, as a DML target, through every reader of the DDL) and expects a refusal; the controls
 //! are the user's own `pg_*` tables, read through their schema, which still lower.
 
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
+use sqleq::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
 
 const MODES: [CatalogSource; 3] = [CatalogSource::Declared, CatalogSource::InferredSeeded, CatalogSource::Inferred];
 
 /// `ddl` and the two statements, lowered under `mode` from a pair file.
-fn lower(ddl: &str, a: &str, b: &str, mode: CatalogSource) -> sqleq_frontend::Result<serde_json::Value> {
+fn lower(ddl: &str, a: &str, b: &str, mode: CatalogSource) -> sqleq::Result<serde_json::Value> {
     lower_with(&format!("{ddl}\n{a};\n{b};"), mode)
 }
 
-fn assert_system_refusal(r: sqleq_frontend::Result<serde_json::Value>, what: &str) {
+fn assert_system_refusal(r: sqleq::Result<serde_json::Value>, what: &str) {
     match r {
         Err(FrontendError::Unsupported(m)) if m.contains("system relation") => {}
         other => panic!("{what}: expected a system-relation refusal, got {other:?}"),

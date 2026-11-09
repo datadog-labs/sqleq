@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! Integration tests for [`sqleq_frontend::reflexive`] — the check that says a pair's two sides
+//! Integration tests for [`sqleq::reflexive`] — the check that says a pair's two sides
 //! become the same tree under the crate's normalizations, so the row is settled without a schema,
 //! a type, or the prover.
 //!
@@ -13,7 +13,7 @@
 //! never widens a refusal into a proof**: every way it can fail answers `false`, and each guard the
 //! normalizations carry has to still hold here.
 
-use sqleq_frontend::{reflexive, reflexive_forms, reflexive_with, Rewrites};
+use sqleq::{reflexive, reflexive_forms, reflexive_with, Rewrites};
 
 /// A pair, in the `.sql` format the corpus driver builds.
 fn pair(a: &str, b: &str) -> String {
@@ -64,7 +64,7 @@ fn it_reaches_a_pair_the_frontend_refuses_to_lower() {
         "SELECT row_number() OVER (ORDER BY a) FROM t WHERE a IN (SELECT DISTINCT x FROM u)",
         "SELECT row_number() OVER (ORDER BY a) FROM t WHERE a IN (SELECT x FROM u)",
     );
-    assert!(sqleq_frontend::lower_sql(&src).is_err(), "test is vacuous if this pair lowers");
+    assert!(sqleq::lower_sql(&src).is_err(), "test is vacuous if this pair lowers");
     assert!(reflexive(&src));
 }
 
@@ -117,7 +117,7 @@ fn an_identical_dml_pair_is_reflexive() {
         "UPDATE t SET a = 1 WHERE a IN (SELECT DISTINCT x FROM u) RETURNING a",
         "UPDATE t SET a = 1 WHERE a IN (SELECT x FROM u) RETURNING a",
     );
-    assert!(sqleq_frontend::lower_sql(&src).is_err(), "test is vacuous if this pair lowers");
+    assert!(sqleq::lower_sql(&src).is_err(), "test is vacuous if this pair lowers");
     assert!(reflexive(&src));
     assert!(!reflexive(&pair("UPDATE t SET a = 1 WHERE a = 2", "UPDATE t SET a = 1 WHERE a = 3")));
 }
@@ -226,7 +226,7 @@ fn the_rendered_forms_agree_with_the_verdict() {
 }
 
 /// The binary says so too. `sqleq-frontend <input.sql>` on a refused pair that is nonetheless
-/// reflexive writes [`sqleq_frontend::REFLEXIVE_NOTE`] on a line of its own *before* the refusal,
+/// reflexive writes [`sqleq::REFLEXIVE_NOTE`] on a line of its own *before* the refusal,
 /// so the refusal is still the last line and the exit code still says no plan was written; a
 /// refused pair that is not reflexive, and a pair that lowers, write no such line.
 #[test]
@@ -254,8 +254,8 @@ fn the_single_file_mode_reports_a_reflexive_refusal() {
         "SELECT row_number() OVER (ORDER BY a) FROM t WHERE a IN (SELECT x FROM u)",
     );
     assert!(!ok, "a refusal is still a failure: no plan was written");
-    assert_eq!(lines.first().map(String::as_str), Some(sqleq_frontend::REFLEXIVE_NOTE));
-    assert_ne!(lines.last().map(String::as_str), Some(sqleq_frontend::REFLEXIVE_NOTE),
+    assert_eq!(lines.first().map(String::as_str), Some(sqleq::REFLEXIVE_NOTE));
+    assert_ne!(lines.last().map(String::as_str), Some(sqleq::REFLEXIVE_NOTE),
                "the refusal itself must stay the last line");
 
     let (ok, lines) = run(
@@ -264,10 +264,10 @@ fn the_single_file_mode_reports_a_reflexive_refusal() {
         "SELECT rank() OVER (ORDER BY a) FROM t",
     );
     assert!(!ok);
-    assert!(!lines.iter().any(|l| l == sqleq_frontend::REFLEXIVE_NOTE), "{lines:?}");
+    assert!(!lines.iter().any(|l| l == sqleq::REFLEXIVE_NOTE), "{lines:?}");
 
     let (ok, lines) = run("lowered", "SELECT a FROM t", "SELECT a FROM t");
     assert!(ok, "{lines:?}");
-    assert!(!lines.iter().any(|l| l == sqleq_frontend::REFLEXIVE_NOTE));
+    assert!(!lines.iter().any(|l| l == sqleq::REFLEXIVE_NOTE));
     let _ = std::fs::remove_dir_all(&dir);
 }

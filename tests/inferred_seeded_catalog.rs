@@ -18,7 +18,7 @@
 //! prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 /// Issue #111's first pair: `t` is read only through `count(*)`, and `$N` keeps the declared catalog
 /// from lowering it at all, so no catalog lowered it.

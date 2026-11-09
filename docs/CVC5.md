@@ -39,25 +39,26 @@ The axis is written against the `bags-algebra` branch of cvc5
 exercises: normal forms for the relational terms the encoding builds, the keys and `NOT NULL`
 columns of the tables read off their constraints (a preprocessing pass, `bags-facts`), and lemmas
 for folds, maps and disequalities. No cvc5 release has it yet, so one script fetches that branch at
-a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the crate against
+a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the axis against
 it:
 
 ```sh
-sh tools/build_cvc5.sh            # once; then, like the other crates:
-cargo build --release -p sqleq-cvc5
-cargo test -p sqleq-cvc5
+sh tools/build_cvc5.sh            # once; then, like the other features:
+cargo build --release --features cvc5
+cargo test --features cvc5
 ```
 
 The first run compiles cvc5 for 5 to 15 minutes, by the cores, and needs git, cmake 3.16 or later,
 a C++17 compiler and Python 3; cvc5 downloads and builds CaDiCaL, SymFPU, LibPoly, MPFR and, where
 the system has none, GMP, and installs the shared ones beside itself.
-A second run with the same commit only rebuilds the crate. `.cargo/config.toml` points
+A second run with the same commit only rebuilds the axis. `.cargo/config.toml` points
 `CVC5_LIB_DIR` at the install, so cargo needs no environment; to build against a cvc5 of your own,
 set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../include` or
 `$CVC5_INCLUDE_DIR`), or `SQLEQ_CVC5_REPO` and `SQLEQ_CVC5_COMMIT` to have the script build another
 commit. Any cvc5 from 1.4.0 on runs the encoding, but proves far fewer pairs without the branch.
-The crate is opt-in like `sqleq-fuzz` and `sqleq-solver` (not a default workspace member), and CI
-does not build it.
+The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
+plans through the crate's `ir` module rather than through the solver, so `--no-default-features
+--features cvc5` builds the axis without compiling Z3.
 
 **Licences.** cvc5 is BSD-licensed, but it links libraries under the LGPL v3: LibPoly and MPFR,
 which its build downloads and installs beside it in `target/cvc5/install/lib`, and GMP (LGPL v3 or
@@ -106,7 +107,7 @@ are checked like any axis's, and are bags answers: a pinned run refuses `--cvc5-
 against a sqleq-fuzz counterexample it is an alarm, like any prover's; but it decides no
 `--portfolio` verdict (a pair only cvc5 proves is `undecided`, and so is one only cvc5 left
 running at the deadline, which is not re-run) and is no evidence for a pinned
-pair's truth (`sqleq-check/src/suite.rs`, `evidence_equivalent`), until the bag work is in a cvc5
+pair's truth (`src/check/suite.rs`, `evidence_equivalent`), until the bag work is in a cvc5
 release and the axis has been cross-checked against sqleq-fuzz. A `model` likewise decides nothing
 alone: it refutes the plan, which lacks the constraints the frontend does not carry, not the pair.
 

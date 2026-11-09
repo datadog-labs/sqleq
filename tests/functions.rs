@@ -7,7 +7,7 @@
 //! which are volatile. Each refusal here is a call that used to lower to the same term as a
 //! different call, or to a per-row scalar where Postgres returns one row.
 
-use sqleq_frontend::{lower_sql, reflexive, reflexive_forms, FrontendError, Rewrites};
+use sqleq::{lower_sql, reflexive, reflexive_forms, FrontendError, Rewrites};
 
 const T: &str = r#"create table "t" ("a" INTEGER, "b" VARCHAR, "c" DOUBLE PRECISION, unique ("a"));
 create table "u" ("k" INTEGER, unique ("k"));"#;

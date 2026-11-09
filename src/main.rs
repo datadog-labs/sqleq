@@ -13,11 +13,11 @@
 //! Writes the JSON to `out.json` (default: the input path with a `.fe.json` extension) and prints
 //! that path on success. On any lowering error it prints the reason to stderr and exits non-zero —
 //! the frontend never emits partial/best-effort IR. When the two sides of a refused pair normalize
-//! to one query, the line [`sqleq_frontend::REFLEXIVE_NOTE`] comes first, so the refusal is still
+//! to one query, the line [`sqleq::REFLEXIVE_NOTE`] comes first, so the refusal is still
 //! the last line a caller reads.
 //!
 //! By default the schema is read from the input's `CREATE TABLE`s. The two flags turn type inference
-//! on instead; see [`sqleq_frontend::CatalogSource`] for what each decides, and note that they also
+//! on instead; see [`sqleq::CatalogSource`] for what each decides, and note that they also
 //! enable the cast rules and the `DECLARE` synthesis, which are not separable from it.
 //!
 //! `--ddl <file>` reads the schema from raw Postgres DDL instead, ignoring any `CREATE TABLE`s in
@@ -26,7 +26,7 @@
 //! `--csv <corpus.csv> -o <dir>` is the batch form: every row of the corpus is lowered directly,
 //! reading its DDL out of the row, and no `.sql` intermediate is written. `--report <report.json>`
 //! adds every row's outcome and the refusal histogram; `--limit N` stops after the first N rows.
-//! See [`sqleq_frontend::corpus`].
+//! See [`sqleq::corpus`].
 //!
 //! `--sqlsolver --ir <input.json>` is the only mode whose input is an `Input` rather than SQL: it
 //! packages an *already lowered* plan as one job for a SQLSolver driver — `sqleq-solver`, or the
@@ -34,12 +34,12 @@
 //! `--name <id>` (default: the file stem) and written to `-o <job.jsonl>` (default: stdout). It
 //! lowers nothing — deliberately, so that `sqleq-check` can hand the SQLSolver axis the very bytes
 //! it handed the QED prover, with no second lowering between the two. See
-//! [`sqleq_frontend::sqlsolver::ir_job_from_input`].
+//! [`sqleq::sqlsolver::ir_job_from_input`].
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use sqleq_frontend::{corpus, CatalogSource};
+use sqleq::{corpus, CatalogSource};
 
 const USAGE: &str = "usage: sqleq-frontend [--infer|--infer-seeded] [--ddl <schema.sql>] <input.sql> [out.json]
        sqleq-frontend [--infer|--infer-seeded] --csv <corpus.csv> -o <dir> [--report <report.json>] [--limit N]
@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     }
     let sqlsolver = args.iter().any(|a| a == "--sqlsolver");
     args.retain(|a| a != "--sqlsolver");
-    // Only meaningful with `--sqlsolver`; see [`sqleq_frontend::sqlsolver::ir_job_from_input`].
+    // Only meaningful with `--sqlsolver`; see [`sqleq::sqlsolver::ir_job_from_input`].
     let ir = args.iter().any(|a| a == "--ir");
     args.retain(|a| a != "--ir");
     let mut source = CatalogSource::Declared;
@@ -135,8 +135,8 @@ fn main() -> ExitCode {
     };
 
     let lowered = match &ddl {
-        Some(d) => sqleq_frontend::lower_with_ddl(&src, d, source),
-        None => sqleq_frontend::lower_with(&src, source),
+        Some(d) => sqleq::lower_with_ddl(&src, d, source),
+        None => sqleq::lower_with(&src, source),
     };
     match lowered {
         Ok(input) => {
@@ -151,8 +151,8 @@ fn main() -> ExitCode {
         Err(e) => {
             // The corpus mode gives such a row a status of its own; a single pair says it here,
             // ahead of the refusal, so the refusal is still the line a caller classifies.
-            if sqleq_frontend::reflexive(&src) {
-                eprintln!("{}", sqleq_frontend::REFLEXIVE_NOTE);
+            if sqleq::reflexive(&src) {
+                eprintln!("{}", sqleq::REFLEXIVE_NOTE);
             }
             eprintln!("{e}");
             ExitCode::FAILURE
@@ -195,7 +195,7 @@ fn run_ir_job(path: &Path, name: Option<&str>, out: Option<&str>) -> ExitCode {
         .map(str::to_string)
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "case".to_string());
-    let job = sqleq_frontend::sqlsolver::ir_job_from_input(name, ir);
+    let job = sqleq::sqlsolver::ir_job_from_input(name, ir);
     if let Some(r) = &job.refusal {
         eprintln!("{r}");
         return ExitCode::FAILURE;

@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, Result};
+use sqleq::{lower_with, lower_with_ddl, CatalogSource, Result};
 
 /// The pair `q0`/`q1` over `ddl`, lowered from a pair file and from raw DDL.
 fn both(ddl: &str, q0: &str, q1: &str) -> [Result<Value>; 2] {

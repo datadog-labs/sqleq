@@ -54,7 +54,7 @@
 
 use std::io::Write as _;
 
-use sqleq_frontend::{lower_with, reflexive, CatalogSource, FrontendError};
+use sqleq::{lower_with, reflexive, CatalogSource, FrontendError};
 
 /// The seed catalog. `t` and `u` share `a` and `b`, so an unqualified or wrongly qualified name can
 /// land on either; `m` has a quoted column `"A"`, which is not `a`; `w` is a third table to join.

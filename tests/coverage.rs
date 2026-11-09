@@ -9,7 +9,7 @@
 //! variants that must still be refused. They do not run a prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" VARCHAR, "k" VARCHAR, "ts" TIMESTAMP, "d" DATE, "n" REAL, unique ("id"));"#;
 const U: &str = "CREATE TABLE u (id integer, s text, xs int[], ys text[], m int[][], unique (id));";

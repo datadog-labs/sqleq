@@ -12,7 +12,7 @@
 //! they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 /// `t` and `u` join on `k`; `w` is a third table for the `IN` shape; `n` has columns named like a
 /// function and like a type, so an output column can share a name with an input column.

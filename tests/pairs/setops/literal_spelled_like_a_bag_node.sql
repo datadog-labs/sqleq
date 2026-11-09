@@ -13,7 +13,7 @@
 -- origin: PR #222 review: sqleq-check withheld from QED a plan whose text spelled a bag set
 --   operation's node, and the literal 'exceptAll' is the same characters as the node's key, so
 --   this pair, which has no bag set operation, was never handed to QED. Only object keys are matched
---   now (sqleq-check/src/case.rs, bag_set_op)
+--   now (src/check/case.rs, bag_set_op)
 create table "t" ("s" VARCHAR);
 SELECT s FROM t WHERE s = 'exceptAll';
 SELECT s FROM t WHERE 'exceptAll' = s;

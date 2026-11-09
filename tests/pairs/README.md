@@ -23,15 +23,15 @@ row slice and `DISTINCT ON`: a non-equivalent pair that no prover may prove.
 ## Running them
 
 ```sh
-# The axes CI runs, one job per axis there. `cargo build --release` builds sqleq-check and the
-# frontend; the other two need `cargo build --release -p sqleq-fuzz -p sqleq-solver` as well.
+# The axes CI runs, one job per axis there. `cargo build --release` builds the four binaries
+# they need: sqleq-check, the frontend, sqleq-fuzz and sqleq-solver.
 sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 # The axes CI does not install (one SQLSolver per run). qed needs the prover, found as
-# sqleq-check/README.md says; sqlsolver-jvm needs the fork, named by --sqlsolver-tree or
+# docs/check.md says; sqlsolver-jvm needs the fork, named by --sqlsolver-tree or
 # $SQLEQ_SQLSOLVER, and $SQLEQ_SQLSOLVER_DEPS:
 sqleq-check --expect pinned --axes qed tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
-# The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test -p sqleq-lean`:
+# The Lean axis, which needs `lake` on PATH; CI checks its pins with `cargo test --features lean`:
 sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
 # The cvc5 axis, which needs sqleq-cvc5 built by `sh tools/build_cvc5.sh` (docs/CVC5.md). Its
 # `model` refutes the plan, not the pair, so an equivalent pair may carry one; a `proved` on a
@@ -104,7 +104,7 @@ line and in `--axes`, and a pin `--bless` rewrites gets the new name.
 
 Read two of these with care. A prover's `no-proof` is not a refutation. A `no-counterexample` is
 not a proof. `sqleq-fuzz` draws values from a small domain (see its
-[README](../../sqleq-fuzz/README.md)), so a non-equivalent pair whose witness needs a varchar
+[README](../../docs/fuzz.md)), so a non-equivalent pair whose witness needs a varchar
 length, a date at infinity or a second session is pinned `no-counterexample` and carries a
 `witness:` instead.
 
@@ -114,7 +114,7 @@ length, a date at infinity or a second session is pinned `no-counterexample` and
 |---|---|
 | an answer that contradicts `truth`: a prover (Lean included) proves a non-equivalent pair, the frontend finds its two sides one query (`emit-reflexive` or `reflexive`), or `sqleq-fuzz` refutes an equivalent one (`counterexample` under `binding: index`, `counterexample-gather` under `binding: gather`) | **fails; `--bless` will not pin it** |
 | the same, on a line marked `!known-unsound` | passes while the bug reproduces |
-| a proof (or the frontend's `emit-reflexive` or `reflexive`) and a `sqleq-fuzz` counterexample under the same binding on one pair, an [alarm](../../sqleq-check/README.md#alarms) — whether or not either contradicts `truth`, as an index-binding proof and counterexample on a gather pair do not | fails, unless one of the two is a `!known-unsound` line that still reproduces |
+| a proof (or the frontend's `emit-reflexive` or `reflexive`) and a `sqleq-fuzz` counterexample under the same binding on one pair, an [alarm](../../docs/check.md#alarms) — whether or not either contradicts `truth`, as an index-binding proof and counterexample on a gather pair do not | fails, unless one of the two is a `!known-unsound` line that still reproduces |
 | a `!known-unsound` line whose answer no longer contradicts `truth` | fails; `--bless` drops the marker |
 | a pinned answer that moved, either way | fails; `--bless` takes the new answer |
 | an axis that ran with no `expect` line | fails; `--bless` adds one |
