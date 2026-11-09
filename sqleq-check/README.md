@@ -30,9 +30,10 @@ only the frontend's library, to read a corpus CSV exactly as the frontend reads 
 - `sqleq-solver` — the prover, asked by default: `cargo build --release -p sqleq-solver`. It is not
   a default workspace member, because its first build compiles Z3 from source.
 - For the axes that ask them, and only then: `qed-prover`, the external QED prover binary, for
-  `--qed` and the default portfolio; `sqleq-fuzz` and `sqleq-lean`, each built with
-  `cargo build --release -p <crate>` (neither is a default workspace member); and the JVM fork for
-  `--sqlsolver-jvm`.
+  `--qed` and the default portfolio; `sqleq-fuzz`, `sqleq-cvc5` and `sqleq-lean`, each built with
+  `cargo build --release -p <crate>` (none is a default workspace member, and `sqleq-cvc5` needs a
+  cvc5 library first, which `sh tools/build_cvc5.sh` builds: see [`../docs/CVC5.md`](../docs/CVC5.md));
+  and the JVM fork for `--sqlsolver-jvm`.
 
 Each binary is looked up in this order, and the first that is found wins:
 
@@ -43,6 +44,7 @@ Each binary is looked up in this order, and the first that is found wins:
 | `qed-prover` | `--prover` | — | `$QED_PROVER` | `PATH`, then the newest wrapped prover under `/nix/store` (that wrapper carries z3 + cvc5 on its own `PATH`, so it works outside the Nix dev shell) |
 | `sqleq-fuzz` | `--fuzz-bin` | `--bin-dir` | `$SQLEQ_FUZZ` | `PATH`, then the newer of this repo's two builds |
 | `sqleq-lean` | `--lean-bin` | `--bin-dir` | `$SQLEQ_LEAN` | this repo's `target/release`, then `target/debug` |
+| `sqleq-cvc5` | `--cvc5-bin` | `--bin-dir` | `$SQLEQ_CVC5_BIN` | `PATH`, then the newer of this repo's two builds |
 
 A flag, a variable or a `--bin-dir` that names a missing or non-executable file is an error, never a
 fallback to another binary — except for `sqleq-lean`, where a `--lean-bin` or `$SQLEQ_LEAN` that
@@ -99,7 +101,7 @@ sqleq-check --keep ./work rewrites/
 | `--frontend PATH` | The `sqleq-frontend` binary ([lookup order](#requirements)). |
 | `--prover PATH` | The `qed-prover` binary ([lookup order](#requirements)). |
 | `--fuzz-bin PATH` | The `sqleq-fuzz` binary ([lookup order](#requirements)). |
-| `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver and sqleq-lean out of DIR, unless a flag names one. |
+| `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver, sqleq-cvc5 and sqleq-lean out of DIR, unless a flag names one. |
 | `--json FILE` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs: each case's in `DIR/<name>`, with every `/` in the name as `__`. That directory is emptied when the case starts, so a re-run never reads the answers a previous run left there. |
 | `--no-retry` | Don't re-run transient failures at the end. |
@@ -112,6 +114,12 @@ sqleq-check --keep ./work rewrites/
 | `--sqleq-solver-mem-gib G` / `--qed-mem-gib G` | Cap each sqleq-solver driver's or the QED prover's (z3 and cvc5 included) address space, as `ulimit -v` does. |
 | `--sqlsolver-jvm` | Ask the original SQLSolver in sqleq-solver's place, as a JVM fork through `tools/sqlsolver/IrDriver`: `sqleq-solver`'s backup cross-check, and deprecated. Same jobs, same result rows, same buckets, but it never decides `--expect equivalent`: add `--qed` for a prover that does, or use `report-only` or `pinned`. Not with `--sqleq-solver` or `--portfolio`. |
 | `--sqlsolver-tree DIR` | With `--sqlsolver-jvm`: the fork to run it from, either as this flag or as `$SQLEQ_SQLSOLVER`. |
+| `--cvc5` | Also ask `sqleq-cvc5`, the lowered plan encoded over cvc5's bags or sets of tuples — see [The cvc5 axis](#the-cvc5-axis). Its `proved` is a proof under that encoding, half of an [alarm](#alarms) against a sqleq-fuzz counterexample, and its `model` a refutation of the plan, half of one against a proof over the same plan; neither decides a verdict while the axis is experimental, so it never changes the exit code but by an alarm or a pin. The same as adding `cvc5` to `--axes`. |
+| `--cvc5-bin PATH` | The `sqleq-cvc5` binary ([lookup order](#requirements)). |
+| `--cvc5-semantics bags\|sets` | The semantics it encodes under (default `bags`, SQL's own; `sets` collapses duplicates and is far easier for the solver). |
+| `--cvc5-opt NAME=VALUE` | A further cvc5 option, repeatable: `bags-deq-decompose=false`, say. |
+| `--cvc5-timeout MS` | cvc5's own cap on each case's check (default: `-t` in ms); the process is killed at the case's deadline regardless. |
+| `--cvc5-mem-gib G` | Cap each `sqleq-cvc5` process's address space, as `ulimit -v` does. Its workers reserve a 512 MiB stack each, which the cap counts, so give it a few GiB at least; a case it kills is an `error`. |
 | `--lean` | Also run the Lean axis, `sqleq-lean`, over the `.sql` cases and corpus rows: `INSERT … VALUES` vs `INSERT … SELECT * FROM unnest(…)` pairs, proved under the gather rule (or, with generated cells such as `DEFAULT`, its weaker generated form). It reads the pair itself, so it answers pairs the frontend refuses. The same as adding `lean` to `--axes`; outside `--expect pinned` it never changes the exit code. See [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `--lean-bin PATH` | The `sqleq-lean` binary ([lookup order](#requirements)). It needs `lake` on `PATH`. |
 | `--lean-replay-plan FILE` | Have sqleq-lean also write what `tools/lean_replay.py` needs. Not under `--portfolio`, which runs Lean per case. |
@@ -290,6 +298,52 @@ is the second opinion, in the same table with the roles swapped. With neither pr
 headed `SQLSolver axis`, and its table ends in one line on the same footing: `proved <n>/<N>`, how
 many of the pairs whose two queries differ it proved.
 
+## The cvc5 axis
+
+`--cvc5` encodes **the same lowered plan** as an SMT problem over cvc5's theory of bags of tuples
+(`--cvc5-semantics sets` for sets) and asks cvc5 for a model, after the frontend's pass, one
+`sqleq-cvc5` process per case, `-j` wide:
+
+```
+  cvc5 axis  — sqleq-cvc5 (bags), over the lowered IR; experimental
+  ────────────────────────────────────────
+  proved                   <n>
+  model                    <n>
+  no-proof                 <n>
+  unsupported              <n>
+  timeout                  <n>
+  ────────────────────────────────────────
+  cvc5 proved   <n>/<N>  (<p>%)   pairs whose two queries differ; decides no verdict
+  model                         <case>  — emp=[(0,'',NULL,...)]
+```
+
+`proved` is a proof under the encoding, and `model` a database on which cvc5's encodings of the
+two queries differ, checked by cvc5 against its own assertions: a refutation of the plan, under the
+encoding's readings of the types (integers unbounded, numerics exact, opaque values compared by
+identity) and under the plan's constraints alone, claimed only when the problem had no
+uninterpreted symbol in it. It is an [alarm](#alarms) against a proof over the same plan, from
+sqleq-solver, the QED prover or the frontend's reflexivity, but decides no verdict on its own -- the
+frontend drops the constraints it cannot carry, so the database may be one the DDL forbids -- and it
+is not an executed counterexample as sqleq-fuzz's is; the report never calls it one. `no-proof` is
+cvc5's `unknown`, a model found under uninterpreted symbols (kept in the note as a candidate), or
+two queries whose rows the encoding cannot compare.
+
+The axis is **experimental**: its bag reasoning lives in an unreleased branch of cvc5 and its
+proofs are not checked. So `proved` is reported, and is an alarm against a sqleq-fuzz
+counterexample, but it decides no verdict, under `--portfolio` or `--expect equivalent`, and counts
+as evidence for no pinned pair's truth, until the bag work is in a cvc5 release and the axis has
+been cross-checked against sqleq-fuzz. Under `--portfolio` a case only cvc5 left unanswered is
+`undecided`, never `timeout`, and is not re-run. Under `--cvc5-semantics sets` the answers are `proved-sets` and
+`model-sets`: about an approximation under which duplicates collapse (`UNION ALL` and `UNION` are
+one set), so they neither claim nor refute anything about the pair, and `--expect pinned` refuses
+the flag (exit 2), since the pins are bags answers.
+
+Each case is one process, killed at the case's deadline; `--cvc5-timeout` is cvc5's own cap within
+it, and `--cvc5-mem-gib` caps the process's address space. A case the cap kills is an `error`.
+`--csv` gains the axis's `c_bucket`, `c_verdict`, `c_ms` and `c_note` columns when it is asked.
+[`../docs/CVC5.md`](../docs/CVC5.md) has the encoding, its approximations and how to build the
+binary.
+
 ## Portfolio: every backend at once
 
 ```sh
@@ -308,19 +362,20 @@ counterexample on the same pair mean one of the two backends is wrong, and a run
 first answer could not see it.
 
 It asks `frontend`, `sqleq-solver`, `qed` and `fuzz` unless `--axes` names others; `--lean` adds the
-Lean axis. Each case gets one verdict, read off the same per-axis answers `--expect pinned` judges,
+Lean axis, and `--cvc5` the cvc5 axis, which can raise an alarm but decides nothing on its own
+([The cvc5 axis](#the-cvc5-axis)). Each case gets one verdict, read off the same per-axis answers `--expect pinned` judges,
 through the suite's own tables of which answer claims, evidences or refutes equivalence under which
 parameter binding:
 
 | verdict | when |
 |---|---|
-| `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair (or the frontend found its two sides one query) and sqleq-fuzz found a counterexample. One of them is wrong. |
+| `alarm` | Under one parameter binding, a backend claims equivalence and another refutes it — in practice, a prover proved the pair (or the frontend found its two sides one query) and sqleq-fuzz found a counterexample, or, over the same plan, cvc5 found a `model`. One of them is wrong. |
 | `not-equivalent` | sqleq-fuzz found an instance on which the two sides differ. |
 | `equivalent` | sqleq-solver or the QED prover proved the pair (`proved` or `proved-literal`), or the frontend found its two sides one query — lowered to the same IR (`emit-reflexive`), or refused but normalized to the same tree (`reflexive`) — under index binding: the claim `provable` makes. |
 | `not-equivalent-gather` | sqleq-fuzz found an instance on which the two sides differ under the gather rule (`counterexample-gather`), and nothing was decided under index binding. |
 | `equivalent-gather` | Only Lean proved it, under the gather rule. A different claim from `equivalent` — see [`../docs/LEAN.md`](../docs/LEAN.md). |
 | `equivalent-gather-generated` | Only Lean proved it, under the gather rule's weaker generated form. |
-| `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. |
+| `timeout` | Nothing decisive, and some backend (the frontend included) was still running at the deadline. More time might decide it. A case only cvc5 left running is `undecided`: its answer could not have decided it. |
 | `undecided` | Nothing decisive, and every backend finished. |
 
 Lean's `no-witness` is a kernel proof that may be vacuous, so it is never evidence of equivalence:
@@ -333,8 +388,8 @@ relation between the two sides' parameters, so beside a Lean proof it makes the 
 says. Neither `timeout` nor `undecided` says the pair is not equivalent.
 
 **The verdict decides the exit code.** `--expect equivalent` (the default) passes only when every
-case is `equivalent`, so a proof from any prover that reads the IR, or the frontend's reflexivity,
-counts, and a Lean proof does not. `--expect report-only` passes unless some case is an `alarm`, which fails every
+case is `equivalent`, so a proof from sqleq-solver or the QED prover, or the frontend's reflexivity,
+counts, and a Lean proof or an experimental cvc5 proof does not. `--expect report-only` passes unless some case is an `alarm`, which fails every
 run, as it does [without `--portfolio`](#alarms). `--expect pinned` and `--sqlsolver-jvm` do not combine with it (exit 2): a pin must not depend
 on a time budget, and a JVM started per case would cost more than the case.
 
@@ -367,8 +422,11 @@ Three things to know before reading one:
 
 A proof and a counterexample on the same pair mean one of the two backends is wrong: a prover's
 proof (`proved` or `proved-literal`), or the frontend's finding that the two sides are one query
-(`emit-reflexive` or `reflexive`), against a sqleq-fuzz `counterexample`; or a Lean proof
-(`proved-gather` or `no-witness`) against a sqleq-fuzz `counterexample-gather`. Every run that asks
+(`emit-reflexive` or `reflexive`), against a sqleq-fuzz `counterexample`; a proof or that finding
+against a cvc5 `model`, which refutes the plan they were reached on; or a Lean proof
+(`proved-gather` or `no-witness`) against a sqleq-fuzz `counterexample-gather`. cvc5's own
+`proved` counts here, experimental as it is: it is a claim, and a counterexample beside it is worth
+knowing about. Every run that asks
 both sides compares them, with or without `--portfolio`, by the same rule its `alarm` verdict uses,
 and under the same parameter binding only. Each alarm is printed by name with the answers that met,
 `--json` lists the cases in `meta.alarms`, and **an alarm fails the run whatever `--expect` says**,
@@ -444,8 +502,8 @@ It prints one table of pins in place of the per-case lines.
 sqleq-check --expect pinned --axes frontend     tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes fuzz         tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes sqleq-solver tests/pairs examples/*.sql
-# After a change that moves answers: rewrite the pins, then review the diff (add qed and lean
-# where they are installed).
+# After a change that moves answers: rewrite the pins, then review the diff (add qed, lean and
+# cvc5 where they are installed).
 sqleq-check --expect pinned --bless --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 ```
 
@@ -456,6 +514,11 @@ Two things a pin depends on, though neither is particular to this policy:
   pin. It reads the pair itself, so `--axes fuzz` alone needs no frontend. It answers a pair of the
   gather rule's shape under that rule, as `counterexample-gather` or `no-counterexample-gather`,
   and those are the answers a `binding: gather` pin judges against its truth.
+* **The cvc5 axis.** Its pins are answers under bags, the default; `--expect pinned` refuses
+  `--cvc5-semantics sets` (exit 2), whose answers are about an approximation. Its `proved` is
+  experimental, so it is no evidence for a case's `truth:`, though on a non-equivalent pair it
+  contradicts it as any prover's would; its `model`, a refutation of the plan, contradicts no
+  truth, and is an alarm against a proof over the same plan instead.
 * **The catalog header.** A case may say `-- catalog: inferred` or `-- catalog: inferred-seeded`,
   and the frontend is run with the matching flag; any `.sql` input may, not only a pinned one.
 

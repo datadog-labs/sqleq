@@ -41,6 +41,7 @@ impl<'a> Portfolio<'a> {
             ("--sqleq-solver-bin", &f.solver),
             ("--fuzz-bin", &f.fuzz),
             ("--lean-bin", &f.lean),
+            ("--cvc5-bin", &f.cvc5),
         ] {
             argv.extend([s(flag), bin.to_string_lossy().into_owned()]);
         }
@@ -242,6 +243,14 @@ fn the_reports_carry_the_verdict() {
     let header = text.lines().next().unwrap();
     assert!(header.ends_with("p_verdict,p_by,p_pending,p_first_s,p_retried"), "{header}");
     assert!(text.lines().nth(1).unwrap().contains(",equivalent,sqleq-solver,"), "{text}");
+
+    // The cvc5 axis's columns come only with the axis, after the portfolio's.
+    p.set("FAKE_CVC5", "EQ");
+    let ran = p.run(&["--axes", "frontend,sqleq-solver,cvc5", "--csv", &csv.to_string_lossy()]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    let text = std::fs::read_to_string(&csv).unwrap();
+    let header = text.lines().next().unwrap();
+    assert!(header.ends_with("p_retried,c_bucket,c_verdict,c_ms,c_note"), "{header}");
 }
 
 #[test]
@@ -318,3 +327,41 @@ fn a_refused_pair_whose_sides_are_one_query_is_equivalent() {
     assert_eq!(verdict(&c), "undecided");
 }
 
+
+#[test]
+fn a_cvc5_model_is_a_candidate_and_contradicts_a_proof() {
+    let f = setup();
+    let mut p = Portfolio::new(&f);
+    p.set("FAKE_CVC5", "NEQ");
+    // Alone, a model decides nothing: it refutes the plan, which may lack a constraint the DDL has.
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(verdict(&case), "undecided");
+    assert_eq!(case["c_bucket"], "model");
+    assert_eq!(case["c_note"], "t=[(0)]");
+
+    p.set("FAKE_QED", "proved");
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 1, "an alarm fails the run");
+    assert_eq!(verdict(&case), "alarm");
+
+    // A model under uninterpreted symbols decides nothing.
+    p.set("FAKE_QED", "no-proof").set("FAKE_CVC5_INEXACT", "1");
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(verdict(&case), "undecided");
+    assert_eq!(case["c_bucket"], "no-proof");
+
+    // The axis is experimental: its proof alone decides nothing, and is reported.
+    p.set("FAKE_CVC5", "EQ");
+    let (ran, case) = p.case(&["--axes", "qed,cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+    assert_eq!(verdict(&case), "undecided");
+    assert!(strings(&case["portfolio"]["by"]).is_empty());
+    assert_eq!(case["c_bucket"], "proved");
+
+    // And it is no portfolio backend on its own.
+    let (ran, _) = p.case(&["--axes", "cvc5", "--expect", "report-only"]);
+    assert_eq!(ran.code, 2, "{}{}", ran.out, ran.err);
+    assert!(ran.err.contains("cvc5 decides nothing on its own"), "{}", ran.err);
+}

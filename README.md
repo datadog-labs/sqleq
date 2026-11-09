@@ -6,7 +6,8 @@ Turns query rewrites, optimizer changes, and migrations into something you verif
 
 ```
                               ┌─▶ sqleq-frontend ──▶ IR ───┬─▶ sqleq-solver ──▶ proof?
-                              │   parse·resolve·type·lower └─▶ qed-prover ────▶ proof? (optional)
+                              │   parse·resolve·type·lower ├─▶ qed-prover ────▶ proof? (optional)
+                              │                            └─▶ sqleq-cvc5 ────▶ proof? model? (experimental)
 SQL pair + DDL ─▶ sqleq-check ┼─▶ sqleq-fuzz ──▶ generated tables in Postgres ▶ counterexample?
                               └─▶ sqleq-lean ──▶ Lean kernel ─────────────────▶ proof? (INSERTs)
 ```
@@ -29,6 +30,16 @@ sqleq-solver's and never changing the exit code, and in a portfolio its proof co
 The original Java SQLSolver can be asked in sqleq-solver's place (`--sqlsolver-jvm`), as a backup
 cross-check that is being retired, but it needs a fork that is not published. See
 [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md).
+
+**`sqleq-cvc5`** encodes the same IR over [cvc5](https://cvc5.github.io/)'s theory of bags of tuples
+(or sets, as an approximation), after the LPAR'24 work on relations and tables in cvc5, and asks
+cvc5 for a model. Asked with `--cvc5`, its `proved` is a proof under that encoding and its `model`
+a database on which the two encodings differ -- a refutation of the plan, which is an alarm against
+a proof over the same plan, though not of the pair: the plan lacks the constraints the frontend does
+not carry, and `sqleq-fuzz`'s executed counterexample remains the refutation. The axis is
+**experimental**: it links a cvc5 library you build from an unreleased branch, and its proofs are
+not checked, so they are reported and raise alarms but decide no verdict. See
+[`docs/CVC5.md`](docs/CVC5.md).
 
 The **Lean axis** (`sqleq-lean`) covers one class of `INSERT` pair the other axes cannot even state:
 `INSERT … VALUES` against `INSERT … SELECT * FROM unnest(…)`, where a parameter is a scalar on one
@@ -194,11 +205,11 @@ $CHECK rewrites/
 # Also the QED prover, as a second opinion beside sqleq-solver; the exit code stays sqleq-solver's.
 $CHECK --qed rewrites/
 
-# Name the axes to ask: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, lean.
+# Name the axes to ask: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, cvc5, lean.
 $CHECK --axes frontend,sqleq-solver,qed --expect report-only rewrites/
 
 # The frontend, sqleq-solver, the QED prover and sqleq-fuzz at once on each pair, one combined
-# verdict per pair, under a shared 60-second deadline (--lean adds the Lean axis).
+# verdict per pair, under a shared 60-second deadline (--cvc5 and --lean add their axes).
 $CHECK --portfolio -t 60 rewrites/
 
 # A corpus CSV (rows of query A, query B, DDL) instead of files, each row against its own DDL,
@@ -260,6 +271,14 @@ subprocess, and the heavier ones are opt-in workspace members, each built with `
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and
   builds the [`lean/`](lean/) package on first use; that package pins its own Lean version and
   needs no Mathlib.
+* **`sqleq-cvc5`** — `sh tools/build_cvc5.sh`, once. It needs the bag reasoning of a cvc5 branch
+  that no release has yet ([`bags-algebra`](https://github.com/mudathirmahgoub/cvc5/pull/27)), so
+  the script fetches that branch at a pinned commit, builds and installs it under `target/cvc5/`
+  (5 to 15 minutes the first time, by the cores; git, cmake, a C++17 compiler and Python 3), and then runs
+  `cargo build --release -p sqleq-cvc5`. After that, `cargo build -p sqleq-cvc5` and `cargo test
+  -p sqleq-cvc5` work like the other crates': `.cargo/config.toml` points `CVC5_LIB_DIR` at the
+  install. The bindings need `libclang`, and the first build compiles Z3 too, since the crate reads
+  the IR through `sqleq-solver`. See [`docs/CVC5.md`](docs/CVC5.md).
 
 The QED prover, which `--qed` and the default portfolio ask, is external (the upstream
 [`qed-solver`](https://github.com/qed-solver/prover) project) and is not vendored here. It needs the native `z3` and `cvc5` solvers, and its Nix flake
@@ -285,6 +304,7 @@ and failing those the newest Nix-built `qed-prover` it can find.
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | how the tool is validated, and the defects that validation has caught |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | why the frontend is built this way |
 | [`docs/SQLSOLVER.md`](docs/SQLSOLVER.md) | `sqleq-solver`, the default prover, on the IR the QED prover reads too, and the Java SQLSolver that cross-checks it |
+| [`docs/CVC5.md`](docs/CVC5.md) | `sqleq-cvc5`, experimental: the same IR as an SMT problem over cvc5's bags or sets of tuples, its proofs and its models |
 | [`docs/LEAN.md`](docs/LEAN.md) | the Lean axis: which `INSERT` pairs it proves, and under what rule |
 | [`docs/INTERNALS.md`](docs/INTERNALS.md) | module map, for reading or changing the code |
 | [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |

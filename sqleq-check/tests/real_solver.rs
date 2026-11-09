@@ -102,6 +102,8 @@ fn a_portfolio_asks_it_per_case() {
         prover: None,
         ss: Some(&driver),
         ss_cap_ms: None,
+        cvc5: None,
+        cvc5_cap_ms: None,
         fuzz: None,
         lean: None,
         timeout: 30.0,

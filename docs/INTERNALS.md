@@ -6,7 +6,9 @@ start at the [README](../README.md).
 `sqleq-check` sits on top and runs every backend as a subprocess. `src/` is the frontend: it parses
 a SQL pair, resolves names and types, and lowers it to the `Relation`/`Expr` IR the provers read —
 `sqleq-solver`, a Rust rewrite of SQLSolver and the default prover, through the jobs
-`src/sqlsolver.rs` packages that IR into, and the QED prover directly. The other backends read the pair themselves:
+`src/sqlsolver.rs` packages that IR into, the QED prover directly, and `sqleq-cvc5`, the
+experimental axis that encodes the same IR over cvc5's bags or sets of tuples. The other backends
+read the pair themselves:
 `sqleq-fuzz` runs the two statements on PostgreSQL looking for a counterexample and uses no part
 of the frontend, and `sqleq-lean` parses with the frontend's parser but builds its own Lean terms.
 See [DESIGN.md](DESIGN.md) for why the frontend refuses what it cannot lower.
@@ -56,7 +58,7 @@ building it builds none of them.
 | `sqleq-check/src/discover.rs` | finding each backend binary, and noticing one built from older sources |
 | `sqleq-check/src/inputs.rs` | which files are cases, what each is called, and whether a pair is `x` against `x` |
 | `sqleq-check/src/case.rs` | one case through the frontend and, when asked, the QED prover, and its SQLSolver job packaged |
-| `sqleq-check/src/axes/{fuzz,solver,lean}.rs` | the axes that run after the frontend's pass: `sqleq-fuzz`, the SQLSolver axis (`sqleq-solver`, the default prover, or the JVM fork), and `sqleq-lean` |
+| `sqleq-check/src/axes/{fuzz,solver,cvc5,lean}.rs` | the axes that run after the frontend's pass: `sqleq-fuzz`, the SQLSolver axis (`sqleq-solver`, the default prover, or the JVM fork), the experimental cvc5 axis (`sqleq-cvc5`, one process per case), and `sqleq-lean` |
 | `sqleq-check/src/portfolio.rs` | `--portfolio`: every backend at once on each case, under one deadline, and one combined verdict |
 | `sqleq-check/src/suite.rs` | the pinned-pair header grammar, lint, judgement and `--bless` behind `--expect pinned` |
 | `sqleq-check/src/pinned.rs` | each axis's answer reduced to the one word a pin records |
@@ -67,6 +69,7 @@ building it builds none of them.
 | `sqleq-check/tests/{portfolio,corpus}.rs` | `--portfolio` and `--corpus` end to end, over stand-in backends |
 | `sqleq-check/tests/real_cases.rs` | the hygiene gate over every committed pair: it lints, carries the licence, and names nothing from a corpus or a machine |
 | `sqleq-check/tests/real_solver.rs` | the SQLSolver pass against the real `sqleq-solver`; skips without a build unless `$SQLEQ_SOLVER_BIN` is set |
+| `sqleq-check/tests/real_cvc5.rs` | the cvc5 axis against the real `sqleq-cvc5`; skips without a build unless `$SQLEQ_CVC5_BIN` is set |
 | `tools/sqlsolver/` | our side of the IR bridge to the JVM SQLSolver, `sqleq-solver`'s backup cross-check: `IrToRel.java` builds the plan pair, `IrDriver.java` runs it; `sqleq-check --sqlsolver-jvm` compiles both ([SQLSOLVER.md](SQLSOLVER.md)) |
 
 Running the provers and `sqleq-fuzz` over one corpus and cross-tabulating the answers is what
@@ -92,6 +95,21 @@ in. What it rewrites, and where it deliberately differs from the original, is in
 | `sqleq-solver/src/eval.rs` | a concrete evaluator, so tests can check a rewrite against data |
 | `sqleq-solver/tests/` | the ladder end to end over hand-built IR, and the binary on plans past its depth bound |
 | `sqleq-solver/examples/` | manual gates and diagnostics run over a job file: translation, the ladder, rung-3 statistics, normalization traces and checks. CI compiles them but runs none, since their inputs are not in the repository |
+
+## The cvc5 axis (`sqleq-cvc5/`)
+
+The lowered IR as an SMT problem over cvc5's theory of bags (or sets) of tuples, after the LPAR'24
+Java translator, opt-in because it links a cvc5 library: `sh tools/build_cvc5.sh` builds the cvc5
+branch it needs and the crate. It reads the IR through `sqleq-solver`'s `ir` module, so the two
+axes read one plan one way, and answers in `IrDriver`'s row format with a `model` on `NEQ`.
+[CVC5.md](CVC5.md) has the encoding and its readings of the types.
+
+| path | what |
+|---|---|
+| `sqleq-cvc5/src/main.rs` | the binary, behind `IrDriver`'s command line and job/result JSONL, plus `--plan`, `--semantics`, `--opt` and `--smt2` |
+| `sqleq-cvc5/src/translate.rs` | the encoding: sorts, tables and their constraints, each relational operator, expressions under three-valued logic, subqueries, and the model read back |
+| `sqleq-cvc5/build.rs` | puts `CVC5_LIB_DIR` in the binary's rpath, when that directory exists |
+| `sqleq-cvc5/tests/encoding.rs` | the encoding end to end over hand-built IR: proofs, exact and candidate models, refusals, and where bags and sets part |
 
 ## The refuting axis (`sqleq-fuzz/`)
 

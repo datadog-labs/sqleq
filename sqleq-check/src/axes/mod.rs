@@ -5,6 +5,7 @@
 
 //! The axes that run after the frontend's pass (and the QED prover's), each over every case at once.
 
+pub mod cvc5;
 pub mod fuzz;
 pub mod lean;
 pub mod solver;
