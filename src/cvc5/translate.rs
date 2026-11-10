@@ -570,6 +570,13 @@ impl Encoder {
         }
     }
 
+    fn fold_kind(&self) -> Kind {
+        match self.sem {
+            Semantics::Bags => Kind::BagFold,
+            Semantics::Sets => Kind::SetFold,
+        }
+    }
+
     fn filter_kind(&self) -> Kind {
         match self.sem {
             Semantics::Bags => Kind::BagFilter,
@@ -1528,11 +1535,12 @@ impl Encoder {
             slot_sorts.extend(s.iter().cloned());
             slots.push(s);
         }
-        // GROUP BY over an empty table has no groups, so SQL answers with no rows, while
-        // table.aggr gives the empty table one empty part folded to a row of initial values. A
-        // hidden counter tells that row apart: it is the one with count 0, filtered out below and
-        // projected away again. (An ite over the whole table would hide the aggregate from the
-        // solver behind a fresh constant.)
+        // GROUP BY over an empty table has no groups, so SQL answers with no rows, as does
+        // table.aggr, whose parts are not empty (cvc5/cvc5#13151). Before, cvc5 gave the empty
+        // table one empty part, folded to a row of initial values; a hidden counter tells that
+        // row apart: it is the one with count 0, filtered out below and projected away again.
+        // The counter keeps the encoding right for those versions, and is the test the bags
+        // rewriter's aggregate rules look for.
         let counted = !indices.is_empty();
         if counted {
             slot_sorts.push(self.tm.integer_sort());
@@ -1593,8 +1601,16 @@ impl Encoder {
         let body = self.tm.mk_tuple(&elements)?;
         let init = self.tm.mk_tuple(&initial)?;
         let f = self.lambda(&[x, y], body)?;
-        let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
-        let mut aggregated = self.tm.mk_term_from_op(op, &[f, init, child.clone()])?;
+        let mut aggregated = if indices.is_empty() {
+            // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*)
+            // FROM empty is 0 -- the fold of all the rows, (bag (bag.fold f i t) 1). table.aggr
+            // by no columns has no row for an empty table, as no part.
+            let fold = self.tm.mk_term(self.fold_kind(), &[f, init, child.clone()])?;
+            self.singleton(fold)?
+        } else {
+            let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
+            self.tm.mk_term_from_op(op, &[f, init, child.clone()])?
+        };
         if counted {
             // keep the groups a row reached, then drop the counter
             let last = slot_sorts.len() - 1;
@@ -1610,8 +1626,6 @@ impl Encoder {
         if slots.iter().any(|s| s.len() > 1) || int_sums.iter().any(|b| *b) {
             aggregated = self.finish_aggregates(aggregated, indices.len(), calls, &slots, &int_sums)?;
         }
-        // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*) FROM
-        // empty is 0 -- which is what the fold of a single empty group gives.
         Ok(aggregated)
     }
 
