@@ -740,8 +740,24 @@ impl Builder {
                     }
                 }
             }
-            _ => {}
+            // Any other statement is read as one the parser rejected is ([`Builder::read_as_rejected`]).
+            other => self.read_as_rejected(other),
         }
+    }
+
+    /// What a statement, or an `ALTER TABLE` operation, that this reader has no arm for may have done:
+    /// read off its words as a statement the parser rejected is (`rejected_ddl`), and so only ever as
+    /// a loss of facts about what it names.
+    ///
+    /// Every statement that can change a relation either has an arm here or, under the parser this
+    /// reader was written against, failed to parse and was read that way. Reading the rest the same
+    /// way keeps a parser upgrade from turning a statement it has newly learned to parse into one
+    /// that is ignored: `CREATE RULE … DO INSTEAD` is a trigger on its table, `CREATE FOREIGN TABLE`
+    /// a relation whose columns are not known, and `ALTER TABLE c INHERIT p` a parent `p` whose
+    /// scans now read `c`'s rows. For a statement the reader already ignored, the words name nothing
+    /// it loses facts about: the heads that do are the ones with arms.
+    fn read_as_rejected(&mut self, st: &impl std::fmt::Display) {
+        crate::rejected_ddl::read(&st.to_string()).into_iter().for_each(|r| self.rejected(r));
     }
 
     /// A relation named `name` whose columns are not known. One already of that exact name is the
@@ -881,11 +897,14 @@ impl Builder {
                 for i in self.targets(&at.name) {
                     self.unread(i);
                 }
+                self.read_as_rejected(at);
             }
             return;
         };
+        // Set by an operation with no arm below, which may have changed more than this table.
+        let mut unmodeled = false;
         for op in &at.operations {
-            let Some(t) = self.table(i) else { return };
+            let Some(t) = self.table(i) else { break };
             use AlterTableOperation as Op;
             match op {
                 // A key added to a partitioned table alone is not on its partitions.
@@ -953,8 +972,14 @@ impl Builder {
                     }
                 }
                 op if changes_nothing_read(op) => {}
-                _ => self.unread(i),
+                _ => {
+                    self.unread(i);
+                    unmodeled = true;
+                }
             }
+        }
+        if unmodeled {
+            self.read_as_rejected(at);
         }
     }
 
