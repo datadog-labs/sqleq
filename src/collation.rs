@@ -158,7 +158,9 @@ fn deterministic(definition: &CreateCollationDefinition) -> bool {
         // A copy has the source's properties; only a predefined source's are known.
         CreateCollationDefinition::From(src) => split(src).is_some_and(|(n, cat)| cat && predefined(&n)),
         CreateCollationDefinition::Options(options) => options.iter().all(|o| match o {
-            SqlOption::KeyValue { key, value } if key.value.eq_ignore_ascii_case("deterministic") => {
+            SqlOption::KeyValue { key, value }
+                if matches!(key.0.as_slice(), [p] if p.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("deterministic"))) =>
+            {
                 let v = value.to_string();
                 matches!(v.trim_matches('\'').to_ascii_lowercase().as_str(), "true" | "on" | "yes" | "1")
             }

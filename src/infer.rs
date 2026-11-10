@@ -61,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    visit_expressions, visit_expressions_mut, AccessExpr, BinaryOperator, Expr, FunctionArg,
+    visit_expressions, visit_expressions_mut, AccessExpr, BinaryOperator, Expr, InTarget, FunctionArg,
     FunctionArgExpr, FunctionArguments, Ident, ObjectName, Query, Select, TableFactor,
     TableWithJoins, Value as SqlValue, Visit, Visitor,
 };
@@ -1261,8 +1261,7 @@ fn is_predicate(e: &Expr) -> bool {
         | Expr::Like { .. }
         | Expr::ILike { .. }
         | Expr::SimilarTo { .. }
-        | Expr::InList { .. }
-        | Expr::InSubquery { .. }
+        | Expr::In { target: InTarget::List(_) | InTarget::Subquery(_), .. }
         | Expr::Between { .. }
         | Expr::Exists { .. } => true,
         Expr::Function(f) => builtin_rtype(&obj_name(&f.name)) == Some(Ty::Bool),

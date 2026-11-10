@@ -146,7 +146,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Array, ArrayElemTypeDef, BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr,
+    Array, ArrayElemTypeDef, BinaryOperator, DataType, Expr, InTarget, FunctionArg, FunctionArgExpr,
     FunctionArguments, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 
@@ -260,7 +260,7 @@ fn side_of(q: &Query, inf: Option<&Inferred>) -> Side {
                 attribute(left, right, inf, &mut side);
                 attribute(right, left, inf, &mut side);
             }
-            Expr::InList { expr, list, .. } => {
+            Expr::In { expr, target: InTarget::List(list), .. } => {
                 for item in list {
                     attribute(item, expr, inf, &mut side);
                 }

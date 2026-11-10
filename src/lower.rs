@@ -15,7 +15,7 @@ use std::ops::ControlFlow;
 use serde_json::{json, Value};
 use sqlparser::ast::visit_expressions;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    AccessExpr, BinaryOperator, Distinct, DuplicateTreatment, Expr, InTarget, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy,
     ObjectName, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
@@ -1562,7 +1562,7 @@ pub(crate) fn is_closed(e: &Expr) -> bool {
         | Expr::CompoundFieldAccess { .. }
         | Expr::Subquery(_)
         | Expr::Exists { .. }
-        | Expr::InSubquery { .. }
+        | Expr::In { target: InTarget::Subquery(_) | InTarget::Table { .. }, .. }
         | Expr::AnyOp { .. }
         | Expr::AllOp { .. } => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
@@ -2224,7 +2224,8 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             json_path,
             sample,
             with_hints: _,
-            index_hints: _,
+            index_directives: _,
+            inheritance,
         } => {
             // SOUNDNESS GUARDS: each of these changes which rows the factor yields, and matching on
             // the fields explicitly (rather than `..`) is what keeps a parser upgrade from adding a
@@ -2235,6 +2236,8 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
             //   partitions     restricts to some partitions, so rows are missing
             //   json_path      navigates into the value rather than scanning it
             //   sample         TABLESAMPLE, which is not even deterministic
+            //   inheritance    `ONLY t` reads no child table and `t *` names them explicitly; this
+            //                  frontend models no inheritance, so neither is lowered as `t`
             let modifier = if args.is_some() {
                 Some("table-valued function arguments")
             } else if version.is_some() {
@@ -2247,6 +2250,8 @@ fn factor_instance(cat: &Catalog, fns: &Fns, tf: &TableFactor, offset: usize, ou
                 Some("PartiQL JSON path")
             } else if sample.is_some() {
                 Some("TABLESAMPLE")
+            } else if inheritance.is_some() {
+                Some("ONLY / * (table inheritance)")
             } else {
                 None
             };
@@ -2582,8 +2587,7 @@ fn implicit_name(e: &Expr) -> Option<String> {
         | Expr::Between { .. }
         | Expr::Like { .. }
         | Expr::ILike { .. }
-        | Expr::InList { .. }
-        | Expr::InSubquery { .. }
+        | Expr::In { target: InTarget::List(_) | InTarget::Subquery(_), .. }
         | Expr::AnyOp { .. }
         | Expr::AllOp { .. } => Some(OPERATOR.to_string()),
         _ => call_or_column_name(e),
@@ -3279,7 +3283,7 @@ fn contains_agg(fns: &Fns, e: &Expr) -> bool {
         | Expr::SimilarTo { expr, pattern, .. } => {
             contains_agg(fns, expr) || contains_agg(fns, pattern)
         }
-        Expr::InList { expr, list, .. } => contains_agg(fns, expr) || any(list),
+        Expr::In { expr, target: InTarget::List(list), .. } => contains_agg(fns, expr) || any(list),
         Expr::Tuple(es) => any(es),
         Expr::Array(a) => any(&a.elem),
         Expr::CompoundFieldAccess { root, access_chain } => {
@@ -3803,7 +3807,7 @@ fn post_columns(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr, out: &mut Vec
         // at that boundary, so `EXISTS (SELECT ... sum(x) ...)` is still offered.
         Expr::Exists { .. }
         | Expr::Subquery(_)
-        | Expr::InSubquery { .. }
+        | Expr::In { target: InTarget::Subquery(_), .. }
         | Expr::AnyOp { .. }
         | Expr::AllOp { .. }
             if !contains_agg(fns, e) =>
@@ -4200,7 +4204,9 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
             Ok(make_cmp("IS NOT DISTINCT FROM", lower_expr(cat, scope, fns, a)?, lower_expr(cat, scope, fns, b)?))
         }
         // x IN (a, b, ...) -> OR(x = a, ...);  (l1,l2) IN ((a1,a2),...) -> OR(AND(l1=a1, l2=a2), ...)
-        Expr::InList { expr, list, negated } => {
+        // `GLOBAL IN` (ClickHouse) and `IN UNNEST`/`IN <table>` are not Postgres's, and are refused
+        // by the catch-all below, as 0.63's separate variants for them were.
+        Expr::In { expr, target: InTarget::List(list), negated, global: false } => {
             let join = if *negated { "AND" } else { "OR" };
             let cmp = if *negated { "<>" } else { "=" };
             let mut terms: Vec<Value> = Vec::new();
@@ -4311,7 +4317,7 @@ fn lower_expr(cat: &Catalog, scope: &Scope, fns: &Fns, e: &Expr) -> Result<Value
         Expr::Cast { expr, data_type, .. } => {
             Ok(lower_cast(lower_expr(cat, scope, fns, expr)?, data_type))
         }
-        Expr::InSubquery { expr, subquery, negated } => {
+        Expr::In { expr, target: InTarget::Subquery(subquery), negated, global: false } => {
             lower_in_subquery(cat, scope, fns, expr, subquery, *negated)
         }
         // `x = ANY(...)` / `x <> ALL(...)` -- see [`lower_quantified`], which also explains why the

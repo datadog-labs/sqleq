@@ -935,6 +935,11 @@ impl Builder {
                             t.not_null[c] = true;
                         }
                         AlterColumnOperation::SetDataType { .. } => self.unread(i),
+                        // A foreign table's column options: not a column this reader models.
+                        AlterColumnOperation::GenericOptions { .. } => {
+                            self.unread(i);
+                            unmodeled = true;
+                        }
                     }
                 }
                 Op::DropConstraint { name, .. } => t.drop_constraint(&key_name(name)),

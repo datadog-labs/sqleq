@@ -120,8 +120,8 @@ const REJECTED: &[Row] = &[
 
 /// Input Postgres accepts.
 const ACCEPTED: &[Row] = &[
-    // Postgres syntax the frontend's parser does not read.
-    row(Unsupported, "SELECT", "SELECT 1", "parser does not read", "prepares: a select list may be empty"),
+    // An empty select list: the parser reads it (from sqlparser 0.64 on), and the frontend refuses it.
+    row(Unsupported, "SELECT", "SELECT 1", "FROM-less SELECT with no projection", "prepares: a select list may be empty"),
     row(Unsupported, r#"SELECT "a" FROM ONLY "t""#, r#"SELECT "a" FROM "t""#, "ONLY in a table reference", "prepares"),
     // A catalog relation Postgres reads and the frontend does not model, not an unknown table (#202).
     row(Unsupported, r#"SELECT "relname" FROM "pg_class""#, r#"SELECT "relname" FROM "pg_class" WHERE true"#,

@@ -248,7 +248,9 @@ fn passed_on(sel: &Select) -> Vec<&Query> {
             match constraint {
                 JoinConstraint::On(e) => conditions.push(e),
                 JoinConstraint::None => {}
-                JoinConstraint::Using(_) | JoinConstraint::Natural => return Vec::new(),
+                JoinConstraint::Using(_) | JoinConstraint::UsingAlias(..) | JoinConstraint::Natural => {
+                    return Vec::new()
+                }
             }
             entries.push(&j.relation);
         }
@@ -1105,7 +1107,7 @@ fn from_clause<'a>(
                     }
                 }
                 JoinConstraint::None => {}
-                JoinConstraint::Natural => return None,
+                JoinConstraint::Natural | JoinConstraint::UsingAlias(..) => return None,
             }
         }
     }

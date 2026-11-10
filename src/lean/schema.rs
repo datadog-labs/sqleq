@@ -49,6 +49,9 @@ pub fn type_key(dt: &DataType) -> TypeKey {
                     (format!("{t}"), true)
                 }
                 E::None => ("".to_string(), true),
+                // `ARRAY(T NOT NULL)` is no Postgres type; keyed by its whole spelling, it equals no
+                // type the rule accepts.
+                E::ParenthesisNotNull(_) => (format!("{dt}"), true),
             }
         }
         other => (format!("{other}"), false),

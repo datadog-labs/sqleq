@@ -11,7 +11,7 @@
 -- expect sqlsolver-jvm: no-plan
 -- expect cvc5: no-plan
 -- expect lean: unsupported
--- origin: an INSERT clause sqlparser reads only from apache/datafusion-sqlparser-rs#2626; the
+-- origin: an INSERT clause sqlparser reads from 0.64 on (apache/datafusion-sqlparser-rs#2626); the
 --   frontend's INSERT reduction replaces the statement by its source, so it must refuse the clause
 --   rather than drop it
 -- witness: on an empty table with $1 = 5, $2 = 'x', the first stores id 5, and the second ignores

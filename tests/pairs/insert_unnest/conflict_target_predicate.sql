@@ -12,7 +12,7 @@
 -- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather
--- origin: an ON CONFLICT target sqlparser reads only from apache/datafusion-sqlparser-rs#2627; the
+-- origin: an ON CONFLICT target sqlparser reads from 0.64 on (apache/datafusion-sqlparser-rs#2627); the
 --   Lean schema model reads a unique index as total, so it must refuse a partial-index arbiter
 --   rather than drop the predicate
 -- argument: both sides name the same arbiter, the partial unique index on a where b > 0; under
