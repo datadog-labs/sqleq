@@ -8,7 +8,7 @@
 //! and a bare column that more than one table in scope could own is refused naming the column and
 //! those tables.
 
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "b" VARCHAR, unique ("id"));"#;
 

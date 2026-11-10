@@ -155,7 +155,7 @@ its own kind of defect.
 * **"No counterexample found" is not a proof.** It is a finite search over small random instances,
   and it degrades with the generator's reach — a predicate comparing against a literal outside the
   generated value domain is satisfied by no row, and the pair looks equivalent when it may not be.
-  See [`sqleq-fuzz/README.md`](../sqleq-fuzz/README.md).
+  See [`docs/fuzz.md`](fuzz.md).
 * **A counterexample *is* a proof of non-equivalence**, provided the instance is valid and both
   queries are deterministic. Enforcing exactly that is most of what the disprover's code does.
 * **Numbers expire.** Coverage figures move with every frontend change and are tied to whichever

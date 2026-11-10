@@ -13,7 +13,7 @@
 //!
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/params/` run them.
 
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "a" INTEGER);
 create table "s" ("id" INTEGER PRIMARY KEY, "t_id" INTEGER);"#;

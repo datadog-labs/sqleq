@@ -11,7 +11,7 @@
 //! to say more than Postgres does, or an input that used to crash the frontend. They run no prover.
 
 use serde_json::{json, Value};
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 fn lower_in(src: &str, mode: CatalogSource) -> Value {
     lower_with(src, mode).unwrap_or_else(|e| panic!("expected Ok, got {e}\n{src}"))

@@ -22,7 +22,7 @@
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/aggregates/` run them.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
+use sqleq::{lower_with, lower_with_ddl, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "b" INTEGER, "s" SMALLINT, "g" BIGINT, "n" NUMERIC);
 create table "u" ("id" INTEGER, "a" INTEGER);"#;

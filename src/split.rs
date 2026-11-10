@@ -46,9 +46,9 @@ impl std::error::Error for SplitError {}
 ///
 /// ```
 /// let sql = "SELECT 'a;b' -- c;\n; /* d; /* e; */ */ SELECT $$f; g$$, E'h\\';i';";
-/// let st = sqleq_frontend::split::statements(sql).unwrap();
+/// let st = sqleq::split::statements(sql).unwrap();
 /// assert_eq!(st, ["SELECT 'a;b'", "SELECT $$f; g$$, E'h\\';i'"]);
-/// assert!(sqleq_frontend::split::statements("SELECT 'unterminated; SELECT 1").is_err());
+/// assert!(sqleq::split::statements("SELECT 'unterminated; SELECT 1").is_err());
 /// ```
 pub fn statements(sql: &str) -> Result<Vec<&str>, SplitError> {
     let toks = lex(sql)?;
@@ -60,7 +60,7 @@ pub fn statements(sql: &str) -> Result<Vec<&str>, SplitError> {
 /// are the same tokens in the same order. `Err` as [`SplitError`] says.
 ///
 /// ```
-/// let c = sqleq_frontend::split::compact("select /* a */ 'x  y'\n  from\tt -- b").unwrap();
+/// let c = sqleq::split::compact("select /* a */ 'x  y'\n  from\tt -- b").unwrap();
 /// assert_eq!(c, "select 'x  y' from t");
 /// ```
 pub fn compact(sql: &str) -> Result<String, SplitError> {

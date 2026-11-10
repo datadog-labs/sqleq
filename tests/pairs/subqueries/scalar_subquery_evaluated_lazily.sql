@@ -13,7 +13,7 @@
 -- origin: PR #209 review: the cvc5 axis asserted that every scalar subquery has at most one row over the
 --   whole database, but Postgres evaluates an uncorrelated one only where it is needed, so a database
 --   on which it has two rows still runs A; a scalar subquery that may have more than one row is
---   refused (sqleq-cvc5/src/translate.rs)
+--   refused (src/cvc5/translate.rs)
 -- witness: u = {(5)}, t = {(1), (2)}: A returns 5, B returns no rows
 create table u (x integer);
 create table t (a integer);

@@ -5,12 +5,16 @@
 
 # Six jobs, split on build cost rather than on subject.
 #
-# `sqleq-fuzz` links DuckDB, whose release library its first build downloads -- a much larger
-# cache than anything else here -- `sqleq-solver` compiles Z3, and `sqleq-lean` needs a Lean
-# toolchain, the largest download of all. Keeping each in its own job means
-# the frontend's answer -- the one that gates most changes -- arrives in under a minute, and the
-# caches do not evict each other. Each job lints the crate it builds, so the union is
-# `cargo clippy --workspace` without any job paying for another's dependencies.
+# The crate has a cargo feature for each heavy build. `fuzz` links DuckDB, whose release library its
+# first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3, and
+# `lean` needs a Lean toolchain, the largest download of all. Each job builds with
+# `--no-default-features` plus its own feature, which means the frontend's answer -- the one that
+# gates most changes -- arrives in under a minute, and the caches do not evict each other. Each job
+# lints everything its feature set compiles, so every feature is linted alone. No code is compiled
+# only under a combination of features, which is why the default set (`solver` and `fuzz` together)
+# needs no job of its own: it would pay for Z3 and DuckDB at once, and DuckDB is fetched
+# digest-pinned only in the fuzz job. Each job runs the tests of its own component; the frontend
+# job runs the frontend's and the harness's.
 #
 # Three of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
 # build: the frontend, sqleq-fuzz and sqleq-solver. The `sqleq-lean` job checks the Lean pins through
@@ -21,9 +25,9 @@
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
 # attribution changing with it.
 #
-# `msrv` is apart for its toolchain rather than its cost: it compiles the default members and
-# sqleq-lean with the oldest Rust that every Cargo.toml's `rust-version` names, so the declared
-# floor is one that builds.
+# `msrv` is apart for its toolchain rather than its cost: it compiles the light build and the `lean`
+# feature with the oldest Rust that Cargo.toml's `rust-version` names, so the declared floor is one
+# that builds.
 #
 # Every other job uses the runner's preinstalled stable, unpinned, and runs clippy with
 # `-D warnings`, so a lint added in a new Rust release can fail a pull request that changed nothing
@@ -59,7 +63,7 @@ permissions:
 # reaches dependency crates too, so an upstream release that adds one warning would break
 # this repo's CI. Clippy runs rustc's own lints, so nothing is lost by scoping it. The doc steps
 # set `RUSTDOCFLAGS` instead, which is safe for the same reason: with `--no-deps`, rustdoc runs on
-# this workspace's crates only.
+# this repository's crate only.
 env:
   CARGO_TERM_COLOR: always
 
@@ -103,22 +107,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: frontend-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: frontend-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+          key: frontend-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: frontend-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
-      # `default-members` is the frontend and sqleq-check, so these two cover both crates and nothing
-      # else. sqleq-check's tests include the hygiene gate over every committed pair (it lints, it
-      # carries the licence, it names no corpus row or machine), and the frontend's include
-      # `tests/doc_links.rs`: every relative link in every Markdown file resolves -- see that file
-      # for why it is a gate and not a habit.
-      - run: cargo test
-      - run: cargo clippy --all-targets -- -D warnings
+      # `--no-default-features` is the frontend and sqleq-check (and the IR reader), so these two cover
+      # both and nothing else. sqleq-check's tests include the hygiene gate over every committed pair
+      # (it lints, it carries the licence, it names no corpus row or machine), and the frontend's
+      # include `tests/doc_links.rs`: every relative link in every Markdown file resolves -- see that
+      # file for why it is a gate and not a habit.
+      - run: cargo test --no-default-features
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
 
-      # The `internals` feature is off by default, so the two lines above never compile it. sqleq-lean
-      # depends on it, and the `sqleq-lean` job's clippy lints the library with it on, but only this
-      # step lints the frontend's own tests and binary with it; without it, a lint would land
-      # unnoticed in code the out-of-repo benchmark harness also links.
-      - run: cargo clippy --features internals --all-targets -- -D warnings
+      # The `internals` feature is off by default, so the two lines above never compile it. The `lean`
+      # feature turns it on, and the `sqleq-lean` job's clippy lints with it, but only this step lints
+      # the frontend without the Lean axis; without it, a lint would land unnoticed in code the
+      # out-of-repo benchmark harness also links.
+      - run: cargo clippy --no-default-features --features internals --all-targets -- -D warnings
 
       # Intra-doc links are resolved only when the docs are built, which nothing above does, so a
       # link to a private or renamed item would otherwise land unnoticed. A public build is the only
@@ -128,13 +132,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps
-          cargo doc --no-deps --features internals
-          cargo doc --no-deps --features internals --document-private-items
+          cargo doc --no-deps --no-default-features
+          cargo doc --no-deps --no-default-features --features internals
+          cargo doc --no-deps --no-default-features --features internals --document-private-items
 
       # The pinned pairs on the frontend axis. A non-equivalent pair that lowers to the same IR on
       # both sides fails here, with no prover anywhere in the job.
-      - run: cargo build --bin sqleq-frontend --bin sqleq-check
+      - run: cargo build --no-default-features --bin sqleq-frontend --bin sqleq-check
       - name: pinned pairs (frontend)
         run: |
           test -x target/debug/sqleq-frontend
@@ -163,7 +167,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      # The pairs run on the PostgreSQL the build fetches (sqleq-fuzz/build.rs), the one a user
+      # The pairs run on the PostgreSQL the build fetches (build.rs), the one a user
       # gets; this makes the Postgres tests fail, not skip, if it cannot run on the runner.
       SQLEQ_PG_REQUIRED: "1"
 
@@ -186,8 +190,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: fuzz-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: fuzz-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+          key: fuzz-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: fuzz-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The build script downloads DuckDB's release library and verifies no checksum on it. This
       # org requires every Action to be pinned to a commit SHA; a 40 MB binary that gets linked
@@ -213,8 +217,10 @@ jobs:
           echo "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb  $dir/libduckdb-linux-amd64.zip" \
             | sha256sum -c -
 
-      - run: cargo test -p sqleq-fuzz
-      - run: cargo clippy -p sqleq-fuzz --all-targets -- -D warnings
+      # The library's unit tests (sqleq-fuzz's among them), the binaries' and sqleq-fuzz's
+      # integration tests. The frontend's and sqleq-check's integration tests run in the frontend job.
+      - run: cargo test --no-default-features --features fuzz --lib --bins --test 'fuzz_*'
+      - run: cargo clippy --no-default-features --features fuzz --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built. The
       # public build is the only one that reports a public item's doc linking to a private one, and
       # the private build the only one that renders private items' docs.
@@ -222,13 +228,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps -p sqleq-fuzz
-          cargo doc --no-deps -p sqleq-fuzz --document-private-items
+          cargo doc --no-deps --no-default-features --features fuzz
+          cargo doc --no-deps --no-default-features --features fuzz --document-private-items
 
       # The pinned pairs on the only axis that refutes. It reads each pair file itself, so it needs
       # no frontend.
-      - run: cargo build -p sqleq-fuzz --bin sqleq-fuzz
-      - run: cargo build -p sqleq-check --bin sqleq-check
+      - run: cargo build --no-default-features --features fuzz --bin sqleq-fuzz --bin sqleq-check
       - name: pinned pairs (fuzz)
         run: |
           test -x target/debug/sqleq-fuzz
@@ -239,8 +244,8 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     env:
-      # The `rust-version` every Cargo.toml declares; the first step checks that they all agree.
-      # Bump the version and those fields together.
+      # The `rust-version` Cargo.toml declares; the first step checks that they agree. Bump the
+      # version and that field together.
       MSRV: "1.88"
       CARGO_INCREMENTAL: "0"
 
@@ -271,19 +276,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: msrv-${{ env.MSRV }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: msrv-${{ env.MSRV }}-${{ runner.os }}-
+          key: msrv-onecrate-${{ env.MSRV }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-onecrate-${{ env.MSRV }}-${{ runner.os }}-
 
       # `check`, not `build`: Cargo refuses a locked crate whose `rust-version` is newer than the
       # toolchain before it compiles anything, and rustc rejects syntax or a library API newer than
       # itself while checking, so code generation would add time and cache, not coverage.
       # `--locked`, because the lockfile is what decides the floor: it is where a dependency bump
-      # raises it. The default members, and sqleq-lean, which needs Lean only at run time.
-      # sqleq-fuzz and sqleq-solver declare the same floor but are left out: checking them would
-      # bring DuckDB's download and a Z3 compile into this job.
+      # raises it. The light build, and the `lean` feature (which turns on `internals`), which needs
+      # Lean only at run time. `fuzz` and `solver` are under the same floor but left out: checking
+      # them would bring DuckDB's download and a Z3 compile into this job.
       - run: |
-          cargo "+$MSRV" check --locked --all-targets --all-features \
-            -p sqleq-frontend -p sqleq-check -p sqleq-lean
+          cargo "+$MSRV" check --locked --all-targets --no-default-features --features lean
 
   licenses:
     name: licenses
@@ -321,9 +325,9 @@ jobs:
           cargo install --locked cargo-deny --version 0.20.2
           cargo install --locked dd-rust-license-tool --version 1.0.6
 
-      # `--workspace`: the root manifest is also the frontend package, so without it the fuzz and
-      # solver crates' dependencies are never looked at. See deny.toml.
-      - run: cargo deny --workspace check licenses
+      # deny.toml's `all-features` makes it look at every optional dependency too, so the fuzz, solver
+      # and cvc5 features' dependencies are checked whatever the defaults are. See deny.toml.
+      - run: cargo deny check licenses
 
       # Invoked through `sh` so it does not depend on the file's executable bit.
       - run: sh tools/update_license_3rdparty.sh --check
@@ -351,35 +355,36 @@ jobs:
           # that matches exactly is never saved again, so a `target/` holding a Z3 built another way
           # would be restored and recompiled on every run. Change the prefix whenever that changes.
           # The compiler is in the key for the same reason; see the header.
-          key: solver-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: solver-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+          key: solver-onecrate-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: solver-onecrate-z3release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # Z3 is compiled from the `z3-src` crate, whose checksum Cargo.lock pins, and linked
       # statically; the cache above keeps that compile to the first build after a lockfile change.
       # It needs cmake and a C++20 compiler, which the runner image provides.
       - run: cmake --version && c++ --version
 
-      - run: cargo test -p sqleq-solver
-      - run: cargo clippy -p sqleq-solver --all-targets -- -D warnings
+      # The library's unit tests (sqleq-solver's among them), the binaries' and sqleq-solver's
+      # integration tests.
+      - run: cargo test --no-default-features --features solver --lib --bins --test 'solver_*'
+      - run: cargo clippy --no-default-features --features solver --all-targets -- -D warnings
       # As in the frontend job. Z3 is not built again: rustdoc reuses the build script's output
       # from the test build above.
       - name: docs
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps -p sqleq-solver
-          cargo doc --no-deps -p sqleq-solver --document-private-items
+          cargo doc --no-deps --no-default-features --features solver
+          cargo doc --no-deps --no-default-features --features solver --document-private-items
 
       # The frontend job runs the harness tests too, but without this binary the ones that drive the
       # real prover skip. Here they must run: `$SQLEQ_SOLVER_BIN` makes a missing
       # binary a failure instead of a skip, and the tests are named. The portfolio's test lowers its
       # pairs, so the frontend is built first.
-      - run: cargo build -p sqleq-solver --bin sqleq-solver
-      - run: cargo build --bin sqleq-frontend --bin sqleq-check
+      - run: cargo build --no-default-features --features solver --bin sqleq-solver --bin sqleq-frontend --bin sqleq-check
       - name: sqleq-check through the real sqleq-solver
         env:
           SQLEQ_SOLVER_BIN: target/debug/sqleq-solver
-        run: cargo test -p sqleq-check --test real_solver -- --nocapture
+        run: cargo test --no-default-features --features solver --test check_real_solver -- --nocapture
 
       # The pinned pairs on sqleq-solver. It proves from the frontend's IR, so this job builds the
       # frontend binary too; the frontend's own pins are checked again on the way, at no extra cost.
@@ -413,8 +418,8 @@ jobs:
             ~/.cargo/git
             target
             lean/.lake
-          key: lean-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock', 'lean/lean-toolchain', 'lean/**/*.lean') }}
-          restore-keys: lean-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+          key: lean-onecrate-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock', 'lean/lean-toolchain', 'lean/**/*.lean') }}
+          restore-keys: lean-onecrate-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The toolchain itself, cached apart from the build because it is large (the archive is over
       # half a gigabyte) and changes only with the version. The key carries the digest, so a cached
@@ -454,12 +459,12 @@ jobs:
       # The integration test runs every pinned pair under tests/pairs that pins the Lean axis through
       # real Lean and asserts the verdict its header declares; it fails, rather than skips, without
       # `lake` on PATH.
-      - run: cargo test -p sqleq-lean
-      - run: cargo clippy -p sqleq-lean --all-targets -- -D warnings
+      - run: cargo test --no-default-features --features lean --lib --bins --test 'lean_*'
+      - run: cargo clippy --no-default-features --features lean --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built.
       - name: docs
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps -p sqleq-lean
-          cargo doc --no-deps -p sqleq-lean --document-private-items
+          cargo doc --no-deps --no-default-features --features lean
+          cargo doc --no-deps --no-default-features --features lean --document-private-items

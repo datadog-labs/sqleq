@@ -11,7 +11,7 @@
 //! type. Each test below reads one DDL both ways and expects one answer. They do not run a prover.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, lower_with_ddl, CatalogSource, FrontendError, Result};
+use sqleq::{lower_with, lower_with_ddl, CatalogSource, FrontendError, Result};
 
 /// The pair `q0`/`q1` over `ddl`, lowered from a pair file and from raw DDL.
 fn both(ddl: &str, q0: &str, q1: &str) -> [Result<Value>; 2] {

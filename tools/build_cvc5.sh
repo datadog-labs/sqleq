@@ -15,7 +15,7 @@
 # The first run takes a while: cvc5 downloads and builds CaDiCaL, SymFPU, LibPoly, MPFR and, where
 # the system has none, GMP, which it installs beside itself, and compiles for some 5 minutes on 18
 # cores (15 on 8). A later run with the same commit skips straight to the cargo build. After it,
-# `cargo build -p sqleq-cvc5` and `cargo test -p sqleq-cvc5` need no environment, and
+# `cargo build --features cvc5` and `cargo test --features cvc5` need no environment, and
 # `sqleq-check --cvc5` finds the binary in target/release.
 #
 # Needs git, cmake 3.16 or later, a C++17 compiler, Python 3 (with the tomli package below 3.11) and
@@ -76,6 +76,6 @@ else
 fi
 
 if [ "$build_axis" = 1 ]; then
-    CVC5_LIB_DIR=$prefix/lib cargo build --release -p sqleq-cvc5
+    CVC5_LIB_DIR=$prefix/lib cargo build --release --no-default-features --features cvc5 --bin sqleq-cvc5
     echo "built target/release/sqleq-cvc5; try: sqleq-check --cvc5 --expect report-only tests/pairs"
 fi

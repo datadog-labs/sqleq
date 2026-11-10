@@ -1790,69 +1790,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqleq-check"
+name = "sqleq"
 version = "0.1.0"
 dependencies = [
  "clap",
  "csv",
- "libc",
- "serde",
- "serde_json",
- "sqleq-frontend",
-]
-
-[[package]]
-name = "sqleq-cvc5"
-version = "0.1.0"
-dependencies = [
  "cvc5",
- "serde",
- "serde_json",
- "sqleq-solver",
-]
-
-[[package]]
-name = "sqleq-frontend"
-version = "0.1.0"
-dependencies = [
- "csv",
- "pg_query",
- "serde_json",
- "sqlparser",
-]
-
-[[package]]
-name = "sqleq-fuzz"
-version = "0.1.0"
-dependencies = [
- "csv",
  "duckdb",
  "flate2",
+ "libc",
+ "pg_query",
  "postgres",
  "rand",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "sqlparser",
  "tar",
  "ureq",
-]
-
-[[package]]
-name = "sqleq-lean"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "sqleq-frontend",
- "sqlparser",
-]
-
-[[package]]
-name = "sqleq-solver"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
  "z3",
 ]
 

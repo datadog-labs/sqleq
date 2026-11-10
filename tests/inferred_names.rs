@@ -16,7 +16,7 @@
 //! they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 fn lowered(src: &str, catalog: CatalogSource) -> Value {
     lower_with(src, catalog).unwrap_or_else(|e| panic!("expected Ok under {catalog:?}, got {e}"))

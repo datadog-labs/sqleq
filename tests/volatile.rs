@@ -5,7 +5,7 @@
 
 //! The public list of volatile functions, which `sqleq-lean` reads and `sqleq-fuzz` follows.
 
-use sqleq_frontend::{is_volatile, VOLATILE_FUNCTIONS};
+use sqleq::{is_volatile, VOLATILE_FUNCTIONS};
 
 #[test]
 fn the_list_is_spelled_as_postgres_spells_it_and_sorted() {

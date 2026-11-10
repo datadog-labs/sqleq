@@ -16,7 +16,7 @@
 //! the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const MODES: [CatalogSource; 2] = [CatalogSource::Declared, CatalogSource::InferredSeeded];
 

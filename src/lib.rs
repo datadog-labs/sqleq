@@ -3,9 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2026-Present Datadog, Inc.
 
-//! `sqleq-frontend` — read a SQL equivalence pair, and lower it to a prover's input IR.
+//! `sqleq` — decide whether two SQL queries are equivalent.
 //!
-//! This crate parses a SQL equivalence pair, resolves names and types, and lowers it to the
+//! The crate root is the frontend, `sqleq-frontend`: read a SQL equivalence pair, and lower it to a
+//! prover's input IR. The other axes are modules beside it, each with its binary in `src/bin/`:
+//! [`check`], the harness that runs them all; [`ir`], the IR read back; and, behind the cargo
+//! features of the same names, `fuzz`, `solver`, `lean` and `cvc5`.
+//!
+//! The frontend parses a SQL equivalence pair, resolves names and types, and lowers it to the
 //! `Relation`/`Expr` JSON the IR-reading provers consume: `sqleq-solver` (a Rust rewrite of
 //! SQLSolver, and the default prover), or the JVM SQLSolver it is cross-checked against, through the
 //! job files [`sqlsolver`] writes, and the QED prover directly. It replaces the legacy Python preprocessor +
@@ -66,6 +71,23 @@ pub mod split;
 pub mod sqlsolver;
 mod types;
 mod verify;
+
+// The typed reader of the IR this frontend lowers to. sqleq-solver and sqleq-cvc5 both read plans
+// through it, so it is behind no feature: the cvc5 axis builds without Z3.
+pub mod ir;
+
+// The other axes and the harness, one module each, behind the cargo feature that keeps its heavy
+// build opt-in. Each binary in `src/bin/` is a thin `main` over its module. `check` runs the others
+// as subprocesses and imports none of them, so it needs no feature.
+pub mod check;
+#[cfg(feature = "cvc5")]
+pub mod cvc5;
+#[cfg(feature = "fuzz")]
+pub mod fuzz;
+#[cfg(feature = "lean")]
+pub mod lean;
+#[cfg(feature = "solver")]
+pub mod solver;
 
 /// Frontend internals, for sqleq's own benchmark harness.
 ///

@@ -11,7 +11,7 @@
 //! with no such column is emitted without the key, exactly as before.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_sql, lower_with, lower_with_ddl, CatalogSource};
+use sqleq::{lower_sql, lower_with, lower_with_ddl, CatalogSource};
 
 const PAIR: &str = "SELECT \"id\" FROM \"t\";\nSELECT \"id\" FROM \"t\" WHERE \"id\" = 1;";
 

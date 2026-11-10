@@ -78,7 +78,7 @@ Refusing has a price, and it is paid deliberately. The set-returning-function gu
 gives up proofs the frontend once made, on pairs whose two sides are textually identical — which is
 exactly why the understated cardinality cancelled and no unsound proof resulted. Such a pair is not
 lost outright: when a refused pair's two sides normalize to one query, the frontend says so
-(`sqleq_frontend::reflexive`), without lowering anything — a query is equivalent to itself, however
+(`sqleq::reflexive`), without lowering anything — a query is equivalent to itself, however
 many `now()`s it contains. `sqleq-check` records that claim as `reflexive`; the pins and
 `--portfolio` (as `equivalent`) credit it, while the default `--expect equivalent` policy, which
 asks whether the run's prover (`sqleq-solver`, unless the axes leave it out) proved the pair, still
@@ -538,7 +538,7 @@ what it is or refused:
   operators.
 - **A volatile function is not a function.** `random()`, `nextval`, `clock_timestamp()` and every
   other function Postgres declares volatile, in its core or in `pgcrypto` and `uuid-ossp`
-  (`sqleq_frontend::VOLATILE_FUNCTIONS`), can give two calls with equal arguments two values, so a
+  (`sqleq::VOLATILE_FUNCTIONS`), can give two calls with equal arguments two values, so a
   call to one is refused rather than read as an uninterpreted function. A volatile function a user
   defines is a name like any other.
 - **An aggregate is not a per-row function.** Every built-in Postgres aggregate is modelled or
@@ -860,7 +860,7 @@ There is also an ordering hazard worth naming, because it bit once: the `$N` set
 snapshotted **before** the equivalence-preserving normalizations, not read off the trees they leave
 behind (`params::mentioned`). `strip_identical_pagination` deletes a `LIMIT` the two sides share and
 is pair-level, so on one pair it took query A's only `$4` and left the two inside query B's `UNION
-ALL` — firing `arity` on a pair whose two texts both mention `$1..$4`, a misalignment this crate had
+ALL` — firing `arity` on a pair whose two texts both mention `$1..$4`, a misalignment the frontend had
 manufactured itself.
 
 ### Why it is a refusal and not a refutation

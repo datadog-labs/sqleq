@@ -3,63 +3,295 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
 # Copyright 2026-Present Datadog, Inc.
 
-[workspace]
-members = ["sqleq-check", "sqleq-cvc5", "sqleq-fuzz", "sqleq-lean", "sqleq-solver"]
-# Bare `cargo build` / `cargo test` stay on the light crates: the frontend, and sqleq-check, the
-# batch harness, which runs every other crate's binary as a subprocess and so builds none of them.
-# sqleq-fuzz links DuckDB, whose release library its first build downloads, so it is opt-in:
-# `cargo build -p sqleq-fuzz`.
-# sqleq-lean needs a Lean toolchain at run time, so it is opt-in too: `cargo build -p sqleq-lean`.
-# sqleq-solver compiles Z3 from source on its first build, so it is opt-in the same way:
-# `cargo build -p sqleq-solver`.
-# sqleq-cvc5 links a cvc5 library (`CVC5_LIB_DIR`) and reads the IR through sqleq-solver, so it is
-# opt-in too: `CVC5_LIB_DIR=... cargo build -p sqleq-cvc5`.
-default-members = [".", "sqleq-check"]
-resolver = "2"
-
-# Shared versions, so the two crates cannot drift apart on the parser.
-[workspace.dependencies]
-serde_json = "1"
-
-# `visitor` gives us the derived AST walker. It is used for the "is this expression closed?"
-# guards, where a hand-written match risks *missing* a variant — and a missed variant there is a
-# soundness hole, not a coverage gap.
-sqlparser = { version = "0.63", features = ["visitor"] }
-# Robust CSV reader for the corpus: the DDL field holds quoted, multi-line SQL.
-csv = "1"
-
 [package]
-name = "sqleq-frontend"
+name = "sqleq"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Analyze SQL equivalence pairs and lower them to prover IR (sqleq-solver, QED)"
+description = "Decides whether two SQL queries are equivalent, meaning they always return the same results. Aims to return a proof when they are equivalent or a concrete counterexample when they are not."
 license = "Apache-2.0"
 publish = false
+# Every binary is listed below, with the feature it needs.
+autobins = false
 
 [lib]
-name = "sqleq_frontend"
+name = "sqleq"
 path = "src/lib.rs"
+
+# One crate, with a cargo feature for each heavy build, so a build pays only for what it asks for.
+# The defaults are the frontend, sqleq-check, sqleq-solver and sqleq-fuzz; `--no-default-features`
+# is the light build: the frontend and sqleq-check, the batch harness, which runs every other
+# binary as a subprocess and so needs none of them.
+[features]
+default = ["solver", "fuzz"]
+# sqleq-solver compiles Z3 from source on its first build.
+solver = ["dep:z3"]
+# sqleq-fuzz links DuckDB, whose release library its first build downloads, and fetches the
+# PostgreSQL its default engine runs on (build.rs).
+fuzz = ["dep:duckdb", "dep:postgres", "dep:rand", "dep:regex", "dep:ureq", "dep:sha2", "dep:flate2", "dep:tar"]
+# sqleq-lean needs a Lean toolchain at run time, and reads the frontend's internals.
+lean = ["internals"]
+# sqleq-cvc5 links a cvc5 library (`CVC5_LIB_DIR`). It reads plans through `ir`, not the solver, so
+# it builds without Z3.
+cvc5 = ["dep:cvc5"]
+# Off by default. Exposes lowering internals to sqleq's own benchmark harness, which audits a
+# corpus that cannot be published and so cannot live in this repository. Exempt from semver.
+internals = []
 
 [[bin]]
 name = "sqleq-frontend"
 path = "src/main.rs"
 
-# Off by default. Exposes lowering internals to sqleq's own benchmark harness, which audits a
-# corpus that cannot be published and so cannot live in this repository. Exempt from semver.
-[features]
-internals = []
+[[bin]]
+name = "sqleq-check"
+path = "src/bin/sqleq-check.rs"
+
+[[bin]]
+name = "sqleq-fuzz"
+path = "src/bin/sqleq-fuzz.rs"
+required-features = ["fuzz"]
+
+[[bin]]
+name = "sqleq-solver"
+path = "src/bin/sqleq-solver.rs"
+required-features = ["solver"]
+
+[[bin]]
+name = "sqleq-lean"
+path = "src/bin/sqleq-lean.rs"
+required-features = ["lean"]
+
+[[bin]]
+name = "sqleq-cvc5"
+path = "src/bin/sqleq-cvc5.rs"
+required-features = ["cvc5"]
 
 [dependencies]
-serde_json = { workspace = true }
-sqlparser = { workspace = true }
-csv = { workspace = true }
+# `unbounded_depth`: real IR nests past serde_json's default 128-level recursion limit (long
+# AND/OR/CAST chains), which is ordinary input, not adversarial. `ir` needs it, and a feature of a
+# dependency applies to the whole crate.
+serde_json = { version = "1", features = ["unbounded_depth"] }
+# `visitor` gives us the derived AST walker. It is used for the "is this expression closed?"
+# guards, where a hand-written match risks *missing* a variant — and a missed variant there is a
+# soundness hole, not a coverage gap. sqleq-fuzz uses it for relation discovery.
+sqlparser = { version = "0.63", features = ["visitor"] }
+# Robust CSV reader for the corpus: the DDL field holds quoted, multi-line SQL.
+csv = "1"
 # Postgres's own grammar (libpg_query, compiled from the Postgres source it vendors). It decides
 # whether a refusal is `parse`: text Postgres cannot parse, as opposed to Postgres syntax this
 # frontend's parser does not read. See `FrontendError::Parse`.
 pg_query = "6.2"
+# sqleq-check's command line.
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+# Process groups: `killpg` at a deadline, and on Ctrl-C, takes a backend's own children with it.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 
-# Profiles are workspace-wide and may only be set at the root (moved here from sqleq-fuzz).
+# sqleq-fuzz. DuckDB, linked against the project's own release library -- which, unlike the
+# crates.io `bundled` amalgamation, has the icu, json and parquet extensions compiled into it. The
+# repository's .cargo/config.toml is what tells the build script to fetch it.
+duckdb = { version = "1", optional = true }
+# Pattern matching for time-freezing, LIMIT/param detection, and the UNIQUE-INDEX regex fallback.
+regex = { version = "1", optional = true }
+# Deterministic, seedable RNG for instance/parameter generation.
+rand = { version = "0.10", optional = true }
+# The Postgres engine's client: synchronous, matching the std::thread pool.
+postgres = { version = "0.19", optional = true }
+
+# sqleq-solver. "vendored": Z3 itself is compiled from the source crate `z3-src` (checksum-pinned in
+# Cargo.lock) and linked statically, so there is no Z3 to install and nothing to find at run time.
+# The first build compiles Z3 and needs cmake and a C++20 compiler. Z3 is built optimised in every
+# profile (`[profile.dev.package.z3-sys]`).
+z3 = { version = "0.21.1", features = ["vendored"], optional = true }
+
+# sqleq-cvc5. The cvc5 bindings (https://github.com/cvc5/cvc5-rs). Without their `static` feature
+# they link the cvc5 library that `CVC5_LIB_DIR` names and read its headers from `CVC5_INCLUDE_DIR`
+# or `$CVC5_LIB_DIR/../include`; build.rs adds that directory to the binary's rpath. The library must
+# be 1.4.0 or later, and this axis is written against the `bags-algebra` branch
+# (https://github.com/mudathirmahgoub/cvc5/pull/27), whose bag reasoning it exercises:
+# `sh tools/build_cvc5.sh` builds it under target/cvc5/, where .cargo/config.toml points
+# CVC5_LIB_DIR.
+cvc5 = { version = "0.6.1", optional = true }
+
+# sqleq-fuzz's build script fetches the PostgreSQL the Postgres engine runs on (build.rs): a
+# download, its SHA-256 check, and the archive's unpacking. These are the versions and features the
+# crate already builds, for `libduckdb-sys`'s own download and the Postgres client.
+[build-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+sha2 = { version = "0.11", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+
+# Each component's integration tests, named for it: several share a file name with another
+# component's or with the frontend's (`cli.rs`, `coverage.rs`, `encoding.rs`, `opaque_identity.rs`).
+[[test]]
+name = "check_corpus"
+path = "tests/check/corpus.rs"
+
+[[test]]
+name = "check_portfolio"
+path = "tests/check/portfolio.rs"
+
+[[test]]
+name = "check_real_cases"
+path = "tests/check/real_cases.rs"
+
+[[test]]
+name = "check_real_cvc5"
+path = "tests/check/real_cvc5.rs"
+
+[[test]]
+name = "check_real_solver"
+path = "tests/check/real_solver.rs"
+
+[[test]]
+name = "check_report_axes"
+path = "tests/check/report_axes.rs"
+
+[[test]]
+name = "check_run_integrity"
+path = "tests/check/run_integrity.rs"
+
+[[test]]
+name = "check_through_main"
+path = "tests/check/through_main.rs"
+
+[[test]]
+name = "fuzz_cli"
+path = "tests/fuzz/cli.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_coverage"
+path = "tests/fuzz/coverage.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_materialization"
+path = "tests/fuzz/materialization.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_nested_cuts"
+path = "tests/fuzz/nested_cuts.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_postgres_engine"
+path = "tests/fuzz/postgres_engine.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_schema_placement"
+path = "tests/fuzz/schema_placement.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_sql_scanning"
+path = "tests/fuzz/sql_scanning.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "fuzz_tester"
+path = "tests/fuzz/tester.rs"
+required-features = ["fuzz"]
+
+[[test]]
+name = "solver_bag_rung"
+path = "tests/solver/bag_rung.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_correlated"
+path = "tests/solver/correlated.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_dedup_by_equality"
+path = "tests/solver/dedup_by_equality.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_deep_jobs"
+path = "tests/solver/deep_jobs.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_extremum_by_equality"
+path = "tests/solver/extremum_by_equality.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_group_constant_keys"
+path = "tests/solver/group_constant_keys.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_limit_slices"
+path = "tests/solver/limit_slices.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_opaque_identity"
+path = "tests/solver/opaque_identity.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_order"
+path = "tests/solver/order.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_scalar_subquery_null"
+path = "tests/solver/scalar_subquery_null.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "solver_typed_values"
+path = "tests/solver/typed_values.rs"
+required-features = ["solver"]
+
+[[test]]
+name = "lean_cli"
+path = "tests/lean/cli.rs"
+required-features = ["lean"]
+
+[[test]]
+name = "lean_examples"
+path = "tests/lean/examples.rs"
+required-features = ["lean"]
+
+[[test]]
+name = "cvc5_encoding"
+path = "tests/cvc5/encoding.rs"
+required-features = ["cvc5"]
+
+# sqleq-solver's diagnostic and gate programs.
+[[example]]
+name = "normalize_check"
+path = "examples/solver/normalize_check.rs"
+required-features = ["solver"]
+
+[[example]]
+name = "normalize_trace"
+path = "examples/solver/normalize_trace.rs"
+required-features = ["solver"]
+
+[[example]]
+name = "phase1_gate"
+path = "examples/solver/phase1_gate.rs"
+required-features = ["solver"]
+
+[[example]]
+name = "phase2_gate"
+path = "examples/solver/phase2_gate.rs"
+required-features = ["solver"]
+
+[[example]]
+name = "rung3_stats"
+path = "examples/solver/rung3_stats.rs"
+required-features = ["solver"]
+
 [profile.release]
 opt-level = 3
 

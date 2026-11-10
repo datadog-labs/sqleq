@@ -13,7 +13,7 @@
 //! are one name lowering as before. They do not run a prover; they pin the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, reflexive, CatalogSource, FrontendError};
+use sqleq::{lower_with, reflexive, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("a" INTEGER, "b" INTEGER);"#;
 

@@ -11,7 +11,7 @@
 //! the lowering.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "s" VARCHAR, "k" VARCHAR, "ts" TIMESTAMP, "c" VARBINARY, unique ("id"));"#;
 
@@ -198,7 +198,7 @@ fn only_in_a_table_reference_is_never_a_table_named_only() {
                 other => panic!("{a} ({mode:?}): expected the ONLY refusal, got {other:?}"),
             }
         }
-        assert!(!sqleq_frontend::reflexive(&src), "{a}: reflexive");
+        assert!(!sqleq::reflexive(&src), "{a}: reflexive");
     }
     // With no DDL at all, `ONLY t` and `ONLY u` were one table named ONLY.
     let infer = "SELECT \"a\" FROM ONLY \"t\";\nSELECT \"a\" FROM ONLY \"u\";";
@@ -208,7 +208,7 @@ fn only_in_a_table_reference_is_never_a_table_named_only() {
 WITH "only" AS (SELECT 1 AS "a") SELECT "a" FROM ONLY "t";
 WITH "only" AS (SELECT 1 AS "a") SELECT "a" FROM "only";"#;
     assert!(matches!(lower_with(cte, CatalogSource::Declared), Err(FrontendError::Unsupported(_))));
-    assert!(!sqleq_frontend::reflexive(cte));
+    assert!(!sqleq::reflexive(cte));
     // Controls: a quoted name is a table, and the DDL's own `ALTER TABLE ONLY` is still read.
     let quoted = format!("{ddl}\nSELECT \"a\" FROM \"only\";\nSELECT \"a\" FROM \"only\" WHERE true;");
     assert!(lower_with(&quoted, CatalogSource::Declared).is_ok());

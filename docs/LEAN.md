@@ -95,7 +95,7 @@ everything else:
     the frontend refuses that spelling.
   - With a mismatched type the two sides apply different coercions. `text[]` into a `uuid` column
     always errors, and `int4[]` into `bigint` differs on overflow. `sqleq-fuzz` refutes such pairs
-    under the gather rule ([its README](../sqleq-fuzz/README.md#the-gather-rule)).
+    under the gather rule ([its README](fuzz.md#the-gather-rule)).
   - A generated cell is `DEFAULT`, `nextval` of a string literal or of a bare parameter (either
     optionally cast to `regclass`), or one of a short list of generators called with no argument:
     the clocks (`now()`, `current_timestamp`, `localtimestamp`, `clock_timestamp()`, …) and the
@@ -205,7 +205,7 @@ credit or withhold credit wrongly.
 | `invalid-sql` | Postgres rejects the pair as written, e.g. a `VALUES` row narrower than the column list. |
 | `error`, `timeout` | Lean did not accept the proof, or did not finish. |
 
-How `sqleq-check` reads them follows from what each claims (`sqleq-check/src/suite.rs`). In the
+How `sqleq-check` reads them follows from what each claims (`src/check/suite.rs`). In the
 pinned suite a pair headed `-- binding: gather` is credited by `proved-gather` alone: a generated
 proof claims less than that truth. Under `-- binding: gather-generated` either proof counts, since a
 plain gather proof claims more. A proof the binding counts is a claim of equivalence whether or not
@@ -291,7 +291,7 @@ It needs a Lean toolchain (`elan`, which installs the version in `lean/lean-tool
 through `sqleq-check` like every other axis:
 
 ```sh
-cargo build --release && cargo build --release -p sqleq-lean
+cargo build --release --features lean
 ./target/release/sqleq-check --axes lean --expect report-only tests/pairs/insert_unnest
 ./target/release/sqleq-check --axes lean --expect report-only --corpus corpus.csv --json out.json
 ```
@@ -312,6 +312,6 @@ be checked under.
 The axis's pinned pairs are in [`tests/pairs/insert_unnest/`](../tests/pairs/insert_unnest/),
 headed `-- binding: gather` because their truth is stated under the gather rule, or `-- binding:
 gather-generated` for a pair with generated cells; [the pinned-pair README](../tests/pairs/README.md)
-describes the format. `cargo test -p sqleq-lean` checks every `-- expect lean:` pin under
+describes the format. `cargo test --features lean` checks every `-- expect lean:` pin under
 `tests/pairs/` against real Lean, and `sqleq-check --expect pinned --axes lean tests/pairs` does the
 same with the suite's other rules.

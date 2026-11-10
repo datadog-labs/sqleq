@@ -20,7 +20,7 @@
 //! These pin the lowering and run no prover; the pairs under `tests/pairs/params/` run them.
 
 use serde_json::Value;
-use sqleq_frontend::{lower_with, CatalogSource, FrontendError};
+use sqleq::{lower_with, CatalogSource, FrontendError};
 
 const T: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "n" NUMERIC, "f" DOUBLE PRECISION);"#;
 
