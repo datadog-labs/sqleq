@@ -199,7 +199,7 @@ Releases are published to crates.io by
 trusted publishing exchanges the workflow's OIDC token for one that lasts 30 minutes.
 
 1. In one pull request, set the new `version` in `Cargo.toml` (and `Cargo.lock`, which a build
-   updates) and add its entry to the changelog.
+   updates) and add its entry to [`CHANGELOG.md`](CHANGELOG.md).
 2. Once it merges, publish a GitHub release for the tag `v<version>` on the merge commit, with the
    changelog entry as its notes.
 3. The release starts the workflow. A maintainer approves it in the `crates-io` environment; it
