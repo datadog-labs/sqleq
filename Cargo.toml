@@ -80,7 +80,7 @@ csv = "1"
 # Postgres's own grammar (libpg_query, compiled from the Postgres source it vendors). It decides
 # whether a refusal is `parse`: text Postgres cannot parse, as opposed to Postgres syntax this
 # frontend's parser does not read. See `FrontendError::Parse`.
-pg_query = "6.2"
+pg_query = "18.1"
 # sqleq-check's command line.
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
 # Process groups: `killpg` at a deadline, and on Ctrl-C, takes a backend's own children with it.
