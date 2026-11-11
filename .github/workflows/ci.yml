@@ -3,7 +3,7 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
 # Copyright 2026-Present Datadog, Inc.
 
-# Six jobs, split on build cost rather than on subject.
+# Seven jobs, six of them split on build cost rather than on subject.
 #
 # The crate has a cargo feature for each heavy build. `duckdb` links DuckDB, whose release library its
 # first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3, and
@@ -12,8 +12,8 @@
 # gates most changes -- arrives in under a minute, and the caches do not evict each other. Each job
 # lints everything its feature set compiles, so every feature is linted alone. No code is compiled
 # only under a combination of features, which is why the default set (`solver` and `fuzz` together)
-# needs no job of its own: it would only pay for Z3 a second time. Each job runs the tests of its
-# own component; the frontend job runs the frontend's and the harness's.
+# needs no test job of its own: it would only pay for Z3 a second time. Each job runs the tests of
+# its own component; the frontend job runs the frontend's and the harness's.
 #
 # Three of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
 # build: the frontend, sqleq-fuzz and sqleq-solver. The `sqleq-lean` job checks the Lean pins through
@@ -23,6 +23,11 @@
 # `licenses` builds nothing. It checks that every dependency is under a permissive licence and
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
 # attribution changing with it.
+#
+# `package` is the seventh: it builds the default set once, but as `cargo install sqleq` will, from
+# the package crates.io would receive, and runs what it installs. It is the only job that would
+# notice a git dependency, a `[patch]`, a file the package leaves out, or a setting only
+# `.cargo/config.toml` supplies.
 #
 # `msrv` is apart for its toolchain rather than its cost: it compiles the light build and the `lean`
 # feature with the oldest Rust that Cargo.toml's `rust-version` names, so the declared floor is one
@@ -471,3 +476,79 @@ jobs:
         run: |
           cargo doc --no-deps --no-default-features --features lean
           cargo doc --no-deps --no-default-features --features lean --document-private-items
+
+  package:
+    name: package
+    # Not `ubuntu-latest`: PostgreSQL 17 comes from the PostgreSQL project's apt repository, set up
+    # here for Ubuntu 24.04, the image the fuzz job runs on too.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # A release build of the default features compiles Z3, as in the solver job, so the cache is
+      # what keeps this job short. Everything in this `target/` was built outside the repository,
+      # by the step below.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: package-onecrate-release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: package-onecrate-release-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+      - run: cmake --version && c++ --version
+
+      # The tarball crates.io would receive: the manifest it would serve, which has no `[patch]` and
+      # no path or git source, the lockfile `cargo install --locked` builds with, and only what
+      # `include` lets in. `--no-verify`, because the install below is the verification. Cargo's
+      # own would compile the tarball here, inside the repository, where `.cargo/config.toml`
+      # applies, and the install would then find every artifact already built: Cargo fingerprints a
+      # local package by paths relative to it, so the unpacked copy counts as the same package.
+      - run: cargo package --locked --no-verify
+
+      # `cargo install`, as a user runs it, on that tarball, from outside the repository. Cargo
+      # reads `.cargo/config.toml` from the working directory upwards, so this repository's cannot
+      # reach it; the only other config Cargo reads is in `$CARGO_HOME`, which must have none. The
+      # build may not touch its sources, which Cargo's verification checks too: the tarball is
+      # unpacked twice and the copy that was built is compared with the one that was not.
+      - name: install the package from outside the repository
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          test ! -e "$HOME/.cargo/config.toml" && test ! -e "$HOME/.cargo/config"
+          version=$(cargo metadata --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --no-deps \
+            --format-version 1 | jq -r '.packages[] | select(.name == "sqleq") | .version')
+          crate="$GITHUB_WORKSPACE/target/package/sqleq-$version.crate"
+          mkdir unpacked untouched
+          tar -xzf "$crate" -C unpacked
+          tar -xzf "$crate" -C untouched
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo install --locked --path "unpacked/sqleq-$version" --root installed
+          diff -r untouched unpacked
+
+      # An installed sqleq fetches no PostgreSQL (build.rs): a user provides one, as here.
+      - name: PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -yq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -yq postgresql-17
+          echo "SQLEQ_PG_BIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      # What it installed, found on PATH as a user's would be, run outside the repository: one pair
+      # proved and one refuted, each by the verdict its file pins.
+      - name: run the installed binaries
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/examples/in_to_join.sql" "$GITHUB_WORKSPACE/examples/dropped_filter.sql" .
+          export PATH="$RUNNER_TEMP/installed/bin:$PATH"
+          sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver in_to_join.sql dropped_filter.sql
