@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqleq::fuzz::lex::split_statements;
-use sqleq::fuzz::{pg, test_pair, Config, Verdict};
+#[cfg(feature = "duckdb")]
+use sqleq::fuzz::test_pair;
+use sqleq::fuzz::{pg, Config, Verdict};
 
 const USAGE: &str = "\
 usage:
@@ -41,7 +43,8 @@ options:
   --rows N       rows per table per instance (default 5)
   --seed N       RNG seed (default 0)
   --engine E     where the statements run: postgres (default; $SQLEQ_FUZZ_ENGINE overrides), a
-                 private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH, or duckdb";
+                 private PostgreSQL 17 cluster from $SQLEQ_PG_BIN or PATH, or duckdb (a build
+                 with the `duckdb` feature)";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -129,6 +132,7 @@ fn load_corpus(path: &str) -> Result<Vec<(String, String, String)>, String> {
 /// about it; but it must not take other rows down with it either. In `csv` mode an uncaught panic
 /// killed the worker thread that drew the row, and with it every row that worker would have run
 /// next, while the run still exited 0.
+#[cfg(feature = "duckdb")]
 fn guarded_test(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     guarded(|| test_pair(a, b, ddl, cfg))
 }
@@ -148,6 +152,7 @@ fn guarded(f: impl FnOnce() -> Verdict) -> Verdict {
 /// Where the pairs run: in-process DuckDB, or a private Postgres cluster with a database per worker.
 enum Runner {
     /// DuckDB's version, as `SELECT version()` reports it.
+    #[cfg(feature = "duckdb")]
     Duck(String),
     Pg(pg::Server),
 }
@@ -156,12 +161,15 @@ impl Runner {
     fn start(engine: &str, workers: usize) -> Result<Runner, String> {
         match engine {
             "postgres" => Ok(Runner::Pg(pg::Server::start(workers)?)),
+            #[cfg(feature = "duckdb")]
             _ => {
                 let version = sqleq::fuzz::duck::open_db()
                     .and_then(|c| c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)))
                     .map_err(|e| format!("cannot open DuckDB: {e}"))?;
                 Ok(Runner::Duck(version.trim_start_matches('v').to_string()))
             }
+            #[cfg(not(feature = "duckdb"))]
+            _ => Err("the DuckDB engine is not in this build: build sqleq with `--features duckdb`".to_string()),
         }
     }
 
@@ -169,6 +177,7 @@ impl Runner {
     /// about DuckDB's semantics, which is why it always says so.
     fn engine(&self) -> String {
         match self {
+            #[cfg(feature = "duckdb")]
             Runner::Duck(v) => format!("duckdb {v}"),
             Runner::Pg(s) => format!("postgres {}", s.version()),
         }
@@ -176,6 +185,7 @@ impl Runner {
 
     fn worker(&self, i: usize) -> Result<Worker, String> {
         match self {
+            #[cfg(feature = "duckdb")]
             Runner::Duck(_) => Ok(Worker::Duck),
             Runner::Pg(s) => Ok(Worker::Pg(Box::new(s.worker(i)?))),
         }
@@ -183,6 +193,7 @@ impl Runner {
 }
 
 enum Worker {
+    #[cfg(feature = "duckdb")]
     Duck,
     Pg(Box<postgres::Client>),
 }
@@ -192,6 +203,7 @@ impl Worker {
     /// how many trials it was given ([`pg::Timing::trials`]).
     fn test(&mut self, a: &str, b: &str, ddl: &str, cfg: Config) -> (Verdict, Option<String>, usize) {
         match self {
+            #[cfg(feature = "duckdb")]
             Worker::Duck => (guarded_test(a, b, ddl, cfg), None, cfg.total_trials()),
             Worker::Pg(client) => {
                 let mut caveat = None;

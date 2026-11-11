@@ -14,17 +14,23 @@ use std::sync::OnceLock;
 
 use crate::check::util::{abspath, is_exe, newest, which};
 
-/// This repository's root, where the crate's manifest is.
-pub fn repo() -> &'static Path {
-    static REPO: OnceLock<PathBuf> = OnceLock::new();
+/// This repository's root, where the crate's manifest is: when this binary was built in a checkout
+/// of it, which a file the published crate leaves out marks. A build of the published crate (`cargo
+/// install sqleq`) has no repository; the directory its manifest was in is cargo's, and nothing here
+/// looks there.
+pub fn repo() -> Option<&'static Path> {
+    static REPO: OnceLock<Option<PathBuf>> = OnceLock::new();
     REPO.get_or_init(|| {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        here.canonicalize().unwrap_or_else(|_| crate::check::util::normalize(here))
+        let root = here.canonicalize().unwrap_or_else(|_| crate::check::util::normalize(here));
+        root.join("lean").join("lakefile.toml").is_file().then_some(root)
     })
+    .as_deref()
 }
 
 fn target_builds(name: &str) -> Vec<PathBuf> {
-    ["release", "debug"].iter().map(|p| repo().join("target").join(p).join(name)).collect()
+    let Some(r) = repo() else { return Vec::new() };
+    ["release", "debug"].iter().map(|p| r.join("target").join(p).join(name)).collect()
 }
 
 fn path_str(p: &Path) -> String {
@@ -172,7 +178,7 @@ pub fn discover_sqleq_solver(flag: Option<&str>, bin_dir: Option<&str>) -> Resul
     Ok(SsDriver {
         imp: "sqleq-solver".into(),
         cmd: vec![found.clone()],
-        cwd: repo().to_path_buf(),
+        cwd: repo().map_or_else(std::env::temp_dir, Path::to_path_buf),
         env: Vec::new(),
         location: found,
     })
@@ -299,7 +305,12 @@ pub fn discover_sqlsolver(tree_flag: Option<&str>) -> Result<(String, PathBuf), 
 /// actually differs between the pristine tree and the de-Calcited fork -- which is also why the
 /// output directory is `out-fork/` and is not shared with `out/`.
 fn compile_driver(cp: &str) -> Result<PathBuf, String> {
-    let dir = repo().join("tools").join("sqlsolver");
+    let Some(repo) = repo() else {
+        return Err("error: --sqlsolver-jvm compiles the bridge in tools/sqlsolver/, so it runs only from a \
+                    checkout of the sqleq repository"
+            .to_string());
+    };
+    let dir = repo.join("tools").join("sqlsolver");
     let srcs: Vec<PathBuf> = ["IrDriver", "IrToRel"].iter().map(|n| dir.join(format!("{n}.java"))).collect();
     let missing: Vec<String> = srcs.iter().filter(|f| !f.is_file()).map(|f| path_str(f)).collect();
     if !missing.is_empty() {
@@ -330,7 +341,7 @@ fn compile_driver(cp: &str) -> Result<PathBuf, String> {
 /// and its component's directory, plus the IR reader for the two that read plans, and the build
 /// script for the two that link a native library through it.
 fn sources(binary_name: &str) -> Option<Vec<PathBuf>> {
-    let r = repo();
+    let r = repo()?;
     let src = r.join("src");
     let mut out = vec![r.join("Cargo.lock"), r.join("Cargo.toml")];
     let (component, reads_ir, build_script) = match binary_name {
@@ -380,13 +391,14 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// from anywhere else has no sources here to compare with.
 pub fn stale_build(binary: &str) -> Option<String> {
     let path = Path::new(binary).canonicalize().ok()?;
-    let target = repo().join("target").canonicalize().ok()?;
+    let repo = repo()?;
+    let target = repo.join("target").canonicalize().ok()?;
     path.strip_prefix(&target).ok()?;
     let srcs = sources(&path.file_name()?.to_string_lossy())?;
     let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let newest = srcs.iter().filter(|f| f.is_file()).max_by_key(|f| mtime(f))?;
     if mtime(newest)? > mtime(&path)? {
-        let rel = newest.strip_prefix(repo()).unwrap_or(newest);
+        let rel = newest.strip_prefix(repo).unwrap_or(newest);
         return Some(format!("{binary} is older than {}", rel.display()));
     }
     None

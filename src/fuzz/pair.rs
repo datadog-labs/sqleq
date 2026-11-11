@@ -5,26 +5,31 @@
 
 //! The per-pair test loop: generate valid instances, run both sides, look for a counterexample.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
 use rand::rngs::StdRng;
-use rand::seq::IndexedRandom;
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 
 use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::fuzz::duck::{accepted_rows, open_db, run_side, table_forms, Forms, RowData};
-use crate::fuzz::gen::{
-    array_element_type, cast_target, lit, randval, randval_cast, randval_col, randval_need,
-    CastTarget, Val,
+// DuckDB's test loop, `test_pair`, below: the rest of this module is shared with the Postgres engine.
+#[cfg(feature = "duckdb")]
+use {
+    crate::fuzz::duck::{accepted_rows, open_db, run_side},
+    crate::fuzz::forms::{table_forms, Forms, RowData},
+    crate::fuzz::gen::{
+        array_element_type, cast_target, lit, randval, randval_cast, randval_col, randval_need,
+        CastTarget, Val,
+    },
+    crate::fuzz::limits::{self, Count},
+    crate::fuzz::patterns as pat,
+    crate::fuzz::rewrite,
+    crate::fuzz::schema::{parse_schema, Schema, VType},
+    crate::fuzz::typing,
+    rand::seq::IndexedRandom,
+    rand::SeedableRng,
+    std::collections::{BTreeMap, BTreeSet, HashMap},
 };
-use crate::fuzz::limits::{self, Count};
-use crate::fuzz::patterns as pat;
-use crate::fuzz::rewrite;
-use crate::fuzz::schema::{parse_schema, Schema, VType};
-use crate::fuzz::typing;
 
 /// Test configuration.
 ///
@@ -82,7 +87,7 @@ pub enum Verdict {
     /// Either they have no shared observable -- a side is an `EXPLAIN`, which has query plans rather
     /// than query results (see [`crate::fuzz::patterns::has_explain`]), or one side is a query and the
     /// other a mutation -- or the generated instances cannot stand for the DDL: a constraint that
-    /// could not be read, a table spelled two ways in a mutation pair (see [`test_pair`]). The
+    /// could not be read, a table spelled two ways in a mutation pair (see `test_pair`). The
     /// Postgres engine adds its own reasons ([`crate::fuzz::pg`]).
     NotComparable(String),
     /// No parseable table schema.
@@ -146,7 +151,7 @@ impl Verdict {
 /// Whether a side is a *query* — something with rows to read — as opposed to a statement whose
 /// effect is on the tables.
 ///
-/// The distinction decides how [`run_side`] observes the side: a query is observed by the rows it
+/// The distinction decides how DuckDB's `run_side` observes the side: a query is observed by the rows it
 /// returns, a statement by the contents of every table afterwards. Getting it wrong on one side of
 /// a pair compares the two sides on *different observables*, and then `NO-COUNTEREXAMPLE` is not
 /// reachable at all — every such pair reports as refuted, whatever it is.
@@ -183,6 +188,7 @@ pub(crate) fn is_query(stmt: &str) -> bool {
 /// list — `'~~(VARCHAR, INTEGER_LITERAL)'` says a parameter was typed wrong, `'~~(VARCHAR, VARCHAR)'`
 /// would say something else entirely — and in DuckDB's phrasing that list starts past column 90. Cut
 /// there and every such row reads as the same undifferentiated failure.
+#[cfg(feature = "duckdb")]
 fn err_msg(e: &duckdb::Error) -> String {
     e.to_string()
         .lines()
@@ -194,6 +200,7 @@ fn err_msg(e: &duckdb::Error) -> String {
 }
 
 /// Render a found counterexample (bound params + the instance rows) for reporting.
+#[cfg(feature = "duckdb")]
 fn describe(binds: &HashMap<u32, Val>, rowdata: &RowData) -> String {
     let mut ps: Vec<(u32, &Val)> = binds.iter().map(|(k, v)| (*k, v)).collect();
     ps.sort_by_key(|(k, _)| *k);
@@ -246,6 +253,7 @@ fn describe(binds: &HashMap<u32, Val>, rowdata: &RowData) -> String {
 /// separated here. It stays
 /// recoverable either way: whether a pair is misaligned is a text-level property of the row, independent
 /// of any verdict.
+#[cfg(feature = "duckdb")]
 pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
     // First, because it is a fact about what kind of statement each side *is* rather than about
     // anything inside it: an explained statement has no rows to compare, so nothing downstream —
@@ -651,6 +659,7 @@ pub fn test_pair(a: &str, b: &str, ddl: &str, cfg: Config) -> Verdict {
 ///   own here, loaded from the same rows, and a mutation through one leaves the other as it was;
 ///   both are one table only if they resolve to it, which the DDL does not say. (`public.t` and `t`
 ///   are one table, and `rewrite::strip_public` has already made them one spelling.)
+#[cfg(feature = "duckdb")]
 fn unfaithful(finals: &[String], forms: &Forms, schema: &Schema, queries: bool) -> Option<String> {
     for t in finals {
         if let Some(why) = &schema[t].unreadable {
@@ -674,7 +683,7 @@ fn unfaithful(finals: &[String], forms: &Forms, schema: &Schema, queries: bool) 
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::{test_pair, Config, Verdict};
 
