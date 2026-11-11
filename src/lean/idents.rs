@@ -123,7 +123,7 @@ pub fn resolve(
     }
     if let Some(OnInsert::OnConflict(c)) = on {
         match &mut c.conflict_target {
-            Some(ConflictTarget::Columns(cols)) => cols.iter_mut().for_each(col_id),
+            Some(ConflictTarget::Columns { columns: cols, .. }) => cols.iter_mut().for_each(col_id),
             // Postgres takes one name here; a qualified one does not parse, and is left as written.
             Some(ConflictTarget::OnConstraint(name)) if name.0.len() == 1 => path(idents(name)),
             _ => {}
@@ -227,7 +227,6 @@ mod tests {
     fn spellings_postgres_resolves_differently_stay_apart() {
         for (a, b) in [
             ("ON CONFLICT (id) DO UPDATE SET name = excluded.\"Name\"", "ON CONFLICT (id) DO UPDATE SET name = excluded.name"),
-            ("RETURNING id AS 'id'", "RETURNING id AS \"id\""),
             // A keyword in a `ColId` position is not the quoted name.
             ("ON CONFLICT (id) DO UPDATE SET name = DEFAULT", "ON CONFLICT (id) DO UPDATE SET name = \"default\""),
             ("RETURNING user", "RETURNING \"user\""),

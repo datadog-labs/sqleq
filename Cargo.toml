@@ -74,7 +74,7 @@ serde_json = { version = "1", features = ["unbounded_depth"] }
 # `visitor` gives us the derived AST walker. It is used for the "is this expression closed?"
 # guards, where a hand-written match risks *missing* a variant — and a missed variant there is a
 # soundness hole, not a coverage gap. sqleq-fuzz uses it for relation discovery.
-sqlparser = { version = "0.63", features = ["visitor"] }
+sqlparser = { version = "0.64", features = ["visitor"] }
 # Robust CSV reader for the corpus: the DDL field holds quoted, multi-line SQL.
 csv = "1"
 # Postgres's own grammar (libpg_query, compiled from the Postgres source it vendors). It decides
@@ -302,10 +302,3 @@ opt-level = 3
 [profile.dev.package.z3-sys]
 opt-level = 3
 debug = false
-
-# sqlparser 0.63.0 plus the two PostgreSQL INSERT clauses it cannot parse yet: `OVERRIDING
-# { SYSTEM | USER } VALUE` and the `ON CONFLICT` target's `WHERE index_predicate`
-# (apache/datafusion-sqlparser-rs#2626, #2627). Drop this, and bump the version, once a release
-# carries both.
-[patch.crates-io]
-sqlparser = { git = "https://github.com/zvonimir-dd/datafusion-sqlparser-rs", rev = "23962bd728db232b2408f1180882fbe9fa3b270e" }

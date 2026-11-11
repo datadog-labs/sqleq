@@ -186,7 +186,7 @@ fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
             }
             None
         }
-        Some(ConflictTarget::Columns(ids)) => {
+        Some(ConflictTarget::Columns { columns: ids, .. }) => {
             let mut want: Vec<usize> = Vec::new();
             for id in ids {
                 match table.column(&fold(id)) {

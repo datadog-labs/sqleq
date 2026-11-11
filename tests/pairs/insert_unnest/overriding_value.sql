@@ -12,7 +12,7 @@
 -- expect cvc5: no-plan
 -- expect lean: unsupported
 -- binding: gather
--- origin: an INSERT clause sqlparser reads only from apache/datafusion-sqlparser-rs#2626; Lean's
+-- origin: an INSERT clause sqlparser reads from 0.64 on (apache/datafusion-sqlparser-rs#2626); Lean's
 --   fragment does not model it, so it refuses it by name
 -- argument: both sides carry the same OVERRIDING SYSTEM VALUE, so the identity column stores the
 --   supplied id on both; under the gather rule the unnest side inserts the VALUES side's rows, the

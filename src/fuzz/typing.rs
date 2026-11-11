@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
+    BinaryOperator, Expr, InTarget, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
     SelectItem, SetExpr, Statement, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -522,7 +522,7 @@ impl Visitor for Needs {
                     self.want(high, Need::Type(t));
                 }
             }
-            Expr::InList { expr, list, .. } => {
+            Expr::In { expr, target: InTarget::List(list), .. } => {
                 if let Some(t) = self.ty(expr) {
                     for x in list {
                         self.want(x, Need::Type(t));

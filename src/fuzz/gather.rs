@@ -209,7 +209,7 @@ fn unnest_arg(e: &Expr) -> Option<(u32, String)> {
     use sqlparser::ast::ArrayElemTypeDef as E;
     let elem = match elem {
         E::SquareBracket(t, _) | E::AngleBracket(t) | E::Parenthesis(t) => t,
-        E::None | E::Qualified(..) => return None,
+        E::None | E::Qualified(..) | E::ParenthesisNotNull(_) => return None,
     };
     Some((placeholder(expr)?, elem.to_string()))
 }

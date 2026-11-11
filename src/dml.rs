@@ -210,7 +210,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    visit_expressions, visit_relations, CaseWhen, CastKind, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    visit_expressions, visit_relations, CaseWhen, CastKind, Delete, Expr, InTarget, FromTable, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Query, SelectItem,
     SelectItemQualifiedWildcardKind,
     SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
@@ -476,6 +476,10 @@ fn delete_to_select(d: &Delete) -> Result<Query> {
     }
     // T-SQL's `OUTPUT` is `RETURNING` with more options (it can see both the old and new row and can
     // write them to a table); nothing in the corpus uses it and it is not analysed here.
+    // ClickHouse's `ON CLUSTER` and `SETTINGS` are not Postgres's, and neither is analysed here.
+    if d.on_cluster.is_some() || d.settings.is_some() {
+        return Err(unsupported("DELETE ... ON CLUSTER / SETTINGS"));
+    }
     if d.output.is_some() {
         return Err(unsupported("DELETE ... OUTPUT"));
     }
@@ -918,6 +922,9 @@ fn set_map<'a>(cat: &Catalog, u: &'a Update) -> Result<Parts<'a>> {
     if u.output.is_some() {
         return Err(unsupported("UPDATE ... OUTPUT"));
     }
+    if u.on_cluster.is_some() || u.settings.is_some() {
+        return Err(unsupported("UPDATE ... ON CLUSTER / SETTINGS"));
+    }
     // SQLite's `UPDATE OR IGNORE|REPLACE|…` changes what happens when the new row violates a
     // constraint, which is an effect on the final table that the projection does not model.
     if u.or.is_some() {
@@ -1031,7 +1038,9 @@ fn may_read(e: &Expr, names: &[String], cols: Option<&[String]>) -> bool {
             Expr::Identifier(c) => cols.is_none_or(|cs| cs.contains(&fold_ident(c))),
             Expr::CompoundIdentifier(p) => p.len() >= 2 && names.contains(&fold_ident(&p[p.len() - 2])),
             Expr::QualifiedWildcard(n, _) => from_name(n),
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+            Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::In { target: InTarget::Subquery(_) | InTarget::Table { .. }, .. } => true,
             Expr::Function(f) => match &f.args {
                 FunctionArguments::List(l) => l.args.iter().any(|a| match a {
                     FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n))
@@ -1279,6 +1288,10 @@ fn insert_shape(i: &Insert) -> Result<InsertParts<'_>> {
     if i.settings.is_some() || i.format_clause.is_some() {
         return Err(unsupported("INSERT ... SETTINGS / FORMAT"));
     }
+    // Databricks' `BY NAME` matches the source's columns to the target's by name, not by position.
+    if i.by_name {
+        return Err(unsupported("INSERT ... BY NAME"));
+    }
     let TableObject::TableName(name) = &i.table else {
         return Err(unsupported("INSERT target is not a plain table"));
     };
@@ -1393,7 +1406,8 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
             partitions: vec![],
             json_path: None,
             sample: None,
-            index_hints: vec![],
+            index_directives: vec![],
+            inheritance: None,
         };
         let (_, cols) = scoped(cat, &target);
         resolve_returning(items, &[(q.clone(), cols)])?;

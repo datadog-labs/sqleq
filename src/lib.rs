@@ -518,31 +518,39 @@ fn parse_statements(src: &str) -> Result<(HashMap<String, FnDecl>, Vec<sqlparser
 
 /// SOUNDNESS GUARD (#190): refuse a relation named by the unquoted word `ONLY`.
 ///
-/// sqlparser reads `ONLY` only where it is a statement's own keyword (`TRUNCATE`, `ALTER TABLE`,
-/// `LOCK`). In a table reference it takes `FROM ONLY t` as a table named `ONLY` with the alias `t`,
-/// and the catalog then resolves that name to whatever table or CTE is called `only`, so two
-/// different queries can lower to one. Postgres reserves `ONLY`: unquoted, it is never a relation
-/// name, only the marker that leaves a table's inheritance children out. So an unquoted `ONLY` as a
-/// relation name is always that marker misread. Lowering `ONLY t` as `t` would also need the catalog
-/// to rule out children, and the qualified and aliased forms do not parse at all, so this refuses.
-/// Statements the frontend reads as DDL are skipped: a view body is not lowered, and the catalog does
-/// not resolve its relations.
+/// `ONLY t` leaves `t`'s inheritance children out, and `t *` names them, in a `FROM` item and in a
+/// DML target alike. The frontend models no inheritance, so it lowers neither: `DELETE FROM ONLY p`
+/// keeps the rows of `p`'s children that `DELETE FROM p` removes. sqlparser from 0.64 on reads the
+/// marker (`TableFactor::Table::inheritance`). Before, it took `FROM ONLY t` as a table named `ONLY`
+/// with the alias `t`; Postgres reserves `ONLY`, so an unquoted `ONLY` as a relation name is still
+/// refused as that marker misread. Statements the frontend reads as DDL are skipped: a view body is
+/// not lowered, and the catalog does not resolve its relations.
 fn refuse_only_as_a_table_name(statements: &[sqlparser::ast::Statement]) -> Result<()> {
-    use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
+    use sqlparser::ast::{visit_relations, ObjectNamePart, Statement, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
+    struct Marked;
+    impl Visitor for Marked {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+            match tf {
+                TableFactor::Table { inheritance: Some(_), .. } => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
     for st in statements {
         if !matches!(st, Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)) {
             continue;
         }
-        let found = visit_relations(st, |name| match name.0.first() {
+        let misread = visit_relations(st, |name| match name.0.first() {
             Some(ObjectNamePart::Identifier(id)) if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("only") => {
                 ControlFlow::Break(())
             }
             _ => ControlFlow::Continue(()),
         });
-        if found.is_break() {
+        if misread.is_break() || st.visit(&mut Marked).is_break() {
             return Err(error::unsupported(
-                "ONLY in a table reference, which the frontend's parser reads as a table named ONLY",
+                "ONLY in a table reference (or `*`): the frontend models no table inheritance",
             ));
         }
     }

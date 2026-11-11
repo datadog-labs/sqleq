@@ -404,6 +404,7 @@ fn unnest_arg(e: &Expr) -> Result<UnnestArg, Refusal> {
         E::SquareBracket(t, None) | E::AngleBracket(t) | E::Parenthesis(t) => (**t).clone(),
         E::SquareBracket(_, Some(_)) => return Err(unsupported("unnest argument has a sized array type")),
         E::None => return Err(unsupported("unnest argument has an array type with no element type")),
+        E::ParenthesisNotNull(_) => return Err(unsupported("unnest argument has an array type Postgres does not spell")),
         // Postgres reads `T ARRAY` as `T[]`, but the frontend refuses that spelling, and so does
         // this, so that the two agree on which pairs they will look at.
         E::Qualified(..) => return Err(unsupported("unnest argument uses the `T ARRAY` spelling")),
@@ -549,6 +550,9 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     if i.settings.is_some() || i.format_clause.is_some() || !i.optimizer_hints.is_empty() {
         return Err(unsupported("INSERT ... SETTINGS / FORMAT / optimizer hint"));
     }
+    if i.by_name {
+        return Err(unsupported("INSERT ... BY NAME"));
+    }
     if i.multi_table_insert_type.is_some()
         || !i.multi_table_into_clauses.is_empty()
         || !i.multi_table_when_clauses.is_empty()
@@ -567,7 +571,7 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     // unique index as total. The re-render check cannot catch it: `Parts` carries the whole
     // `ON CONFLICT` clause, so the predicate renders back and would be silently left out of the
     // model. It has to be refused by name.
-    if matches!(&i.on, Some(sqlparser::ast::OnInsert::OnConflict(c)) if c.conflict_target_predicate.is_some()) {
+    if matches!(&i.on, Some(sqlparser::ast::OnInsert::OnConflict(c)) if matches!(&c.conflict_target, Some(sqlparser::ast::ConflictTarget::Columns { predicate: Some(_), .. }))) {
         return Err(unsupported("ON CONFLICT target with a WHERE predicate (a partial-index arbiter)"));
     }
     let TableObject::TableName(name) = &i.table else {

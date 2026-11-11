@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value, Visit, Visitor};
+use sqlparser::ast::{BinaryOperator, Expr, InTarget, UnaryOperator, Value, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -78,7 +78,7 @@ impl Visitor for Harvest {
                 self.add(expr, low);
                 self.add(expr, high);
             }
-            Expr::InList { expr, list, .. } => {
+            Expr::In { expr, target: InTarget::List(list), .. } => {
                 for l in list {
                     self.add(expr, l);
                 }

@@ -64,7 +64,7 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{
     AccessExpr, ArrayElemTypeDef, BinaryOperator, CastKind, CeilFloorKind, Cte, DataType, DateTimeField, Distinct,
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    Expr, InTarget, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
     Ident, Interval,
     JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderByKind, Query, SelectItem, SetExpr,
     SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableWithJoins, TypedString, UnaryOperator,
@@ -696,7 +696,7 @@ impl VisitorMut for Strip {
 
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<Self::Break> {
         let subquery = match e {
-            Expr::InSubquery { subquery, .. } | Expr::Exists { subquery, .. } => &mut **subquery,
+            Expr::In { target: InTarget::Subquery(subquery), .. } | Expr::Exists { subquery, .. } => &mut **subquery,
             _ => return ControlFlow::Continue(()),
         };
         // The slice lives on the `Query`, not on the `SELECT`, and `FETCH FIRST n ROWS ONLY` is a
@@ -841,7 +841,7 @@ fn rewrite_in_filter(e: &mut Expr) {
             rewrite_in_filter(right);
         }
         Expr::Nested(inner) => rewrite_in_filter(inner),
-        Expr::InSubquery { expr, subquery, negated: false } => {
+        Expr::In { expr, target: InTarget::Subquery(subquery), negated: false, global: false } => {
             if let Some(arg) = sole_unnest_arg(subquery) {
                 *e = Expr::AnyOp {
                     left: expr.clone(),
@@ -1067,6 +1067,8 @@ pub(crate) fn array_elem_type(dt: &DataType) -> Option<DataType> {
             | ArrayElemTypeDef::Parenthesis(t) => Some((**t).clone()),
             // A bare `ARRAY` with no element type: nothing to distribute.
             ArrayElemTypeDef::None => None,
+            // `ARRAY(T NOT NULL)` is not Postgres's spelling of any array type.
+            ArrayElemTypeDef::ParenthesisNotNull(_) => None,
             // The SQL-standard `T ARRAY` / `T ARRAY[n]`. Postgres reads it as `T[]`, but it is left
             // undistributed, as `CAST(x AS T ARRAY)` always was, rather than grow what can be proved
             // on a parser upgrade.
