@@ -50,6 +50,15 @@ impl Lean {
 
     /// Build the library once, so every batch imports compiled `.olean`s.
     pub fn build(&self) -> Result<(), String> {
+        // The package ships in this repository, not in the published crate: an installed build has
+        // none unless `$SQLEQ_LEAN_DIR` names one.
+        if !self.package.join("lakefile.toml").is_file() {
+            return Err(format!(
+                "no Lean package at {}: run from a checkout of the sqleq repository, or set SQLEQ_LEAN_DIR \
+                 to its lean/ directory",
+                self.package.display()
+            ));
+        }
         let out = Command::new(&self.lake)
             .arg("build")
             .arg("Sqleq")

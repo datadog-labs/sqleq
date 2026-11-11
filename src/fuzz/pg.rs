@@ -7,7 +7,7 @@
 //! Postgres computes is the answer and nothing has to be emulated.
 //!
 //! The instance generator, the parameter analysis and the cut and nondeterminism rules are the ones
-//! [`crate::fuzz::test_pair`] uses. What differs is where and how the statements run:
+//! `test_pair` uses. What differs is where and how the statements run:
 //!
 //! * [`Server`] serves a copy of a cached template cluster from a fresh temp directory, on a unix
 //!   socket there only, with one database per worker, and is gone when dropped or when the process
@@ -43,7 +43,7 @@ use rand::seq::IndexedRandom;
 use rand::{RngExt, SeedableRng};
 use regex::Regex;
 
-use crate::fuzz::duck::{table_forms, RowData};
+use crate::fuzz::forms::{table_forms, RowData};
 use crate::fuzz::gather::{self, Gather};
 use crate::fuzz::gen::{
     array_element_type, cast_target, clocks, randval, randval_cast, randval_col, randval_need,
@@ -109,8 +109,9 @@ pub fn bin_dir() -> Result<PathBuf, String> {
                  install the libraries it needs, or set SQLEQ_PG_BIN to a PostgreSQL {MAJOR}"
             ),
             None => format!(
-                "no PostgreSQL {MAJOR} found: set SQLEQ_PG_BIN to the directory holding its \
-                 `postgres` and `initdb`"
+                "no PostgreSQL {MAJOR} found: put one on PATH, or set SQLEQ_PG_BIN to the directory \
+                 holding its `postgres` and `initdb` (a build from a checkout fetches one; an \
+                 installed one does not)"
             ),
         })
 }

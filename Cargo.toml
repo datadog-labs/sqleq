@@ -10,9 +10,24 @@ edition = "2021"
 rust-version = "1.88"
 description = "Decides whether two SQL queries are equivalent, meaning they always return the same results. Aims to return a proof when they are equivalent or a concrete counterexample when they are not."
 license = "Apache-2.0"
+repository = "https://github.com/datadog-labs/sqleq"
+homepage = "https://github.com/datadog-labs/sqleq"
+readme = "README.md"
+keywords = ["sql", "sql-equivalence", "formal-verification", "smt", "query-optimization"]
+categories = ["database", "development-tools::testing", "command-line-utilities"]
+# What the published crate carries: the sources, the build script, and the licence and notice files
+# a distributed package must ship. Not the tests, the Lean package, the tools or the docs; the Lean
+# package's absence is also how an installed sqleq-check tells it is not in a checkout.
+include = ["/src", "/build.rs", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/LICENSE-3rdparty.csv"]
 publish = false
 # Every binary is listed below, with the feature it needs.
 autobins = false
+
+# docs.rs builds without the network and within a time limit: the frontend, sqleq-check, the IR reader
+# and sqleq-fuzz, without Z3's source build or DuckDB's download.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["fuzz"]
 
 [lib]
 name = "sqleq"
@@ -28,7 +43,10 @@ default = ["solver", "fuzz"]
 solver = ["dep:z3"]
 # sqleq-fuzz links DuckDB, whose release library its first build downloads, and fetches the
 # PostgreSQL its default engine runs on (build.rs).
-fuzz = ["dep:duckdb", "dep:postgres", "dep:rand", "dep:regex", "dep:ureq", "dep:sha2", "dep:flate2", "dep:tar"]
+fuzz = ["dep:postgres", "dep:rand", "dep:regex", "dep:ureq", "dep:sha2", "dep:flate2", "dep:tar"]
+# sqleq-fuzz's other engine, DuckDB, off by default: its library is linked from a download that only
+# this repository's .cargo/config.toml asks for, so a build from the published crate would not link.
+duckdb = ["fuzz", "dep:duckdb"]
 # sqleq-lean needs a Lean toolchain at run time, and reads the frontend's internals.
 lean = ["internals"]
 # sqleq-cvc5 links a cvc5 library (`CVC5_LIB_DIR`). It reads plans through `ir`, not the solver, so
@@ -159,22 +177,22 @@ path = "tests/check/through_main.rs"
 [[test]]
 name = "fuzz_cli"
 path = "tests/fuzz/cli.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "fuzz_coverage"
 path = "tests/fuzz/coverage.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "fuzz_materialization"
 path = "tests/fuzz/materialization.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "fuzz_nested_cuts"
 path = "tests/fuzz/nested_cuts.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "fuzz_postgres_engine"
@@ -189,12 +207,12 @@ required-features = ["fuzz"]
 [[test]]
 name = "fuzz_sql_scanning"
 path = "tests/fuzz/sql_scanning.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "fuzz_tester"
 path = "tests/fuzz/tester.rs"
-required-features = ["fuzz"]
+required-features = ["duckdb"]
 
 [[test]]
 name = "solver_bag_rung"

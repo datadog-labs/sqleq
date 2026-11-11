@@ -347,7 +347,7 @@ fn what_a_corpus_cannot_be_combined_with_is_a_setup_error() {
 fn the_real_frontend_lowers_a_row_exactly_as_its_whole_corpus_run_does() {
     let Some(fe) = ["debug", "release"]
         .iter()
-        .map(|p| sqleq::check::discover::repo().join("target").join(p).join("sqleq-frontend"))
+        .map(|p| sqleq::check::discover::repo().expect("a checkout").join("target").join(p).join("sqleq-frontend"))
         .find(|b| sqleq::check::util::is_exe(b))
     else {
         eprintln!("skipped: sqleq-frontend is not built");
