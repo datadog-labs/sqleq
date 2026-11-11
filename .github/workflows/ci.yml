@@ -206,7 +206,7 @@ jobs:
       - name: fetch libduckdb (digest-pinned)
         run: |
           set -euo pipefail
-          # libduckdb-sys 1.MMmmpp.0 bundles DuckDB MM.mm.pp: 1.10505.0 is 1.5.5.
+          # libduckdb-sys 1.MMmmpp.x bundles DuckDB MM.mm.pp: 1.10506.1 is 1.5.6.
           ver=$(awk '/^name = "libduckdb-sys"$/ { getline; split($3, v, "."); e = v[2]
             printf "%d.%d.%d", int(e / 10000), int(e / 100) % 100, e % 100 }' Cargo.lock)
           test -n "$ver"
@@ -214,7 +214,7 @@ jobs:
           mkdir -p "$dir"
           curl -fsSL --retry 3 -o "$dir/libduckdb-linux-amd64.zip" \
             "https://github.com/duckdb/duckdb/releases/download/v$ver/libduckdb-linux-amd64.zip"
-          echo "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb  $dir/libduckdb-linux-amd64.zip" \
+          echo "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b  $dir/libduckdb-linux-amd64.zip" \
             | sha256sum -c -
 
       # The library's unit tests (sqleq-fuzz's among them), the binaries' and sqleq-fuzz's
@@ -328,6 +328,11 @@ jobs:
       # deny.toml's `all-features` makes it look at every optional dependency too, so the fuzz, solver
       # and cvc5 features' dependencies are checked whatever the defaults are. See deny.toml.
       - run: cargo deny check licenses
+      # Known vulnerabilities, from the RustSec advisory database, in any dependency of any feature.
+      # The database is fetched on every run, so a newly published advisory fails this step on a pull
+      # request that changed nothing it names: that is how one is seen. The fix is a lockfile update
+      # in its own pull request, or an entry in deny.toml's `[advisories] ignore` with the reason.
+      - run: cargo deny check advisories
 
       # Invoked through `sh` so it does not depend on the file's executable bit.
       - run: sh tools/update_license_3rdparty.sh --check

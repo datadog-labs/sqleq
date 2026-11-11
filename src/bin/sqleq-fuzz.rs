@@ -165,7 +165,7 @@ impl Runner {
         }
     }
 
-    /// `postgres 17.11` or `duckdb 1.5.5`: the engine a verdict is a claim about. A DuckDB verdict is
+    /// `postgres 17.11` or `duckdb 1.5.6`: the engine a verdict is a claim about. A DuckDB verdict is
     /// about DuckDB's semantics, which is why it always says so.
     fn engine(&self) -> String {
         match self {
