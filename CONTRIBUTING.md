@@ -191,3 +191,25 @@ this project can have. Open an issue with the two queries, the DDL, and the coun
 have one — it does not need to be minimized. The
 [soundness bug template](https://github.com/datadog-labs/sqleq/issues/new?template=soundness_bug.md)
 asks for exactly that. The fix will add the pair, minimized, to [`tests/pairs/`](tests/pairs/README.md).
+
+## Releasing
+
+Releases are published to crates.io by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), with no stored token: crates.io's
+trusted publishing exchanges the workflow's OIDC token for one that lasts 30 minutes.
+
+1. In one pull request, set the new `version` in `Cargo.toml` (and `Cargo.lock`, which a build
+   updates) and add its entry to the changelog.
+2. Once it merges, publish a GitHub release for the tag `v<version>` on the merge commit, with the
+   changelog entry as its notes.
+3. The release starts the workflow. A maintainer approves it in the `crates-io` environment; it
+   checks that the tag names the version, verifies the package, uploads it, and then installs it
+   from crates.io on a clean runner and runs one pair it must prove and one it must refute.
+
+A published version cannot be deleted, only yanked, so a mistake is fixed by the next version.
+
+Before the first release, once: a `crates-io` environment that only `v*` tags can deploy to, with
+required reviewers; the first version uploaded by hand with a short-lived token scoped to the crate
+(a trusted publisher can only be added to a crate that exists); then, on crates.io, this repository,
+`release.yml` and the `crates-io` environment registered as the crate's trusted publisher, the token
+revoked, and trusted publishing made required.
