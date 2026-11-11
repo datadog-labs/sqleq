@@ -12,8 +12,13 @@
 use serde_json::json;
 use sqleq::check::axes::cvc5::{self, run_cvc5};
 use sqleq::check::case::{ss_slug, Case};
-use sqleq::check::discover::{repo, Cvc5Driver};
+use sqleq::check::discover::Cvc5Driver;
 use sqleq::check::util::{is_exe, TempDir};
+
+/// This checkout's root: the tests always run in one.
+fn repo() -> &'static std::path::Path {
+    sqleq::check::discover::repo().expect("the tests run in a checkout of the repository")
+}
 
 fn sqleq_cvc5() -> Option<Cvc5Driver> {
     let bin = match std::env::var("SQLEQ_CVC5_BIN").ok().filter(|b| !b.is_empty()) {

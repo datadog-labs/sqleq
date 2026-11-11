@@ -8,8 +8,13 @@
 
 use std::path::{Path, PathBuf};
 
-use sqleq::check::discover::repo;
+
 use sqleq::check::suite;
+
+/// This checkout's root: the tests always run in one.
+fn repo() -> &'static std::path::Path {
+    sqleq::check::discover::repo().expect("the tests run in a checkout of the repository")
+}
 
 fn sql_files(dir: &Path, recurse: bool, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };

@@ -9,7 +9,7 @@
 //! (honouring NOT NULL and every UNIQUE / PRIMARY KEY / UNIQUE INDEX, empty tables included), binds
 //! `$N` params to random typed values consistently across A and B, holds `now()`/`current_*` to one
 //! instant per trial and skips nondeterministic functions, runs both statements on PostgreSQL ([`pg`]) — or,
-//! with `--engine duckdb`, on DuckDB, as DuckDB evaluates them ([`test_pair`]) — and
+//! with `--engine duckdb`, on DuckDB, as DuckDB evaluates them (`test_pair`) — and
 //! compares outputs as **sorted multisets** (bag semantics — an ORDER BY-only difference never
 //! counts). SELECT pairs compare result sets; UPDATE/DELETE/INSERT pairs compare final table
 //! state, and the returned rows too when both sides carry RETURNING. A pair with no one observable to
@@ -23,7 +23,7 @@
 //! mention different sets of `$N`, that assumption is visibly wrong and no verdict is available in
 //! either direction: substituting one value compares two queries the caller never paired, so a
 //! difference is not a counterexample and an agreement is not evidence. Those pairs report
-//! `PARAM-MISALIGNED` ([`patterns::misalignment`], [`test_pair`]).
+//! `PARAM-MISALIGNED` ([`patterns::misalignment`], `test_pair`).
 //!
 //! One shape of pair is bound another way. An `INSERT … VALUES` against an `INSERT … SELECT * FROM
 //! unnest(…)` has a value at `$1` on one side and an array on the other, so the Postgres engine runs
@@ -35,7 +35,10 @@
 //! uniqueness enforcement, time freezing, LIMIT/OFFSET handling, array canonicalization, the
 //! cardinality-only rule, and value-from-data param biasing. `README.md` states each one.
 
+// DuckDB, the other engine, behind the off-by-default `duckdb` feature.
+#[cfg(feature = "duckdb")]
 pub mod duck;
+pub mod forms;
 pub mod gather;
 pub mod gen;
 pub mod lex;
@@ -48,4 +51,6 @@ pub mod rewrite;
 pub mod schema;
 pub mod typing;
 
-pub use pair::{test_pair, Config, Verdict};
+pub use pair::{Config, Verdict};
+#[cfg(feature = "duckdb")]
+pub use pair::test_pair;

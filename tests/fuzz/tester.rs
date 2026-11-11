@@ -7,7 +7,8 @@
 
 use std::collections::HashSet;
 
-use sqleq::fuzz::duck::{ddl_for, table_forms};
+use sqleq::fuzz::duck::ddl_for;
+use sqleq::fuzz::forms::table_forms;
 use sqleq::fuzz::gen::{
     array_element_type, cast_target, clocks, CastTarget, DATES, INTERVALS, TIMESTAMPS,
 };

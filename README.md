@@ -56,8 +56,8 @@ Build `sqleq-check` and the two backends Cargo builds by itself:
 cargo build --release   # sqleq-frontend and sqleq-check, the refuter sqleq-fuzz and the prover sqleq-solver
 ```
 
-The first build of `sqleq-fuzz` downloads DuckDB's release library (~40 MB) and the PostgreSQL 17 it
-runs pairs on (~12 MB, for Linux and macOS on x86_64 and arm64); the first build of `sqleq-solver`
+The first build of `sqleq-fuzz` downloads the PostgreSQL 17 it runs pairs on (~12 MB, for Linux and
+macOS on x86_64 and arm64); the first build of `sqleq-solver`
 compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler.
 See [Building](#building).
 
@@ -254,10 +254,11 @@ crate, with a binary for each axis and a cargo feature for each axis whose build
 and `solver`; `--no-default-features` builds the frontend and `sqleq-check` alone. `sqleq-check`
 needs no feature: it runs each backend as a subprocess.
 
-* **`sqleq-fuzz`** — the `fuzz` feature, on by default. Its first build downloads DuckDB's
-  release library (~40 MB) and a prebuilt PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS
-  on x86_64 and arm64, which it runs pairs on. To link a libduckdb you already have instead, set
-  `DUCKDB_LIB_DIR`; the build script checks it before it considers downloading anything. To run
+* **`sqleq-fuzz`** — the `fuzz` feature, on by default. Its first build downloads a prebuilt
+  PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS on x86_64 and arm64, which it runs pairs
+  on. Its other engine, DuckDB (`--engine duckdb`), is the `duckdb` feature, off by default: that
+  build downloads DuckDB's release library (~40 MB), or links the libduckdb `DUCKDB_LIB_DIR` names,
+  which the build script checks before it considers downloading anything. To run
   pairs on a PostgreSQL 17 of your own, set `SQLEQ_PG_BIN` to its `bin` directory, and
   `SQLEQ_PG_DOWNLOAD=0` to skip the download. On Linux the fetched PostgreSQL uses the system's
   OpenSSL 3, libxml2, Kerberos, zstd and lz4 libraries; where one is missing it cannot start, and

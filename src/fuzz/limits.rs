@@ -7,7 +7,7 @@
 //! determined.
 //!
 //! A cut over rows whose order leaves ties keeps an arbitrary choice among the tied rows, so two
-//! runs of the *same* query can return different bags. [`crate::fuzz::pair::test_pair`] then trusts only a
+//! runs of the *same* query can return different bags. `test_pair` then trusts only a
 //! difference in cardinality, which no tie-break can change -- so long as nothing above the cut can
 //! tell which rows it kept. A level above that filters them, joins on them, groups or deduplicates
 //! them, or tests membership in them can turn the choice into a difference in cardinality as well,

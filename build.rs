@@ -80,12 +80,15 @@ fn main() {
 #[cfg(feature = "fuzz")]
 fn fuzz() {
     println!("cargo:rerun-if-env-changed=SQLEQ_PG_DOWNLOAD");
-    match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
-        "linux" => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/deps:$ORIGIN"),
-        "macos" => {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/deps,-rpath,@loader_path");
+    // DuckDB's library sits beside the executables only when the `duckdb` feature links it.
+    if std::env::var_os("CARGO_FEATURE_DUCKDB").is_some() {
+        match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+            "linux" => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/deps:$ORIGIN"),
+            "macos" => {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/deps,-rpath,@loader_path");
+            }
+            _ => {}
         }
-        _ => {}
     }
     match fetch_postgres() {
         Ok(Some(rel)) => println!("cargo:rustc-env=SQLEQ_PG_FETCHED={rel}"),
@@ -102,6 +105,17 @@ fn fuzz() {
 #[cfg(feature = "fuzz")]
 fn fetch_postgres() -> Result<Option<String>, String> {
     if std::env::var("SQLEQ_PG_DOWNLOAD").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    // A build of the published crate, which `cargo package` marks with `.cargo_vcs_info.json`, is
+    // most often a `cargo install`, and cargo deletes that build's target directory when it is done:
+    // a PostgreSQL fetched into it would be gone before the binary first ran.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from).unwrap_or_default();
+    if manifest.join(".cargo_vcs_info.json").is_file() {
+        println!(
+            "cargo:warning=sqleq-fuzz: no PostgreSQL is fetched for a build of the published crate; \
+             put a PostgreSQL 17 on PATH, or set SQLEQ_PG_BIN to its bin directory"
+        );
         return Ok(None);
     }
     let target = std::env::var("TARGET").map_err(|e| e.to_string())?;

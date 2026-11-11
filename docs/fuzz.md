@@ -309,16 +309,17 @@ Two things this test does **not** cover, both stated rather than papered over:
 
 ## Usage
 
-sqleq-fuzz is the crate's `fuzz` feature, on by default. Its first build downloads DuckDB's release
-library, which `--no-default-features` skips.
+sqleq-fuzz is the crate's `fuzz` feature, on by default. The DuckDB engine is the `duckdb` feature,
+off by default; its first build downloads DuckDB's release library.
 
 ```
-cargo build --release                                                # first build downloads libduckdb (~40 MB)
-cargo test --no-default-features --features fuzz --lib --bins --test 'fuzz_*'   # the self-contained suite below
+cargo build --release                                                # the Postgres engine
+cargo test --no-default-features --features duckdb --lib --bins --test 'fuzz_*'   # the suite below, both engines
 ```
 
-Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says — the build fetches one for
-the common platforms; `--engine duckdb` needs none.
+Running pairs needs a PostgreSQL 17, found as [Engines](#engines) says — a build from a checkout
+fetches one for the common platforms, and an installed one uses the one on `PATH` or in
+`SQLEQ_PG_BIN`; `--engine duckdb` needs none, but a build with the `duckdb` feature.
 
 `sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
 the defaults below cannot move its answers. On its own:

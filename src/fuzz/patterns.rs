@@ -629,7 +629,7 @@ pub fn placeholders(sql: &str) -> Result<Vec<Placeholder>, String> {
 ///
 /// The same set substitution replaces ([`placeholders`], [`substitute_at`]), so a check built on it
 /// is a check on the binding sqleq-fuzz actually performs. A statement whose placeholders cannot be
-/// read gives the empty set; [`crate::fuzz::pair::test_pair`] reports such a statement as an error before
+/// read gives the empty set; `test_pair` reports such a statement as an error before
 /// it asks.
 pub fn params_of(sql: &str) -> BTreeSet<u32> {
     placeholders(sql)
@@ -755,7 +755,7 @@ pub fn may_create_objects(stmt: &str) -> bool {
 /// returned bag -- and the two are independent: `UPDATE t SET c = c WHERE true RETURNING c` and the
 /// same statement `WHERE false` leave the table byte-identical and return different bags. Observing
 /// only the table therefore hands out a `no-counterexample` that never looked at half the meaning,
-/// so [`crate::fuzz::duck::run_side`] observes the bag as well and [`crate::fuzz::pair::test_pair`] refuses a
+/// so the DuckDB engine's `run_side` observes the bag as well and `test_pair` refuses a
 /// pair that carries the clause on one side only.
 ///
 /// Read from the AST, never the text: `RETURNING` is not a reserved word, so a column or alias may

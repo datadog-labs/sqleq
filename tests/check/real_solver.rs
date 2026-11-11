@@ -13,9 +13,14 @@ use serde_json::{json, Value};
 use sqleq::check::axes::solver::{self, run_pass};
 use sqleq::check::portfolio;
 use sqleq::check::case::{ss_slug, Case};
-use sqleq::check::discover::{repo, SsDriver};
+use sqleq::check::discover::SsDriver;
 use sqleq::check::inputs::Item;
 use sqleq::check::util::{is_exe, TempDir};
+
+/// This checkout's root: the tests always run in one.
+fn repo() -> &'static std::path::Path {
+    sqleq::check::discover::repo().expect("the tests run in a checkout of the repository")
+}
 
 fn sqleq_solver() -> Option<SsDriver> {
     let bin = match std::env::var("SQLEQ_SOLVER_BIN").ok().filter(|b| !b.is_empty()) {

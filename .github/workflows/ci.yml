@@ -5,16 +5,15 @@
 
 # Six jobs, split on build cost rather than on subject.
 #
-# The crate has a cargo feature for each heavy build. `fuzz` links DuckDB, whose release library its
+# The crate has a cargo feature for each heavy build. `duckdb` links DuckDB, whose release library its
 # first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3, and
 # `lean` needs a Lean toolchain, the largest download of all. Each job builds with
 # `--no-default-features` plus its own feature, which means the frontend's answer -- the one that
 # gates most changes -- arrives in under a minute, and the caches do not evict each other. Each job
 # lints everything its feature set compiles, so every feature is linted alone. No code is compiled
 # only under a combination of features, which is why the default set (`solver` and `fuzz` together)
-# needs no job of its own: it would pay for Z3 and DuckDB at once, and DuckDB is fetched
-# digest-pinned only in the fuzz job. Each job runs the tests of its own component; the frontend
-# job runs the frontend's and the harness's.
+# needs no job of its own: it would only pay for Z3 a second time. Each job runs the tests of its
+# own component; the frontend job runs the frontend's and the harness's.
 #
 # Three of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
 # build: the frontend, sqleq-fuzz and sqleq-solver. The `sqleq-lean` job checks the Lean pins through
@@ -219,7 +218,10 @@ jobs:
 
       # The library's unit tests (sqleq-fuzz's among them), the binaries' and sqleq-fuzz's
       # integration tests. The frontend's and sqleq-check's integration tests run in the frontend job.
-      - run: cargo test --no-default-features --features fuzz --lib --bins --test 'fuzz_*'
+      # Built with `duckdb`, which brings `fuzz`, so both engines' tests run. `fuzz` alone, the default
+      # without DuckDB that a published build gets, is linted separately.
+      - run: cargo test --no-default-features --features duckdb --lib --bins --test 'fuzz_*'
+      - run: cargo clippy --no-default-features --features duckdb --all-targets -- -D warnings
       - run: cargo clippy --no-default-features --features fuzz --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built. The
       # public build is the only one that reports a public item's doc linking to a private one, and
@@ -228,12 +230,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
+          cargo doc --no-deps --no-default-features --features duckdb
+          cargo doc --no-deps --no-default-features --features duckdb --document-private-items
           cargo doc --no-deps --no-default-features --features fuzz
-          cargo doc --no-deps --no-default-features --features fuzz --document-private-items
 
       # The pinned pairs on the only axis that refutes. It reads each pair file itself, so it needs
       # no frontend.
-      - run: cargo build --no-default-features --features fuzz --bin sqleq-fuzz --bin sqleq-check
+      - run: cargo build --no-default-features --features duckdb --bin sqleq-fuzz --bin sqleq-check
       - name: pinned pairs (fuzz)
         run: |
           test -x target/debug/sqleq-fuzz
