@@ -7,7 +7,7 @@ the command line, the IR or the library's API.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-11
+## [0.1.0] - 2026-11-13
 
 The first release, published on crates.io as `sqleq`: `cargo install --locked sqleq`.
 
