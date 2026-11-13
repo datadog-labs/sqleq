@@ -201,15 +201,17 @@ trusted publishing exchanges the workflow's OIDC token for one that lasts 30 min
 1. In one pull request, set the new `version` in `Cargo.toml` (and `Cargo.lock`, which a build
    updates) and add its entry to the changelog.
 2. Once it merges, publish a GitHub release for the tag `v<version>` on the merge commit, with the
-   changelog entry as its notes.
-3. The release starts the workflow. A maintainer approves it in the `crates-io` environment; it
-   checks that the tag names the version, verifies the package, uploads it, and then installs it
-   from crates.io on a clean runner and runs one pair it must prove and one it must refute.
+   changelog entry as its notes. Publishing it creates the tag: an organization ruleset protects
+   tags, and workflows cannot create them.
+3. The release starts the workflow, in the organization's `protected-main-env` environment, which
+   only `main` and tags can deploy to. It checks that the tag names the version, verifies the
+   package, uploads it, and then installs it from crates.io on a clean runner and runs one pair it
+   must prove and one it must refute.
 
 A published version cannot be deleted, only yanked, so a mistake is fixed by the next version.
 
-Before the first release, once: a `crates-io` environment that only `v*` tags can deploy to, with
-required reviewers; the first version uploaded by hand with a short-lived token scoped to the crate
-(a trusted publisher can only be added to a crate that exists); then, on crates.io, this repository,
-`release.yml` and the `crates-io` environment registered as the crate's trusted publisher, the token
-revoked, and trusted publishing made required.
+Before the first release, once: the first version uploaded by hand with a short-lived token scoped
+to the crate (a trusted publisher can only be added to a crate that exists); then, on crates.io, this
+repository, `release.yml` and the `protected-main-env` environment registered as the crate's trusted
+publisher, the token revoked, and trusted publishing made required. The environment and the tag
+protection are the organization's, so the repository needs no settings of its own.
