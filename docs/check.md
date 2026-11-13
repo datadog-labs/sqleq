@@ -243,7 +243,8 @@ Mechanics worth knowing before reading a slow run:
   fix rather than reporting `missing` for every row.
 - `sqleq-solver` needs only its binary, which `cargo build --release` builds (the default `solver`
   feature): it compiles Z3 from source and links it in, so nothing is needed at run time (the first build needs
-  cmake and a C++20 compiler whose standard library has `<format>`, such as GCC 13 or newer).
+  cmake 3.26 or newer and a C++20 compiler whose standard library has `<format>`, such as GCC 13 or
+  newer).
 - With `--sqlsolver-jvm` it requires the fork tree (its `lib/` holds the Z3 natives), a JDK, and
   `$SQLEQ_SQLSOLVER_DEPS` pointing at the exploded dependency directory the fork was compiled
   against. The harness compiles the bridge driver with `javac` on first use, into

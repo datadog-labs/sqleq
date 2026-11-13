@@ -37,9 +37,9 @@ sqleq is one crate, with a cargo feature for each axis whose build is heavy. The
 and `solver`, make a bare `cargo build` or `cargo test` slow the first time: the `fuzz` feature
 downloads the PostgreSQL it runs on (the DuckDB engine and its ~40 MB library are the off-by-default
 `duckdb` feature), and
-the `solver` feature compiles Z3 from source, which takes minutes and needs cmake and a C++20
-compiler whose standard library has `<format>` (GCC 13 or newer). `--no-default-features` builds
-neither, and is the quick loop for the frontend and
+the `solver` feature compiles Z3 from source, which takes minutes and needs cmake 3.26 or newer
+and a C++20 compiler whose standard library has `<format>` (GCC 13 or newer).
+`--no-default-features` builds neither, and is the quick loop for the frontend and
 `sqleq-check`. The `lean` feature is off by default: it runs the Lean 4 toolchain that
 `lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a release's `bin`
 there yourself), and its integration test fails rather than skips without it.
