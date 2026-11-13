@@ -7,14 +7,16 @@
 #
 # Publishing a GitHub release starts it. `publish` uploads the crate through crates.io's trusted
 # publishing: GitHub's OIDC token is exchanged for a crates.io token that lasts 30 minutes and is
-# scoped to this crate, this repository, this workflow and the `crates-io` environment, so no
-# secret is stored anywhere. crates.io accepts the exchange only once a crate owner has registered
+# scoped to this crate, this repository, this workflow and the `protected-main-env` environment,
+# so no secret is stored anywhere. crates.io accepts the exchange only once a crate owner has registered
 # this workflow as the crate's trusted publisher. The first version is uploaded by hand, because a
 # trusted publisher can only be added to a crate that exists; its release then finds the version
 # already there, and only proves the exchange.
 #
-# The `crates-io` environment is set up in the repository's settings: only release tags may deploy
-# to it, and a maintainer approves each run. CONTRIBUTING.md has the steps for a release.
+# `protected-main-env` is the environment the datadog-labs organization provides for jobs that
+# publish: only `main` and tags may deploy to it. An organization ruleset protects every tag, and
+# Actions cannot bypass it, so the tag a release needs is created by the person who publishes the
+# release, never by a workflow. CONTRIBUTING.md has the steps for a release.
 #
 # `install` then installs the published version on a clean runner with `cargo install`, as a user
 # would, and runs it on one pair it must prove and one it must refute.
@@ -38,7 +40,7 @@ jobs:
     name: publish to crates.io
     # The image CI's package job installs this tarball on.
     runs-on: ubuntu-24.04
-    environment: crates-io
+    environment: protected-main-env
     permissions:
       contents: read
       # The OIDC token trusted publishing exchanges.
