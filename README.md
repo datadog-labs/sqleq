@@ -58,8 +58,11 @@ That installs `sqleq-check`, the command you run, with the frontend (`sqleq-fron
 (`sqleq-solver`) and the refuter (`sqleq-fuzz`), into `~/.cargo/bin`. It builds them from source, so
 it needs:
 
-* **cmake and a C++20 compiler.** Z3, which `sqleq-solver` links statically, is compiled from
-  source; that takes minutes.
+* **cmake, and a C++20 compiler whose standard library has `<format>`.** Z3, which `sqleq-solver`
+  links statically, is compiled from source; that takes minutes. With GCC that means GCC 13 or
+  newer. GCC 12 and older, the defaults on Ubuntu 22.04 and Debian 12, fail with
+  `fatal error: format: No such file or directory`. `CC` and `CXX` choose the compiler the build
+  uses.
 * **libclang.** The frontend parses with PostgreSQL's own parser, whose Rust bindings are generated
   at build time.
 * **PostgreSQL 17, at run time,** for `sqleq-fuzz`: on `PATH`, or in the directory `SQLEQ_PG_BIN`
@@ -92,8 +95,8 @@ cargo build --release   # sqleq-frontend and sqleq-check, the refuter sqleq-fuzz
 
 The first build of `sqleq-fuzz` downloads the PostgreSQL 17 it runs pairs on (~12 MB, for Linux and
 macOS on x86_64 and arm64); the first build of `sqleq-solver`
-compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler.
-See [Building](#building).
+compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler whose standard
+library has `<format>` (GCC 13 or newer; see [Install](#install)). See [Building](#building).
 
 Two pairs ship in [`examples/`](examples/), in the [input format](#input-format) every pair uses: a
 rewrite that unnests an `IN` subquery into a join, which is equivalent only because the schema
@@ -299,7 +302,8 @@ needs no feature: it runs each backend as a subprocess.
   `sqleq-fuzz` uses the `postgres` on `PATH` instead. Its libxml2 is `libxml2.so.2`, which Ubuntu
   26.04 does not ship; there, point `SQLEQ_PG_BIN` at a PostgreSQL 17 of the system's own.
 * **`sqleq-solver`**, the default prover — the `solver` feature, on by default. Its first build
-  compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in
+  compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler whose standard
+  library has `<format>`, such as GCC 13 or newer ([Install](#install)). Z3 is linked in
   statically, so the binary needs nothing at run time.
 * **`sqleq-lean`** — `cargo build --release --features lean`. At run time it needs `lake` (from a Lean
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and

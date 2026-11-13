@@ -38,7 +38,8 @@ and `solver`, make a bare `cargo build` or `cargo test` slow the first time: the
 downloads the PostgreSQL it runs on (the DuckDB engine and its ~40 MB library are the off-by-default
 `duckdb` feature), and
 the `solver` feature compiles Z3 from source, which takes minutes and needs cmake and a C++20
-compiler. `--no-default-features` builds neither, and is the quick loop for the frontend and
+compiler whose standard library has `<format>` (GCC 13 or newer). `--no-default-features` builds
+neither, and is the quick loop for the frontend and
 `sqleq-check`. The `lean` feature is off by default: it runs the Lean 4 toolchain that
 `lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a release's `bin`
 there yourself), and its integration test fails rather than skips without it.

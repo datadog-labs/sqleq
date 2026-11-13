@@ -373,7 +373,8 @@ jobs:
 
       # Z3 is compiled from the `z3-src` crate, whose checksum Cargo.lock pins, and linked
       # statically; the cache above keeps that compile to the first build after a lockfile change.
-      # It needs cmake and a C++20 compiler, which the runner image provides.
+      # It needs cmake and a C++20 compiler whose standard library has `<format>` (GCC 13 or newer),
+      # which the runner image provides.
       - run: cmake --version && c++ --version
 
       # The library's unit tests (sqleq-solver's among them), the binaries' and sqleq-solver's
