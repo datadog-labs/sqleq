@@ -19,7 +19,6 @@ categories = ["database", "development-tools::testing", "command-line-utilities"
 # a distributed package must ship. Not the tests, the Lean package, the tools or the docs; the Lean
 # package's absence is also how an installed sqleq-check tells it is not in a checkout.
 include = ["/src", "/build.rs", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/LICENSE-3rdparty.csv"]
-publish = false
 # Every binary is listed below, with the feature it needs.
 autobins = false
 
