@@ -169,8 +169,9 @@ pub fn discover_sqleq_solver(flag: Option<&str>, bin_dir: Option<&str>) -> Resul
             Some(p) => path_str(&abspath(&p)),
             None => {
                 return Err("error: could not find 'sqleq-solver'. Build it with `cargo build --release \
-                            --features solver` (its first build compiles Z3, which needs cmake and a C++20 \
-                            compiler whose standard library has <format>, such as GCC 13 or newer), \
+                            --features solver` (its first build compiles Z3, which needs cmake 3.26 \
+                            or newer and a C++20 compiler whose standard library has <format>, such \
+                            as GCC 13 or newer), \
                             put it on PATH, or pass --sqleq-solver-bin/$SQLEQ_SOLVER_BIN."
                     .to_string())
             }
