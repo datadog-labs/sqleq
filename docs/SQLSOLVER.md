@@ -314,7 +314,7 @@ using the module's concrete evaluator.
 
 The `solver` feature, on by default, compiles Z3 from source and links it statically, so the
 binary needs nothing at run time; the first build takes minutes and needs cmake and a C++20
-compiler.
+compiler whose standard library has `<format>` (GCC 13 or newer).
 
 ## The JVM fork
 

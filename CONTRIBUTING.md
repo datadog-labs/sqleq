@@ -38,7 +38,8 @@ and `solver`, make a bare `cargo build` or `cargo test` slow the first time: the
 downloads the PostgreSQL it runs on (the DuckDB engine and its ~40 MB library are the off-by-default
 `duckdb` feature), and
 the `solver` feature compiles Z3 from source, which takes minutes and needs cmake and a C++20
-compiler. `--no-default-features` builds neither, and is the quick loop for the frontend and
+compiler whose standard library has `<format>` (GCC 13 or newer). `--no-default-features` builds
+neither, and is the quick loop for the frontend and
 `sqleq-check`. The `lean` feature is off by default: it runs the Lean 4 toolchain that
 `lean/lean-toolchain` names, with `lake` on `PATH` (elan installs it, or put a release's `bin`
 there yourself), and its integration test fails rather than skips without it.
@@ -191,3 +192,27 @@ this project can have. Open an issue with the two queries, the DDL, and the coun
 have one — it does not need to be minimized. The
 [soundness bug template](https://github.com/datadog-labs/sqleq/issues/new?template=soundness_bug.md)
 asks for exactly that. The fix will add the pair, minimized, to [`tests/pairs/`](tests/pairs/README.md).
+
+## Releasing
+
+Releases are published to crates.io by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), with no stored token: crates.io's
+trusted publishing exchanges the workflow's OIDC token for one that lasts 30 minutes.
+
+1. In one pull request, set the new `version` in `Cargo.toml` (and `Cargo.lock`, which a build
+   updates) and add its entry to [`CHANGELOG.md`](CHANGELOG.md).
+2. Once it merges, publish a GitHub release for the tag `v<version>` on the merge commit, with the
+   changelog entry as its notes. Publishing it creates the tag: an organization ruleset protects
+   tags, and workflows cannot create them.
+3. The release starts the workflow, in the organization's `protected-main-env` environment, which
+   only `main` and tags can deploy to. It checks that the tag names the version, verifies the
+   package, uploads it, and then installs it from crates.io on a clean runner and runs one pair it
+   must prove and one it must refute.
+
+A published version cannot be deleted, only yanked, so a mistake is fixed by the next version.
+
+Before the first release, once: the first version uploaded by hand with a short-lived token scoped
+to the crate (a trusted publisher can only be added to a crate that exists); then, on crates.io, this
+repository, `release.yml` and the `protected-main-env` environment registered as the crate's trusted
+publisher, the token revoked, and trusted publishing made required. The environment and the tag
+protection are the organization's, so the repository needs no settings of its own.

@@ -1,4 +1,4 @@
-# <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo/mark-dark.svg"><img src="docs/logo/mark-light.svg" alt="" height="44"></picture> sqleq
+# <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/datadog-labs/sqleq/main/docs/logo/mark-dark.svg"><img src="https://raw.githubusercontent.com/datadog-labs/sqleq/main/docs/logo/mark-light.svg" alt="" height="44"></picture> sqleq
 
 Decides whether two SQL queries are equivalent, meaning they always return the same results. Aims to
 return a **proof** when they are equivalent or a **concrete counterexample** when they are not.
@@ -48,9 +48,46 @@ parameters correspond, and has the Lean kernel check the proof. It needs a Lean 
 `sqleq-check --lean` asks it, and outside `--expect pinned` its answer changes no exit code. See
 [`docs/LEAN.md`](docs/LEAN.md).
 
+## Install
+
+```sh
+cargo install --locked sqleq
+```
+
+That installs `sqleq-check`, the command you run, with the frontend (`sqleq-frontend`), the prover
+(`sqleq-solver`) and the refuter (`sqleq-fuzz`), into `~/.cargo/bin`. It builds them from source, so
+it needs:
+
+* **cmake, and a C++20 compiler whose standard library has `<format>`.** Z3, which `sqleq-solver`
+  links statically, is compiled from source; that takes minutes. With GCC that means GCC 13 or
+  newer. GCC 12 and older, the defaults on Ubuntu 22.04 and Debian 12, fail with
+  `fatal error: format: No such file or directory`. `CC` and `CXX` choose the compiler the build
+  uses.
+* **libclang.** The frontend parses with PostgreSQL's own parser, whose Rust bindings are generated
+  at build time.
+* **PostgreSQL 17, at run time,** for `sqleq-fuzz`: on `PATH`, or in the directory `SQLEQ_PG_BIN`
+  names (the one holding `postgres` and `initdb`). A build from a checkout fetches one; an installed
+  one does not. On Debian and Ubuntu, the `postgresql-17` package from the
+  [PostgreSQL apt repository](https://wiki.postgresql.org/wiki/Apt) puts it in
+  `/usr/lib/postgresql/17/bin`.
+
+`--features duckdb` adds `sqleq-fuzz`'s DuckDB engine, linked against the libduckdb that
+`DUCKDB_LIB_DIR` names, which must also be on the system's library path at run time. The Lean and
+cvc5 axes build from a checkout only (see [Building](#building)), and the QED prover is a separate
+project.
+
+**As a library dependency**, `default-features = false` builds neither Z3 nor `sqleq-fuzz`'s
+dependencies. With the `solver` feature, a crate that depends on `sqleq` compiles Z3 unoptimised in
+its own dev profile, which is slow to run, unless it sets what this crate's `Cargo.toml` sets:
+
+```toml
+[profile.dev.package.z3-sys]
+opt-level = 3
+```
+
 ## Quick start
 
-Build `sqleq-check` and the two backends Cargo builds by itself:
+From a checkout, build `sqleq-check` and the two backends Cargo builds by itself:
 
 ```sh
 cargo build --release   # sqleq-frontend and sqleq-check, the refuter sqleq-fuzz and the prover sqleq-solver
@@ -58,15 +95,15 @@ cargo build --release   # sqleq-frontend and sqleq-check, the refuter sqleq-fuzz
 
 The first build of `sqleq-fuzz` downloads the PostgreSQL 17 it runs pairs on (~12 MB, for Linux and
 macOS on x86_64 and arm64); the first build of `sqleq-solver`
-compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler.
-See [Building](#building).
+compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler whose standard
+library has `<format>` (GCC 13 or newer; see [Install](#install)). See [Building](#building).
 
 Two pairs ship in [`examples/`](examples/), in the [input format](#input-format) every pair uses: a
 rewrite that unnests an `IN` subquery into a join, which is equivalent only because the schema
 declares a key, and a rewrite that drops a predicate, which is not equivalent.
 
 ```sh
-CHECK=./target/release/sqleq-check
+CHECK=./target/release/sqleq-check   # or CHECK=sqleq-check, installed
 $CHECK --portfolio --axes fuzz,sqleq-solver --expect report-only -v examples/
 ```
 
@@ -265,7 +302,8 @@ needs no feature: it runs each backend as a subprocess.
   `sqleq-fuzz` uses the `postgres` on `PATH` instead. Its libxml2 is `libxml2.so.2`, which Ubuntu
   26.04 does not ship; there, point `SQLEQ_PG_BIN` at a PostgreSQL 17 of the system's own.
 * **`sqleq-solver`**, the default prover — the `solver` feature, on by default. Its first build
-  compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler. Z3 is linked in
+  compiles Z3 from source, which takes minutes and needs cmake and a C++20 compiler whose standard
+  library has `<format>`, such as GCC 13 or newer ([Install](#install)). Z3 is linked in
   statically, so the binary needs nothing at run time.
 * **`sqleq-lean`** — `cargo build --release --features lean`. At run time it needs `lake` (from a Lean
   toolchain, e.g. via [elan](https://github.com/leanprover/elan)) on `PATH` or in `$LAKE`, and
@@ -311,6 +349,7 @@ and failing those the newest Nix-built `qed-prover` it can find.
 | [`tests/pairs/README.md`](tests/pairs/README.md) | the pinned pairs: known truths, every axis's answer, and how to add one |
 | [`docs/fuzz.md`](docs/fuzz.md) | the disproving axis, and its own soundness rules |
 | [`tools/README.md`](tools/README.md) | the scripts that are not part of the crate |
+| [`CHANGELOG.md`](CHANGELOG.md) | what each release changed |
 
 ## Contributing
 

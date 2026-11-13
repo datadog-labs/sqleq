@@ -1,0 +1,161 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the
+# Apache License Version 2.0.
+# This product includes software developed at Datadog (https://www.datadoghq.com/).
+# Copyright 2026-Present Datadog, Inc.
+
+# Publishes a release to crates.io, then installs it from there.
+#
+# Publishing a GitHub release starts it. `publish` uploads the crate through crates.io's trusted
+# publishing: GitHub's OIDC token is exchanged for a crates.io token that lasts 30 minutes and is
+# scoped to this crate, this repository, this workflow and the `protected-main-env` environment,
+# so no secret is stored anywhere. crates.io accepts the exchange only once a crate owner has registered
+# this workflow as the crate's trusted publisher. The first version is uploaded by hand, because a
+# trusted publisher can only be added to a crate that exists; its release then finds the version
+# already there, and only proves the exchange.
+#
+# `protected-main-env` is the environment the datadog-labs organization provides for jobs that
+# publish: only `main` and tags may deploy to it. An organization ruleset protects every tag, and
+# Actions cannot bypass it, so the tag a release needs is created by the person who publishes the
+# release, never by a workflow. CONTRIBUTING.md has the steps for a release.
+#
+# `install` then installs the published version on a clean runner with `cargo install`, as a user
+# would, and runs it on one pair it must prove and one it must refute.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+# Each job asks for what it needs and nothing else.
+permissions: {}
+
+# Two releases published together would race on the index check below; the second waits.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish to crates.io
+    # The image CI's package job installs this tarball on.
+    runs-on: ubuntu-24.04
+    environment: protected-main-env
+    permissions:
+      contents: read
+      # The OIDC token trusted publishing exchanges.
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+
+    steps:
+      # The release's tag, which is what `release` events check out. Pinned as in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The tag must be `v` and the version Cargo.toml declares, so a release can only publish the
+      # version it is named for. The tag reaches the script through the environment, never pasted
+      # into it.
+      - id: version
+        name: the tag names the version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "sqleq") | .version')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::the release's tag is $TAG, but Cargo.toml declares version $version (tag v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # No build cache in this workflow: this job can mint a publishing token, so nothing it runs may
+      # come from a cache that another workflow wrote.
+      - run: cmake --version && c++ --version
+
+      # Verified before authenticating: the verification compiles Z3, which can take longer than
+      # the token lives. The upload below sends this same tarball unverified.
+      - run: cargo package --locked
+
+      # Read from crates.io's sparse index, one line per version, slurped into one array: with
+      # several inputs, `jq -e` takes its status from the last line alone in some versions. A crate
+      # with no version yet is a 404, which is "not published" too.
+      - id: published
+        name: is this version on crates.io already?
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if curl -fsS https://index.crates.io/sq/le/sqleq \
+              | jq -e -s --arg v "$VERSION" 'any(.[]; .vers == $v)' > /dev/null; then
+            echo "sqleq $VERSION is on crates.io already, so nothing is uploaded"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Runs either way, so a release of a version uploaded by hand still proves the exchange. The
+      # action revokes the token when the job ends.
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - if: steps.published.outputs.exists != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --no-verify
+
+  install:
+    name: cargo install from crates.io
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.publish.outputs.version }}
+
+    steps:
+      # Only for the two example pairs; what runs is what crates.io serves.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # An installed sqleq fetches no PostgreSQL, so it is installed here, as in CI's package job.
+      - name: PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -yq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -yq postgresql-17
+          echo "SQLEQ_PG_BIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      # The index can trail an upload by a little; wait up to ten minutes for the version to appear.
+      - name: wait for the index
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 40); do
+            if curl -fsS https://index.crates.io/sq/le/sqleq \
+                | jq -e -s --arg v "$VERSION" 'any(.[]; .vers == $v)' > /dev/null; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::sqleq $VERSION did not appear in the crates.io index"
+          exit 1
+
+      # From outside the repository, as a user would; `~/.cargo/bin` is on the runner's PATH.
+      - name: cargo install
+        working-directory: ${{ runner.temp }}
+        run: cargo install --locked sqleq --version "$VERSION"
+
+      - name: prove one pair, refute another
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/examples/in_to_join.sql" "$GITHUB_WORKSPACE/examples/dropped_filter.sql" .
+          sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver in_to_join.sql dropped_filter.sql
