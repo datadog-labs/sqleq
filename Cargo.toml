@@ -120,7 +120,7 @@ postgres = { version = "0.19", optional = true }
 # The first build compiles Z3 and needs cmake and a C++20 compiler whose standard library has
 # `<format>` (GCC 13 or newer). Z3 is built optimised in every profile
 # (`[profile.dev.package.z3-sys]`).
-z3 = { version = "0.21.1", features = ["vendored"], optional = true }
+z3 = { version = "0.22.0", features = ["vendored"], optional = true }
 
 # sqleq-cvc5. The cvc5 bindings (https://github.com/cvc5/cvc5-rs). Without their `static` feature
 # they link the cvc5 library that `CVC5_LIB_DIR` names and read its headers from `CVC5_INCLUDE_DIR`
