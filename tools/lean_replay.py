@@ -81,6 +81,77 @@ import sys
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
+# The contrib extensions `--setup` installs: the ones sqleq-fuzz installs into the database every
+# pair runs in (`EXTENSIONS`, src/fuzz/pg.rs), in its order, so a proof is replayed where the pair
+# was tested. A test there holds the two lists, and the stand-ins below, equal.
+EXTENSIONS = (
+    "citext",
+    "pg_trgm",
+    "uuid-ossp",
+    "hstore",
+    "pgcrypto",
+    "ltree",
+    "unaccent",
+    "btree_gist",
+    "btree_gin",
+)
+
+# The uuid-ossp functions core PostgreSQL can stand in for, defined under their own names where the
+# extension cannot load (a build may link a library the system lacks). sqleq-fuzz's, word for word.
+UUID_OSSP_CORE = """
+    CREATE FUNCTION uuid_generate_v4() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE
+        AS 'SELECT gen_random_uuid()';
+    CREATE FUNCTION uuid_generate_v1() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE
+        AS $$SELECT overlay(gen_random_uuid()::text PLACING '1' FROM 15 FOR 1)::uuid$$;
+    CREATE FUNCTION uuid_generate_v1mc() RETURNS uuid LANGUAGE sql VOLATILE PARALLEL SAFE
+        AS $$SELECT overlay(gen_random_uuid()::text PLACING '1' FROM 15 FOR 1)::uuid$$;
+    CREATE FUNCTION uuid_generate_v3(namespace uuid, name text) RETURNS uuid LANGUAGE sql
+        IMMUTABLE STRICT PARALLEL SAFE AS $$
+        SELECT (substr(h, 1, 12) || '3' || substr(h, 14, 3)
+                || to_hex((('x' || substr(h, 17, 1))::bit(4)::int & 3) | 8) || substr(h, 18))::uuid
+        FROM (SELECT md5(decode(replace(namespace::text, '-', ''), 'hex')
+                         || convert_to(name, 'UTF8')) AS h) AS s $$;
+    CREATE FUNCTION uuid_nil() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS $$SELECT '00000000-0000-0000-0000-000000000000'::uuid$$;
+    CREATE FUNCTION uuid_ns_dns() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS $$SELECT '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid$$;
+    CREATE FUNCTION uuid_ns_url() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS $$SELECT '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid$$;
+    CREATE FUNCTION uuid_ns_oid() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS $$SELECT '6ba7b812-9dad-11d1-80b4-00c04fd430c8'::uuid$$;
+    CREATE FUNCTION uuid_ns_x500() RETURNS uuid LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS $$SELECT '6ba7b814-9dad-11d1-80b4-00c04fd430c8'::uuid$$;"""
+
+# `uuid_generate_v5()`, which needs pgcrypto's `digest`: defined only where that loaded.
+UUID_OSSP_V5 = """
+    CREATE FUNCTION uuid_generate_v5(namespace uuid, name text) RETURNS uuid LANGUAGE sql
+        IMMUTABLE STRICT PARALLEL SAFE AS $$
+        SELECT (substr(h, 1, 12) || '5' || substr(h, 14, 3)
+                || to_hex((('x' || substr(h, 17, 1))::bit(4)::int & 3) | 8) || substr(h, 18, 15))::uuid
+        FROM (SELECT encode(public.digest(decode(replace(namespace::text, '-', ''), 'hex')
+                                          || convert_to(name, 'UTF8'), 'sha1'), 'hex') AS h) AS s $$;"""
+
+
+def setup(psql: list[str]) -> None:
+    """Prepare the database as sqleq-fuzz prepares the one it tests in: its extensions, each where
+    the install has it, and its uuid-ossp stand-ins where the extension's functions are missing."""
+    def run(sql: str) -> subprocess.CompletedProcess:
+        return subprocess.run(psql + ["-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                              capture_output=True, text=True)
+
+    def has(procedure: str) -> bool:
+        return run(f"SELECT to_regprocedure('{procedure}') IS NOT NULL").stdout.strip() == "t"
+
+    for ext in EXTENSIONS:
+        p = run(f'CREATE EXTENSION IF NOT EXISTS "{ext}"')
+        print(f"extension {ext}: {'ok' if p.returncode == 0 else p.stderr.strip()}", file=sys.stderr)
+    if not has("uuid_generate_v4()"):
+        p = run(UUID_OSSP_CORE)
+        if p.returncode == 0 and has("public.digest(bytea,text)"):
+            p = run(UUID_OSSP_V5)
+        print(f"uuid-ossp stand-ins: {'ok' if p.returncode == 0 else p.stderr.strip()}", file=sys.stderr)
+
+
 def _base36(n: int) -> str:
     s = ""
     while True:
@@ -112,7 +183,8 @@ def value_for(raw_type: str, n: int, enums: dict[str, list[str]] | None = None) 
     if enums and bare in enums and enums[bare]:
         labels = enums[bare]
         return labels[n % len(labels)].replace("''", "'")
-    t = re.sub(r"^pg_catalog\.", "", t)
+    # A dump qualifies an extension's type with the schema it is installed in.
+    t = re.sub(r"^(pg_catalog|public)\.", "", t)
     if t.endswith("[]") or t.startswith("array"):
         raise NoValue(f"array type {raw_type}")
     m = re.match(r'^"?([a-z_ ]+?)"?\s*(\((\d+)(\s*,\s*\d+)?\))?(\s*with(out)? time zone)?$', t)
@@ -162,6 +234,11 @@ def value_for(raw_type: str, n: int, enums: dict[str, list[str]] | None = None) 
         return "w" + _base36(n)
     if base in ("inet", "cidr"):
         return f"10.{(n >> 16) & 255}.{(n >> 8) & 255}.{n & 255}"
+    if base == "ltree":
+        # A two-label path, the second label the parameter's own.
+        return "a." + _base36(n)
+    if base == "hstore":
+        return f"k=>{n}"
     raise NoValue(f"type {raw_type}")
 
 
@@ -712,19 +789,17 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--setup", action="store_true",
-                    help="first install the contrib extensions dumps commonly use (uuid-ossp, pgcrypto, "
-                         "citext, pg_trgm, hstore) into the database. The only write outside a rolled-back "
-                         "transaction, so it is opt-in.")
+                    help="first install the contrib extensions sqleq-fuzz installs (" + ", ".join(EXTENSIONS)
+                         + ") into the database, and its stand-ins for uuid-ossp's functions where that "
+                           "extension does not load. The only write outside a rolled-back transaction, "
+                           "so it is opt-in.")
     a = ap.parse_args()
     psql = [a.psql]
     for flag, v in (("-h", a.host), ("-p", a.port), ("-U", a.user), ("-d", a.dbname)):
         if v:
             psql += [flag, v]
     if a.setup:
-        for ext in ("uuid-ossp", "pgcrypto", "citext", "pg_trgm", "hstore"):
-            p = subprocess.run(psql + ["-X", "-q", "-c", f'CREATE EXTENSION IF NOT EXISTS "{ext}"'],
-                               capture_output=True, text=True)
-            print(f"extension {ext}: {'ok' if p.returncode == 0 else p.stderr.strip()}", file=sys.stderr)
+        setup(psql)
     plans = json.load(open(a.plan))
     out: dict = {}
     with cf.ThreadPoolExecutor(a.jobs) as ex:

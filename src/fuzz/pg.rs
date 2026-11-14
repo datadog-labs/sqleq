@@ -2715,6 +2715,30 @@ fn run_pair(
 mod tests {
     use super::*;
 
+    /// `tools/lean_replay.py --setup` prepares the database the Lean replay runs in as the template
+    /// here is prepared: the same extensions, and the same `uuid-ossp` stand-ins where the
+    /// extension does not load. It keeps its own copy of both, being a standalone script, and this
+    /// holds the copies equal, so that a Lean proof is replayed in the environment its pair was
+    /// tested in (an `ltree` column stayed inconclusive there while the list was five long).
+    #[test]
+    fn the_lean_replay_prepares_its_database_as_the_template_is_prepared() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/lean_replay.py");
+        let Ok(py) = std::fs::read_to_string(path) else {
+            // The package crates.io receives has no `tools/`.
+            eprintln!("skipped, no {path}");
+            return;
+        };
+        let after = |marker: &str| py.split(marker).nth(1).unwrap_or_else(|| panic!("no `{marker}` in {path}"));
+        let list = after("EXTENSIONS = (").split(')').next().expect("a closing parenthesis");
+        let theirs: Vec<&str> = list.split(',').map(|e| e.trim().trim_matches('"')).filter(|e| !e.is_empty()).collect();
+        assert_eq!(theirs, EXTENSIONS, "the extensions --setup installs");
+        let squeeze = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (name, ours) in [("UUID_OSSP_CORE", UUID_OSSP_CORE), ("UUID_OSSP_V5", UUID_OSSP_V5)] {
+            let theirs = after(&format!("{name} = \"\"\"")).split("\"\"\"").next().expect("a closing quote");
+            assert_eq!(squeeze(theirs), squeeze(ours), "{name}");
+        }
+    }
+
     /// The `uuid-ossp` stand-ins give what the extension gives: RFC 4122's name-based uuids exactly,
     /// and a fresh version-1 uuid per call from the time-based ones. Defined in a scratch schema, so
     /// this holds whether or not the build's own extension loads.

@@ -281,6 +281,14 @@ other generated values than it found) is reported as inconclusive rather than as
 
     python3 tools/lean_replay.py --setup --plan plan.json --json replay.json --host <socket dir>
 
+`--setup` prepares the database as `sqleq-fuzz` prepares the one it tests in, so a proof is replayed
+where its pair was tested. It installs the same contrib extensions, each where the install has it
+(`citext`, `pg_trgm`, `uuid-ossp`, `hstore`, `pgcrypto`, `ltree`, `unaccent`, `btree_gist`,
+`btree_gin`), and where `uuid-ossp` does not load it defines the same stand-ins for its functions.
+It is the only write outside a rolled-back transaction, so it is opt-in. The replay binds each
+parameter a distinct value of its type; a type it has no value for (an array, a type it does not
+know) leaves the pair `inconclusive`, with the type named.
+
 `ALARM-sides-differ` is the outcome the axis must never produce. `witness-disagrees` is a gap in
 the witness model, and the direction matters: a credited pair that fails in Postgres means credit
 was wrong, while a withheld one that succeeds only cost credit.
