@@ -11,11 +11,18 @@
 //! is among the commonest wrong rewrites, and it can be told apart only by a row that holds the
 //! literal itself, or, for an integer or a date, the value next to it. These are those values, for
 //! the trials that draw them ([`crate::fuzz::pg`]).
+//!
+//! There are two readings. [`harvest`] takes a literal a column itself is compared with, as the
+//! text the query writes. [`harvest_wide`] also takes one compared with an expression of the column
+//! (`coalesce(c, 0) <= -2`), one a `CASE c WHEN` holds its operand against, and a constant that is
+//! not its literal's text (`CAST('-1.7305e-12'::float8 AS int8)` is `0`), which the engine is asked
+//! for. They are kept apart because the trials that draw the first reading's values must go on
+//! drawing exactly those.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{BinaryOperator, Expr, InTarget, UnaryOperator, Value, Visit, Visitor};
+use sqlparser::ast::{BinaryOperator, Expr, InTarget, Query, UnaryOperator, Value, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -49,6 +56,100 @@ pub fn harvest(a: &str, b: &str) -> BTreeMap<String, Vec<Lit>> {
     h.0
 }
 
+/// What [`harvest_wide`] finds a column held against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// A literal, as [`harvest`] reads one.
+    Lit(Lit),
+    /// A constant that need not be its literal's text, as SQL: a cast over a literal, or arithmetic
+    /// over literals. What it is, is the engine's to say.
+    Constant(String),
+}
+
+/// [`harvest`], read more widely: each column that a comparison, a `BETWEEN`, an `IN` list or an
+/// `IS [NOT] DISTINCT FROM` in either statement holds against a constant, by its bare lower-cased
+/// name, and the constants.
+///
+/// - **The column may be anywhere under its side**: in `coalesce(c, 0) <= -2` it is `c`, in
+///   `a + b > 10` both. A column inside a subquery is not under it; that is another row's.
+/// - **A `CASE c WHEN k` holds `c` against `k`.**
+/// - **A constant is a literal, or literals under casts, signs, arithmetic and parentheses.** One
+///   with a cast or an operator in it is given as SQL too ([`Side::Constant`]), since its value can
+///   be another than the text inside it: `CAST('-1.7305e-12'::float8 AS int8)` is `0`.
+///
+/// Everything [`harvest`] finds is here as a [`Side::Lit`], so this reading only adds. A name
+/// stands for every column of that name, as there, and a constant of another type than the column
+/// is dropped when the column's values are made ([`values`]).
+pub fn harvest_wide(a: &str, b: &str) -> BTreeMap<String, Vec<Side>> {
+    let mut h = Wide(BTreeMap::new());
+    for sql in [a, b] {
+        if let Ok(parsed) = Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+            for st in &parsed {
+                let _ = st.visit(&mut h);
+            }
+        }
+    }
+    h.0
+}
+
+struct Wide(BTreeMap<String, Vec<Side>>);
+
+impl Wide {
+    fn add(&mut self, col: &Expr, constant: &Expr) {
+        let sides = sides(constant);
+        if sides.is_empty() {
+            return;
+        }
+        for c in columns(col) {
+            let held = self.0.entry(c).or_default();
+            for s in &sides {
+                if !held.contains(s) {
+                    held.push(s.clone());
+                }
+            }
+        }
+    }
+}
+
+impl Visitor for Wide {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        compared(e, |x, y| self.add(x, y));
+        if let Expr::Case { operand: Some(operand), conditions, .. } = e {
+            for when in conditions {
+                self.add(operand, &when.condition);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Each (column side, literal side) that `e` itself compares, both ways round where either operand
+/// could be the column.
+fn compared(e: &Expr, mut f: impl FnMut(&Expr, &Expr)) {
+    match e {
+        Expr::BinaryOp { left, op, right } if is_comparison(op) => {
+            f(left, right);
+            f(right, left);
+        }
+        Expr::IsDistinctFrom(x, y) | Expr::IsNotDistinctFrom(x, y) => {
+            f(x, y);
+            f(y, x);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            f(expr, low);
+            f(expr, high);
+        }
+        Expr::In { expr, target: InTarget::List(list), .. } => {
+            for l in list {
+                f(expr, l);
+            }
+        }
+        _ => {}
+    }
+}
+
 struct Harvest(BTreeMap<String, Vec<Lit>>);
 
 impl Harvest {
@@ -61,30 +162,13 @@ impl Harvest {
         }
     }
 
-    fn pair(&mut self, x: &Expr, y: &Expr) {
-        self.add(x, y);
-        self.add(y, x);
-    }
 }
 
 impl Visitor for Harvest {
     type Break = ();
 
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-        match e {
-            Expr::BinaryOp { left, op, right } if is_comparison(op) => self.pair(left, right),
-            Expr::IsDistinctFrom(x, y) | Expr::IsNotDistinctFrom(x, y) => self.pair(x, y),
-            Expr::Between { expr, low, high, .. } => {
-                self.add(expr, low);
-                self.add(expr, high);
-            }
-            Expr::In { expr, target: InTarget::List(list), .. } => {
-                for l in list {
-                    self.add(expr, l);
-                }
-            }
-            _ => {}
-        }
+        compared(e, |x, y| self.add(x, y));
         ControlFlow::Continue(())
     }
 }
@@ -109,6 +193,90 @@ fn column(e: &Expr) -> Option<String> {
         Expr::Nested(x) | Expr::Cast { expr: x, .. } => column(x),
         _ => None,
     }
+}
+
+/// The bare lower-cased names of the columns under `e`, outside any subquery, in reading order.
+fn columns(e: &Expr) -> Vec<String> {
+    struct Columns {
+        depth: usize,
+        names: Vec<String>,
+    }
+    impl Visitor for Columns {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let name = match e {
+                Expr::Identifier(id) => Some(id.value.to_lowercase()),
+                Expr::CompoundIdentifier(parts) => parts.last().map(|id| id.value.to_lowercase()),
+                _ => None,
+            };
+            if let (0, Some(n)) = (self.depth, name) {
+                if !self.names.contains(&n) {
+                    self.names.push(n);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut c = Columns { depth: 0, names: Vec::new() };
+    let _ = e.visit(&mut c);
+    c.names
+}
+
+/// What a constant `e` gives a column: its literal as [`literal`] reads it, and itself as SQL where
+/// it computes something.
+fn sides(e: &Expr) -> Vec<Side> {
+    let mut out: Vec<Side> = literal(e).map(Side::Lit).into_iter().collect();
+    if constant(e) && computes(e) {
+        out.push(Side::Constant(e.to_string()));
+    }
+    out
+}
+
+/// Whether `e` is literals alone, under casts, signs, arithmetic and parentheses. A parameter, a
+/// column, a function and a subquery are none of these: such an expression is not one value, or
+/// not one the engine can be asked for ahead of the trials.
+fn constant(e: &Expr) -> bool {
+    match e {
+        Expr::Value(v) => matches!(v.value, Value::Number(..) | Value::SingleQuotedString(_)),
+        Expr::TypedString(_) => true,
+        Expr::Nested(x) | Expr::Cast { expr: x, .. } => constant(x),
+        Expr::UnaryOp { op: UnaryOperator::Minus | UnaryOperator::Plus, expr } => constant(expr),
+        Expr::BinaryOp { left, op, right } => is_arithmetic(op) && constant(left) && constant(right),
+        _ => false,
+    }
+}
+
+/// Whether a constant has a cast or an operator between two operands in it, so that its value can
+/// be another than the text of the literal inside.
+fn computes(e: &Expr) -> bool {
+    match e {
+        Expr::Cast { .. } | Expr::BinaryOp { .. } => true,
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => computes(x),
+        _ => false,
+    }
+}
+
+fn is_arithmetic(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::StringConcat
+    )
 }
 
 fn literal(e: &Expr) -> Option<Lit> {
@@ -231,6 +399,50 @@ mod tests {
         assert_eq!(h["g"], [n("2.5")]);
         assert_eq!(h["k"], [t("2001-02-03")]);
         assert!(!h.contains_key("h"), "a parameter is no literal");
+    }
+
+    #[test]
+    fn the_wide_reading_looks_under_an_expression_and_asks_for_a_computed_constant() {
+        let c = |s: &str| Side::Constant(s.into());
+        let h = harvest_wide(
+            "SELECT * FROM t WHERE coalesce(c, 0) <= -2 AND a + x.b > 10 \
+               AND (CASE d WHEN '2001-01-13'::date THEN 1 END) = 1 \
+               AND e < CAST('-1.7305e-12'::float8 AS int8) AND f = 2 * 3 AND g = $1 + 1 AND h = now() \
+               AND i IN (SELECT j FROM u WHERE k = 5) AND length(m) = 0",
+            "SELECT * FROM t WHERE c = 7",
+        );
+        // Under a function, and what the narrow reading finds as well.
+        assert_eq!(h["c"], [Side::Lit(n("-2")), Side::Lit(n("7"))]);
+        // Every column under the side.
+        assert_eq!(h["a"], [Side::Lit(n("10"))]);
+        assert_eq!(h["b"], [Side::Lit(n("10"))]);
+        // The CASE against 1; and its operand against its arm, whose cast is asked for.
+        assert_eq!(
+            h["d"],
+            [Side::Lit(n("1")), Side::Lit(t("2001-01-13")), c("'2001-01-13'::DATE")]
+        );
+        // A cast: the literal's text as the narrow reading takes it, and the cast itself.
+        assert_eq!(h["e"], [Side::Lit(t("-1.7305e-12")), c("CAST('-1.7305e-12'::FLOAT8 AS INT8)")]);
+        // Arithmetic over literals has no literal to read, only a value to ask for.
+        assert_eq!(h["f"], [c("2 * 3")]);
+        // A parameter and a function are not constants.
+        assert!(!h.contains_key("g") && !h.contains_key("h"));
+        // A subquery's column is not under the side that holds the subquery; its own comparison is read.
+        assert!(!h.contains_key("i") && !h.contains_key("j"));
+        assert_eq!(h["k"], [Side::Lit(n("5"))]);
+        assert_eq!(h["m"], [Side::Lit(n("0"))]);
+    }
+
+    #[test]
+    fn the_wide_reading_holds_everything_the_narrow_one_does() {
+        let a = "SELECT * FROM t WHERE 334 <= c AND x.d > '2000-01-01'::date AND e BETWEEN 1 AND -5";
+        let b = r#"SELECT * FROM t WHERE (c) < 335 AND f IN ('a', 'b') AND g IS DISTINCT FROM 2.5 AND "K" = DATE '2001-02-03'"#;
+        let wide = harvest_wide(a, b);
+        for (col, lits) in harvest(a, b) {
+            for l in lits {
+                assert!(wide[&col].contains(&Side::Lit(l.clone())), "{col}: {l:?}");
+            }
+        }
     }
 
     #[test]
