@@ -7,7 +7,8 @@
 //!
 //! Values are drawn from a tiny domain (ints {0,1,2}, doubles {0,1,2}, chars {a,b,c}, a few
 //! dates/timestamps/uuids, both booleans, and a few values of each type Postgres names that has one) so equality filters and joins actually collide across the
-//! small instances — that collision is what surfaces DISTINCT / LIMIT / filter differences.
+//! small instances — that collision is what surfaces DISTINCT / LIMIT / filter differences. The
+//! values that domain cannot stand for (an infinite date, `NaN`, the empty string) are [`specials`].
 
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -126,6 +127,43 @@ pub fn clocks() -> [String; 3] {
         format!("{}+00", TIMESTAMPS[TIMESTAMPS.len() / 2]),
         "2100-01-01 00:00:00+00".to_string(),
     ]
+}
+
+/// The special values of a type: the ones no small domain of ordinary values stands for, because
+/// arithmetic and comparisons treat them as no ordinary value is treated.
+///
+/// * A date or a timestamp: `infinity` and `-infinity`. `'infinity'::date + 1` is `infinity`, so
+///   `d + 1 > d` fails there, and a cast of an infinite timestamp to a date is no one-day range.
+/// * A `numeric` or a float: `NaN`, and `Infinity` and `-Infinity` where the type holds them.
+///   `NaN * 0` is `NaN`, and `Infinity + 1` is not above `Infinity`. A `numeric(p, s)` holds `NaN`
+///   and no infinity; a bare `numeric` and the floats hold all three.
+/// * A string: the empty string, which `length(c) = 0` and `c = ''` tell from every other.
+///
+/// `pg_type` is the type as Postgres names it (`format_type`), for a column; a parameter has no
+/// typmod and passes `None`. A type the generator only stands in for (`money` drawn as a number,
+/// `inet` as a string) has none.
+///
+/// These are drawn on the Postgres engine alone, in trials of their own after every other
+/// (`pg::run_pair`), so the trials before them draw exactly what they drew without. They are not
+/// in the domains above: the middle clock is read off [`TIMESTAMPS`], and a clock is never infinite.
+pub fn specials(vt: VType, pg_type: Option<&str>) -> Vec<Val> {
+    use crate::fuzz::gather::{kind, Kind};
+    let kind = pg_type.map(kind);
+    let strs = |vs: &[&str]| vs.iter().map(|v| Val::Str((*v).to_string())).collect();
+    match vt {
+        VType::Date => vec![Val::Date("infinity".into()), Val::Date("-infinity".into())],
+        VType::Timestamp | VType::TimestampTz => vec![Val::Ts("infinity".into()), Val::Ts("-infinity".into())],
+        VType::Double | VType::Decimal(..) => match kind {
+            Some(Kind::Numeric(Some(_))) => strs(&["NaN"]),
+            Some(Kind::Numeric(None) | Kind::Float4 | Kind::Float8) | None => strs(&["NaN", "Infinity", "-Infinity"]),
+            Some(_) => Vec::new(),
+        },
+        VType::Varchar => match kind {
+            Some(Kind::Str(_)) | None => strs(&[""]),
+            Some(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// Generate a value for a column of type `vt`. Nullable columns are NULL with probability 0.3.
@@ -325,6 +363,38 @@ mod tests {
     /// on containment with a NULL element (`[NULL] @> [NULL]` is TRUE in DuckDB, FALSE in Postgres,
     /// which defines containment through `=`), so a counterexample resting on one would be a claim
     /// about DuckDB rather than about the rewrite. The array as a whole may still be NULL.
+    #[test]
+    fn special_values_follow_the_type() {
+        let texts = |vs: Vec<Val>| -> Vec<String> {
+            vs.into_iter()
+                .map(|v| match v {
+                    Val::Str(s) | Val::Date(s) | Val::Ts(s) => s,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(texts(specials(VType::Date, Some("date"))), ["infinity", "-infinity"]);
+        assert_eq!(texts(specials(VType::Timestamp, Some("timestamp without time zone"))), ["infinity", "-infinity"]);
+        assert_eq!(texts(specials(VType::TimestampTz, None)), ["infinity", "-infinity"]);
+        // A numeric with a typmod holds NaN and no infinity; a bare one and the floats hold all three.
+        assert_eq!(texts(specials(VType::Decimal(38, 18), Some("numeric(10,2)"))), ["NaN"]);
+        assert_eq!(texts(specials(VType::Decimal(38, 18), Some("numeric(10)"))), ["NaN"]);
+        assert_eq!(texts(specials(VType::Decimal(38, 18), Some("numeric"))), ["NaN", "Infinity", "-Infinity"]);
+        assert_eq!(texts(specials(VType::Double, Some("double precision"))), ["NaN", "Infinity", "-Infinity"]);
+        assert_eq!(texts(specials(VType::Double, Some("real"))), ["NaN", "Infinity", "-Infinity"]);
+        // A parameter has no typmod.
+        assert_eq!(texts(specials(VType::Decimal(38, 18), None)), ["NaN", "Infinity", "-Infinity"]);
+        // `money` is drawn as a number and has none of them.
+        assert!(specials(VType::Double, Some("money")).is_empty());
+        assert_eq!(texts(specials(VType::Varchar, Some("character varying(20)"))), [""]);
+        assert_eq!(texts(specials(VType::Varchar, Some("text"))), [""]);
+        // A type only drawn as a string is not one: the empty string is no `inet`.
+        assert!(specials(VType::Varchar, Some("inet")).is_empty());
+        assert!(specials(VType::Integer, Some("integer")).is_empty());
+        assert!(specials(VType::Boolean, None).is_empty());
+        assert!(specials(VType::Uuid, Some("uuid")).is_empty());
+    }
+
     #[test]
     fn generated_arrays_never_contain_a_null_element() {
         let c = Column {
