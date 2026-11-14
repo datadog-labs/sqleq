@@ -216,8 +216,18 @@ A Postgres type is mapped onto an IR type only where the IR type's operations ar
 type's. Both provers read REAL as exact rational arithmetic and any type's `=` as equality, so:
 
 - **`numeric` is REAL, but its division is not exact, and REAL has no scale.** Addition,
-  subtraction and multiplication of numerics are exact; division rounds to a finite scale
+  subtraction and multiplication of finite numerics are exact; division rounds to a finite scale
   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
+- **`numeric` has `NaN`, `Infinity` and `-Infinity`, which REAL has not.** They are values of the
+  type (`NaN` in any `numeric` column, the infinities in an unconstrained one), `NaN = NaN` holds
+  and `NaN` sorts above every other value, so `=` and the order still behave as an order does. The
+  identities of the real numbers that fail on them are the ones a prover must not use: `x * 0 = 0`
+  (`NaN * 0` and `Infinity * 0` are `NaN`), `x - x = 0`, and `x + 1 > x`. `sqleq-solver` reads a
+  product with a `numeric` in it as an uninterpreted function of which it knows only that it
+  commutes, so nothing folds it to zero; it leaves sums uncancelled, and it does not interpret the
+  order of REAL values. The QED prover reads REAL as
+  the real numbers, so it proves pairs that differ only at these values; such a pair is pinned
+  with `qed: proved !known-unsound`.
   A numeric's text shows its scale, `1.0` and `1.00` being one number and two strings, and so does
   the scale a division rounds to; what that costs is
   [below](#values-that--calls-equal-and-that-are-still-two-values).
@@ -261,6 +271,10 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   which Postgres computes as an integer division. `count`, `min` and `max` are integers, so they keep
   their operand's type.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
+  So is `oid`, which is a number but not an integer: it is unsigned, and Postgres reads an integer
+  beside one as an `oid`, so a negative integer wraps (`(-1)::oid` is `4294967295`, and `o > -1`
+  holds for no `o`). An `oid` is opaque with an identity `=`; a cast to or from it is the named
+  conversion `q_cast_oid`, never the identity, and its order is uninterpreted.
   A column's type is read one way, whether a pair file or raw DDL declares it, and a cast's target
   from the same table of names, so `uuid` and `money` are opaque in both.
 - **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
@@ -469,22 +483,25 @@ what it is or refused:
   some of the types it stands for declare no negator (`path`'s `=` has none, and `point` has a `<>`
   and no `=`); an order comparison of strings under a collation other than `C` or `POSIX`
   (`q_str_lt`); `IS DISTINCT FROM`, `LIKE`, an `IN` subquery, and `= ANY` over an array value.
-- **A parameter has the type Postgres gives it at its first use.** A client that sends `$N` without a
-  type leaves it to Postgres, which types it where it first meets it, in the order it analyses the
-  statement: in `n + 0 = $1 AND $1 > 0`, over a `numeric` `n`, `$1` is a `numeric`. Type inference
-  ranks its evidence by confidence instead, and reads no type off an expression, an aggregate or a
-  subquery, so the type it gives a parameter can differ. A wider one (`numeric` where Postgres says
-  integer) quantifies over more values. A narrower one is unfaithful: an integer `$1` makes
-  `$1 > 0 AND $1 < 1` empty. So a parameter inference typed as an integer and that meets a `numeric`
-  or float value in a comparison, arithmetic, `CASE` or `coalesce` and its kin is refused, whatever
-  its other uses say, unless the pair casts it wherever it appears; and a cast over a parameter is
-  dropped only when it is the parameter's own type, since otherwise it is a conversion Postgres runs
-  (`$1::int` rounds a `numeric`). A parameter in arithmetic takes its partner's type when it is
-  known, as Postgres gives it. One function reads an untyped parameter as a text instead:
-  `substring(s from $1)` is Postgres's regular-expression form, `substring(text, text)`, and only
-  `substring(s from $1::integer)` the position form. So a parameter inference typed as an integer
-  that is the position or the length of a `substring` is refused as well, and so is any other
-  argument there that is not an integer, a string literal included.
+- **A parameter has the type Postgres gives it at its first use.** A client that sends `$N` without
+  a type leaves it to Postgres, which types it where it first meets it, in the order it analyses
+  the statement: in `n + 0 = $1 AND $1 > 0`, over a `numeric` `n`, `$1` is a `numeric`. Type
+  inference ranks its evidence by confidence instead, and reads no type off an expression, an
+  aggregate or a subquery, so the type it gives a parameter can differ. A wider one (`numeric`
+  where Postgres says integer) quantifies over more values. A narrower one is unfaithful: an
+  integer `$1` makes `$1 > 0 AND $1 < 1` empty. So a parameter inference typed as an integer and
+  that meets a `numeric` or float value in a comparison, arithmetic, `CASE` or `coalesce` and its
+  kin is refused, whatever its other uses say, unless the pair casts it wherever it appears; and a
+  cast over a parameter is dropped only when it is the parameter's own type, since otherwise it is
+  a conversion Postgres runs (`$1::int` rounds a `numeric`). A parameter in arithmetic takes its
+  partner's type when it is known, as Postgres gives it, and an untyped one that is `NULLIF`'s
+  second argument takes the first's, where inference could read none off it (`NULLIF(SUM(b), $1)`
+  prepares with `$1` a `bigint`; the lowering's type for the sum is `numeric`, the wider reading).
+  One function reads an untyped parameter as a text instead: `substring(s from $1)` is Postgres's
+  regular-expression form, `substring(text, text)`, and only `substring(s from $1::integer)` the
+  position form. So a parameter inference typed as an integer that is the position or the length of
+  a `substring` is refused as well, and so is any other argument there that is not an integer, a
+  string literal included.
 - **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
   where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
   it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.

@@ -1396,18 +1396,6 @@ fn lower_values(cat: &Catalog, fns: &Fns, v: &Values) -> Result<(Value, OutCols)
     Ok((json!({ "values": { "schema": schema_tys, "content": content } }), out_cols))
 }
 
-/// Whether `v` is a parameter the inference left untyped, which it types opaque. Postgres types such a
-/// parameter from where it is used, so in a set operation's or a `VALUES` list's column it takes the
-/// column's type, as a NULL does. Inference gives a parameter one type for the whole pair, so an
-/// opaque one is untyped everywhere it occurs; and were one occurrence of it given another type than
-/// another, the two would only be read as two independent values, which a proof over every value
-/// covers.
-fn is_untyped_param(v: &Value) -> bool {
-    v.get("operator").and_then(Value::as_str).and_then(|o| o.strip_prefix("QP")).is_some_and(|d| {
-        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
-    }) && is_opaque(&ty_of(v))
-}
-
 /// Whether `cell` takes any type a column needs without a conversion: a NULL is the null of any
 /// type, and an untyped parameter is a value of whatever type it is used at.
 fn takes_any_type(cell: &Value) -> bool {

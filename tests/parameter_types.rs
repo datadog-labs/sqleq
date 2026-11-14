@@ -264,3 +264,37 @@ fn a_parameter_among_coalesce_arguments_takes_the_others_type() {
     // Two columns of two numeric types are not unified: `COALESCE(a, n)` still lowers.
     lowers_in(CatalogSource::InferredSeeded, r#"SELECT COALESCE("a", "n") FROM "t""#, r#"SELECT COALESCE("a", "n") FROM "t""#);
 }
+
+/// The refusal's message for `q` against itself under the seeded catalog and `ddl`.
+fn nullif_refusal(ddl: &str, q: &str) -> String {
+    match lower_with(&format!("{ddl}\n{q};\n{q};"), CatalogSource::InferredSeeded) {
+        Err(FrontendError::Unsupported(m)) => m,
+        Err(e) => panic!("expected a refusal, got {e}\n{q}"),
+        Ok(v) => panic!("expected a refusal, but it lowered to {v}\n{q}"),
+    }
+}
+
+#[test]
+fn an_untyped_parameter_as_nullifs_second_argument_takes_the_firsts_type() {
+    // Inference reads no type off an aggregate or an expression, so `$1` beside `SUM(a)` reaches the
+    // lowering untyped. Postgres types it as NULLIF's first argument (`PREPARE` says `bigint` for the
+    // first of these), and so does the lowering; it was refused as a VARBINARY against a REAL (#251).
+    assert_eq!(param_type(r#"SELECT "id", NULLIF(SUM("a"), $1) FROM "t" GROUP BY "id""#, 1), "REAL");
+    assert_eq!(param_type(r#"SELECT "id", NULLIF(COUNT(*), $1) FROM "t" GROUP BY "id""#, 1), "INTEGER");
+    assert_eq!(param_type(r#"SELECT NULLIF("a" + 1, $1) FROM "t""#, 1), "INTEGER");
+    assert_eq!(param_type(r#"SELECT NULLIF(SUM("n"), $1) FROM "t""#, 1), "REAL");
+    // It is the parameter that takes the type: there is no cast of it.
+    let ddl = r#"create table "t" ("id" INTEGER, "a" INTEGER, "n" NUMERIC, "s" TEXT, "p" BOOLEAN);"#;
+    let q = r#"SELECT "id", NULLIF(SUM("a"), $1) FROM "t" GROUP BY "id""#;
+    let v = lower_with(&format!("{ddl}\n{q};\n{q};"), CatalogSource::InferredSeeded).unwrap();
+    assert!(!v.to_string().contains(r#""operator":"CAST""#), "{v}");
+
+    // A parameter with a type of its own is a typed value, and is checked as one: over an INTEGER,
+    // `$1::numeric` compares at numeric, and cast to INTEGER 1.5 would be 2.
+    let m = nullif_refusal(ddl, r#"SELECT NULLIF("a", $1::numeric) FROM "t""#);
+    assert!(m.contains("NULLIF of a value of type INTEGER against one of type REAL"), "{m}");
+    // So is one a client declared, of an opaque type included.
+    let declared = format!("{ddl}\ndeclare function QP1(INTEGER) returns DOUBLE PRECISION;");
+    let m = nullif_refusal(&declared, r#"SELECT "id", NULLIF(SUM("a"), $1) FROM "t" GROUP BY "id""#);
+    assert!(m.contains("NULLIF of a value of type REAL against one of type VARBINARY"), "{m}");
+}

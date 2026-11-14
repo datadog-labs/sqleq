@@ -180,6 +180,39 @@ fn integer_division_truncates_toward_zero() {
 }
 
 #[test]
+fn numeric_arithmetic_is_not_the_reals() {
+    // `numeric` has NaN and the infinities: `NaN * 0` is NaN, and `Infinity + 1` is not above
+    // `Infinity`. Read as real arithmetic, `a * 0 = 0` and `a + 1 > a` held of every non-null `a`,
+    // and both were proved equal to `a IS NOT NULL` (issues #234, #280).
+    let schemas = || vec![table("t", &["INTEGER", "REAL", "INTEGER"], &[false, true, true], &[&[0]])];
+    let ids = |cond: Value| project(filter(scan(0), cond), vec![col(0, "INTEGER")]);
+    let a = || col(1, "REAL");
+    let not_null = |c: Value| pred("IS NOT NULL", vec![c]);
+    let zero = || lit("0", "INTEGER");
+    let times_zero = pred("=", vec![call("*", "REAL", vec![a(), zero()]), zero()]);
+    let plus_one = pred(">", vec![call("+", "REAL", vec![a(), lit("1", "INTEGER")]), a()]);
+    let minus_self = pred("=", vec![call("-", "REAL", vec![a(), a()]), zero()]);
+    for cond in [times_zero, plus_one, minus_self] {
+        match run(Semantics::Bags, schemas(), ids(cond.clone()), ids(not_null(a()))) {
+            Ok(Outcome::Equivalent) => panic!("proved {cond}"),
+            Ok(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    // A sum and a product still commute, and an expression is still itself.
+    for op in ["+", "*"] {
+        let gt = |x: Value, y: Value| ids(pred(">", vec![call(op, "REAL", vec![x, y]), zero()]));
+        let two = || lit("2.0", "REAL");
+        assert!(matches!(run(Semantics::Bags, schemas(), gt(a(), two()), gt(two(), a())), Ok(Outcome::Equivalent)), "{op}");
+        assert!(matches!(run(Semantics::Bags, schemas(), gt(a(), two()), gt(a(), two())), Ok(Outcome::Equivalent)), "{op}");
+    }
+    // Integers have no such values: their arithmetic is cvc5's.
+    let n = || col(2, "INTEGER");
+    let int_times_zero = pred("=", vec![call("*", "INTEGER", vec![n(), zero()]), zero()]);
+    assert!(matches!(run(Semantics::Bags, schemas(), ids(int_times_zero), ids(not_null(n()))), Ok(Outcome::Equivalent)));
+}
+
+#[test]
 fn rows_of_different_shapes_are_incomparable_not_refuted() {
     let one = project(scan(0), vec![col(0, "INTEGER")]);
     let two = project(scan(0), vec![col(0, "INTEGER"), col(1, "VARCHAR")]);

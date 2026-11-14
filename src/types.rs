@@ -38,7 +38,8 @@
 //! A type is mapped onto an IR type only where the IR type's operations are Postgres's. Both provers
 //! read REAL as exact rational arithmetic and every type's `=` as equality, so:
 //!
-//! * `numeric` is REAL: its `+`, `-` and `*` are exact. Its division rounds to a finite scale
+//! * `numeric` is REAL: its `+`, `-` and `*` are exact on finite values (it also has `NaN` and
+//!   `±Infinity`, where `x * 0` is not `0`: `docs/SOUNDNESS.md`). Its division rounds to a finite scale
 //!   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over REAL is the uninterpreted `q_arith_div_real_real`
 //!   ([`make_arith`]). REAL carries no scale, so an operation that shows it -- a cast to text, or a
 //!   division, whose scale follows its operands' -- is [`crate::equality`]'s.
@@ -49,7 +50,10 @@
 //!   spaces, so two values it calls equal can still be told apart, and a value of either is refused
 //!   wherever it reaches the plan ([`refuse_unfaithful`]). So are `box`, `circle`, `lseg` and
 //!   `line`, whose `=` compares within a tolerance and is not transitive.
-//! * Integer types are matched by name, so `int4range` and `point` are not integers.
+//! * Integer types are matched by name, so `int4range` and `point` are not integers. Nor is `oid`:
+//!   it is unsigned, and an integer beside it is read as an `oid`, so a negative one wraps
+//!   (`(-1)::oid` is `4294967295`, and `o > -1` holds for no `o`). It is opaque with an identity
+//!   `=` ([`Scalar::Oid`]), and a cast to or from it is a named conversion, never the identity.
 //! * A type no reader names keeps its own name (`numrange`), or is VARBINARY under raw DDL, and so
 //!   is the result of a function nobody declared. Its `=` is not taken to be identity
 //!   ([`coarse_class`]) unless it is on the [`opaque_identity`] list; a domain is its base type
@@ -342,6 +346,11 @@ pub enum Scalar {
     Str,
     Bool,
     Binary,
+    /// `oid`: an unsigned 32-bit number. Its `=` is identity, but it is not the integers' type:
+    /// Postgres reads an integer beside one as an `oid`, and a negative integer wraps (`(-1)::oid`
+    /// is `4294967295`), so `o > -1` is false for every `o`. Opaque, with an identity `=`, as a
+    /// binary type is; its order and its casts are uninterpreted.
+    Oid,
 }
 
 /// Classify a type's name by exact spelling: upper-cased, unquoted, without its typmod. `None` is a
@@ -360,7 +369,8 @@ pub fn scalar_class(name: &str) -> Option<Scalar> {
     let base = canon.split('(').next().unwrap_or(&canon).trim();
     Some(match base {
         "INT" | "INTEGER" | "INT2" | "INT4" | "INT8" | "SMALLINT" | "BIGINT" | "TINYINT" | "MEDIUMINT"
-        | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" | "OID" => Scalar::Int,
+        | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" => Scalar::Int,
+        "OID" => Scalar::Oid,
         "NUMERIC" | "DECIMAL" | "DEC" => Scalar::Numeric,
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Scalar::Float,
         "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" | "NCHAR VARYING"
@@ -547,7 +557,7 @@ pub fn map_type(dt: &DataType) -> String {
         Some(Scalar::Numeric) => "REAL",
         // `-0 = 0` holds, and the two print differently: see [`crate::equality`].
         Some(Scalar::Float) => opaque_name(base),
-        Some(Scalar::Binary) => IDENTITY_OPAQUE,
+        Some(Scalar::Binary | Scalar::Oid) => IDENTITY_OPAQUE,
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => base,
@@ -577,7 +587,7 @@ pub fn normalize_type_name(t: &str) -> String {
         Some(Scalar::Int) => "INTEGER",
         Some(Scalar::Numeric) => "REAL",
         Some(Scalar::Float) => opaque_name(&up),
-        Some(Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Binary | Scalar::Oid) => "VARBINARY",
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => return up,
@@ -599,7 +609,8 @@ pub fn normalize_type_name(t: &str) -> String {
 ///
 /// * `bytea`; `uuid`, whose input is case-insensitive and whose braces and hyphens are optional,
 ///   and whose output is canonical; `money`, a count of cents (`'1.5'` and `'1.50'` both print
-///   `$1.50`); `name`;
+///   `$1.50`); `name`; `oid`, an unsigned number whose output is its decimal digits (`'01'::oid`
+///   and `' 1'::oid` both print `1`);
 /// * the discrete ranges `int4range`, `int8range` and `daterange`, which are canonicalized
 ///   (`int4range(1, 2, '[]')` is `[1,3)`);
 /// * an array of any type with an identity `=`, the integers, strings, `boolean`, `date`, `time`,
@@ -625,7 +636,7 @@ pub fn opaque_identity(name: &str) -> bool {
     let array = elem.len() < canon.trim().len();
     let base = elem.split('(').next().unwrap_or(elem).trim();
     let named = matches!(base, "BYTEA" | "UUID" | "MONEY" | "NAME" | "INT4RANGE" | "INT8RANGE" | "DATERANGE");
-    if named || scalar_class(elem) == Some(Scalar::Binary) {
+    if named || matches!(scalar_class(elem), Some(Scalar::Binary | Scalar::Oid)) {
         return true;
     }
     // A scalar of these is not opaque, so only its array is asked about.
@@ -796,10 +807,19 @@ pub fn coerce_literal_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
 /// `NULLIF(i, 1.5::integer)` compares two integers. Cast to INTEGER, `1.5` would be `2`, and the
 /// two would be one plan. So a second argument of a wider type than the first's is refused, as is
 /// one of another type than the first's, which Postgres rejects.
+///
+/// A parameter nothing typed is untyped as a string literal is: Postgres resolves it to the first
+/// argument's type (`NULLIF(SUM(b), $1)` prepares with `$1` a `bigint`), so it takes that type
+/// ([`is_untyped_param`], and of plain VARBINARY) and nothing is refused. It is relabelled, not
+/// cast: a `CAST` of the opaque parameter would be a conversion, and there is none. A parameter that
+/// carries a type, an explicit `$1::numeric` or a declared one included, is a typed value and is
+/// checked as one.
 pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<Vec<Value>> {
     if is_builtin(ret) {
         if name == "NULLIF" {
-            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v);
+            // Plain VARBINARY only: a parameter declared of an opaque type (`float8`) has that type.
+            let untyped_param = |v: &Value| is_untyped_param(v) && ty_of(v) == "VARBINARY";
+            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v) || untyped_param(v);
             if let Some(v) = operand.iter().skip(1).find(|v| !untyped(v) && common_type(ret, &ty_of(v)) != ret) {
                 return Err(unsupported(format!(
                     "NULLIF of a value of type {ret} against one of type {}, which Postgres compares at their \
@@ -807,10 +827,34 @@ pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<
                     ty_of(v)
                 )));
             }
+            return Ok(operand
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut v)| {
+                    if i > 0 && untyped_param(&v) {
+                        v["type"] = json!(ret);
+                        return v;
+                    }
+                    cast_to(v, ret)
+                })
+                .collect());
         }
         return Ok(operand.into_iter().map(|v| cast_to(v, ret)).collect());
     }
     Ok(coerce_literal_args(operand, ret))
+}
+
+/// Whether `v` is a parameter the inference left untyped, which it types opaque. Postgres types such a
+/// parameter from where it is used, so in a set operation's or a `VALUES` list's column it takes the
+/// column's type, as a NULL does, and as `NULLIF`'s second argument it takes the first's
+/// ([`coerce_select_args`]). Inference gives a parameter one type for the
+/// whole pair, so an opaque one is untyped everywhere it occurs; and were one occurrence of it given
+/// another type than another, the two would only be read as two independent values, which a proof
+/// over every value covers.
+pub(crate) fn is_untyped_param(v: &Value) -> bool {
+    v.get("operator").and_then(Value::as_str).and_then(|o| o.strip_prefix("QP")).is_some_and(|d| {
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+    }) && is_opaque(&ty_of(v))
 }
 
 /// [`cast_to`] `ct`, where `ct` is the type `like` gave the comparison or the expression `v` is

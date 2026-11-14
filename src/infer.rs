@@ -416,7 +416,8 @@ pub fn canon_type_name(txt: &str) -> String {
 ///
 /// `None` means unmappable — `jsonb`, `geometry`, an enum, an array, a float (`double precision`
 /// rounds, and the IR's REAL is exact), `uuid` (its input reads `'{A0EE…}'` and `'a0ee…'` as one
-/// value, which text does not), `citext` and `char(n)`. This function stays silent
+/// value, which text does not), `oid` (unsigned: a negative integer cast to it wraps), `citext` and
+/// `char(n)`. This function stays silent
 /// rather than guess, and *inference* keeps that silence: an unmappable target contributes no type,
 /// exactly as a column nobody told us about contributes none.
 ///
@@ -462,7 +463,7 @@ pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
     }
     let qualified = t.contains('(');
     // The classification is `types::map_type`'s, so a name means one thing to both readers. Of its
-    // classes only four have a `Ty`: a float, a binary type, and anything it does not name are
+    // classes only four have a `Ty`: a float, a binary type, `oid`, and anything it does not name are
     // unmappable, and so is an `UNFAITHFUL` type (`citext`, `char(n)`), which the readers that
     // need it name through `types::unfaithful_type`.
     use crate::types::{scalar_class, Scalar};
@@ -471,7 +472,7 @@ pub fn map_type_name(txt: &str) -> (Option<Ty>, bool) {
         Some(Scalar::Numeric) => Some(Ty::Real),
         Some(Scalar::Str) => Some(Ty::Str),
         Some(Scalar::Bool) => Some(Ty::Bool),
-        Some(Scalar::Float | Scalar::Binary) | None => None,
+        Some(Scalar::Float | Scalar::Binary | Scalar::Oid) | None => None,
     };
     (ty, qualified)
 }
