@@ -64,6 +64,28 @@ use crate::solver::uterm::{mk_add, mk_mul, mk_neg, mk_or, mk_squash, mk_sum, Ord
 /// as exactly that, and nothing else does; see `sql_eq`.
 pub const NUMERIC_EQ_KEY: &str = "eq:numeric";
 
+/// The prefix of the symbol a product is when it is not a product of integers: `numeric` has `NaN`
+/// and `±Infinity`, and `NaN * 0` is `NaN`, so such a product is not one a `0` annihilates (see
+/// `translate_call_value`). The symbol is uninterpreted but for one thing, that a product commutes,
+/// which holds at those values too and for every type Postgres multiplies. Its name
+/// (`times_symbol`) carries its two operand types in a fixed order, so that it is one symbol
+/// whichever way the product was written; normalization keeps its two operands in one order, and
+/// the evaluator reads it as a function of the pair, not of the order.
+pub const TIMES: &str = "times:";
+
+/// Whether `name` is a `times_symbol`. No other symbol is: every name `typed_symbol` gives a
+/// function of the IR has a `(` in it, whatever the function is called, and this one has none.
+pub fn is_times(name: &str) -> bool {
+    name.starts_with(TIMES) && !name.contains('(')
+}
+
+/// The [`TIMES`] symbol over operands of the IR types `args`, in any order, with result type `ret`.
+fn times_symbol(args: &[Type], ret: Type) -> String {
+    let mut args: Vec<&str> = args.iter().map(|t| t.name()).collect();
+    args.sort_unstable();
+    format!("{TIMES}{}->{}", args.join(","), ret.name())
+}
+
 /// The name of an uninterpreted symbol for `base` over operands of the IR types `args`, with
 /// result type `ret`. Postgres resolves a function or operator by its name *and* its argument
 /// types, so a symbol that left the types out would stand for several functions at once, and an
@@ -1024,7 +1046,18 @@ impl<'s> Translator<'s> {
                 let value = match operator {
                     "+" => mk_add([a.value, b.value]),
                     "-" => mk_add([a.value, mk_mul([UTerm::Const(UConst::Int(-1)), b.value])]),
-                    "*" => mk_mul([a.value, b.value]),
+                    // A product of integers is a product. A product with a `numeric` in it is not
+                    // one a `0` annihilates: `numeric` has `NaN` and `±Infinity`, and `NaN * 0` and
+                    // `Infinity * 0` are `NaN`. A `Mul` is read as zero wherever a factor is, by
+                    // `normalize::simplify_value`, by a substitution that puts a `0` in place of a
+                    // factor it is equal to, and by the selection reading in `smt`, since a `CASE`
+                    // is a product of a guard and a value too. So it is a symbol ([`TIMES`]), as
+                    // `/` is, that none of them looks into. It keeps that a product commutes. It
+                    // gives up `x * 1 = x` and that a product associates, which hold for `NaN` as
+                    // well; `+`, `-` and unary `-` keep their reading, whose only constant factor
+                    // is `-1`.
+                    "*" if types_of(operand).iter().all(|t| *t == Type::Integer) => mk_mul([a.value, b.value]),
+                    "*" => UTerm::Func { name: times_symbol(&types_of(operand), ty), args: vec![a.value, b.value] },
                     // Integer division truncates and decimal division does not, so `/` is one
                     // symbol per operand and result types (`typed_symbol`), never one for all.
                     _ => UTerm::Func { name: typed_symbol("divide", &types_of(operand), ty), args: vec![a.value, b.value] },
