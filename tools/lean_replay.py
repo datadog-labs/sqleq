@@ -434,7 +434,11 @@ def unqualify(text: str, schemas: list[str]) -> str:
 _CLOCK = re.compile(r"\b(?:now|statement_timestamp|transaction_timestamp)\s*\(\s*\)|\bcurrent_timestamp\b(?:\s*\(\s*\d*\s*\))?"
                     r"|\blocaltimestamp\b(?:\s*\(\s*\d*\s*\))?|\bclock_timestamp\s*\(\s*\)", re.I)
 _DATE = re.compile(r"\bcurrent_date\b", re.I)
-_UUID = re.compile(r"\b(?:public\.|pg_catalog\.)?(?:gen_random_uuid|uuid_generate_v4|uuid_generate_v7|uuid_generate_v1|uuid_generate_v1mc|uuidv4|uuidv7)\s*\(\s*\)", re.I)
+# A uuid generator, under any schema: sqleq-lean reads `ext.uuid_generate_v4()` in a default as the
+# generator it is named after (when the DDL declares no function of that name), so the qualifier goes
+# with the call. A bare name was matched after the dot before, which left `ext.` in front of the
+# value put in its place.
+_UUID = re.compile(r"(?:(?:\"(?:[^\"]|\"\")+\"|\b[a-z_][\w$]*)\s*\.\s*)?\b(?:gen_random_uuid|uuid_generate_v4|uuid_generate_v7|uuid_generate_v1|uuid_generate_v1mc|uuidv4|uuidv7)\s*\(\s*\)", re.I)
 _RANDOM = re.compile(r"\brandom\s*\(\s*\)", re.I)
 FIXED_CLOCK = "'2020-06-01 12:00:00+00'::timestamptz"
 # The variant nibble 9 sets these apart from the canonical parameter uuids (8, see `value_for`),
