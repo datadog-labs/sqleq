@@ -106,6 +106,34 @@ fn a_join_on_a_key_is_an_exists() {
 }
 
 #[test]
+fn a_chain_of_joins_on_keys_is_an_exists() {
+    // `sale JOIN shop ON shop.id = sale.shop_id JOIN district ON district.id = shop.district_id`
+    // against `sale WHERE EXISTS (the same two joins)`: the sale's `shop_id` pins one shop, and
+    // that shop's `district_id` one district (#236). The second key is tied to a column of the
+    // first joined row, not of the sale.
+    let schemas = |district_key: &[&[usize]]| {
+        vec![
+            table("sale", &["INTEGER", "INTEGER", "INTEGER"], &[false, false, true], &[&[0]]),
+            table("shop", &["INTEGER", "INTEGER"], &[false, false], &[&[0]]),
+            table("district", &["INTEGER", "INTEGER"], &[false, true], district_key),
+        ]
+    };
+    let join = |left: Value, right: usize, on: Value| json!({ "join": { "kind": "INNER", "left": left, "right": scan(right), "condition": on } });
+    // sale is columns 0-2, shop 3-4, district 5-6.
+    let joined = project(join(join(scan(0), 1, eq(int(3), int(1))), 2, eq(int(5), int(4))), vec![int(0), int(2)]);
+    // Under the EXISTS, shop is columns 3-4 and district 5-6 again, with the sale's row outside.
+    let inner = project(filter(join(scan(1), 2, eq(int(5), int(4))), eq(int(3), int(1))), vec![lit("1", "INTEGER")]);
+    let exists_form = project(filter(scan(0), exists(inner)), vec![int(0), int(2)]);
+    let keyed = schemas(&[&[0]]);
+    assert!(proved(&pair(keyed.clone(), joined.clone(), exists_form.clone())), "the chain");
+    agrees(&keyed, &joined, &exists_form);
+    // Without district's key a sale comes back once per matching district.
+    let unkeyed = schemas(&[]);
+    assert!(!proved(&pair(unkeyed.clone(), joined.clone(), exists_form.clone())), "no key on district");
+    assert!(std::panic::catch_unwind(|| agrees(&unkeyed, &joined, &exists_form)).is_err());
+}
+
+#[test]
 fn a_semi_join_of_a_table_with_itself_on_its_key_is_its_filter() {
     // `WHERE k IN (SELECT k FROM t WHERE a = $1)` against `WHERE a = $1`.
     let held = |c: u32| eq(int(c), param(1));
