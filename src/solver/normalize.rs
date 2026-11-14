@@ -199,9 +199,12 @@ impl Normalizer {
 
     /// A unique key makes a squash redundant (`applyUniqueAddSquash*`, the direction that removes
     /// one): `‖Σ_V body‖` is `Σ_V body` itself when the sum can only be 0 or 1. That holds when every
-    /// factor of the body is 0/1 and every bound var `v` of `V` has a keyed table factor `T(v)` whose
-    /// key columns the body's equalities tie to terms mentioning no var of `V` -- then at most one
-    /// row of each `T` can match, so at most one assignment of `V` survives.
+    /// factor of the body is 0/1 and every bound var `v` of `V` is pinned: it has a keyed table
+    /// factor `T(v)` whose key columns the body's equalities tie to terms that mention only free
+    /// vars and vars of `V` pinned before it. Taken in the order they are pinned, each var then has
+    /// at most one row once the ones before it are fixed, so at most one assignment of `V`
+    /// survives. A chain of joins on keys is pinned so: `shop` by the sale's `shop_id`, and
+    /// `district` by that shop's `district_id`.
     fn drop_key_squash(&self, t: &UTerm) -> UTerm {
         match t {
             UTerm::Squash(c) => {
@@ -228,18 +231,35 @@ impl Normalizer {
         if !factors.iter().all(zero_one) {
             return false;
         }
-        let bound = base_ids(vars);
         let tables = direct_tables(body);
         let classes = Congruence::from_factors(&factors);
-        bound.iter().all(|&v| {
-            tables.iter().filter(|(_, y)| *y == v).any(|(name, _)| {
-                self.ics.keys.get(name).into_iter().flatten().any(|key| {
-                    key.iter().all(|&c| {
-                        classes.members_of(&UTerm::Var(UVar::proj(c, UVar::Base(v)))).iter().any(|m| !mentions_any(m, &bound))
+        // The vars not yet known to be pinned. A var is pinned when a key of its table is tied to
+        // terms that mention none of them: only free vars, and vars pinned before it. Each round
+        // pins the vars whose keys are tied so, until a round pins none; the vars one round pins do
+        // not rest on each other, since none of them was pinned when the round began.
+        let mut unpinned = base_ids(vars);
+        loop {
+            let pinned: Vec<u32> = unpinned
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    tables.iter().filter(|(_, y)| *y == v).any(|(name, _)| {
+                        self.ics.keys.get(name).into_iter().flatten().any(|key| {
+                            key.iter().all(|&c| {
+                                let col = UTerm::Var(UVar::proj(c, UVar::Base(v)));
+                                classes.members_of(&col).iter().any(|m| !mentions_any(m, &unpinned))
+                            })
+                        })
                     })
                 })
-            })
-        })
+                .collect();
+            if pinned.is_empty() {
+                return unpinned.is_empty();
+            }
+            for v in pinned {
+                unpinned.remove(&v);
+            }
+        }
     }
 
     /// [`Normalizer::same_key`] across a scope boundary. In a product holding a direct table atom
