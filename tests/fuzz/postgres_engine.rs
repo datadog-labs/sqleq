@@ -869,6 +869,133 @@ fn a_boundary_at_a_literal_outside_the_domain_is_refuted() {
 }
 
 #[test]
+fn a_special_value_tells_apart_what_no_ordinary_value_does() {
+    // Each pair agrees on every value of the small domains and differs at one the special trials
+    // draw: an infinite date or timestamp, NaN or an infinity of a numeric or a float, the empty
+    // string (#210, #234, #207).
+    for (ddl, a, b) in [
+        // 'infinity' + 1 is 'infinity'.
+        ("CREATE TABLE t (id int PRIMARY KEY, d date)", "SELECT id FROM t WHERE d + 1 > d", "SELECT id FROM t WHERE d IS NOT NULL"),
+        // A parameter takes one too: for an infinite $1 the one-day range is empty.
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, ts timestamp)",
+            "SELECT id FROM t WHERE ts::date = $1",
+            "SELECT id FROM t WHERE ts >= $1::date AND ts < ($1::date + 1)",
+        ),
+        ("CREATE TABLE t (id int PRIMARY KEY, d date)", "SELECT id FROM t WHERE d = $1", "SELECT id FROM t WHERE d >= $1 AND d < $1 + 1"),
+        // NaN * 0 is NaN, and Infinity + 1 is not above Infinity.
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric)", "SELECT id FROM t WHERE amt * 0 = 0", "SELECT id FROM t WHERE amt IS NOT NULL"),
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric)", "SELECT id FROM t WHERE amt + 1 > amt", "SELECT id FROM t WHERE amt IS NOT NULL"),
+        // A numeric(p, s) holds NaN, and no infinity.
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric(10,2))", "SELECT id FROM t WHERE amt * 0 = 0", "SELECT id FROM t WHERE amt IS NOT NULL"),
+        ("CREATE TABLE t (id int PRIMARY KEY, f float8)", "SELECT id FROM t WHERE f - f = 0", "SELECT id FROM t WHERE f IS NOT NULL"),
+        ("CREATE TABLE t (id int PRIMARY KEY, c text)", "SELECT id FROM t WHERE length(c) = 0", "SELECT id FROM t WHERE false"),
+    ] {
+        assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
+fn a_special_value_refutes_nothing_equivalent() {
+    for (ddl, a, b) in [
+        // The infinities are ordered like any other value, and NaN is above every one and equal to itself.
+        ("CREATE TABLE t (id int PRIMARY KEY, d date)", "SELECT id FROM t WHERE NOT (d < $1)", "SELECT id FROM t WHERE d >= $1"),
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric)", "SELECT id FROM t WHERE NOT (amt < 1)", "SELECT id FROM t WHERE amt >= 1"),
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric)", "SELECT id FROM t WHERE amt = amt", "SELECT id FROM t WHERE amt IS NOT NULL"),
+        // A numeric(p, s) column holds no infinity: Postgres refuses the row, and the generator
+        // draws none.
+        ("CREATE TABLE t (id int PRIMARY KEY, amt numeric(10,2))", "SELECT id FROM t WHERE amt + 1 > amt OR amt = 'NaN'", "SELECT id FROM t WHERE amt IS NOT NULL"),
+        // A row a CHECK refuses is in no instance: NaN is above 100, and -Infinity below 0.
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, amt numeric CHECK (amt >= 0 AND amt < 100))",
+            "SELECT id FROM t WHERE amt * 0 = 0",
+            "SELECT id FROM t WHERE amt IS NOT NULL",
+        ),
+        // A parameter of a type the generator only stands in for takes none: `money` is drawn as
+        // a number and holds no NaN.
+        ("CREATE TABLE t (id int PRIMARY KEY, m money)", "SELECT id FROM t WHERE m = $1", "SELECT id FROM t WHERE $1 = m"),
+        ("CREATE TABLE t (id int PRIMARY KEY, c text)", "SELECT id FROM t WHERE c = ''", "SELECT id FROM t WHERE length(c) = 0"),
+    ] {
+        assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+    }
+}
+
+#[test]
+fn a_special_trial_that_raises_is_not_reported() {
+    // `'infinity'::date - 'infinity'::date` raises. The two agree wherever the first runs, and the
+    // run says so, with no partial verdict for the trials that raised.
+    let (ddl, a, b) = ("CREATE TABLE t (id int PRIMARY KEY, d date)", "SELECT id FROM t WHERE d - d = 0", "SELECT id FROM t WHERE d IS NOT NULL");
+    if let Some(o) = outcome(a, b, ddl) {
+        assert!(matches!(o.verdict, Verdict::NoCounterexample), "{:?}", o.verdict);
+        assert!(o.verdict.partial().is_none(), "{:?}", o.verdict.partial());
+    }
+}
+
+#[test]
+fn a_special_trial_that_does_not_end_is_not_an_error() {
+    // The recursion stops at the largest date, and never once that date is infinity, where
+    // `d + 1` is `d`. The statement is cancelled at its time limit, which ends the special trials
+    // and is no verdict on the pair: the ordinary trials ran.
+    let ddl = "CREATE TABLE t (id int PRIMARY KEY, d date NOT NULL)";
+    let q = |step: &str| {
+        format!(
+            "WITH RECURSIVE s(d) AS (SELECT min(d) FROM t UNION ALL SELECT {step} FROM s WHERE d < (SELECT max(d) FROM t)) \
+             SELECT count(*) FROM s"
+        )
+    };
+    assert_kind!(&q("d + 1"), &q("1 + d"), ddl, "NO-COUNTEREXAMPLE");
+}
+
+#[test]
+fn a_literal_held_against_an_expression_of_a_column_is_drawn_into_it() {
+    // Each pair differs only at a row that holds a literal the pair never compares the bare column
+    // with: it is compared with an expression of the column, a `CASE` holds its operand against
+    // it, or it is behind a cast or arithmetic that makes another value of it (#207).
+    for (ddl, a, b) in [
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE coalesce(c, 0) <= -2", "SELECT * FROM t WHERE coalesce(c, 0) < -2"),
+        ("CREATE TABLE t (c date)", "SELECT * FROM t WHERE (CASE c WHEN '2001-01-13'::date THEN 1 END) = 1", "SELECT * FROM t WHERE false"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE NOT ((CASE WHEN false THEN 0 ELSE c END) > -2)", "SELECT * FROM t WHERE false"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE c + 0 <= -2", "SELECT * FROM t WHERE false"),
+        // The cast is 0, which the text inside it is not; the row c = -1 is below it.
+        ("CREATE TABLE t (c int8)", "SELECT * FROM t WHERE c < CAST('-1.7305e-12'::float8 AS int8)", "SELECT * FROM t WHERE false"),
+        // The cast is '1.7976931348623157e+308', and the text inside it sorts above that. The
+        // check keeps the empty string out, which would tell the two apart by itself.
+        (
+            "CREATE TABLE t (c text NOT NULL CHECK (c <> ''))",
+            "SELECT * FROM t WHERE CAST('1.7976931348623157e308'::float8 AS text) >= c",
+            "SELECT * FROM t WHERE false",
+        ),
+        // Arithmetic over literals has no literal to read at all.
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE c <= 300 + 34", "SELECT * FROM t WHERE c < 300 + 34"),
+    ] {
+        assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
+fn a_literal_held_against_an_expression_refutes_nothing_equivalent() {
+    for (ddl, a, b) in [
+        // No value of c puts abs(c) at -2.
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE abs(c) <= -2", "SELECT * FROM t WHERE abs(c) < -2"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE coalesce(c, 0) <= -2", "SELECT * FROM t WHERE coalesce(c, 0) < -1"),
+        ("CREATE TABLE t (c int8)", "SELECT * FROM t WHERE c < CAST('-1.7305e-12'::float8 AS int8)", "SELECT * FROM t WHERE c < 0"),
+        // 2020 is no timestamp, and is not drawn into the column under EXTRACT.
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, ts timestamp NOT NULL)",
+            "SELECT id FROM t WHERE EXTRACT(year FROM ts) = 2020",
+            "SELECT id FROM t WHERE 2020 = EXTRACT(year FROM ts)",
+        ),
+    ] {
+        assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+    }
+    // A constant that raises is no value to draw, and the two sides raise alike.
+    let (a, b) = ("SELECT * FROM t WHERE c = CAST('x' AS int4)", "SELECT * FROM t WHERE CAST('x' AS int4) = c");
+    if let Some(got) = kind(a, b, "CREATE TABLE t (c int4)") {
+        assert_ne!(got, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
 fn a_literal_drawn_into_a_column_refutes_nothing_equivalent() {
     for (ddl, a, b) in [
         ("CREATE TABLE t (c int4 NOT NULL)", "SELECT * FROM t WHERE c < 334", "SELECT * FROM t WHERE c <= 333"),

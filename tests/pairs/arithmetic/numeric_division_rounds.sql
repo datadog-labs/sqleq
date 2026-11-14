@@ -3,18 +3,19 @@
 -- This product includes software developed at Datadog (https://www.datadoghq.com/).
 -- Copyright 2026-Present Datadog, Inc.
 
--- truth: equivalent
+-- truth: not-equivalent
 -- expect frontend: refuse:unsupported
--- expect fuzz: no-counterexample
+-- expect fuzz: counterexample
 -- expect qed: no-plan
 -- expect sqleq-solver: no-plan
 -- expect cvc5: no-plan
 -- expect lean: unsupported
 -- origin: issue #89: sqleq-fuzz let DuckDB divide a numeric into a DOUBLE, where Postgres divides to a
 --   finite decimal scale, so 2 / 3 * 3 came back as 2
--- argument: n has scale 0, so n / 3 is exact, and times 3 gives n back, exactly when 3 divides n;
---   otherwise any finite rounding r of n / 3 has 3 * r <> n (Postgres gives 2.00000000000000000001 for
---   2 / 3 * 3). Postgres 17 returns id 1 for both on t = {(1, 0), (2, NULL), (NULL, 2), (NULL, NULL)}
+--   The pair was pinned equivalent, which it is on every finite n (arithmetic/numeric_division_rounds_on_finite_values.sql).
+--   A numeric(10,0) holds NaN too (issue #234), and there the two differ
+-- witness: t = {(1, 'NaN')}: NaN / 3 * 3 is NaN and NaN = NaN holds, so A returns 1; NaN % 3 is NaN, which is not
+--   0, so B returns no row
 
 create table "t" ("id" INTEGER, "n" NUMERIC(10,0), unique ("id"));
 SELECT "id" FROM "t" WHERE "n" / 3 * 3 = "n";

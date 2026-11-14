@@ -105,8 +105,8 @@ line and in `--axes`, and a pin `--bless` rewrites gets the new name.
 Read two of these with care. A prover's `no-proof` is not a refutation. A `no-counterexample` is
 not a proof. `sqleq-fuzz` draws values from a small domain (see its
 [README](../../docs/fuzz.md)), so a non-equivalent pair whose witness needs a varchar
-length, a date at infinity or a second session is pinned `no-counterexample` and carries a
-`witness:` instead.
+length, a value the domain has not got or a second session is pinned `no-counterexample` and
+carries a `witness:` instead.
 
 ## What fails
 
