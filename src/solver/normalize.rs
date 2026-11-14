@@ -979,6 +979,11 @@ fn simplify_pred(kind: PredKind, args: &[UTerm]) -> UTerm {
     UTerm::Pred { kind, args: vec![a.clone(), b.clone()] }
 }
 
+/// Whether some summand of `ts` is the negation of another.
+fn holds_a_term_and_its_negation(ts: &[Rc<UTerm>]) -> bool {
+    ts.iter().any(|t| matches!(&**t, UTerm::Neg(q) if ts.iter().any(|o| o == q)))
+}
+
 /// Every term reached by `+`, `×` and `Σ` from here is non-negative (no negative constant among
 /// them), so `x > 0` does not depend on whether a nested `Squash` is kept.
 fn spine_nonneg(t: &UTerm) -> bool {
@@ -1038,6 +1043,10 @@ pub fn simplify(t: &UTerm) -> UTerm {
         UTerm::Pred { kind, args } => simplify_pred(*kind, &args.iter().map(simplify_value).collect::<Vec<_>>()),
         UTerm::Squash(c) => match strip_squash(simplify(c)) {
             UTerm::Const(UConst::Int(n)) => int((n != 0) as i64),
+            // Excluded middle: of `q` and `¬q` one is at least 1, so a sum of non-negative terms
+            // that holds both is not zero. It is what `c IS NOT DISTINCT FROM c` comes to on a
+            // nullable `c`, `‖[c = NULL] + ¬[c = NULL]‖`.
+            UTerm::Add(ts) if ts.iter().all(|t| spine_nonneg(t)) && holds_a_term_and_its_negation(&ts) => int(1),
             c if is_zero_one(&c) => c,
             c => UTerm::Squash(Rc::new(c)),
         },
@@ -1888,6 +1897,19 @@ mod tests {
         let widths = HashMap::from([(0, 2), (OUT_VAR_ID, 2)]);
         let got = Normalizer::new(widths, 1_000_000).normalize(&term).unwrap();
         assert_eq!(got, UTerm::Table { name: "t".into(), var: UVar::Base(OUT_VAR_ID) });
+    }
+
+    #[test]
+    fn a_squashed_sum_of_a_term_and_its_negation_is_one() {
+        // Excluded middle: `‖q + ¬q‖` is 1, with other non-negative summands beside it or not.
+        let q = eq(col(1, 0), UTerm::Const(UConst::Null));
+        let r = eq(col(2, 0), col(3, 0));
+        let neg = |t: &UTerm| UTerm::Neg(Rc::new(t.clone()));
+        let squash = |ts: Vec<UTerm>| UTerm::Squash(Rc::new(UTerm::Add(ts.into_iter().map(Rc::new).collect())));
+        assert_eq!(simplify(&squash(vec![q.clone(), neg(&q)])), int(1));
+        assert_eq!(simplify(&squash(vec![r.clone(), neg(&q), q.clone()])), int(1));
+        // A term beside the negation of another is no such pair.
+        assert_ne!(simplify(&squash(vec![q.clone(), neg(&r)])), int(1));
     }
 
     #[test]
