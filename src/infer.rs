@@ -262,11 +262,46 @@ pub struct Uf {
     /// per call because [`gather_types`] is driven one query at a time: the driver knows which query
     /// it is walking, so the two dozen call sites inside it do not have to carry it.
     origin: Origin,
+    /// Atoms whose every source of a type is of unknown type: the results of a `CASE`, or the
+    /// arguments of `coalesce` and its kin, that are all untyped parameters and NULLs. Postgres
+    /// resolves such a set to `text`; [`Uf::resolve_unknown_as_text`] does, once every other piece
+    /// of evidence is in. Each with the query that offered it.
+    unknown: Vec<(Atom, Origin)>,
 }
 
 impl Uf {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that `x` is an untyped parameter among inputs that are all of unknown type.
+    fn all_unknown(&mut self, x: &Atom) {
+        self.unknown.push((x.clone(), self.origin));
+    }
+
+    /// Type as text every recorded atom that nothing else typed. Postgres's rule for `UNION`, `CASE`
+    /// and related constructs: inputs that are all of unknown type resolve as `text`, so `CASE WHEN p
+    /// THEN $1 ELSE $2 END` prepares with both parameters `text`.
+    ///
+    /// Only a class of parameters is resolved. A class with a column in it is left alone: in the
+    /// catalog that infers its columns, typing it would type a column of a table nobody declared
+    /// from where one of its parameters happens to stand.
+    pub fn resolve_unknown_as_text(&mut self) -> Result<()> {
+        for (x, origin) in std::mem::take(&mut self.unknown) {
+            if self.get_type(&x).is_some() || self.has_column(&x) {
+                continue;
+            }
+            self.origin = origin;
+            self.set_type(&x, Ty::Str, Conf::Use)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `x`'s class holds a column.
+    fn has_column(&mut self, x: &Atom) -> bool {
+        let root = self.find(x);
+        let atoms: Vec<Atom> = self.parent.keys().filter(|k| matches!(k, Atom::Col(..))).cloned().collect();
+        atoms.iter().any(|k| self.find(k) == root)
     }
 
     /// Attribute everything set from here on to `s`. See [`Origin`].
@@ -1161,7 +1196,8 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
     })?;
 
     // 8. CASE branches share a type (SQL requires it), so unify them and let any concrete branch
-    //    type the rest. `CASE WHEN p THEN f(x) ELSE col END` type-checks only because of this.
+    //    type the rest. `CASE WHEN p THEN f(x) ELSE col END` type-checks only because of this. With
+    //    no concrete branch, results that are all untyped parameters are text, as Postgres has them.
     sweep(q, |e| {
         let Expr::Case { conditions, else_result, .. } = e else { return Ok(()) };
         let mut parts: Vec<&Expr> = conditions.iter().map(|w| &w.result).collect();
@@ -1177,6 +1213,11 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
                 if let Some((t, c)) = side_type(p)? {
                     uf.set_type(first, t, c)?;
                 }
+            }
+            // Results that are all untyped parameters and NULLs are all of unknown type, which
+            // Postgres resolves as text. Recorded, not set: another use may still type the class.
+            if parts.iter().all(|p| is_unknown_input(p)) {
+                uf.all_unknown(first);
             }
         }
         Ok(())
@@ -1213,6 +1254,16 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
                 evidence.push(t);
             }
         }
+        // No evidence at all, over arguments that are all untyped parameters and NULLs: all of
+        // unknown type, which Postgres resolves as text, as it does a CASE's results (rule 8).
+        if evidence.is_empty() && args.iter().all(|a| is_unknown_input(a)) {
+            for a in &args {
+                if let Some(k @ Atom::Param(_)) = side_key(at, a) {
+                    uf.all_unknown(&k);
+                }
+            }
+            return Ok(());
+        }
         let Some(t) = fold_numeric(&evidence) else { return Ok(()) };
         for a in &args {
             if let Some(k @ Atom::Param(_)) = side_key(at, a) {
@@ -1223,6 +1274,14 @@ fn gather_types(at: &Attributor, q: &Query, uf: &mut Uf) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Whether `e` is an input Postgres reads as of unknown type and this pass can type: an untyped
+/// parameter, or a bare NULL. A parameter under a cast is not one, and a string literal, unknown to
+/// Postgres too, already reads as text here ([`literal_type`]).
+fn is_unknown_input(e: &Expr) -> bool {
+    let e = unnest_parens(e);
+    param_index(e).is_some() || matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::Null))
 }
 
 /// `e` without the parentheses around it.
@@ -1415,6 +1474,8 @@ pub fn infer(queries: &[Query], prov: Option<&Catalog>) -> Result<Inferred> {
         uf.on_query(Origin::query(i));
         gather_types(&at, q, &mut uf)?;
     }
+    // After both queries: a parameter either of them typed keeps that type.
+    uf.resolve_unknown_as_text()?;
     // Every parameter either query mentions, in either spelling.
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     for q in queries {
