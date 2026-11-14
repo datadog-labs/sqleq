@@ -497,11 +497,15 @@ what it is or refused:
   partner's type when it is known, as Postgres gives it, and an untyped one that is `NULLIF`'s
   second argument takes the first's, where inference could read none off it (`NULLIF(SUM(b), $1)`
   prepares with `$1` a `bigint`; the lowering's type for the sum is `numeric`, the wider reading).
-  One function reads an untyped parameter as a text instead: `substring(s from $1)` is Postgres's
-  regular-expression form, `substring(text, text)`, and only `substring(s from $1::integer)` the
-  position form. So a parameter inference typed as an integer that is the position or the length of
-  a `substring` is refused as well, and so is any other argument there that is not an integer, a
-  string literal included.
+  The results of a `CASE`, or the arguments of `coalesce` and its kin, that are all untyped
+  parameters and NULLs are `text`: Postgres resolves inputs that are all of unknown type so (`CASE
+  WHEN p THEN $1 ELSE $2 END` prepares with both `text`). That is taken last, so a parameter
+  anything else in the pair typed keeps that type, and never for a class that holds a column whose
+  type the catalog had to infer. One function reads an untyped parameter as a text instead:
+  `substring(s from $1)` is Postgres's regular-expression form, `substring(text, text)`, and only
+  `substring(s from $1::integer)` the position form. So a parameter inference typed as an integer
+  that is the position or the length of a `substring` is refused as well, and so is any other
+  argument there that is not an integer, a string literal included.
 - **A failure-tolerant cast is not a cast.** `TRY_CAST(x AS t)` and `SAFE_CAST(x AS t)` yield NULL
   where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
   it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.
