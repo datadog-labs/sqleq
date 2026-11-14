@@ -36,7 +36,7 @@ fn an_opaque_column_whose_equality_is_identity_is_listed() {
     let names = [
         "BYTEA", "INTEGER[]", "BIGINT[]", "TEXT[]", "VARCHAR(8)[]", "BOOLEAN[]", "DATE[]", "TIMESTAMP[]", "BYTEA[]",
         "INT ARRAY", "uuid", "money", "name", "int4range", "int8range", "daterange", "uuid[]", "timestamptz[]",
-        "int4range[]",
+        "int4range[]", "oid", "oid[]",
     ];
     for (ty, raw) in names.iter().flat_map(|t| [(*t, false), (*t, true)]) {
         let (types, flags) = schema_of(ty, raw);

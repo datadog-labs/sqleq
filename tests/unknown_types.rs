@@ -186,7 +186,7 @@ fn a_value_of_an_unknown_type_is_still_compared_and_computed_in_place() {
 fn a_type_whose_equality_is_identity_keeps_its_proofs() {
     // `uuid` keeps its own name in a declared `CREATE TABLE`; `bytea` and the arrays of identity
     // types are opaque. A cast to text over any of them is not refused, and nothing is rewritten.
-    for ty in ["uuid", "bytea", "INTEGER[]", "TEXT[]", "int4range", "money"] {
+    for ty in ["uuid", "bytea", "INTEGER[]", "TEXT[]", "int4range", "money", "oid"] {
         let ddl = format!(r#"create table "t" ("id" INTEGER, "a" {ty}, "b" {ty});"#);
         let v = lowers(&ddl, CAST_A, CAST_B);
         assert!(!operators(&v).iter().any(|o| o.starts_with("q_exact_")), "{ty}: {v}");

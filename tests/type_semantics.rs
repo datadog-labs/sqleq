@@ -417,12 +417,64 @@ fn both_type_readers_agree_on_every_name() {
             (a, b) => panic!("{name}: the declared reader says {a:?}, the raw-DDL reader {b:?}"),
         }
     }
-    // And the names this pins: no integer among the ranges and points, no REAL among the floats.
-    for name in ["int4range", "point", "real", "double precision", "float8", "money", "uuid"] {
+    // And the names this pins: no integer among the ranges, the points and `oid`, no REAL among the
+    // floats.
+    for name in ["int4range", "point", "real", "double precision", "float8", "money", "uuid", "oid"] {
         let t = read_column(name, true).unwrap();
         assert!(!builtin(&t), "{name}: {t}");
     }
     assert_eq!(read_column("numeric", false).unwrap(), "REAL");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// #233, #279: `oid` is a number and not an integer
+// ---------------------------------------------------------------------------------------------------
+
+const O: &str = r#"create table "t" ("id" INTEGER, "a" INTEGER, "o" oid NOT NULL, "q" oid NOT NULL, unique ("id"));"#;
+
+#[test]
+fn an_oid_column_is_not_compared_as_an_integer() {
+    // Postgres reads the integer beside an `oid` as an `oid`, and `-1` wraps to 4294967295: `o > -1`
+    // holds for no row and `o >= 0` for every row (#279). Read as integers the two are one predicate.
+    let (a, b) = (r#"SELECT "id" FROM "t" WHERE "o" > -1"#, r#"SELECT "id" FROM "t" WHERE "o" >= 0"#);
+    assert!(!identical_in(O, a, b));
+    for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        let v = lower_in(O, a, b, src);
+        // The column is opaque with an identity `=`, and the integer reaches it through a conversion.
+        assert_eq!(schema_types(&v)[2], "VARBINARY", "{src:?}: {v}");
+        assert_eq!(v["schemas"][0]["opaque_identity"][2], true, "{src:?}: {v}");
+        assert!(ops(&v).iter().any(|o| o == "q_cast_oid"), "{src:?}: {v}");
+        assert!(!v.to_string().contains("VARBINARY="), "an internal name leaked: {v}");
+    }
+}
+
+#[test]
+fn a_cast_to_oid_is_never_the_identity() {
+    // `CAST(-1 AS oid) > 0` is true and `-1 > 0` is not (#233). The cast used to be a CAST between
+    // equal IR types in the declared catalog, and to be dropped in the inferring ones.
+    let (a, b) = (r#"SELECT "id" FROM "t" WHERE CAST("a" AS oid) > 0"#, r#"SELECT "id" FROM "t" WHERE "a" > 0"#);
+    assert!(!identical_in(O, a, b));
+    for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        let v = lower_in(O, a, b, src);
+        let ops = ops(&v);
+        assert!(!ops.iter().any(|o| o == "CAST"), "{src:?}: a bare CAST: {v}");
+        assert!(ops.iter().any(|o| o == "q_cast_oid" || o.starts_with("QCAST")), "{src:?}: {v}");
+    }
+    // And out of it: `o::int` is a conversion too, not the column.
+    let (a, b) = (r#"SELECT CAST("o" AS INTEGER) FROM "t""#, r#"SELECT "o" FROM "t""#);
+    assert!(!identical_in(O, a, b));
+}
+
+#[test]
+fn an_oid_keeps_the_proofs_that_need_only_its_equality() {
+    // `=` on an `oid` is identity, so a join on two `oid` columns and a comparison with one spelling
+    // of a number lower, and the same text on both sides is the same plan.
+    assert!(identical_in(O, r#"SELECT "id" FROM "t" WHERE "o" = 5"#, r#"SELECT "id" FROM "t" WHERE "o" = 5"#));
+    for src in [CatalogSource::Declared, CatalogSource::InferredSeeded] {
+        lower_in(O, r#"SELECT "id" FROM "t" WHERE "o" = "q""#, r#"SELECT "id" FROM "t" WHERE "q" = "o""#, src);
+        lower_in(O, r#"SELECT DISTINCT "o" FROM "t""#, r#"SELECT "o" FROM "t" GROUP BY "o""#, src);
+    }
+    lower_in(O, r#"SELECT "id" FROM "t" WHERE "o" = $1"#, r#"SELECT "id" FROM "t" WHERE $1 = "o""#, CatalogSource::InferredSeeded);
 }
 
 // ---------------------------------------------------------------------------------------------------

@@ -261,6 +261,10 @@ type's. Both provers read REAL as exact rational arithmetic and any type's `=` a
   which Postgres computes as an integer division. `count`, `min` and `max` are integers, so they keep
   their operand's type.
 - **Integer types are matched by name.** `int4range` and `point` contain `INT` and are opaque.
+  So is `oid`, which is a number but not an integer: it is unsigned, and Postgres reads an integer
+  beside one as an `oid`, so a negative integer wraps (`(-1)::oid` is `4294967295`, and `o > -1`
+  holds for no `o`). An `oid` is opaque with an identity `=`; a cast to or from it is the named
+  conversion `q_cast_oid`, never the identity, and its order is uninterpreted.
   A column's type is read one way, whether a pair file or raw DDL declares it, and a cast's target
   from the same table of names, so `uuid` and `money` are opaque in both.
 - **An opaque column says whether its `=` is identity.** VARBINARY stands for `bytea` and `uuid`,
