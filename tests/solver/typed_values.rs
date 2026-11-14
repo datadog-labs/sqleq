@@ -127,6 +127,44 @@ fn numeric_equality_still_compares_values() {
 }
 
 #[test]
+fn a_numeric_times_zero_is_not_zero() {
+    // `numeric` has NaN and ±Infinity, and `NaN * 0` is NaN (issue #234). On t = {(1, 'NaN')},
+    // `a * 0 = 0` drops the row and `a IS NOT NULL` keeps it.
+    let ids = |cond: Value| select_where(vec![col(0, "INTEGER")], cond);
+    let times = |x: Value, y: Value| call("*", "REAL", vec![x, y]);
+    let zero = || lit("0", "INTEGER");
+    let not_null = |ty: &str| pred("IS NOT NULL", vec![a(ty)]);
+    let v = pair(t_with("REAL"), ids(pred("=", vec![times(a("REAL"), zero()), zero()])), ids(not_null("REAL")));
+    assert!(!proved(&v), "{v:?}");
+    // The zero need not be written in the product: `n = 0` puts it there. t = {(1, 0, 'NaN')}.
+    let schemas = || vec![table("t", &["INTEGER", "INTEGER", "REAL"], &[true, true, true], &[])];
+    let n_is_zero = || pred("=", vec![col(1, "INTEGER"), zero()]);
+    let lhs = pred("AND", vec![n_is_zero(), pred("=", vec![times(col(2, "REAL"), col(1, "INTEGER")), zero()])]);
+    let rhs = pred("AND", vec![n_is_zero(), pred("IS NOT NULL", vec![col(2, "REAL")])]);
+    let v = pair(schemas(), ids(lhs), ids(rhs));
+    assert!(!proved(&v), "{v:?}");
+    // Nor one a guard selects: `a * CASE WHEN p THEN 1 ELSE 0 END` is NaN where p is false.
+    let schemas = || vec![table("t", &["INTEGER", "BOOLEAN", "REAL"], &[true, false, true], &[])];
+    let one_or_zero = call("CASE", "INTEGER", vec![col(1, "BOOLEAN"), lit("1", "INTEGER"), zero()]);
+    let lhs = pred("=", vec![times(col(2, "REAL"), one_or_zero), zero()]);
+    let rhs = pred("AND", vec![pred("NOT", vec![col(1, "BOOLEAN")]), pred("IS NOT NULL", vec![col(2, "REAL")])]);
+    let v = pair(schemas(), ids(lhs), ids(rhs));
+    assert!(!proved(&v), "{v:?}");
+    // An integer has neither, so its product with zero is zero.
+    let int_times = call("*", "INTEGER", vec![a("INTEGER"), zero()]);
+    let v = pair(t_with("INTEGER"), ids(pred("=", vec![int_times, zero()])), ids(not_null("INTEGER")));
+    assert!(proved(&v), "{v:?}");
+    // And one product is still itself, whatever its type, in either order of its operands: a
+    // product commutes at NaN too.
+    let product = |x: Value, y: Value| ids(pred(">", vec![times(x, y), zero()]));
+    let two = || lit("2", "INTEGER");
+    assert!(proved(&pair(t_with("REAL"), product(a("REAL"), two()), product(a("REAL"), two()))));
+    assert!(proved(&pair(t_with("REAL"), product(a("REAL"), two()), product(two(), a("REAL")))));
+    let schemas = vec![table("t", &["INTEGER", "REAL", "REAL"], &[true, true, true], &[])];
+    assert!(proved(&pair(schemas, product(col(1, "REAL"), col(2, "REAL")), product(col(2, "REAL"), col(1, "REAL")))));
+}
+
+#[test]
 fn an_integer_and_a_decimal_constant_are_different_values() {
     // t = {(1, 2)}: '1.0' against '1'.
     let text_of = |x: Value| distinct(project(scan(0), vec![cast("VARCHAR", x)]), &["VARCHAR"]);

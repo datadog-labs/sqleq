@@ -38,7 +38,8 @@
 //! A type is mapped onto an IR type only where the IR type's operations are Postgres's. Both provers
 //! read REAL as exact rational arithmetic and every type's `=` as equality, so:
 //!
-//! * `numeric` is REAL: its `+`, `-` and `*` are exact. Its division rounds to a finite scale
+//! * `numeric` is REAL: its `+`, `-` and `*` are exact on finite values (it also has `NaN` and
+//!   `±Infinity`, where `x * 0` is not `0`: `docs/SOUNDNESS.md`). Its division rounds to a finite scale
 //!   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over REAL is the uninterpreted `q_arith_div_real_real`
 //!   ([`make_arith`]). REAL carries no scale, so an operation that shows it -- a cast to text, or a
 //!   division, whose scale follows its operands' -- is [`crate::equality`]'s.

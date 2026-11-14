@@ -216,8 +216,18 @@ A Postgres type is mapped onto an IR type only where the IR type's operations ar
 type's. Both provers read REAL as exact rational arithmetic and any type's `=` as equality, so:
 
 - **`numeric` is REAL, but its division is not exact, and REAL has no scale.** Addition,
-  subtraction and multiplication of numerics are exact; division rounds to a finite scale
+  subtraction and multiplication of finite numerics are exact; division rounds to a finite scale
   (`1 / 3.0 * 3.0` is `0.99…990`), so `/` over a REAL is the uninterpreted `q_arith_div_real_real`.
+- **`numeric` has `NaN`, `Infinity` and `-Infinity`, which REAL has not.** They are values of the
+  type (`NaN` in any `numeric` column, the infinities in an unconstrained one), `NaN = NaN` holds
+  and `NaN` sorts above every other value, so `=` and the order still behave as an order does. The
+  identities of the real numbers that fail on them are the ones a prover must not use: `x * 0 = 0`
+  (`NaN * 0` and `Infinity * 0` are `NaN`), `x - x = 0`, and `x + 1 > x`. `sqleq-solver` reads a
+  product with a `numeric` in it as an uninterpreted function of which it knows only that it
+  commutes, so nothing folds it to zero; it leaves sums uncancelled, and it does not interpret the
+  order of REAL values. The QED prover reads REAL as
+  the real numbers, so it proves pairs that differ only at these values; such a pair is pinned
+  with `qed: proved !known-unsound`.
   A numeric's text shows its scale, `1.0` and `1.00` being one number and two strings, and so does
   the scale a division rounds to; what that costs is
   [below](#values-that--calls-equal-and-that-are-still-two-values).

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::solver::translate::NUMERIC_EQ_KEY;
+use crate::solver::translate::{is_times, NUMERIC_EQ_KEY};
 use crate::solver::uterm::{PredKind, UConst, UTerm, UVar};
 
 pub struct Db {
@@ -119,7 +119,22 @@ impl Db {
                 let vals: Vec<UConst> = args.iter().map(|a| self.eval(a, env)).collect::<Result<_, _>>()?;
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 name.hash(&mut h);
-                vals.hash(&mut h);
+                if is_times(name) {
+                    // The one thing known of a non-integer product is that it commutes, so its
+                    // interpretation is a function of its operands as a pair, whatever their order.
+                    let mut each: Vec<u64> = vals
+                        .iter()
+                        .map(|v| {
+                            let mut one = std::collections::hash_map::DefaultHasher::new();
+                            v.hash(&mut one);
+                            one.finish()
+                        })
+                        .collect();
+                    each.sort_unstable();
+                    each.hash(&mut h);
+                } else {
+                    vals.hash(&mut h);
+                }
                 self.universe[(h.finish() % self.universe.len() as u64) as usize].clone()
             }
             UTerm::Add(ts) => {

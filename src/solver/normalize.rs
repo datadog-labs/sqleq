@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::solver::ic::Ics;
-use crate::solver::translate::{NUMERIC_EQ_KEY, OUT_VAR_ID};
+use crate::solver::translate::{is_times, NUMERIC_EQ_KEY, OUT_VAR_ID};
 use crate::solver::uterm::{mk_mul, mk_sum, Order, PredKind, UConst, UTerm, UVar};
 
 /// Rounds of (simplify, eliminate bound vars, rename apart) before giving up on a fixpoint. Stopping
@@ -1024,6 +1024,14 @@ pub fn simplify(t: &UTerm) -> UTerm {
                     other => other,
                 })
                 .collect();
+            UTerm::Func { name: name.clone(), args }
+        }
+        // A product that is not of integers is uninterpreted, except that it commutes: its two
+        // operands are kept in the normal form's order. Nothing else is assumed of it, a `0` or a
+        // `1` operand included (`translate::TIMES`).
+        UTerm::Func { name, args } if is_times(name) => {
+            let mut args: Vec<UTerm> = args.iter().map(simplify_value).collect();
+            args.sort_by_key(key);
             UTerm::Func { name: name.clone(), args }
         }
         UTerm::Func { name, args } => UTerm::Func { name: name.clone(), args: args.iter().map(simplify_value).collect() },
