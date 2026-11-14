@@ -947,6 +947,55 @@ fn a_special_trial_that_does_not_end_is_not_an_error() {
 }
 
 #[test]
+fn a_literal_held_against_an_expression_of_a_column_is_drawn_into_it() {
+    // Each pair differs only at a row that holds a literal the pair never compares the bare column
+    // with: it is compared with an expression of the column, a `CASE` holds its operand against
+    // it, or it is behind a cast or arithmetic that makes another value of it (#207).
+    for (ddl, a, b) in [
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE coalesce(c, 0) <= -2", "SELECT * FROM t WHERE coalesce(c, 0) < -2"),
+        ("CREATE TABLE t (c date)", "SELECT * FROM t WHERE (CASE c WHEN '2001-01-13'::date THEN 1 END) = 1", "SELECT * FROM t WHERE false"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE NOT ((CASE WHEN false THEN 0 ELSE c END) > -2)", "SELECT * FROM t WHERE false"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE c + 0 <= -2", "SELECT * FROM t WHERE false"),
+        // The cast is 0, which the text inside it is not; the row c = -1 is below it.
+        ("CREATE TABLE t (c int8)", "SELECT * FROM t WHERE c < CAST('-1.7305e-12'::float8 AS int8)", "SELECT * FROM t WHERE false"),
+        // The cast is '1.7976931348623157e+308', and the text inside it sorts above that. The
+        // check keeps the empty string out, which would tell the two apart by itself.
+        (
+            "CREATE TABLE t (c text NOT NULL CHECK (c <> ''))",
+            "SELECT * FROM t WHERE CAST('1.7976931348623157e308'::float8 AS text) >= c",
+            "SELECT * FROM t WHERE false",
+        ),
+        // Arithmetic over literals has no literal to read at all.
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE c <= 300 + 34", "SELECT * FROM t WHERE c < 300 + 34"),
+    ] {
+        assert_kind!(a, b, ddl, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
+fn a_literal_held_against_an_expression_refutes_nothing_equivalent() {
+    for (ddl, a, b) in [
+        // No value of c puts abs(c) at -2.
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE abs(c) <= -2", "SELECT * FROM t WHERE abs(c) < -2"),
+        ("CREATE TABLE t (c int4)", "SELECT * FROM t WHERE coalesce(c, 0) <= -2", "SELECT * FROM t WHERE coalesce(c, 0) < -1"),
+        ("CREATE TABLE t (c int8)", "SELECT * FROM t WHERE c < CAST('-1.7305e-12'::float8 AS int8)", "SELECT * FROM t WHERE c < 0"),
+        // 2020 is no timestamp, and is not drawn into the column under EXTRACT.
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, ts timestamp NOT NULL)",
+            "SELECT id FROM t WHERE EXTRACT(year FROM ts) = 2020",
+            "SELECT id FROM t WHERE 2020 = EXTRACT(year FROM ts)",
+        ),
+    ] {
+        assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+    }
+    // A constant that raises is no value to draw, and the two sides raise alike.
+    let (a, b) = ("SELECT * FROM t WHERE c = CAST('x' AS int4)", "SELECT * FROM t WHERE CAST('x' AS int4) = c");
+    if let Some(got) = kind(a, b, "CREATE TABLE t (c int4)") {
+        assert_ne!(got, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
 fn a_literal_drawn_into_a_column_refutes_nothing_equivalent() {
     for (ddl, a, b) in [
         ("CREATE TABLE t (c int4 NOT NULL)", "SELECT * FROM t WHERE c < 334", "SELECT * FROM t WHERE c <= 333"),

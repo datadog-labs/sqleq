@@ -57,6 +57,8 @@ use crate::fuzz::pair::{is_query, small_size, Config, Verdict, SMALL_STREAM};
 const LITERAL_STREAM: u64 = 0x11e7_e4a1_5eed_0b0d;
 /// The stream the special-value trials draw from, apart from every other for the same reason.
 const SPECIAL_STREAM: u64 = 0x5bec_1a15_5eed_0f0f;
+/// The stream of the trials that draw the wider reading's literals, apart from every other too.
+const WIDE_STREAM: u64 = 0x71de_11e7_5eed_0a0a;
 use crate::fuzz::patterns as pat;
 use crate::fuzz::schema::{parse_schema, Column, Schema, Table, VType};
 use crate::fuzz::typing;
@@ -570,8 +572,9 @@ pub struct Timing {
     pub ddl_ms: f64,
     pub trial_ms: Vec<f64>,
     /// The trials the pair was given: [`Config::total_trials`], the literal trials where a column
-    /// is compared with a literal, and the special-value trials where a column or a parameter is
-    /// of a type that has special values.
+    /// is compared with a literal, the special-value trials where a column or a parameter is of a
+    /// type that has special values, and the trials of the wider reading of the literals where it
+    /// finds a value the literal trials have not got.
     pub trials: usize,
     pub rows_tried: usize,
     pub rows_kept: usize,
@@ -668,6 +671,70 @@ impl Db<'_> {
             }
         }
     }
+}
+
+/// What the server makes of each constant (`literals::Side::Constant`), by its SQL: its text, as
+/// a number where its type is one. A constant that raises, or is NULL, is left out.
+///
+/// They are asked for together, and one by one only where one of them raises.
+fn constants(db: &mut Db, sqls: &[String]) -> BTreeMap<String, literals::Lit> {
+    const NUMBERS: &[&str] = &["smallint", "integer", "bigint", "numeric", "real", "double precision"];
+    fn ask(db: &mut Db, sqls: &[String]) -> Result<Vec<Option<literals::Lit>>, String> {
+        let cols: Vec<String> =
+            sqls.iter().map(|q| format!("({q})::text, pg_typeof({q})::text")).collect();
+        let msgs = db.guarded(|db| db.simple(&format!("SELECT {}", cols.join(", "))))?;
+        let row = msgs
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .ok_or("no row")?;
+        Ok((0..sqls.len())
+            .map(|i| {
+                let (text, ty) = (row.get(2 * i)?, row.get(2 * i + 1)?);
+                Some(if NUMBERS.contains(&ty) {
+                    literals::Lit::Number(text.to_string())
+                } else {
+                    literals::Lit::Text(text.to_string())
+                })
+            })
+            .collect())
+    }
+    let made = match ask(db, sqls) {
+        Ok(made) => made,
+        Err(_) => sqls
+            .iter()
+            .map(|q| ask(db, std::slice::from_ref(q)).ok().and_then(|mut v| v.pop().flatten()))
+            .collect(),
+    };
+    sqls.iter().cloned().zip(made).filter_map(|(q, l)| Some((q, l?))).collect()
+}
+
+/// Whether each candidate, a type and a value's text, is a value the type reads, or `None` where
+/// the server cannot say so without raising (a type whose input function reports no soft error).
+fn readable(db: &mut Db, candidates: &[(String, String)]) -> Option<Vec<bool>> {
+    if candidates.is_empty() {
+        return Some(Vec::new());
+    }
+    let rows: Vec<String> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (ty, text))| format!("({i}, {}, {})", ql(text), ql(ty)))
+        .collect();
+    let sql = format!(
+        "SELECT pg_input_is_valid(v, t) FROM (VALUES {}) AS c(i, v, t) ORDER BY i",
+        rows.join(", ")
+    );
+    let msgs = db.guarded(|db| db.simple(&sql)).ok()?;
+    let read: Vec<bool> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r.get(0) == Some("t")),
+            _ => None,
+        })
+        .collect();
+    (read.len() == candidates.len()).then_some(read)
 }
 
 fn qi(s: &str) -> String {
@@ -2226,12 +2293,92 @@ fn run_pair(
     let special_params =
         pgtypes.iter().any(|(n, (vt, _))| !specials(*vt, ptext.get(n).map(String::as_str)).is_empty());
     let special_trials = if special_pools.is_empty() && !special_params { 0 } else { cfg.trials / 4 };
-    timing.trials = cfg.total_trials() + literal_trials + special_trials;
+
+    // The wider reading of the pair's literals (`literals::harvest_wide`): one compared with an
+    // expression of a column, one a `CASE` holds its operand against, and a constant with a cast
+    // or an operator in it, which the server is asked for once. Where it gives a column a value
+    // its literal pool has not got, another `--trials / 4` trials, after every other and from a
+    // stream of their own, draw from both. The literal trials keep their pools, so here too a
+    // pair can only gain a counterexample.
+    let wide = literals::harvest_wide(a, b);
+    let mut asked: Vec<String> = Vec::new();
+    for side in wide.values().flatten() {
+        if let literals::Side::Constant(q) = side {
+            if !asked.contains(q) {
+                asked.push(q.clone());
+            }
+        }
+    }
+    let made = if asked.is_empty() { BTreeMap::new() } else { constants(db, &asked) };
+    // Per table and column: the values the wider reading adds, and the column's type.
+    let mut added: BTreeMap<String, Vec<(Vec<Val>, String)>> = BTreeMap::new();
+    for t in &loaded {
+        let tg = targets.iter().find(|(k, _)| k == t).map(|(_, tg)| tg);
+        let narrow = literal_pools.get(t);
+        let cols: Vec<(Vec<Val>, String)> = tables[t]
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                let ty = tg.and_then(|tg| tg.col_types.get(j).cloned().flatten());
+                let (Some(sides), Some(ty), false) = (wide.get(&c.name), ty, c.array) else {
+                    return (Vec::new(), String::new());
+                };
+                let lits: Vec<literals::Lit> = sides
+                    .iter()
+                    .filter_map(|s| match s {
+                        literals::Side::Lit(l) => Some(l.clone()),
+                        literals::Side::Constant(q) => made.get(q).cloned(),
+                    })
+                    .collect();
+                let held = narrow.map_or(&[][..], |p| p[j].as_slice());
+                let new = literals::values(c.vt, &ty, &lits).into_iter().filter(|v| !held.contains(v));
+                (new.collect(), ty)
+            })
+            .collect();
+        added.insert(t.clone(), cols);
+    }
+    // A literal held against an expression need not be a value of the column under it
+    // (`EXTRACT(year FROM ts) = 2020`), and a row with one would only be rejected. An integer or a
+    // date is made to fit (`literals::values`); any other is kept where the type reads it.
+    let texts = |v: &Val| match v {
+        Val::Str(s) | Val::Uuid(s) => Some(s.clone()),
+        _ => None,
+    };
+    let candidates: Vec<(String, String)> = added
+        .values()
+        .flatten()
+        .flat_map(|(vals, ty)| vals.iter().filter_map(texts).map(move |s| (ty.clone(), s)))
+        .collect();
+    if let Some(read) = readable(db, &candidates) {
+        let mut read = read.into_iter();
+        for (vals, _) in added.values_mut().flatten() {
+            vals.retain(|v| texts(v).is_none() || read.next().unwrap_or(true));
+        }
+    }
+    let mut wide_pools: BTreeMap<String, Vec<Vec<Val>>> = BTreeMap::new();
+    for (t, cols) in added {
+        if cols.iter().all(|(vals, _)| vals.is_empty()) {
+            continue;
+        }
+        let narrow = literal_pools.get(&t);
+        let pools = cols
+            .into_iter()
+            .enumerate()
+            .map(|(j, (vals, _))| narrow.map_or(Vec::new(), |p| p[j].clone()).into_iter().chain(vals).collect())
+            .collect();
+        wide_pools.insert(t, pools);
+    }
+    let wide_trials = if wide_pools.is_empty() { 0 } else { cfg.trials / 4 };
+    timing.trials = cfg.total_trials() + literal_trials + special_trials + wide_trials;
 
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
     let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
     let mut literal_rng = StdRng::seed_from_u64(cfg.seed ^ LITERAL_STREAM);
     let mut special_rng = StdRng::seed_from_u64(cfg.seed ^ SPECIAL_STREAM);
+    let mut wide_rng = StdRng::seed_from_u64(cfg.seed ^ WIDE_STREAM);
+    // Set once a special trial has run into the statement timeout: the rest of them are skipped.
+    let mut special_over = false;
     let small_trials = cfg.trials / 4;
     let mut last_err: Option<String> = None;
     let mut ok_trials = 0usize;
@@ -2245,6 +2392,12 @@ fn run_pair(
     }
 
     for i in 0..timing.trials {
+        let wide = i >= cfg.total_trials() + literal_trials + special_trials;
+        let special = !wide && i >= cfg.total_trials() + literal_trials;
+        let literal = !special && !wide && i >= cfg.total_trials();
+        if special && special_over {
+            continue;
+        }
         let t_trial = Instant::now();
         // By the trial's number, not the generator, so every value drawn is the one it would be.
         let clock = clocked.then(|| clocks[i % clocks.len()].as_str());
@@ -2269,10 +2422,10 @@ fn run_pair(
             .into_iter()
             .chain(zone.map(|z| format!("TimeZone: {z}")))
             .collect();
-        let special = i >= cfg.total_trials() + literal_trials;
-        let literal = !special && i >= cfg.total_trials();
-        let small = !literal && !special && i % 5 == 4 && i / 5 < small_trials;
-        let rng: &mut StdRng = if special {
+        let small = !literal && !special && !wide && i % 5 == 4 && i / 5 < small_trials;
+        let rng: &mut StdRng = if wide {
+            &mut wide_rng
+        } else if special {
             &mut special_rng
         } else if literal {
             &mut literal_rng
@@ -2290,7 +2443,13 @@ fn run_pair(
                 cfg.nrows
             };
             let mut rows: Vec<Vec<Val>> = Vec::with_capacity(size);
-            let pools = if special { special_pools.get(t) } else { literal_pools.get(t).filter(|_| literal) };
+            let pools = if wide {
+                wide_pools.get(t)
+            } else if special {
+                special_pools.get(t)
+            } else {
+                literal_pools.get(t).filter(|_| literal)
+            };
             for _ in 0..size {
                 let row: Vec<Val> = table
                     .cols
@@ -2601,10 +2760,12 @@ fn run_pair(
                 if e.msg.contains("statement timeout") {
                     // A special value can make a statement run without end (a recursion that
                     // stops at a date it never reaches, since `infinity + 1` is `infinity`), which
-                    // says nothing of the pair. The special trials are the last ones, and the
-                    // next would wait out the timeout too, so the rest of them are given up.
+                    // says nothing of the pair. The next special trial would wait out the
+                    // timeout too, so the rest of them are given up.
                     if special {
-                        break;
+                        special_over = true;
+                        timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
+                        continue;
                     }
                     return Verdict::Error(e.msg);
                 }

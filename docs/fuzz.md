@@ -390,7 +390,7 @@ Some values no small domain of ordinary ones stands for, because arithmetic and 
 them as no ordinary value is treated: `infinity` and `-infinity` of a date or a timestamp
 (`'infinity'::date + 1` is `infinity`), `NaN`, `Infinity` and `-Infinity` of a `numeric` or a float
 (`NaN * 0` is `NaN`), and the empty string. On the Postgres engine a column or a parameter of such
-a type takes them in a last `--trials / 4` trials, drawn from a stream of their own after the
+a type takes them in another `--trials / 4` trials, drawn from a stream of their own after the
 literal ones: a column in about half its rows, a parameter about half the time. A `numeric(p, s)`
 column takes `NaN` alone, since it holds no infinity. The clock is never one of them. A trial of
 these in which a statement raises is skipped and not reported, since it says nothing of the pair:
@@ -398,6 +398,24 @@ these in which a statement raises is skipped and not reported, since it says not
 ends them, unreported as well: a recursion that stops at a date never ends once that date is
 `infinity`. A pair with no such column or parameter runs exactly the trials it ran without. The
 DuckDB engine draws none.
+
+A pair can also hold a column against a literal without comparing the two: `coalesce(c, 0) <= -2`
+compares `-2` with an expression of `c`, `CASE c WHEN '2001-01-13' …` holds `c` against its arm,
+and `c < CAST('-1.7305e-12'::float8 AS int8)` compares `c` with `0`, which is not the text inside
+the cast. So on the Postgres engine the literals are read a second, wider way:
+
+- a literal joins the domain of every column under the side it is compared with, outside a
+  subquery;
+- the operand of a simple `CASE` takes its `WHEN` arms;
+- a constant built of literals with a cast or arithmetic in it is asked of the server once, and
+  joins as its value.
+
+A literal held against an expression need not be a value of the column under it (`EXTRACT(year
+FROM ts) = 2020`), so one the column's type does not read is left out. Where this reading gives a
+column a value the literal trials lack, a last `--trials / 4` trials, from a stream of their own
+after every other, draw from both. The literal trials keep their own pools, so a pair again can
+only gain a counterexample. A boundary an expression moves is not found: `c + 5 <= -2` and
+`c + 5 < -2` differ at `c = -7`, and `-7` is nowhere in the pair.
 
 ## Validation
 
