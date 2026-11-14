@@ -124,6 +124,26 @@ fn is_not_distinct_from_is_equality_or_both_null() {
 }
 
 #[test]
+fn a_self_join_on_a_key_with_is_not_distinct_from_is_the_table() {
+    // `SELECT a.k, b.v FROM t a JOIN t b ON a.k = b.k AND a.v IS NOT DISTINCT FROM b.v` against
+    // `SELECT k, v FROM t`: the key makes the two rows one, and a nullable `v` is not distinct
+    // from itself. As a sum of two cases the predicate split the row in two, and nothing merged
+    // `X·[v = NULL] + X·¬[v = NULL]` back (#241). `t` is columns 0-4 and its second copy 5-9.
+    let not_distinct = |a: u32, b: u32| pred("IS NOT DISTINCT FROM", vec![int(a), int(b)]);
+    let self_join = |on: Value| {
+        project(json!({ "join": { "kind": "INNER", "left": scan(0), "right": scan(0), "condition": on } }), vec![int(0), int(6)])
+    };
+    let table = project(scan(0), vec![int(0), int(1)]);
+    proves(self_join(and(vec![eq(int(0), int(5)), not_distinct(1, 6)])), table.clone());
+    // On one table: `v IS NOT DISTINCT FROM v` keeps every row.
+    proves(ks(not_distinct(1, 1)), project(scan(0), vec![int(0)]));
+    // `=` in its place is UNKNOWN on a NULL `v`, and the row goes.
+    refutes(self_join(and(vec![eq(int(0), int(5)), eq(int(1), int(6))])), table.clone());
+    // And on a column that is no key the join pairs every two rows that agree.
+    refutes(self_join(and(vec![eq(int(1), int(6)), not_distinct(1, 6)])), table);
+}
+
+#[test]
 fn what_differs_is_not_proved() {
     // `a IS NOT NULL OR a > 0` keeps a = -1-like rows that `a > 0` drops.
     let gt = || pred(">", vec![int(1), lit("0", "INTEGER")]);

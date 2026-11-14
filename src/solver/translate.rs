@@ -905,13 +905,19 @@ impl<'s> Translator<'s> {
     }
 
     /// `a IS NOT DISTINCT FROM b`, two-valued: both NULL, or neither and SQL's `=` holds.
+    ///
+    /// One 0/1 term, the squash of the two cases. They exclude each other, so their sum is already
+    /// 0 or 1 and the squash changes no value; what it changes is the shape. A bare sum in a join's
+    /// product distributes, and the row's term becomes two summands, `X·[c = NULL] + X·¬[c = NULL]`,
+    /// that nothing merges back into `X` once a key has made the two rows one. Under the squash the
+    /// two cases stay one factor, as an `OR` of them is.
     fn not_distinct(&mut self, operand: &[Expr], scope: &Scope) -> Result<UTerm, TranslateError> {
         let a = self.translate_value(&operand[0], scope)?;
         let b = self.translate_value(&operand[1], scope)?;
         let both_null = mk_mul([a.is_null.clone(), b.is_null.clone()]);
         let both_nonnull = mk_mul([mk_neg(a.is_null), mk_neg(b.is_null)]);
         let eq = sql_eq(a.value, Some(scope.eq_type(&operand[0])), b.value, Some(scope.eq_type(&operand[1])));
-        Ok(mk_add([both_null, mk_mul([both_nonnull, eq])]))
+        Ok(mk_squash(mk_add([both_null, mk_mul([both_nonnull, eq])])))
     }
 
     /// Whether `query` returns a row, which a `LIMIT` of one or more does not change
