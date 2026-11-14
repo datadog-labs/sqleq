@@ -807,10 +807,19 @@ pub fn coerce_literal_args(operand: Vec<Value>, ret: &str) -> Vec<Value> {
 /// `NULLIF(i, 1.5::integer)` compares two integers. Cast to INTEGER, `1.5` would be `2`, and the
 /// two would be one plan. So a second argument of a wider type than the first's is refused, as is
 /// one of another type than the first's, which Postgres rejects.
+///
+/// A parameter nothing typed is untyped as a string literal is: Postgres resolves it to the first
+/// argument's type (`NULLIF(SUM(b), $1)` prepares with `$1` a `bigint`), so it takes that type
+/// ([`is_untyped_param`], and of plain VARBINARY) and nothing is refused. It is relabelled, not
+/// cast: a `CAST` of the opaque parameter would be a conversion, and there is none. A parameter that
+/// carries a type, an explicit `$1::numeric` or a declared one included, is a typed value and is
+/// checked as one.
 pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<Vec<Value>> {
     if is_builtin(ret) {
         if name == "NULLIF" {
-            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v);
+            // Plain VARBINARY only: a parameter declared of an opaque type (`float8`) has that type.
+            let untyped_param = |v: &Value| is_untyped_param(v) && ty_of(v) == "VARBINARY";
+            let untyped = |v: &Value| is_string_literal(v) || is_bare_null(v) || untyped_param(v);
             if let Some(v) = operand.iter().skip(1).find(|v| !untyped(v) && common_type(ret, &ty_of(v)) != ret) {
                 return Err(unsupported(format!(
                     "NULLIF of a value of type {ret} against one of type {}, which Postgres compares at their \
@@ -818,10 +827,34 @@ pub fn coerce_select_args(name: &str, operand: Vec<Value>, ret: &str) -> Result<
                     ty_of(v)
                 )));
             }
+            return Ok(operand
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut v)| {
+                    if i > 0 && untyped_param(&v) {
+                        v["type"] = json!(ret);
+                        return v;
+                    }
+                    cast_to(v, ret)
+                })
+                .collect());
         }
         return Ok(operand.into_iter().map(|v| cast_to(v, ret)).collect());
     }
     Ok(coerce_literal_args(operand, ret))
+}
+
+/// Whether `v` is a parameter the inference left untyped, which it types opaque. Postgres types such a
+/// parameter from where it is used, so in a set operation's or a `VALUES` list's column it takes the
+/// column's type, as a NULL does, and as `NULLIF`'s second argument it takes the first's
+/// ([`coerce_select_args`]). Inference gives a parameter one type for the
+/// whole pair, so an opaque one is untyped everywhere it occurs; and were one occurrence of it given
+/// another type than another, the two would only be read as two independent values, which a proof
+/// over every value covers.
+pub(crate) fn is_untyped_param(v: &Value) -> bool {
+    v.get("operator").and_then(Value::as_str).and_then(|o| o.strip_prefix("QP")).is_some_and(|d| {
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+    }) && is_opaque(&ty_of(v))
 }
 
 /// [`cast_to`] `ct`, where `ct` is the type `like` gave the comparison or the expression `v` is
