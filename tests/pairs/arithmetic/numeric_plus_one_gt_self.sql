@@ -8,7 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved !known-unsound
 -- expect sqleq-solver: no-proof
--- expect cvc5: proved !known-unsound
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #234: a prover that reads numeric as the real numbers proves x + 1 > x for every x that is not NULL.
 --   Infinity + 1 is Infinity and NaN + 1 is NaN, and neither is greater than itself

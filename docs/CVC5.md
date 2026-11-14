@@ -207,8 +207,14 @@ A proof holds, and a model is a database, under these readings of the IR's types
 * `INTEGER`, `DATE`, `TIME` and `TIMESTAMP` are cvc5 integers: unbounded, so no overflow and no
   `infinity`. A model may use a value Postgres has not got.
 * `REAL` is a cvc5 real: an exact rational, so `2.0` and `2.00` are one value where Postgres prints
-  them apart, and `1/3` is exact where `numeric` rounds. Numeric division is left to the frontend's
-  uninterpreted `q_arith_div_real_*` for that reason.
+  them apart. Its `=` and its order are cvc5's. Its arithmetic is not. Postgres's `numeric` has
+  `NaN`, `Infinity` and `-Infinity`, which a real has not, and `x * 0 = 0`, `x - x = 0` and
+  `x + 1 > x` hold of every real and fail at them; and its division rounds to a scale a rational
+  does not have. So `+`, `-`, `*`, `/` and unary `-` over a REAL are uninterpreted functions, of
+  which the encoding keeps only that a sum and a product commute. Integer arithmetic is cvc5's own.
+  `SUM` over a REAL is still a sum of reals, associative and commutative as `numeric`'s is; a proof
+  that rests on the value of a sum over rows holding `NaN` or opposite infinities is beyond this
+  reading.
 * `VARCHAR` is a cvc5 string, so `=` is identity: a deterministic collation. Its order is code
   point order only where the frontend emitted a native comparison, which it does under the `C` and
   `POSIX` collations alone (`src/collation.rs`); `MIN`, `MAX` and a row slice ordered by a string
