@@ -137,7 +137,15 @@ value:
   clause or `RETURNING`, or from a `CHECK` on the table, one of its columns or a column's domain.
   A sequence a parameter names could be any, so then an omitted column whose default draws from
   any sequence is refused too;
-- `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator;
+- `DEFAULT` on a column whose default is not a constant, a sequence or a recognised generator.
+  A column default is read a little more widely than a `VALUES` cell. One of the generators above
+  is itself under any schema (`public.uuid_generate_v4()`), since a name the DDL does not declare
+  is the extension's or the server's; and an expression over the statement's clock and constants
+  (`EXTRACT(epoch FROM CURRENT_TIMESTAMP) * 1000`, `now() + '1 day'::interval`,
+  `date_trunc('day', now())`) is a generator of one value per statement, as the clock is. Still
+  refused: a default that calls a function the DDL itself declares, whatever generator it is named
+  after, since that function may do anything; and an expression over `clock_timestamp()`, which
+  differs between rows, or over any other function, a column or a subquery;
 - a generator whose value the column's type cannot take, or two generators in one column.
 
 Every condition above that concerns the two statements is checked twice: once in Rust, to give a
