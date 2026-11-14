@@ -1958,6 +1958,38 @@ impl Encoder {
         Ok((a, b))
     }
 
+    /// `a op b` over two numeric operands of one sort ([`Self::numeric_operands`]), for `+`, `-`,
+    /// `*` and `/` (or the frontend's `add`, `sub`, `mul`).
+    ///
+    /// Over the integers it is cvc5's own operator. Over the reals, which stand for Postgres's
+    /// `numeric`, it is an uninterpreted function: `numeric` has `NaN`, `Infinity` and `-Infinity`,
+    /// which the reals have not, and the reals' arithmetic proves what fails at them. `x * 0 = 0`
+    /// (`NaN * 0` is `NaN`), `x - x = 0`, and `x + 1 > x` (`Infinity + 1` is `Infinity`) all hold
+    /// of every real. One function per operator over the real sort stands for the `numeric`
+    /// operator, whose operands Postgres converts to `numeric` first. The one thing kept is that a
+    /// sum and a product commute, which holds at those values too: their two operands are applied
+    /// in one order, cvc5's own order of terms. The order of the reals stays cvc5's, since `=` and
+    /// `<` on a `numeric` are a total order with `NaN` above every other value.
+    fn arithmetic(&mut self, op: &str, a: Term, b: Term) -> R<Term> {
+        let sort = a.sort().nullable_element_sort()?;
+        if sort.is_integer() {
+            return self.lift(arith_kind(op), &[a, b]);
+        }
+        let (name, commutes) = match op {
+            "+" | "add" => ("numeric:+", true),
+            "-" | "sub" => ("numeric:-", false),
+            "/" => ("numeric:/", false),
+            _ => ("numeric:*", true),
+        };
+        let f = self.fun(name, &[sort.clone(), sort.clone()], sort)?;
+        self.strict(&[a, b], |enc, mut v| {
+            if commutes {
+                v.sort();
+            }
+            enc.apply(f, &v)
+        })
+    }
+
     /// Two numeric operands over one sort: an integer beside a real is read as a real.
     fn numeric_pair(&mut self, a: Term, b: Term) -> R<(Term, Term)> {
         let (sa, sb) = (a.sort().nullable_element_sort()?, b.sort().nullable_element_sort()?);
@@ -1989,17 +2021,18 @@ impl Encoder {
                 self.compare(op, a, b)
             }
             // Integer and numeric arithmetic, as the frontend spells it: the operators themselves,
-            // or its `q_arith_<op>_<left>_<right>` functions over INTEGER and REAL. `+`, `-` and `*`
-            // are exact in Postgres and here; integer `/` and `%` truncate toward zero; numeric
-            // division is left to the frontend's own uninterpreted `q_arith_div_real_*`, since
-            // Postgres rounds it to a scale cvc5's rationals do not have.
+            // or its `q_arith_<op>_<left>_<right>` functions over INTEGER and REAL. Over integers
+            // `+`, `-` and `*` are exact in Postgres and here, and `/` and `%` truncate toward
+            // zero. Over a `numeric` none of them is cvc5's ([`Self::arithmetic`]): the type has
+            // `NaN` and the infinities, and its division rounds to a scale cvc5's rationals do not
+            // have.
             ("+", 2) | ("-", 2) | ("*", 2) => {
                 let (a, b) = self.numeric_operands(op, args[0].clone(), args[1].clone())?;
-                self.lift(arith_kind(op), &[a, b])
+                self.arithmetic(op, a, b)
             }
             (_, 2) if numeric_arith(op).is_some_and(|(o, _)| matches!(o, "add" | "sub" | "mul")) => {
                 let (a, b) = self.numeric_operands(op, args[0].clone(), args[1].clone())?;
-                self.lift(arith_kind(numeric_arith(op).expect("checked").0), &[a, b])
+                self.arithmetic(numeric_arith(op).expect("checked").0, a, b)
             }
             ("/", 2) | ("q_arith_div_integer_integer", 2) => {
                 let (a, b) = self.numeric_operands(op, args[0].clone(), args[1].clone())?;
@@ -2007,7 +2040,7 @@ impl Encoder {
                     // Postgres truncates integer division toward zero; SMT-LIB's `div` floors.
                     self.strict(&[a, b], |enc, v| enc.truncating_division(v[0].clone(), v[1].clone()))
                 } else if op == "/" {
-                    self.lift(Kind::Division, &[a, b])
+                    self.arithmetic(op, a, b)
                 } else {
                     self.strict_fun(op, ty, operand, &args)
                 }
@@ -2033,7 +2066,14 @@ impl Encoder {
                         args[0].sort().nullable_element_sort()?
                     )));
                 }
-                self.lift(Kind::Neg, &args)
+                if args[0].sort().nullable_element_sort()?.is_integer() {
+                    return self.lift(Kind::Neg, &args);
+                }
+                // Over a `numeric`, as the binary operators are: `-x` puts `NaN` below every value
+                // in the reals' order, and Postgres keeps it above.
+                let real = args[0].sort().nullable_element_sort()?;
+                let f = self.fun("numeric:neg", std::slice::from_ref(&real), real.clone())?;
+                self.strict(&args, |enc, v| enc.apply(f, &v))
             }
             ("+", 1) => Ok(args[0].clone()),
             ("IS NULL", 1) => {

@@ -8,7 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved !known-unsound
 -- expect sqleq-solver: no-proof
--- expect cvc5: proved !known-unsound
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #234: sqleq-solver folded a product with a 0 factor to 0 whatever its type. numeric has NaN and
 --   Infinity, and NaN * 0 and Infinity * 0 are NaN

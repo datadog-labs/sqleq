@@ -8,7 +8,7 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved !known-unsound
 -- expect sqleq-solver: no-proof
--- expect cvc5: proved !known-unsound
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: issue #234: the 0 need not be written in the product. sqleq-solver put the 0 that n = 0 gives in place of n,
 --   and then folded amt * 0 to 0
