@@ -49,7 +49,10 @@
 //!   spaces, so two values it calls equal can still be told apart, and a value of either is refused
 //!   wherever it reaches the plan ([`refuse_unfaithful`]). So are `box`, `circle`, `lseg` and
 //!   `line`, whose `=` compares within a tolerance and is not transitive.
-//! * Integer types are matched by name, so `int4range` and `point` are not integers.
+//! * Integer types are matched by name, so `int4range` and `point` are not integers. Nor is `oid`:
+//!   it is unsigned, and an integer beside it is read as an `oid`, so a negative one wraps
+//!   (`(-1)::oid` is `4294967295`, and `o > -1` holds for no `o`). It is opaque with an identity
+//!   `=` ([`Scalar::Oid`]), and a cast to or from it is a named conversion, never the identity.
 //! * A type no reader names keeps its own name (`numrange`), or is VARBINARY under raw DDL, and so
 //!   is the result of a function nobody declared. Its `=` is not taken to be identity
 //!   ([`coarse_class`]) unless it is on the [`opaque_identity`] list; a domain is its base type
@@ -342,6 +345,11 @@ pub enum Scalar {
     Str,
     Bool,
     Binary,
+    /// `oid`: an unsigned 32-bit number. Its `=` is identity, but it is not the integers' type:
+    /// Postgres reads an integer beside one as an `oid`, and a negative integer wraps (`(-1)::oid`
+    /// is `4294967295`), so `o > -1` is false for every `o`. Opaque, with an identity `=`, as a
+    /// binary type is; its order and its casts are uninterpreted.
+    Oid,
 }
 
 /// Classify a type's name by exact spelling: upper-cased, unquoted, without its typmod. `None` is a
@@ -360,7 +368,8 @@ pub fn scalar_class(name: &str) -> Option<Scalar> {
     let base = canon.split('(').next().unwrap_or(&canon).trim();
     Some(match base {
         "INT" | "INTEGER" | "INT2" | "INT4" | "INT8" | "SMALLINT" | "BIGINT" | "TINYINT" | "MEDIUMINT"
-        | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" | "OID" => Scalar::Int,
+        | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" => Scalar::Int,
+        "OID" => Scalar::Oid,
         "NUMERIC" | "DECIMAL" | "DEC" => Scalar::Numeric,
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Scalar::Float,
         "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" | "NCHAR VARYING"
@@ -547,7 +556,7 @@ pub fn map_type(dt: &DataType) -> String {
         Some(Scalar::Numeric) => "REAL",
         // `-0 = 0` holds, and the two print differently: see [`crate::equality`].
         Some(Scalar::Float) => opaque_name(base),
-        Some(Scalar::Binary) => IDENTITY_OPAQUE,
+        Some(Scalar::Binary | Scalar::Oid) => IDENTITY_OPAQUE,
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => base,
@@ -577,7 +586,7 @@ pub fn normalize_type_name(t: &str) -> String {
         Some(Scalar::Int) => "INTEGER",
         Some(Scalar::Numeric) => "REAL",
         Some(Scalar::Float) => opaque_name(&up),
-        Some(Scalar::Binary) => "VARBINARY",
+        Some(Scalar::Binary | Scalar::Oid) => "VARBINARY",
         Some(Scalar::Str) => "VARCHAR",
         Some(Scalar::Bool) => "BOOLEAN",
         None => return up,
@@ -599,7 +608,8 @@ pub fn normalize_type_name(t: &str) -> String {
 ///
 /// * `bytea`; `uuid`, whose input is case-insensitive and whose braces and hyphens are optional,
 ///   and whose output is canonical; `money`, a count of cents (`'1.5'` and `'1.50'` both print
-///   `$1.50`); `name`;
+///   `$1.50`); `name`; `oid`, an unsigned number whose output is its decimal digits (`'01'::oid`
+///   and `' 1'::oid` both print `1`);
 /// * the discrete ranges `int4range`, `int8range` and `daterange`, which are canonicalized
 ///   (`int4range(1, 2, '[]')` is `[1,3)`);
 /// * an array of any type with an identity `=`, the integers, strings, `boolean`, `date`, `time`,
@@ -625,7 +635,7 @@ pub fn opaque_identity(name: &str) -> bool {
     let array = elem.len() < canon.trim().len();
     let base = elem.split('(').next().unwrap_or(elem).trim();
     let named = matches!(base, "BYTEA" | "UUID" | "MONEY" | "NAME" | "INT4RANGE" | "INT8RANGE" | "DATERANGE");
-    if named || scalar_class(elem) == Some(Scalar::Binary) {
+    if named || matches!(scalar_class(elem), Some(Scalar::Binary | Scalar::Oid)) {
         return true;
     }
     // A scalar of these is not opaque, so only its array is asked about.
