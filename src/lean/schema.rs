@@ -12,7 +12,7 @@
 //! aliases resolved, and marks the two things the checker refuses outright: a type modifier (the
 //! length in `varchar(10)`, the precision in `numeric(10,2)`) and an array type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::internals::enforced_per_statement;
 use sqlparser::ast::{DataType, Expr, Ident, ObjectName, Statement, Value};
@@ -193,23 +193,148 @@ pub enum DefaultSource {
     Other,
 }
 
-/// Classify a `DEFAULT` expression for a `DEFAULT` cell.
-pub fn default_source(e: &Expr) -> DefaultSource {
+/// The names of the functions raw DDL declares, by its words (lower-cased): `create [or replace]
+/// function [schema.]name(`. Read off the text, so that a declaration sqlparser cannot read still
+/// counts. A quoted name is folded with the rest, which can only declare more.
+fn declared_functions(words: &[String]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (i, w) in words.iter().enumerate() {
+        let after_create = i >= 1 && words[i - 1] == "create";
+        let after_replace = i >= 3 && words[i - 1] == "replace" && words[i - 2] == "or" && words[i - 3] == "create";
+        if w != "function" || !(after_create || after_replace) {
+            continue;
+        }
+        if let Some(name) = words.get(i + 1) {
+            let name = name.split('(').next().unwrap_or(name);
+            let bare = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
+            if !bare.is_empty() {
+                out.insert(bare.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Classify a `DEFAULT` expression for a `DEFAULT` cell. `declared` holds the names of the functions
+/// the DDL itself declares, folded and unqualified.
+///
+/// A generator is recognised by its name, and the captured DDL is what says whose function a name
+/// is. One it declares is its author's, and may do anything, read a sequence included, so a default
+/// that calls it is [`DefaultSource::Other`] however it is spelled. One it does not declare is the
+/// extension's or the server's, and then the schema it is written under does not matter:
+/// `public.uuid_generate_v4()` is `uuid_generate_v4()`. Only a default is read so; a `VALUES` cell
+/// keeps the rule of `recognize::generator`.
+///
+/// An expression over the statement's clock is a generator too (`statement_clock`):
+/// `EXTRACT(epoch FROM CURRENT_TIMESTAMP) * 1000` takes one value per statement, as `now()` does.
+pub fn default_source(e: &Expr, declared: &HashSet<String>) -> DefaultSource {
+    use crate::lean::recognize::generator;
+    let clock_or_other = |e: &Expr| match statement_clock(e, declared) {
+        Some(true) => DefaultSource::Generator,
+        _ => DefaultSource::Other,
+    };
     match e {
-        Expr::Nested(inner) => default_source(inner),
+        Expr::Nested(inner) => default_source(inner, declared),
         Expr::Value(_) | Expr::TypedString(_) => DefaultSource::Constant,
         Expr::UnaryOp { expr, .. } if matches!(expr.as_ref(), Expr::Value(_)) => DefaultSource::Constant,
-        Expr::Cast { expr, .. } => default_source(expr),
-        Expr::Function(f) => match crate::lean::recognize::generator(f) {
-            Ok(g) => match g.seq {
-                Some(Seq::Named(s)) => DefaultSource::Sequence(s),
-                // A DDL default has no parameter to name a sequence with.
-                Some(Seq::Param(_)) => DefaultSource::Other,
-                None => DefaultSource::Generator,
-            },
-            Err(_) => DefaultSource::Other,
+        Expr::Cast { expr, .. } => match default_source(expr, declared) {
+            // A cast of an expression is an expression: the clock decides.
+            DefaultSource::Other => clock_or_other(e),
+            source => source,
         },
-        _ => DefaultSource::Other,
+        Expr::Function(f) => {
+            if last_name(&f.name).is_some_and(|n| declared.contains(&n)) {
+                return DefaultSource::Other;
+            }
+            match generator(f).or_else(|refused| bare_generator(f).map_or(Err(refused), |bare| generator(&bare))) {
+                Ok(g) => match g.seq {
+                    Some(Seq::Named(s)) => DefaultSource::Sequence(s),
+                    // A DDL default has no parameter to name a sequence with.
+                    Some(Seq::Param(_)) => DefaultSource::Other,
+                    None => DefaultSource::Generator,
+                },
+                Err(_) => clock_or_other(e),
+            }
+        }
+        other => clock_or_other(other),
+    }
+}
+
+/// `f` under its bare name, when it is a schema-qualified call to one of the generators that take
+/// no argument ([`crate::lean::recognize::GENERATORS`]). Not `nextval`: its argument names a
+/// sequence, and which `nextval` a qualified one is has never been asked.
+fn bare_generator(f: &sqlparser::ast::Function) -> Option<sqlparser::ast::Function> {
+    let name = last_name(&f.name)?;
+    if f.name.0.len() < 2 || !crate::lean::recognize::GENERATORS.iter().any(|(g, _, _)| *g == name) {
+        return None;
+    }
+    let mut bare = f.clone();
+    bare.name = ObjectName(vec![f.name.0.last()?.clone()]);
+    Some(bare)
+}
+
+/// Whether `e` is built of the statement's clock and constants alone: `Some(true)` when it reads
+/// the clock, `Some(false)` when it is a constant expression, `None` when anything else is in it.
+///
+/// The clock is one of the generators that take one value per statement (`now()`,
+/// `CURRENT_TIMESTAMP`, `statement_timestamp()`, ...), so an expression over it and constants takes
+/// one value per statement too. `clock_timestamp()` is not one here: it differs between rows, and
+/// what an expression makes of two readings a moment apart is not the one value the witness gives
+/// the column. Around the clock only what is immutable or depends on the session alone is read:
+/// parentheses, a cast, unary `+` and `-`, the arithmetic operators, `EXTRACT`, `AT TIME ZONE`, and
+/// a few functions by name, none of which the DDL may declare. A column, a subquery, a volatile or
+/// an unknown function is `None`.
+fn statement_clock(e: &Expr, declared: &HashSet<String>) -> Option<bool> {
+    use sqlparser::ast::{BinaryOperator as B, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator as U};
+    const AROUND: &[&str] = &["date_trunc", "date_part", "timezone", "ceiling", "round", "trunc"];
+    let both = |a: bool, b: bool| a || b;
+    match e {
+        Expr::Value(_) | Expr::TypedString(_) => Some(false),
+        // `floor(x)` and `ceil(x)` have nodes of their own in sqlparser's tree.
+        Expr::Nested(x)
+        | Expr::Cast { expr: x, .. }
+        | Expr::Extract { expr: x, .. }
+        | Expr::Floor { expr: x, .. }
+        | Expr::Ceil { expr: x, .. } => statement_clock(x, declared),
+        Expr::UnaryOp { op: U::Plus | U::Minus, expr } => statement_clock(expr, declared),
+        Expr::BinaryOp { left, op: B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo, right } => {
+            Some(both(statement_clock(left, declared)?, statement_clock(right, declared)?))
+        }
+        Expr::AtTimeZone { timestamp, time_zone } => {
+            Some(both(statement_clock(timestamp, declared)?, statement_clock(time_zone, declared)?))
+        }
+        Expr::Function(f) => {
+            let name = last_name(&f.name)?;
+            if declared.contains(&name) {
+                return None;
+            }
+            if let Ok(g) = crate::lean::recognize::generator(f) {
+                return (g.seq.is_none() && g.kind == crate::lean::recognize::GenKind::Once && g.func != "clock_timestamp")
+                    .then_some(true);
+            }
+            let builtin = match f.name.0.as_slice() {
+                [_] => true,
+                [schema, _] => schema.as_ident().is_some_and(|s| fold(s) == "pg_catalog"),
+                _ => false,
+            };
+            let plain = !f.uses_odbc_syntax
+                && matches!(f.parameters, FunctionArguments::None)
+                && f.filter.is_none()
+                && f.null_treatment.is_none()
+                && f.over.is_none()
+                && f.within_group.is_empty();
+            let FunctionArguments::List(list) = &f.args else { return None };
+            if !builtin || !plain || !AROUND.contains(&name.as_str()) || list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return None;
+            }
+            let mut clock = false;
+            for a in &list.args {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a else { return None };
+                clock |= statement_clock(x, declared)?;
+            }
+            Some(clock)
+        }
+        _ => None,
     }
 }
 
@@ -372,8 +497,24 @@ impl Schema {
     /// after the frontend's retry, which quotes every column name: their names are folded
     /// regardless of quoting, as the frontend's own catalog does.
     pub fn from_statements<'a>(statements: impl IntoIterator<Item = (&'a Statement, bool)>) -> Schema {
+        Schema::from_statements_declaring(statements, HashSet::new())
+    }
+
+    /// [`Schema::from_statements`], with the names of the functions the DDL declares in statements
+    /// that are not among `statements` (ones sqlparser could not read).
+    fn from_statements_declaring<'a>(
+        statements: impl IntoIterator<Item = (&'a Statement, bool)>,
+        mut declared: HashSet<String>,
+    ) -> Schema {
         use sqlparser::ast::{ColumnOption as O, GeneratedAs, NullsDistinctOption, TableConstraint as C};
         let statements: Vec<(&Statement, bool)> = statements.into_iter().collect();
+        // The functions the DDL declares, before any column: a default that calls one is the
+        // author's function, whatever generator it is named after (`default_source`).
+        for (st, _) in &statements {
+            if let Statement::CreateFunction(f) = st {
+                declared.extend(last_name(&f.name));
+            }
+        }
         // Domains first, whatever the order of the DDL: a column of a domain type takes the
         // domain's default unless it declares its own, and the domain's CHECK applies to it.
         let mut domains: HashMap<String, (Option<&Expr>, bool, bool)> = HashMap::new();
@@ -447,7 +588,7 @@ impl Schema {
                     if let Some(e) = default {
                         col.default = default_kind(e);
                         col.default_text = Some(e.to_string());
-                        col.source = default_source(e);
+                        col.source = default_source(e, &declared);
                         (col.seqs, col.seq_state) = sequence_use(e);
                     }
                     t.has_check |= check;
@@ -460,7 +601,7 @@ impl Schema {
                         O::Default(e) => {
                             col.default = default_kind(e);
                             col.default_text = Some(e.to_string());
-                            col.source = default_source(e);
+                            col.source = default_source(e, &declared);
                             (col.seqs, col.seq_state) = sequence_use(e);
                         }
                         O::PrimaryKey(pk) => {
@@ -609,8 +750,8 @@ impl Schema {
                 None => unread.push(r.statement),
             }
         }
-        let mut s = Schema::from_statements(statements.iter().map(|(s, r)| (s, *r)));
         let words: Vec<String> = raw.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let mut s = Schema::from_statements_declaring(statements.iter().map(|(s, r)| (s, *r)), declared_functions(&words));
         s.user_casts = words.windows(2).any(|w| w[0] == "create" && w[1].starts_with("cast"));
         // A domain sqlparser cannot read (it has no domain-level `NOT NULL`, for one) constrains
         // every column of its type, and those statements never name a table.
@@ -825,6 +966,65 @@ mod tests {
         assert_eq!(k("k").source, DefaultSource::Other, "an unknown function");
         assert_eq!((k("l").source.clone(), k("l").seq_state), (DefaultSource::Other, true));
         assert_eq!((k("n").source.clone(), k("n").seqs, k("n").seq_state), (DefaultSource::Other, vec!["s2".to_string()], false));
+    }
+
+    #[test]
+    fn a_generator_under_a_schema_and_a_clock_expression_are_generators() {
+        // #215. A generator is one by its name, whatever schema it is written under, unless the DDL
+        // declares a function of that name; and an expression over the statement's clock takes one
+        // value per statement, as the clock does.
+        let source = |ddl: &str, column: &str| {
+            let s = Schema::from_ddl(ddl);
+            let t = s.table("t").unwrap();
+            t.columns[t.column(column).unwrap()].source.clone()
+        };
+        let one = |default: &str| source(&format!("CREATE TABLE t (id int, c text DEFAULT {default});"), "c");
+        for default in [
+            "public.uuid_generate_v4()",
+            "extensions.gen_random_uuid()",
+            "\"MySchema\".uuid_generate_v4()",
+            "pg_catalog.now()",
+            "(EXTRACT(epoch FROM CURRENT_TIMESTAMP) * 1000)",
+            "(EXTRACT(epoch FROM now()) * 1000)::bigint",
+            "now() + '1 day'::interval",
+            "date_trunc('day', now())",
+            "floor(EXTRACT(epoch FROM statement_timestamp()))",
+            "ceil(EXTRACT(epoch FROM now()) / 60)",
+            "round(EXTRACT(epoch FROM now()))",
+            "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
+            "-EXTRACT(epoch FROM now())",
+        ] {
+            assert_eq!(one(default), DefaultSource::Generator, "{default}");
+        }
+        for default in [
+            // Not one value per statement, or not known to be.
+            "EXTRACT(epoch FROM clock_timestamp())",
+            "now() + random() * '1 day'::interval",
+            "lower(now()::text)",
+            "my_schema.date_trunc('day', now())",
+            // No clock in it: an expression, as before.
+            "(1 + 2)",
+            // A sequence under a schema is not asked about.
+            "public.nextval('s')",
+            "public.frobnicate()",
+        ] {
+            assert_eq!(one(default), DefaultSource::Other, "{default}");
+        }
+        // A function the DDL declares is its author's, under a schema or not, however it is spelled.
+        for declare in [
+            "CREATE FUNCTION public.uuid_generate_v4() RETURNS uuid LANGUAGE sql AS 'SELECT gen_random_uuid()';",
+            "CREATE OR REPLACE FUNCTION uuid_generate_v4() RETURNS uuid AS $$ SELECT gen_random_uuid() $$ LANGUAGE sql;",
+        ] {
+            for default in ["public.uuid_generate_v4()", "uuid_generate_v4()"] {
+                let ddl = format!("{declare}\nCREATE TABLE t (id int, c uuid DEFAULT {default});");
+                assert_eq!(source(&ddl, "c"), DefaultSource::Other, "{declare} / {default}");
+            }
+        }
+        let ddl = "CREATE FUNCTION now() RETURNS timestamptz LANGUAGE sql AS 'SELECT clock_timestamp()';\n\
+                   CREATE TABLE t (id int, c numeric DEFAULT EXTRACT(epoch FROM now()));";
+        assert_eq!(source(ddl, "c"), DefaultSource::Other, "a declared function inside a clock expression");
+        // Without a declaration the same defaults are generators.
+        assert_eq!(source("CREATE TABLE t (id int, c uuid DEFAULT uuid_generate_v4());", "c"), DefaultSource::Generator);
     }
 
     #[test]
