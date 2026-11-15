@@ -493,20 +493,25 @@ what it is or refused:
   that meets a `numeric` or float value in a comparison, arithmetic, `CASE` or `coalesce` and its
   kin is refused, whatever its other uses say, unless the pair casts it wherever it appears; and a
   cast over a parameter is dropped only when it is the parameter's own type, since otherwise it is
-  a conversion Postgres runs (`$1::int` rounds a `numeric`). For a type inference has no class for
-  (an array, `uuid`, `jsonb`, a float, a range, an enum) it has no type to compare the cast with,
-  so every use of the parameter is asked instead, in both queries: the cast is dropped only where
-  each of them states that one type, and the pair is refused otherwise (`casts::stated_types`). A
-  use states a type when it is a cast over the parameter, a comparison of it with a column (`=`
-  and its kin, `IN`, `BETWEEN`, `= ANY`) or a value stored in one, and the DDL says what the
-  column is; a column no DDL declares and inference found nothing for has the type that fits. A
-  use that states none, a select item or a function's argument, leaves the type to the order
-  Postgres reads the statement in, which the frontend does not follow. So `u = $1::uuid` and `u =
-  $1` over a `uuid` column are one plan, and `($1)::jsonb` against `($1)::uuid`, `f = $1::float4`
-  against `f = $1` over a `double precision`, and `n = ANY($1::int[]) AND name = ANY($1::text[])`
-  against its two conjuncts the other way round are refused: in the last, `$1` is an `int[]` on
-  one side and a `text[]` on the other. A pair that numbers its parameters differently is refused
-  for that, as before. A parameter in arithmetic takes its
+  a conversion Postgres runs (`$1::int` rounds a `numeric`). The uses of the parameter are asked
+  as well, in both queries, what type each states (`casts::stated_types`). A use states a type
+  when it is a cast over the parameter, a comparison of it with a column or with a cast (`=` and
+  its kin, `IN`, `BETWEEN`, `= ANY`) or a value stored in a column, and the DDL says what the
+  column is; a column no DDL declares and inference found nothing for has the type that fits; and
+  a bare parameter among a statement's own select items is a `text`. No use may state another
+  type than the cast's, whatever the type: `ts = $1::date` against `ts = $1` over a `timestamp`
+  column is refused, since the parameter is a `date` in one statement and a `timestamp` in the
+  other, and so is `SELECT ($1)::bigint` against `SELECT $1`. Inference keeps the temporal classes
+  apart in a comparison and reads nothing off a select item, so its own test does not see these.
+  For a type inference has no class for (an array, `uuid`, `jsonb`, a float, a range, an enum)
+  every use must state it: a use that states none, a function's argument or an operand of another
+  operator, leaves the type to the order Postgres reads the statement in, which the frontend does
+  not follow. So `u = $1::uuid` and `u = $1` over a `uuid` column are one plan, and
+  `($1)::jsonb` against `($1)::uuid`, `f = $1::float4` against `f = $1` over a `double precision`,
+  and `n = ANY($1::int[]) AND name = ANY($1::text[])` against its two conjuncts the other way
+  round are refused: in the last, `$1` is an `int[]` on one side and a `text[]` on the other. A
+  pair that numbers its parameters differently is refused for that, as before. A parameter in
+  arithmetic takes its
   partner's type when it is known, as Postgres gives it, and an untyped one that is `NULLIF`'s
   second argument takes the first's, where inference could read none off it (`NULLIF(SUM(b), $1)`
   prepares with `$1` a `bigint`; the lowering's type for the sum is `numeric`, the wider reading).

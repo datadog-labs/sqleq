@@ -30,14 +30,19 @@
 //! `n = ANY($1::int[]) AND name = ANY($1::text[])` the parameter is an `int[]`, and with the two
 //! conjuncts the other way round it is a `text[]`: two statements that differ.
 //!
-//! For a target inference has a type for, the test is inference's own: the cast must state the
-//! type the parameter was inferred to have. For a target it has none for (an array, `uuid`,
-//! `jsonb`, a float, a range, an enum), inference says nothing, and the rule asks every use of the
-//! parameter instead ([`stated_types`]): the cast is dropped only where each of them, in both
-//! queries, states that one type. A use states a type when it is a cast, a comparison with a
-//! column, or a value stored in a column, and the DDL says what the column is. A use that states
-//! none (`SELECT $1`, an argument of a function) leaves the parameter's type to an order of
-//! reading the frontend does not follow, and the pair is refused.
+//! Two tests decide it, and both ask the uses of the parameter, in both queries, what type each
+//! states ([`stated_types`]). A use states a type when it is a cast, a comparison with a column
+//! or with a cast, or a value stored in a column, where the DDL says what the column is; and a
+//! bare parameter that is an item of a statement's own select list is a `text`.
+//!
+//! * **No use may state another type**, whatever the target. In `ts = $1::date` beside `ts = $1`
+//!   over a `timestamp` column the parameter is a `date` in one statement and a `timestamp` in the
+//!   other, and the cast truncates what the bare one holds.
+//! * **For a target inference has no type for** (an array, `uuid`, `jsonb`, a float, a range, an
+//!   enum) every use must state it. Inference says nothing of such a type, so a use that states
+//!   none (an argument of a function, an operand of another operator) leaves the parameter's type
+//!   to an order of reading the frontend does not follow. For a target it has a type for, its own
+//!   test covers those uses: the cast must state the type the parameter was inferred to have.
 //!
 //! ## Why rule 5b cannot license a false proof
 //!
@@ -208,26 +213,53 @@ enum Use {
     Fits,
 }
 
-/// For each parameter, the one type every use of it states, in either query: `Some(key)` when each
-/// use states `key` or fits any type and at least one states it, `None` when two uses state two
-/// types or some use states none.
+/// What the uses of one parameter state between them, in both queries.
+#[derive(Clone, Debug, Default)]
+struct Uses {
+    /// The types its uses state, each once.
+    keys: Vec<TypeKey>,
+    /// Whether some use states no type.
+    silent: bool,
+}
+
+impl Uses {
+    /// Whether every use states `key`: none states another type and none is silent.
+    fn all_state(&self, key: &TypeKey) -> bool {
+        !self.silent && self.keys.as_slice() == std::slice::from_ref(key)
+    }
+
+    /// Whether some use states a type other than `key`.
+    fn some_state_another(&self, key: &TypeKey) -> bool {
+        self.keys.iter().any(|k| k != key)
+    }
+}
+
+/// For each parameter, what its uses state, in either query.
 ///
 /// A use states a type when it is
 /// * the operand of a cast: the target;
 /// * compared with a bare column by `=`, `<>`, `<`, `<=`, `>`, `>=` or `IS [NOT] DISTINCT FROM`, an
 ///   item of that column's `IN` list or a bound of its `BETWEEN`: the column's declared type, which
-///   is the type Postgres resolves the parameter to there;
+///   is the type Postgres resolves the parameter to there. The same with a cast in the column's
+///   place, whose target is the type of that side: in `ts::date = $1` the parameter is a `date`;
 /// * the array of `col <op> ANY/ALL($N)`: the array of the column's declared type;
-/// * the value a reduced `INSERT` or `UPDATE` stores in a column: that column's declared type.
+/// * the value a reduced `INSERT` or `UPDATE` stores in a column: that column's declared type;
+/// * an item of a statement's own select list, bare: `text`, which is what Postgres makes of an
+///   output column it has no type for. Not in a set operation, where the other branch types it,
+///   nor in a subquery, nor in a reduced `INSERT` or `UPDATE`.
 ///
-/// Any other use (a select item, a function's argument, an operand of arithmetic) states none.
-/// Postgres does type the parameter there, by rules this does not model, so nothing is assumed.
-fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap<u32, Option<TypeKey>> {
+/// Any other use (a function's argument, an operand of arithmetic or of another operator) states
+/// none. Postgres does type the parameter there, by rules this does not model, so nothing is
+/// assumed.
+fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap<u32, Uses> {
     // The address of a placeholder -> what the expression around it says.
     let mut stated: HashMap<usize, Use> = HashMap::new();
     let (cols, uf) = (&inf.col, &mut inf.uf);
     let mut column = |e: &Expr| -> Option<Use> {
         let e = unwrap_nested(e);
+        if let Expr::Cast { data_type, .. } = e {
+            return Some(Use::Stated(type_key(&data_type.to_string())));
+        }
         if !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
             return None;
         }
@@ -294,23 +326,39 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
         }
     }
 
-    // `None` once two uses disagree or one states nothing; `Some(None)` while every use so far
-    // only fits.
-    let mut agreed: HashMap<u32, Option<Option<TypeKey>>> = HashMap::new();
+    // A bare parameter among a statement's own select items is a `text`. Last, so that a value a
+    // reduced statement stores keeps the type of its column.
+    for (i, q) in queries.iter().enumerate() {
+        let reduced = ctx.stores.is_some_and(|s| s.get(i).is_some_and(|s| s.stores_any()));
+        if let (false, sqlparser::ast::SetExpr::Select(select)) = (reduced, &*q.body) {
+            for item in &select.projection {
+                use sqlparser::ast::SelectItem;
+                let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else {
+                    continue;
+                };
+                note(&mut stated, e, Some(Use::Stated(TypeKey::Scalar(Ty::Str))));
+            }
+        }
+    }
+
+    let mut uses: HashMap<u32, Uses> = HashMap::new();
     for q in queries {
         let _ = sweep(q, |e| {
             let Some(n) = placeholder_index(e) else { return Ok(()) };
-            let so_far = agreed.entry(n).or_insert(Some(None));
-            *so_far = match (so_far.take(), stated.get(&nid(e))) {
-                (Some(k), Some(Use::Fits)) => Some(k),
-                (Some(None), Some(Use::Stated(k))) => Some(Some(k.clone())),
-                (Some(Some(have)), Some(Use::Stated(k))) if have == *k => Some(Some(have)),
-                _ => None,
-            };
+            let u = uses.entry(n).or_default();
+            match stated.get(&nid(e)) {
+                Some(Use::Stated(k)) => {
+                    if !u.keys.contains(k) {
+                        u.keys.push(k.clone());
+                    }
+                }
+                Some(Use::Fits) => {}
+                None => u.silent = true,
+            }
             Ok(())
         });
     }
-    agreed.into_iter().map(|(n, k)| (n, k.flatten())).collect()
+    uses
 }
 
 /// What to do with one cast. Recorded against the cast node's [`nid`] by [`decide`].
@@ -560,8 +608,14 @@ fn decide(
             let key = type_key(&txt);
             let modelled = matches!(key, TypeKey::Scalar(_));
             let typmod = if modelled { qualified } else { has_typmod(&txt) };
-            if let Some(n) = placeholder_index(op).filter(|_| !modelled) {
-                if uses.get(&n).is_none_or(|agreed| agreed.as_ref() != Some(&key)) && rw.mistyped.is_none() {
+            if let Some(n) = placeholder_index(op) {
+                let said = uses.get(&n);
+                // Whatever the target: a use that states another type makes the parameter that
+                // type in its statement, and this cast a conversion.
+                let another = said.is_some_and(|u| u.some_state_another(&key));
+                // A target with no `Ty`: nothing but the uses says what the parameter is.
+                let unsaid = !modelled && !said.is_some_and(|u| u.all_state(&key));
+                if (another || unsaid) && rw.mistyped.is_none() {
                     rw.mistyped = Some(unsupported(format!(
                         "${n} is cast to {txt}, but not every use of ${n} states that type: Postgres \
                          types an untyped parameter at its first use, and a cast to another type \
@@ -1404,5 +1458,33 @@ mod tests {
         )
         .expect("rewrites");
         assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
+    }
+
+    #[test]
+    fn a_cast_beside_a_use_that_states_another_type_is_refused_whatever_the_target() {
+        // #299. A bare parameter among a statement's own select items is a `text`, so a cast of it
+        // to anything else on the other side is a cast to another type.
+        for sql in [
+            "SELECT t.id, ($1)::bigint AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id, $1::timestamptz AS x FROM t; SELECT t.id, $1 AS x FROM t",
+        ] {
+            let err = run(sql).expect_err(sql).to_string();
+            assert!(err.contains("not every use of $1 states that type"), "{sql}: {err}");
+        }
+        // The same use, stating the cast's own type; and a comparison with a cast, whose target is
+        // what the parameter is there.
+        for sql in [
+            "SELECT t.id, $1::text AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id, $1::varchar AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id FROM t WHERE t.ts::date = $1::date; SELECT t.id FROM t WHERE t.ts::date = $1",
+            // Not a statement's own select list: a branch of a set operation takes its type from
+            // the other branch, and a subquery's item from what it is compared with.
+            "SELECT $1::bigint AS x UNION ALL SELECT t.a FROM t; SELECT $1 AS x UNION ALL SELECT t.a FROM t",
+            "SELECT t.id FROM t WHERE t.a IN (SELECT $1::bigint); SELECT t.id FROM t WHERE t.a IN (SELECT $1)",
+        ] {
+            // The cast over the parameter is gone, so the two sides are one query.
+            let (q, _) = run(sql).expect(sql);
+            assert_eq!(q[0], q[1], "{sql}");
+        }
     }
 }

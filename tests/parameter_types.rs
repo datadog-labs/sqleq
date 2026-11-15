@@ -424,3 +424,50 @@ fn a_misaligned_pair_is_still_refused_as_misaligned() {
         }
     }
 }
+
+/// Temporal columns, for the tests of #299.
+const TEMPORAL: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "ts" TIMESTAMP, "tz" TIMESTAMPTZ, "d" DATE, "s" TEXT);"#;
+
+/// A cast over a parameter is a conversion wherever some other use makes the parameter another
+/// type, a type inference has a class for included: it keeps the temporal classes apart in a
+/// comparison, so its own test did not see these.
+#[test]
+fn a_temporal_cast_beside_a_column_of_another_temporal_type_is_refused() {
+    for (q0, q1) in [
+        // A `date` drops what a `timestamp` parameter holds.
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::date"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        // A `timestamptz` reads an offset that a `timestamp` drops.
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::timestamptz"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "d" = $1::timestamp"#, r#"SELECT "id" FROM "t" WHERE "d" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "ts" BETWEEN $1::date AND $2"#, r#"SELECT "id" FROM "t" WHERE "ts" BETWEEN $1 AND $2"#),
+        // A bare select item is a `text`.
+        (r#"SELECT "id", $1::timestamptz AS "at" FROM "t""#, r#"SELECT "id", $1 AS "at" FROM "t""#),
+        (r#"SELECT "id", ($1)::bigint AS "x" FROM "t""#, r#"SELECT "id", $1 AS "x" FROM "t""#),
+    ] {
+        match lower_with(&format!("{TEMPORAL}\n{q0};\n{q1};"), CatalogSource::InferredSeeded) {
+            Err(FrontendError::Unsupported(m)) => {
+                assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}\n{q0}\n{q1}")
+            }
+            other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}
+
+#[test]
+fn a_temporal_cast_to_the_type_its_other_uses_state_is_still_one_plan() {
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::timestamp"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "tz" = $1::timestamptz"#, r#"SELECT "id" FROM "t" WHERE "tz" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "d" = $1::date"#, r#"SELECT "id" FROM "t" WHERE "d" = $1"#),
+        // Compared with a cast, the parameter has the cast's type.
+        (r#"SELECT "id" FROM "t" WHERE "ts"::date = $1::date"#, r#"SELECT "id" FROM "t" WHERE "ts"::date = $1"#),
+        (r#"SELECT "id", $1::text AS "x" FROM "t""#, r#"SELECT "id", $1 AS "x" FROM "t""#),
+        // A branch of a set operation is typed by the other branch, not as a select item.
+        (r#"SELECT $1::text AS "s" UNION ALL SELECT "s" FROM "t""#, r#"SELECT $1 AS "s" UNION ALL SELECT "s" FROM "t""#),
+        (r#"UPDATE "t" SET "ts" = $1::timestamp WHERE "id" = $2"#, r#"UPDATE "t" SET "ts" = $1 WHERE "id" = $2"#),
+    ] {
+        let v = lower_with(&format!("{TEMPORAL}\n{q0};\n{q1};"), CatalogSource::InferredSeeded)
+            .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
+    }
+}
