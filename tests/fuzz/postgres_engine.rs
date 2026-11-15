@@ -931,6 +931,68 @@ fn a_special_trial_that_raises_is_not_reported() {
     }
 }
 
+/// Four filters on one table, three of them equalities with a parameter.
+const FILTERED: &str = "CREATE TABLE t (id int PRIMARY KEY, tenant text, status text, kind text, created_at timestamp)";
+
+#[test]
+fn parameters_bound_to_one_row_reach_a_row_several_filters_must_select() {
+    // #296. The two differ only at an infinite `$4` and a row that holds `infinity` and is also the
+    // row `$1`, `$2` and `$3` select. Drawn one by one the four seldom agree on a row: at the default
+    // seed and trials no trial found it. Bound to one row's values they do.
+    assert_kind!(
+        "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 AND created_at::date = $4",
+        "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 \
+         AND (created_at >= $4::date AND created_at < ($4::date + 1))",
+        FILTERED,
+        "NOT-EQUIVALENT"
+    );
+}
+
+#[test]
+fn parameters_bound_to_one_row_refute_nothing_equivalent() {
+    for (ddl, a, b) in [
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 AND created_at >= $4",
+            "SELECT id FROM t WHERE kind = $3 AND NOT (created_at < $4) AND status = $2 AND tenant = $1",
+        ),
+        // A date parameter takes the row's timestamp, which it reads as that timestamp's date.
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND created_at::date = $3",
+            "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND created_at::date >= $3 AND created_at::date <= $3",
+        ),
+        // An array parameter takes the row's value as an element.
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE tenant = $1 AND status = ANY($2) AND kind = $3",
+            "SELECT id FROM t WHERE kind = $3 AND tenant = $1 AND status = ANY($2)",
+        ),
+        // Two tables, each with parameters of its own: each takes a row of its own table.
+        (
+            "CREATE TABLE o (id int PRIMARY KEY, tenant text, status text); \
+             CREATE TABLE l (lid int PRIMARY KEY, o_id int, kind text, qty int)",
+            "SELECT l.lid FROM o JOIN l ON l.o_id = o.id WHERE o.tenant = $1 AND o.status = $2 AND l.kind = $3 AND l.qty = $4",
+            "SELECT l.lid FROM l JOIN o ON o.id = l.o_id WHERE l.qty = $4 AND l.kind = $3 AND o.status = $2 AND o.tenant = $1",
+        ),
+    ] {
+        assert_kind!(a, b, ddl, "NO-COUNTEREXAMPLE");
+    }
+}
+
+#[test]
+fn a_row_trial_that_raises_is_not_reported() {
+    // A row trial gives `d` an infinite value and binds `$2` to it, and `d - d` then raises. The two
+    // agree wherever the first runs, and the run says so, with no partial verdict.
+    let ddl = "CREATE TABLE t (id int PRIMARY KEY, tenant text, d date)";
+    let a = "SELECT id FROM t WHERE tenant = $1 AND d = $2 AND d - d = 0";
+    let b = "SELECT id FROM t WHERE tenant = $1 AND d = $2 AND d IS NOT NULL";
+    if let Some(o) = outcome(a, b, ddl) {
+        assert!(matches!(o.verdict, Verdict::NoCounterexample), "{:?}", o.verdict);
+        assert!(o.verdict.partial().is_none(), "{:?}", o.verdict.partial());
+    }
+}
+
 #[test]
 fn a_special_trial_that_does_not_end_is_not_an_error() {
     // The recursion stops at the largest date, and never once that date is infinity, where

@@ -59,6 +59,36 @@ const LITERAL_STREAM: u64 = 0x11e7_e4a1_5eed_0b0d;
 const SPECIAL_STREAM: u64 = 0x5bec_1a15_5eed_0f0f;
 /// The stream of the trials that draw the wider reading's literals, apart from every other too.
 const WIDE_STREAM: u64 = 0x71de_11e7_5eed_0a0a;
+/// The stream of the trials that bind a table's parameters to one of its rows, apart too.
+const ROW_STREAM: u64 = 0x20b0_c0de_5eed_0c0c;
+
+/// The block of trials a trial is in. Each block after the ordinary one is appended to the ones
+/// before it and draws from a stream of its own, so adding one changes no earlier trial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Block {
+    /// The full and the small trials: [`Config::total_trials`].
+    Ordinary,
+    Literal,
+    Special,
+    Wide,
+    Row,
+}
+
+/// The block of trial `i`, given how many trials each block before the last has. Whatever is past
+/// them is a row trial.
+fn trial_block(i: usize, ordinary: usize, literal: usize, special: usize, wide: usize) -> Block {
+    if i < ordinary {
+        Block::Ordinary
+    } else if i < ordinary + literal {
+        Block::Literal
+    } else if i < ordinary + literal + special {
+        Block::Special
+    } else if i < ordinary + literal + special + wide {
+        Block::Wide
+    } else {
+        Block::Row
+    }
+}
 use crate::fuzz::patterns as pat;
 use crate::fuzz::schema::{parse_schema, Column, Schema, Table, VType};
 use crate::fuzz::typing;
@@ -573,8 +603,9 @@ pub struct Timing {
     pub trial_ms: Vec<f64>,
     /// The trials the pair was given: [`Config::total_trials`], the literal trials where a column
     /// is compared with a literal, the special-value trials where a column or a parameter is of a
-    /// type that has special values, and the trials of the wider reading of the literals where it
-    /// finds a value the literal trials have not got.
+    /// type that has special values, the trials of the wider reading of the literals where it
+    /// finds a value the literal trials have not got, and the row trials where a table has two
+    /// parameters or more to bind to one of its rows.
     pub trials: usize,
     pub rows_tried: usize,
     pub rows_kept: usize,
@@ -1131,6 +1162,14 @@ fn compatible(p: VType, l: VType) -> bool {
         || p == VType::Varchar
         || (matches!(p, VType::Double | VType::Decimal(..)) && l == VType::Integer)
         || (matches!(p, VType::Timestamp | VType::TimestampTz) && l == VType::Date)
+}
+
+/// Whether a placeholder Postgres types `p` can be given the value a row holds in a column of
+/// domain `l`: where [`compatible`] says so, and a date from a timestamp, whose text a date reads
+/// (`'2020-01-02 12:00:00'::date` is `2020-01-02`, and `infinity` stays `infinity`). Apart from
+/// `compatible`, which decides what every other trial draws and must go on saying what it said.
+fn row_fits(p: VType, l: VType) -> bool {
+    compatible(p, l) || (p == VType::Date && matches!(l, VType::Timestamp | VType::TimestampTz))
 }
 
 static PREPARED: AtomicUsize = AtomicUsize::new(0);
@@ -2370,15 +2409,72 @@ fn run_pair(
         wide_pools.insert(t, pools);
     }
     let wide_trials = if wide_pools.is_empty() { 0 } else { cfg.trials / 4 };
-    timing.trials = cfg.total_trials() + literal_trials + special_trials + wide_trials;
+
+    // Each parameter is drawn on its own: toward a value its column holds, not toward the values
+    // of one row. So where a difference shows only on a row that several parameters must select,
+    // `tenant = $1 AND status = $2 AND kind = $3 AND created_at::date = $4`, the chance that they
+    // agree on one falls with every parameter. Where two or more parameters are compared with
+    // columns of one table, a last `--trials / 4` trials, from a stream of their own after every
+    // other, bind them to the values of one row the table holds. The columns they are bound from
+    // take their special values there as well, since the row that tells two statements apart is
+    // often the one that holds one (`created_at = 'infinity'`). Not under the gather rule, whose
+    // parameters are the rows a statement stores and are drawn to meet none; nor for a pair whose
+    // parameters do not line up.
+    //
+    // Per table: each such parameter, the column it is compared with, and whether the parameter
+    // and the column are arrays.
+    let mut row_links: BTreeMap<String, Vec<(u32, usize, bool, bool)>> = BTreeMap::new();
+    if gathered.is_none() && misaligned.is_none() {
+        for &n in &pnums {
+            let Some((t, idx, vt, col_array)) = pcol.get(&n).and_then(|c| colloc.get(c)) else { continue };
+            let pg = pgtypes.get(&n).copied();
+            if neutral.contains_key(&n) || !pg.is_none_or(|(p, _)| row_fits(p, *vt)) {
+                continue;
+            }
+            let is_array = pg.map_or_else(|| parray.contains(&n), |(_, arr)| arr);
+            row_links.entry(t.clone()).or_default().push((n, *idx, is_array, *col_array));
+        }
+        row_links.retain(|_, params| params.len() >= 2);
+    }
+    // The pools a row trial draws from: a column's literals, as a wide or else a literal trial
+    // draws them, and for a column a parameter is bound from its special values too. A column no
+    // parameter is bound from takes none, so that a test of it (`deleted_at IS NULL`) keeps the
+    // odds an ordinary trial gives it.
+    let mut row_pools: BTreeMap<String, Vec<Vec<Val>>> = BTreeMap::new();
+    if !row_links.is_empty() {
+        for t in &loaded {
+            let literals = wide_pools.get(t).or_else(|| literal_pools.get(t));
+            let pools: Vec<Vec<Val>> = (0..tables[t].cols.len())
+                .map(|j| {
+                    let mut pool = literals.map_or(Vec::new(), |p| p[j].clone());
+                    if row_links.get(t).is_some_and(|ps| ps.iter().any(|(_, idx, _, _)| *idx == j)) {
+                        for v in special_pools.get(t).map_or(&[][..], |p| p[j].as_slice()) {
+                            if !pool.contains(v) {
+                                pool.push(v.clone());
+                            }
+                        }
+                    }
+                    pool
+                })
+                .collect();
+            if pools.iter().any(|p| !p.is_empty()) {
+                row_pools.insert(t.clone(), pools);
+            }
+        }
+    }
+    let row_trials = if row_links.is_empty() { 0 } else { cfg.trials / 4 };
+    timing.trials = cfg.total_trials() + literal_trials + special_trials + wide_trials + row_trials;
 
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
     let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
     let mut literal_rng = StdRng::seed_from_u64(cfg.seed ^ LITERAL_STREAM);
     let mut special_rng = StdRng::seed_from_u64(cfg.seed ^ SPECIAL_STREAM);
     let mut wide_rng = StdRng::seed_from_u64(cfg.seed ^ WIDE_STREAM);
+    let mut row_rng = StdRng::seed_from_u64(cfg.seed ^ ROW_STREAM);
     // Set once a special trial has run into the statement timeout: the rest of them are skipped.
+    // And the same for the row trials.
     let mut special_over = false;
+    let mut row_over = false;
     let small_trials = cfg.trials / 4;
     let mut last_err: Option<String> = None;
     let mut ok_trials = 0usize;
@@ -2392,10 +2488,10 @@ fn run_pair(
     }
 
     for i in 0..timing.trials {
-        let wide = i >= cfg.total_trials() + literal_trials + special_trials;
-        let special = !wide && i >= cfg.total_trials() + literal_trials;
-        let literal = !special && !wide && i >= cfg.total_trials();
-        if special && special_over {
+        let block = trial_block(i, cfg.total_trials(), literal_trials, special_trials, wide_trials);
+        let (literal, special, wide, row) =
+            (block == Block::Literal, block == Block::Special, block == Block::Wide, block == Block::Row);
+        if (special && special_over) || (row && row_over) {
             continue;
         }
         let t_trial = Instant::now();
@@ -2422,8 +2518,10 @@ fn run_pair(
             .into_iter()
             .chain(zone.map(|z| format!("TimeZone: {z}")))
             .collect();
-        let small = !literal && !special && !wide && i % 5 == 4 && i / 5 < small_trials;
-        let rng: &mut StdRng = if wide {
+        let small = block == Block::Ordinary && i % 5 == 4 && i / 5 < small_trials;
+        let rng: &mut StdRng = if row {
+            &mut row_rng
+        } else if wide {
             &mut wide_rng
         } else if special {
             &mut special_rng
@@ -2443,7 +2541,9 @@ fn run_pair(
                 cfg.nrows
             };
             let mut rows: Vec<Vec<Val>> = Vec::with_capacity(size);
-            let pools = if wide {
+            let pools = if row {
+                row_pools.get(t)
+            } else if wide {
                 wide_pools.get(t)
             } else if special {
                 special_pools.get(t)
@@ -2722,6 +2822,49 @@ fn run_pair(
             e.1 += kept.get(t).map_or(0, Vec::len);
         }
 
+        // A row trial: the parameters compared with one table's columns take the values of one row
+        // the table holds. Of the rows Postgres kept, since a row it rejected is in no instance; and
+        // of those the ones with the fewest NULLs in the columns bound from, since a parameter is
+        // left as it was drawn where the row holds NULL, which no comparison selects.
+        if row {
+            for (t, params) in &row_links {
+                let rows = &kept[t];
+                let nulls = |r: &Vec<Val>| params.iter().filter(|(_, idx, _, _)| r[*idx] == Val::Null).count();
+                let Some(fewest) = rows.iter().map(nulls).min() else { continue };
+                let candidates: Vec<&Vec<Val>> = rows.iter().filter(|r| nulls(r) == fewest).collect();
+                let chosen = candidates[rng.random_range(0..candidates.len())];
+                for &(n, idx, param_array, col_array) in params {
+                    // A date parameter given a timestamp's text reads its date: say so in the
+                    // value, so that a counterexample shows what the statement compared.
+                    let as_param = |v: &Val| match (v, pgtypes.get(&n)) {
+                        (Val::Ts(s), Some((VType::Date, _))) => {
+                            Val::Date(s.split(' ').next().unwrap_or(s).to_string())
+                        }
+                        _ => v.clone(),
+                    };
+                    let value = match (&chosen[idx], col_array) {
+                        (Val::Null, _) => continue,
+                        (Val::List(elems), true) if param_array => Val::List(elems.clone()),
+                        (Val::List(elems), true) => match elems.iter().find(|e| **e != Val::Null) {
+                            Some(e) => as_param(e),
+                            None => continue,
+                        },
+                        (v, _) => as_param(v),
+                    };
+                    match binds.get_mut(&n) {
+                        // An array parameter compared with a scalar column: its first element.
+                        Some(Val::List(elems)) if param_array && !matches!(value, Val::List(_)) => match elems.first_mut()
+                        {
+                            Some(first) => *first = value,
+                            None => elems.push(value),
+                        },
+                        Some(bound) => *bound = value,
+                        None => {}
+                    }
+                }
+            }
+        }
+
         let (sub_a, sub_b) = match &gathered {
             // The `VALUES` side's parameters as Postgres types them; the `unnest` side's arrays as
             // literals, which each argument's own cast types.
@@ -2764,6 +2907,12 @@ fn run_pair(
                     // timeout too, so the rest of them are given up.
                     if special {
                         special_over = true;
+                        timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
+                        continue;
+                    }
+                    // A row trial's rows hold special values too.
+                    if row {
+                        row_over = true;
                         timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
                         continue;
                     }
@@ -2820,13 +2969,13 @@ fn run_pair(
                             let w = describe_gather(&binds, &arrays, &kept, &session, Some(raised));
                             return Verdict::NotEquivalentGather(w);
                         }
-                        Some(_) if special || (boundary_trial && last_err.is_some()) => {}
+                        Some(_) if special || row || (boundary_trial && last_err.is_some()) => {}
                         Some(w) => {
                             last_err =
                                 Some(format!("{who} alone raised {code}: {} (skipped: {w})", e.msg))
                         }
                     }
-                } else if !e.msg.is_empty() && !special && (!boundary_trial || last_err.is_none()) {
+                } else if !e.msg.is_empty() && !special && !row && (!boundary_trial || last_err.is_none()) {
                     last_err = Some(e.msg);
                 }
                 timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
@@ -2843,7 +2992,12 @@ fn run_pair(
             timing.trial_ms.push(t_trial.elapsed().as_secs_f64() * 1000.0);
             continue;
         }
-        ok_trials += 1;
+        // A row trial is not counted among the trials that ran. Where every earlier trial raised,
+        // the pair's verdict is that error, and a trial added here can only turn a verdict into a
+        // counterexample.
+        if !row {
+            ok_trials += 1;
+        }
         if misaligned.is_some() {
             let _ = finish(db);
             break;
@@ -3178,6 +3332,44 @@ create table "s"."t" ("a" INTEGER);"#;
             let other = "CREATE TABLE t (id int);\nCREATE TABLE s.u (id int);\nCREATE INDEX i ON s.t (id);";
             let placed = place_tables(other, other);
             assert!(placed.starts_with("CREATE TABLE \"s\".t (id int);"), "{placed}");
+        }
+    }
+
+    #[test]
+    fn the_row_trials_change_the_block_of_no_earlier_trial() {
+        // The classification as it was before there were row trials, written out.
+        let before = |i: usize, total: usize, literal: usize, special: usize| {
+            let wide = i >= total + literal + special;
+            let special = !wide && i >= total + literal;
+            let literal = !special && !wide && i >= total;
+            match (literal, special, wide) {
+                (true, _, _) => Block::Literal,
+                (_, true, _) => Block::Special,
+                (_, _, true) => Block::Wide,
+                _ => Block::Ordinary,
+            }
+        };
+        for (total, literal, special, wide) in
+            [(150, 30, 30, 30), (150, 0, 30, 0), (150, 30, 0, 30), (150, 0, 0, 30), (150, 0, 0, 0), (5, 1, 1, 1)]
+        {
+            let earlier = total + literal + special + wide;
+            for i in 0..earlier {
+                assert_eq!(trial_block(i, total, literal, special, wide), before(i, total, literal, special), "{i}");
+            }
+            for i in earlier..earlier + 40 {
+                assert_eq!(trial_block(i, total, literal, special, wide), Block::Row, "{i}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_gives_a_date_parameter_a_timestamp_and_nothing_else_new() {
+        use VType::*;
+        assert!(row_fits(Date, Timestamp) && row_fits(Date, TimestampTz));
+        assert!(!compatible(Date, Timestamp), "which the other trials must go on refusing");
+        // Everything else is what `compatible` says.
+        for (p, l) in [(Integer, Varchar), (Varchar, Integer), (Timestamp, Date), (Integer, Date), (Boolean, Integer)] {
+            assert_eq!(row_fits(p, l), compatible(p, l), "{p:?} {l:?}");
         }
     }
 }
