@@ -125,8 +125,9 @@ z3 = { version = "0.22.0", features = ["vendored"], optional = true }
 # sqleq-cvc5. The cvc5 bindings (https://github.com/cvc5/cvc5-rs). Without their `static` feature
 # they link the cvc5 library that `CVC5_LIB_DIR` names and read its headers from `CVC5_INCLUDE_DIR`
 # or `$CVC5_LIB_DIR/../include`; build.rs adds that directory to the binary's rpath. The library must
-# be 1.4.0 or later, and this axis is written against the `bags-algebra` branch
-# (https://github.com/mudathirmahgoub/cvc5/pull/27), whose bag reasoning it exercises:
+# have cvc5/cvc5#13151, and this axis is written against the `bags-algebra` branch
+# (https://github.com/mudathirmahgoub/cvc5/pull/27) merged with cvc5's main, whose bag reasoning it
+# exercises:
 # `sh tools/build_cvc5.sh` builds it under target/cvc5/, where .cargo/config.toml points
 # CVC5_LIB_DIR.
 cvc5 = { version = "0.6.1", optional = true }

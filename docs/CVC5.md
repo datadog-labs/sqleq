@@ -55,7 +55,12 @@ A second run with the same commit only rebuilds the axis. `.cargo/config.toml` p
 `CVC5_LIB_DIR` at the install, so cargo needs no environment; to build against a cvc5 of your own,
 set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../include` or
 `$CVC5_INCLUDE_DIR`), or `SQLEQ_CVC5_REPO` and `SQLEQ_CVC5_COMMIT` to have the script build another
-commit. Any cvc5 from 1.4.0 on runs the encoding, but proves far fewer pairs without the branch.
+commit. The cvc5 must have cvc5/cvc5#13151 (in `main` since 2026-11-14): before it, the aggregate of
+an empty table had one row of initial values where SQL's `GROUP BY` has none, and this encoding
+relies on its having none. So the pinned commit is on `bags-algebra-partition`, which is
+`bags-algebra` merged with `main`. There `bags-lazy-fold` is off by default, until the lazy folds
+follow cvc5's new lambda lifting (cvc5/cvc5#13017), which costs the proof of a few pairs. It proves
+far fewer pairs without the branch.
 The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.
@@ -152,7 +157,7 @@ Each relational operator is one term over its inputs:
 | `intersectAll`, `exceptAll` | `bag.inter_min`, `bag.difference_subtract` | refused: multiplicities, which a set has not got |
 | `union` (always `UNION ALL`) | `bag.union_disjoint` | `set.union` |
 | `group` with no call | `bag.setof` of a projection | a projection |
-| `group` with calls | with keys, `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`), and a hidden count of the group's rows, kept only where it is at least 1 and then projected away (cvc5 before cvc5/cvc5#13151 folds the empty table as one empty group, whose row has count 0; the bags rewriter's aggregate rules look for the test); without keys, one row, `(bag (bag.fold f init T) 1)`, also for an empty table | `rel.aggr`; without keys, `(set.singleton (set.fold f init T))` |
+| `group` with calls | with keys, `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`): one row per group, and none for an empty table; without keys, one row, `(bag (bag.fold f init T) 1)`, also for an empty table | `rel.aggr`; without keys, `(set.singleton (set.fold f init T))` |
 | `values` | `bag.union_disjoint` of `(bag row 1)` | `set.union` of `set.singleton` |
 | `sort` | the source, when it has no `offset` or `limit`; `LIMIT 0` the empty bag; a row slice under an `ORDER BY` whose keys contain a key of the rows, so that no two rows tie, a `bag.filter` keeping the rows whose place -- a `bag.fold` counting the rows sorted before them -- lies in `[offset, offset + limit)`; refused under possible ties, for a computed size, and when `offset + limit` overflows an i64 | the source, or the empty set for `LIMIT 0`; a slice is refused |
 | `EXISTS q` | `(distinct q bag.empty)` | |

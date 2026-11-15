@@ -1493,11 +1493,9 @@ impl Encoder {
     /// `GROUP BY` over `child` by the columns `indices`, the calls folding over every row, each
     /// reading column `args[j]` (none for `COUNT(*)`), and `extra[j]` the further columns of a
     /// `COUNT` of several. For `SELECT k, COUNT(*) FROM t GROUP BY k`, k column 0,
-    /// `((_ table.project 0 1) (bag.filter (lambda ((r U)) (>= ((_ tuple.select 2) r) 1))
-    /// ((_ table.aggr 0) (lambda ((x T) (y U)) (tuple ((_ tuple.select 0) x) (nullable.some (+
-    /// (nullable.val ((_ tuple.select 1) y)) 1)) (+ ((_ tuple.select 2) y) 1))) (tuple (as
-    /// nullable.null (Nullable Int)) (nullable.some 0) 0) t)))`: the last column counts the rows of
-    /// the group, and the filter drops the row of initial values `table.aggr` gives an empty `t`.
+    /// `((_ table.aggr 0) (lambda ((x T) (y U)) (tuple ((_ tuple.select 0) x) (nullable.some (+
+    /// (nullable.val ((_ tuple.select 1) y)) 1)))) (tuple (as nullable.null (Nullable Int))
+    /// (nullable.some 0)) t)`: one row per group, and none for an empty `t`, as SQL's `GROUP BY`.
     fn aggregate_over(
         &mut self,
         child: Term,
@@ -1536,15 +1534,7 @@ impl Encoder {
             slots.push(s);
         }
         // GROUP BY over an empty table has no groups, so SQL answers with no rows, as does
-        // table.aggr, whose parts are not empty (cvc5/cvc5#13151). Before, cvc5 gave the empty
-        // table one empty part, folded to a row of initial values; a hidden counter tells that
-        // row apart: it is the one with count 0, filtered out below and projected away again.
-        // The counter keeps the encoding right for those versions, and is the test the bags
-        // rewriter's aggregate rules look for.
-        let counted = !indices.is_empty();
-        if counted {
-            slot_sorts.push(self.tm.integer_sort());
-        }
+        // table.aggr, whose parts are not empty (cvc5/cvc5#13151).
         let y_sort = self.tm.mk_tuple_sort(&slot_sorts)?;
         let x = self.var(x_sort.clone(), "x")?;
         let y = self.var(y_sort.clone(), "y")?;
@@ -1591,13 +1581,6 @@ impl Encoder {
             initial.extend(i);
             at += slots[j].len();
         }
-        if counted {
-            let last = slot_sorts.len() - 1;
-            let acc = self.select(y.clone(), last)?;
-            let one = self.tm.mk_integer(1);
-            elements.push(self.tm.mk_term(Kind::Add, &[acc, one])?);
-            initial.push(self.tm.mk_integer(0));
-        }
         let body = self.tm.mk_tuple(&elements)?;
         let init = self.tm.mk_tuple(&initial)?;
         let f = self.lambda(&[x, y], body)?;
@@ -1611,18 +1594,6 @@ impl Encoder {
             let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
             self.tm.mk_term_from_op(op, &[f, init, child.clone()])?
         };
-        if counted {
-            // keep the groups a row reached, then drop the counter
-            let last = slot_sorts.len() - 1;
-            let r = self.var(y_sort.clone(), "r")?;
-            let cnt = self.select(r.clone(), last)?;
-            let one = self.tm.mk_integer(1);
-            let reached = self.tm.mk_term(Kind::Geq, &[cnt, one])?;
-            let p = self.lambda(&[r], reached)?;
-            aggregated = self.tm.mk_term(self.filter_kind(), &[p, aggregated])?;
-            let keep: Vec<u32> = (0..last as u32).collect();
-            aggregated = self.project(&keep, aggregated)?;
-        }
         if slots.iter().any(|s| s.len() > 1) || int_sums.iter().any(|b| *b) {
             aggregated = self.finish_aggregates(aggregated, indices.len(), calls, &slots, &int_sums)?;
         }
