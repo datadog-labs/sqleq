@@ -681,6 +681,12 @@ pub fn with_declared(ty: String, declared: &str) -> String {
     if !is_opaque(&ty) {
         return ty;
     }
+    with_tag(ty, &fold_type_name(declared))
+}
+
+/// A type name as Postgres folds it: lower case outside double quotes, a quoted name as written,
+/// runs of white space as one space.
+pub(crate) fn fold_type_name(declared: &str) -> String {
     let mut canon = String::new();
     let (mut quoted, mut space) = (false, false);
     for c in declared.trim().chars() {
@@ -700,7 +706,7 @@ pub fn with_declared(ty: String, declared: &str) -> String {
             canon.extend(c.to_lowercase());
         }
     }
-    with_tag(ty, &canon)
+    canon
 }
 
 /// `ty` carrying `tag`, as it is: the declared type it stands for where a coercion into it is named
