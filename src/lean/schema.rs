@@ -389,8 +389,13 @@ pub struct Unique {
     /// `NULLS NOT DISTINCT`
     pub nnd: bool,
     /// A partial index (`WHERE …`): treated as total when checking collisions, which only adds
-    /// them, and never inferred as an arbiter.
+    /// them. It is inferred as an arbiter only through `pred`.
     pub partial: bool,
+    /// A partial index's predicate, where it is nothing but `IS [NOT] NULL` tests on the table's
+    /// columns joined by `AND` (`null_tests`): each column and whether its test is `IS NULL`,
+    /// sorted. `None` for a total index, and for a partial one whose predicate is anything else,
+    /// which is then never an arbiter.
+    pub pred: Option<Vec<(usize, bool)>>,
     /// On expressions rather than bare columns: `cols` are the columns the expressions read.
     /// Never inferred as an arbiter.
     pub expr: bool,
@@ -399,6 +404,43 @@ pub struct Unique {
     /// arbiter, and raises instead (see `translate::conflict`). It still counts for collisions: a
     /// witness is a run that commits on its own, so a deferred key is checked all the same.
     pub deferrable: bool,
+}
+
+/// The tests of a predicate that is nothing but `col IS [NOT] NULL` on unqualified columns, joined
+/// by `AND`, under any parentheses: each column, named as `ident` reads it, and whether its test is
+/// `IS NULL`; sorted, each once. `None` for any other predicate.
+///
+/// These are the predicates of a partial unique index, and of the `ON CONFLICT` target that infers
+/// one, that this model reads. Postgres infers the index when the target's predicate implies the
+/// index's, and it proves that of two such chains by finding each clause of the index's among the
+/// target's. So the index's tests being among the target's is exactly when it is an arbiter, and
+/// the order and the parentheses pg_dump adds do not matter. Any other predicate (a comparison, a
+/// call, an `OR`) would need Postgres's own prover to compare, and is left out.
+pub(crate) fn null_tests(e: &Expr, ident: &dyn Fn(&Ident) -> String) -> Option<Vec<(String, bool)>> {
+    fn walk(e: &Expr, ident: &dyn Fn(&Ident) -> String, out: &mut Vec<(String, bool)>) -> Option<()> {
+        match e {
+            Expr::Nested(x) => walk(x, ident, out),
+            Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
+                walk(left, ident, out)?;
+                walk(right, ident, out)
+            }
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                let mut col = &**x;
+                while let Expr::Nested(inner) = col {
+                    col = inner;
+                }
+                let Expr::Identifier(id) = col else { return None };
+                out.push((ident(id), matches!(e, Expr::IsNull(_))));
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, ident, &mut out)?;
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 /// The name Postgres gives an unnamed constraint: `t_pkey`, or `t_a_b_key` for `UNIQUE (a, b)`.
@@ -609,14 +651,14 @@ impl Schema {
                             let name = pk.name.as_ref().or(o.name.as_ref()).map(fold)
                                 .or_else(|| Some(default_name(&name, &[], true)));
                             let deferrable = !enforced_per_statement(pk.characteristics.as_ref());
-                            t.uniques.push(Unique { name, cols: vec![idx], nnd: false, partial: false, expr: false, deferrable });
+                            t.uniques.push(Unique { name, cols: vec![idx], nnd: false, partial: false, pred: None, expr: false, deferrable });
                         }
                         O::Unique(uc) => {
                             let name = uc.name.as_ref().or(o.name.as_ref()).map(fold)
                                 .or_else(|| Some(default_name(&name, &[&col.name], false)));
                             let nnd = matches!(uc.nulls_distinct, NullsDistinctOption::NotDistinct);
                             let deferrable = !enforced_per_statement(uc.characteristics.as_ref());
-                            t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, expr: false, deferrable });
+                            t.uniques.push(Unique { name, cols: vec![idx], nnd, partial: false, pred: None, expr: false, deferrable });
                         }
                         O::Check(e) => {
                             t.has_check = true;
@@ -692,7 +734,7 @@ impl Schema {
                 }
                 let names: Vec<&str> = set.iter().map(|&i| t.columns[i].name.as_str()).collect();
                 let name = name.map(fold).or_else(|| Some(default_name(&t.name, &names, pk)));
-                t.uniques.push(Unique { name, cols: set, nnd, partial: false, expr, deferrable });
+                t.uniques.push(Unique { name, cols: set, nnd, partial: false, pred: None, expr, deferrable });
             }
             s.add(t);
         }
@@ -720,12 +762,24 @@ impl Schema {
             if set.is_empty() {
                 continue;
             }
+            // A test on a column the table has not got is no test this reads.
+            let pred = ci.predicate.as_ref().and_then(|p| {
+                let ident = |id: &Ident| if retried { id.value.to_lowercase() } else { fold(id) };
+                let mut tests = null_tests(p, &ident)?
+                    .into_iter()
+                    .map(|(c, null)| t.column(&c).map(|i| (i, null)))
+                    .collect::<Option<Vec<_>>>()?;
+                tests.sort_unstable();
+                tests.dedup();
+                Some(tests)
+            });
             t.uniques.push(Unique {
                 // An index is not a constraint: `ON CONFLICT ON CONSTRAINT` cannot name it.
                 name: None,
                 cols: set,
                 nnd: ci.nulls_distinct == Some(false),
                 partial: ci.predicate.is_some(),
+                pred,
                 expr,
                 // A unique index cannot be deferrable; only a constraint can.
                 deferrable: false,
@@ -1140,6 +1194,44 @@ mod fresh_defaults {
         let t = s.table("t").unwrap();
         for c in ["a", "b"] {
             assert_eq!(t.columns[t.column(c).unwrap()].default, DefaultKind::Same, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_partial_index_keeps_a_predicate_of_null_tests_and_no_other() {
+        let s = Schema::from_ddl(
+            "CREATE TABLE t (id int, a int, b text, c text);
+             CREATE UNIQUE INDEX t_live ON public.t USING btree (id, a) WHERE ((c IS NULL) AND (b IS NOT NULL));
+             CREATE UNIQUE INDEX t_pos ON t (id) WHERE a > 0;
+             CREATE UNIQUE INDEX t_qual ON t (id) WHERE t.b IS NULL;
+             CREATE UNIQUE INDEX t_or ON t (id) WHERE b IS NULL OR c IS NULL;
+             CREATE UNIQUE INDEX t_not ON t (id) WHERE NOT (b IS NULL);
+             CREATE UNIQUE INDEX t_all ON t (a);",
+        );
+        let u = &s.table("t").unwrap().uniques;
+        // Columns in table order, `IS NULL` as `true`, whatever order and parentheses the DDL wrote.
+        assert_eq!(u[0].pred, Some(vec![(2, false), (3, true)]));
+        for other in &u[1..=4] {
+            assert!(other.partial && other.pred.is_none(), "{other:?}");
+        }
+        assert!(!u[5].partial && u[5].pred.is_none());
+    }
+
+    #[test]
+    fn null_tests_reads_a_chain_of_null_tests_only() {
+        let read = |sql: &str| {
+            let dialect = sqlparser::dialect::PostgreSqlDialect {};
+            let e = sqlparser::parser::Parser::new(&dialect).try_with_sql(sql).unwrap().parse_expr().unwrap();
+            null_tests(&e, &fold)
+        };
+        assert_eq!(read("b IS NULL"), Some(vec![("b".to_string(), true)]));
+        assert_eq!(
+            read("((B IS NOT NULL) AND (c IS NULL)) AND b IS NOT NULL"),
+            Some(vec![("b".to_string(), false), ("c".to_string(), true)])
+        );
+        assert_eq!(read("\"B\" IS NULL"), Some(vec![("B".to_string(), true)]));
+        for other in ["b > 0", "b IS NULL OR c IS NULL", "NOT (b IS NULL)", "t.b IS NULL", "lower(b) IS NULL", "b IS NOT TRUE"] {
+            assert_eq!(read(other), None, "{other}");
         }
     }
 }

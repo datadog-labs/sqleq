@@ -241,6 +241,15 @@ fn explain(p: &LeanPair, w: &str) -> String {
         "nothingInserted" => "it inserts no row".into(),
         other => format!("the canonical run ends in `{other}`"),
     };
+    // The witness reads a partial unique index as total, so a collision on one is not always one
+    // in Postgres, which checks the index only for the rows its predicate holds of.
+    let on_partial = matches!(tag, "unique" | "secondTime") && uniq(arg).starts_with(translate::PARTIAL_INDEX);
+    if on_partial {
+        return format!(
+            "the witness finds no run of the VALUES side with non-NULL parameters that succeeds: {why}, \
+             which it reads as total"
+        );
+    }
     format!("the VALUES side fails every run with non-NULL parameters: {why}")
 }
 

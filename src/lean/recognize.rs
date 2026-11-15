@@ -567,12 +567,19 @@ fn extract(i: &Insert) -> Result<Parts, Refusal> {
     if i.overriding.is_some() {
         return Err(unsupported("INSERT ... OVERRIDING { SYSTEM | USER } VALUE"));
     }
-    // Which unique index is the arbiter depends on this predicate, and the schema model reads every
-    // unique index as total. The re-render check cannot catch it: `Parts` carries the whole
+    // Which unique index is the arbiter depends on this predicate. The witness reads one that is
+    // nothing but `IS [NOT] NULL` tests (`translate::conflict`); any other it could not compare
+    // with an index's, and the re-render check cannot catch that: `Parts` carries the whole
     // `ON CONFLICT` clause, so the predicate renders back and would be silently left out of the
     // model. It has to be refused by name.
-    if matches!(&i.on, Some(sqlparser::ast::OnInsert::OnConflict(c)) if matches!(&c.conflict_target, Some(sqlparser::ast::ConflictTarget::Columns { predicate: Some(_), .. }))) {
-        return Err(unsupported("ON CONFLICT target with a WHERE predicate (a partial-index arbiter)"));
+    if let Some(sqlparser::ast::OnInsert::OnConflict(c)) = &i.on {
+        if let Some(sqlparser::ast::ConflictTarget::Columns { predicate: Some(p), .. }) = &c.conflict_target {
+            if crate::lean::schema::null_tests(p, &crate::lean::schema::fold).is_none() {
+                return Err(unsupported(
+                    "ON CONFLICT target predicate other than IS [NOT] NULL tests on columns joined by AND",
+                ));
+            }
+        }
     }
     let TableObject::TableName(name) = &i.table else {
         return Err(unsupported("INSERT target is not a plain table"));
@@ -852,5 +859,26 @@ mod tests {
     #[test]
     fn a_repeated_column_is_invalid_sql() {
         assert!(matches!(rec("INSERT INTO t (a, a) VALUES ($1, $2)"), Err(Refusal::InvalidSql(_))));
+    }
+
+    /// A conflict target's predicate is read where it is a chain of `IS [NOT] NULL` tests, which
+    /// the witness can compare with a partial index's (#212), and refused by name otherwise.
+    #[test]
+    fn a_conflict_target_predicate_is_read_only_as_null_tests() {
+        for sql in [
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b IS NULL DO NOTHING",
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE ((b IS NOT NULL) AND (a IS NOT NULL)) DO UPDATE SET b = EXCLUDED.b",
+        ] {
+            rec(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        for sql in [
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b > 0 DO NOTHING",
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b IS NULL OR a IS NULL DO NOTHING",
+        ] {
+            assert!(
+                matches!(rec(sql), Err(Refusal::Unsupported(r)) if r.contains("ON CONFLICT target predicate other than")),
+                "{sql}"
+            );
+        }
     }
 }
