@@ -182,6 +182,18 @@ The model covers:
   statement inserted. A deferrable constraint is never an arbiter: Postgres raises before reading
   a row when a column target matches one (even beside a constraint that is not deferrable), when
   `ON CONSTRAINT` names one, and on a target-less `DO NOTHING` when the table has one;
+- a partial unique index as the arbiter of `ON CONFLICT (cols) WHERE pred`. Postgres infers one
+  when the target's predicate implies the index's. Both are read where they are nothing but
+  `IS [NOT] NULL` tests on columns joined by `AND`, and then the index is the arbiter exactly when
+  each of its tests is among the target's, whatever the order and the parentheses (pg_dump writes
+  `((x IS NOT NULL) AND (y IS NULL))`). A target predicate of any other form is `unsupported`; an
+  index predicate of any other form is never an arbiter. A total unique index on the same columns
+  is an arbiter under any target predicate, as in Postgres. The witness does not evaluate the
+  predicate: it reads a partial index as total, which only adds collisions. So under `DO UPDATE`
+  a run it finds is one with no collision at all, and under `DO NOTHING` with only a partial
+  arbiter it asks for the same, since it could not tell a row the arbiter skips from one Postgres
+  inserts or raises on. Where two proposed rows share a key that Postgres would keep apart by the
+  predicate, the pair is `no-witness`, and the reason says the index was read as total;
 - `GENERATED ALWAYS` columns.
 
 CHECK and foreign-key constraints are not modelled; a record carries `unmodelled` when the target
