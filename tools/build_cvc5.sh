@@ -40,7 +40,7 @@ esac
 # (cvc5/cvc5#13151): the encoding of GROUP BY relies on that, so `bags-algebra` itself, or any cvc5
 # before it, gives wrong answers.
 repo=${SQLEQ_CVC5_REPO:-https://github.com/mudathirmahgoub/cvc5.git}
-commit=${SQLEQ_CVC5_COMMIT:-3fe3ca4ebac32f91f1a21344a542ca3dc71c5369}
+commit=${SQLEQ_CVC5_COMMIT:-8b58a460c3255ef60f0bb20b8d7cd290f6d22bcf}
 jobs=${SQLEQ_CVC5_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
 for tool in git cmake python3; do

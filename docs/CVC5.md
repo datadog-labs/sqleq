@@ -58,9 +58,7 @@ set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../inc
 commit. The cvc5 must have cvc5/cvc5#13151 (in `main` since 2026-11-14): before it, the aggregate of
 an empty table had one row of initial values where SQL's `GROUP BY` has none, and this encoding
 relies on its having none. So the pinned commit is on `bags-algebra-partition`, which is
-`bags-algebra` merged with `main`. There `bags-lazy-fold` is off by default, until the lazy folds
-follow cvc5's new lambda lifting (cvc5/cvc5#13017), which costs the proof of a few pairs. It proves
-far fewer pairs without the branch.
+`bags-algebra` merged with `main`. It proves far fewer pairs without the branch.
 The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.

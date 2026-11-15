@@ -10,6 +10,7 @@
 -- expect qed: proved
 -- expect sqleq-solver: proved
 -- expect sqlsolver-jvm: no-plan
+-- expect cvc5: proved
 -- expect lean: unsupported
 -- origin: issue #174: the same COALESCE under NOT, inside an aggregate's CASE
 -- argument: `a = $1` and `$1 = a` are one comparison, so each row is counted on both sides or on neither
