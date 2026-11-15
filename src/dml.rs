@@ -1464,6 +1464,58 @@ pub struct Stores {
     guarded: bool,
 }
 
+impl Stores {
+    /// Each expression of the reduced query `q` whose value the statement stores in a column, with
+    /// the type the DDL declares for that column. Postgres gives a bare parameter stored in a
+    /// column the column's type, which is what the cast rewrite reads this for
+    /// ([`crate::casts`]). The shapes are the ones [`stored_at`] reads off the lowered query: the
+    /// branches of a `UNION ALL`, the rows of a `VALUES`, the items of a projection, and under a
+    /// guard the `THEN` of the `CASE` an `UPDATE`'s `WHERE` became. A column no DDL spelled a
+    /// type for gives nothing.
+    pub(crate) fn stored_values<'q>(&self, q: &'q Query) -> Vec<(&'q Expr, &str)> {
+        let mut out = Vec::new();
+        self.stored_in(&q.body, &mut out);
+        out
+    }
+
+    fn stored_in<'q, 's>(&'s self, body: &'q SetExpr, out: &mut Vec<(&'q Expr, &'s str)>) {
+        let mut push = |k: usize, e: &'q Expr| {
+            if let Some(Some(store)) = self.columns.get(k) {
+                if !store.declared.is_empty() {
+                    out.push((e, store.declared.as_str()));
+                }
+            }
+        };
+        match body {
+            SetExpr::Query(q) => self.stored_in(&q.body, out),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.stored_in(left, out);
+                self.stored_in(right, out);
+            }
+            SetExpr::Values(v) => {
+                for row in &v.rows {
+                    row.iter().enumerate().for_each(|(k, e)| push(k, e));
+                }
+            }
+            SetExpr::Select(s) => {
+                for (k, item) in s.projection.iter().enumerate() {
+                    let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else {
+                        continue;
+                    };
+                    match e {
+                        Expr::Case { operand: None, conditions, .. } if self.guarded && conditions.len() == 1 => {
+                            push(k, &conditions[0].result)
+                        }
+                        _ if self.guarded => {}
+                        _ => push(k, e),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A column a reduction stores a value in.
 #[derive(Clone, Debug)]
 struct Store {

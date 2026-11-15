@@ -345,3 +345,82 @@ fn a_column_nobody_declared_is_not_typed_text_by_a_case_beside_it() {
     assert!(!text.contains(r#""operator":"QP1","type":"VARCHAR""#) && !text.contains(r#""type":"VARCHAR","operator":"QP1""#), "{v}");
     assert!(!v["schemas"].to_string().contains("VARCHAR"), "{v}");
 }
+
+/// A table with columns of types inference has no class for, for the tests of #285.
+const U: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "a" BIGINT, "u" UUID, "f" DOUBLE PRECISION, "j" JSONB, "tags" TEXT[], "ts" TIMESTAMP, "s" TEXT);"#;
+
+fn lowered(src: CatalogSource, q0: &str, q1: &str) -> Result<Value, FrontendError> {
+    lower_with(&format!("{U}\n{q0};\n{q1};"), src)
+}
+
+/// A cast over a parameter is the identity only where Postgres gave the parameter that type. For a
+/// type inference has no class for, the cast is dropped where every use of the parameter states the
+/// type: a cast to it, a comparison with a column the DDL declares of it, a value stored in one.
+#[test]
+fn a_cast_to_the_type_every_use_states_is_one_plan_with_the_bare_parameter() {
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "u" = $1::uuid"#, r#"SELECT "id" FROM "t" WHERE "u" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "u" IN ($1::uuid, $2::uuid)"#, r#"SELECT "id" FROM "t" WHERE "u" IN ($1, $2)"#),
+        (r#"SELECT "id" FROM "t" WHERE "a" = ANY($1::bigint[])"#, r#"SELECT "id" FROM "t" WHERE "a" = ANY($1)"#),
+        (r#"SELECT "id" FROM "t" WHERE "u" = ANY($1::uuid[])"#, r#"SELECT "id" FROM "t" WHERE "u" = ANY($1)"#),
+        (r#"SELECT "id" FROM "t" WHERE "tags" = $1::text[]"#, r#"SELECT "id" FROM "t" WHERE "tags" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "f" = $1::float8"#, r#"SELECT "id" FROM "t" WHERE "f" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "f" BETWEEN $1::double precision AND $2"#, r#"SELECT "id" FROM "t" WHERE "f" BETWEEN $1 AND $2"#),
+        (r#"UPDATE "t" SET "j" = $1::jsonb WHERE "id" = $2"#, r#"UPDATE "t" SET "j" = $1 WHERE "id" = $2"#),
+        (r#"INSERT INTO "t" ("id", "u") VALUES ($1, $2::uuid)"#, r#"INSERT INTO "t" ("id", "u") VALUES ($1, $2)"#),
+    ] {
+        let v = lowered(CatalogSource::InferredSeeded, q0, q1).unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
+    }
+}
+
+#[test]
+fn a_cast_to_a_type_some_use_does_not_state_is_refused() {
+    for (q0, q1) in [
+        // #285's three pairs: an array is not its element.
+        (r#"SELECT "id" FROM "t" WHERE "a" = ($1)::bigint[]"#, r#"SELECT "id" FROM "t" WHERE "a" = ($1)::bigint"#),
+        (r#"SELECT "id", ($1)::bigint[] AS "x" FROM "t""#, r#"SELECT "id", ($1)::bigint AS "x" FROM "t""#),
+        (r#"SELECT ($1)::bigint[] AS "s" UNION ALL SELECT "s" FROM "t""#, r#"SELECT $1 AS "s" UNION ALL SELECT "s" FROM "t""#),
+        // The column is another type than the cast's: `float4` rounds what a `double precision`
+        // parameter holds, and a `date` drops what a `timestamp` one holds.
+        (r#"SELECT "id" FROM "t" WHERE "f" = $1::float4"#, r#"SELECT "id" FROM "t" WHERE "f" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "ts" = ANY($1::date[])"#, r#"SELECT "id" FROM "t" WHERE "ts" = ANY($1)"#),
+        (r#"SELECT "id" FROM "t" WHERE "j" = $1::json"#, r#"SELECT "id" FROM "t" WHERE "j" = $1::jsonb"#),
+        // A use that states no type.
+        (r#"SELECT "id", ($1)::jsonb AS "x" FROM "t""#, r#"SELECT "id", $1 AS "x" FROM "t""#),
+        (r#"SELECT "id" FROM "t" WHERE "u" = $1::uuid"#, r#"SELECT "id" FROM "t" WHERE "u" = $1 OR lower($1) = 'x'"#),
+        // One query, two casts, in two orders.
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" = ANY($1::int[]) AND "s" = ANY($1::text[])"#,
+            r#"SELECT "id" FROM "t" WHERE "s" = ANY($1::text[]) AND "a" = ANY($1::int[])"#,
+        ),
+    ] {
+        match lowered(CatalogSource::InferredSeeded, q0, q1) {
+            Err(FrontendError::Unsupported(m)) => {
+                assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}\n{q0}\n{q1}")
+            }
+            other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}
+
+/// A pair that numbers its parameters differently is refused for that, as before: there two uses of
+/// `$1` are two parameters, and that they state two types is the misalignment's doing.
+#[test]
+fn a_misaligned_pair_is_still_refused_as_misaligned() {
+    for (q0, q1) in [
+        (
+            r#"SELECT "id" FROM "t" WHERE "u" = $1::uuid AND "j" = $2::jsonb"#,
+            r#"SELECT "id" FROM "t" WHERE "j" = $1::jsonb AND "u" = $2::uuid"#,
+        ),
+        (
+            r#"SELECT "id" FROM "t" WHERE "u" = $1::uuid AND "f" = $2"#,
+            r#"SELECT "id" FROM "t" WHERE "f" = $1 AND "u" = $2::uuid"#,
+        ),
+    ] {
+        match lowered(CatalogSource::InferredSeeded, q0, q1) {
+            Err(FrontendError::ParameterMisaligned(_)) => {}
+            other => panic!("expected a misalignment, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}
