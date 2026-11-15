@@ -417,6 +417,29 @@ after every other, draw from both. The literal trials keep their own pools, so a
 only gain a counterexample. A boundary an expression moves is not found: `c + 5 <= -2` and
 `c + 5 < -2` differ at `c = -7`, and `-7` is nowhere in the pair.
 
+Each parameter is drawn on its own: toward a value its column holds, and not toward the values of
+one row. Where a difference shows only on a row that several parameters must select, `tenant = $1
+AND status = $2 AND kind = $3 AND created_at::date = $4`, the chance that they agree on one falls
+with every parameter. So on the Postgres engine, where two or more parameters are compared with
+columns of one table, a last `--trials / 4` trials, from a stream of their own after every other,
+bind them to the values of one row the table holds:
+
+- the row is one Postgres accepted, and among those one with the fewest NULLs in the columns the
+  parameters are compared with; a parameter keeps the value it was drawn where the row holds NULL;
+- a date parameter takes a timestamp column's value, whose date it reads; an array parameter takes
+  the row's value as an element;
+- the columns the parameters are bound from take their special values in these trials too, since
+  the row that tells two statements apart is often one that holds one; other columns do not, so a
+  test of them (`deleted_at IS NULL`) keeps its odds;
+- parameters compared with two tables each take a row of their own table, which is exact for one
+  table and no worse than before for a join.
+
+A trial of these in which a statement raises, or does not finish in time, is not reported, and
+none is counted among the trials that ran: a pair can only gain a counterexample. A parameter is
+tied to a column by name, as everywhere here, so one the pair compares only with an expression of
+the column on both sides (`created_at::date = $4` and nothing else) is not bound. Not under the
+gather rule, whose parameters are the rows a statement stores.
+
 ## Validation
 
 `cargo test` runs a self-contained suite (no corpus) covering the bag-semantics, uniqueness-recovery,
