@@ -466,7 +466,7 @@ what it is or refused:
 - **A typmod is a computation.** `$1::varchar(2)` truncates and `$1::timestamp(0)` rounds, so only
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
-  target.
+  target. A typmod on an array's element counts: `$1::varchar(1)[]` truncates each element.
 - **A second cast to the type a cast just gave is no cast.** In Postgres, `CAST(CAST(e AS T) AS T)`
   is `CAST(e AS T)`: the outer cast is handed a value of its own type, and a typmod's coercion and a
   domain's checks are idempotent. So it is removed before anything reads the tree
@@ -493,7 +493,20 @@ what it is or refused:
   that meets a `numeric` or float value in a comparison, arithmetic, `CASE` or `coalesce` and its
   kin is refused, whatever its other uses say, unless the pair casts it wherever it appears; and a
   cast over a parameter is dropped only when it is the parameter's own type, since otherwise it is
-  a conversion Postgres runs (`$1::int` rounds a `numeric`). A parameter in arithmetic takes its
+  a conversion Postgres runs (`$1::int` rounds a `numeric`). For a type inference has no class for
+  (an array, `uuid`, `jsonb`, a float, a range, an enum) it has no type to compare the cast with,
+  so every use of the parameter is asked instead, in both queries: the cast is dropped only where
+  each of them states that one type, and the pair is refused otherwise (`casts::stated_types`). A
+  use states a type when it is a cast over the parameter, a comparison of it with a column (`=`
+  and its kin, `IN`, `BETWEEN`, `= ANY`) or a value stored in one, and the DDL says what the
+  column is; a column no DDL declares and inference found nothing for has the type that fits. A
+  use that states none, a select item or a function's argument, leaves the type to the order
+  Postgres reads the statement in, which the frontend does not follow. So `u = $1::uuid` and `u =
+  $1` over a `uuid` column are one plan, and `($1)::jsonb` against `($1)::uuid`, `f = $1::float4`
+  against `f = $1` over a `double precision`, and `n = ANY($1::int[]) AND name = ANY($1::text[])`
+  against its two conjuncts the other way round are refused: in the last, `$1` is an `int[]` on
+  one side and a `text[]` on the other. A pair that numbers its parameters differently is refused
+  for that, as before. A parameter in arithmetic takes its
   partner's type when it is known, as Postgres gives it, and an untyped one that is `NULLIF`'s
   second argument takes the first's, where inference could read none off it (`NULLIF(SUM(b), $1)`
   prepares with `$1` a `bigint`; the lowering's type for the sum is `numeric`, the wider reading).
@@ -510,7 +523,9 @@ what it is or refused:
   where `CAST` raises an error, and Postgres has neither. sqlparser accepts both and builds the node
   it builds for a `CAST`, so the frontend refuses them before anything else reads the tree.
 - **An array is not its element type.** An array column is opaque whatever it holds, and a cast to
-  an array type is a function named after it, never the identity (`ys::int[]` parses); `||` over an
+  an array type is a function named after it, never the identity (`ys::int[]` parses), except over
+  a parameter every use of which states that array type, whose type it then is (above): `n =
+  ($1)::bigint[]` is not `n = ($1)::bigint`; `||` over an
   opaque operand is a function, not text concatenation, because array `||` is not strict (`'{a}' ||
   NULL` is `{a}`); and `x = ANY(ARRAY[..])` is expanded into comparisons only when every element is
   a scalar, since over `ARRAY[arr]` it ranges over the leaves.
