@@ -8,7 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
--- expect cvc5: error
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: a plain GROUP BY that reads GROUPING(..) is expanded as its one grouping set,
 --   and lost its DISTINCT as the single set of GROUPING SETS ((a)) did

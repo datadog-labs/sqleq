@@ -38,9 +38,11 @@ esac
 # The commit the axis was measured against, the tip of `bags-algebra-partition`; bump it to take a
 # newer one. That branch is `bags-algebra` merged with cvc5's main, where an empty table has no group
 # (cvc5/cvc5#13151): the encoding of GROUP BY relies on that, so `bags-algebra` itself, or any cvc5
-# before it, gives wrong answers.
+# before it, gives wrong answers. At this commit the keys of tables rewrite the assertions in cvc5's
+# learned-rewrite pass, which the axis turns on, and the rewrite EQ_EMPTY_ARG, with which the bag
+# solver could answer sat with a model that check-models rejects, is gone.
 repo=${SQLEQ_CVC5_REPO:-https://github.com/mudathirmahgoub/cvc5.git}
-commit=${SQLEQ_CVC5_COMMIT:-8b58a460c3255ef60f0bb20b8d7cd290f6d22bcf}
+commit=${SQLEQ_CVC5_COMMIT:-4e408a18c414404f440994362d9c19f3542f50c3}
 jobs=${SQLEQ_CVC5_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
 for tool in git cmake python3; do
