@@ -65,6 +65,8 @@ mod tests {
             key: vec![vec![0], vec![1]],
             nullable: vec![false, true],
             opaque_identity: vec![],
+            violations: vec![],
+            references: vec![],
         }];
         let ics = Ics::from_schemas(&schemas);
         assert_eq!(ics.keys.get("t"), Some(&vec![vec![0]]));

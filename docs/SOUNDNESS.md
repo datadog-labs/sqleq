@@ -147,7 +147,8 @@ is the unsound direction, so what the reader cannot follow loses facts rather th
 - An `ALTER TABLE` operation it does not read, one that adds, drops, renames or retypes a column
   among them, leaves the table *unread*: a query over it is refused.
 - A dropped constraint whose name it does not know, which may be the name Postgres generated for an
-  unnamed key or, from Postgres 18, a `NOT NULL`'s, takes every key and `NOT NULL` of the table.
+  unnamed key, `CHECK` or `FOREIGN KEY` or, from Postgres 18, a `NOT NULL`'s, takes every key,
+  `NOT NULL`, `CHECK` and `FOREIGN KEY` of the table.
 - A table another inherits from keeps no key and no `NOT NULL`: a scan of it reads the other
   table's rows, which neither binds. The inheriting table, whose columns are partly its parent's,
   is unread, and a key added to a partitioned table alone (`ALTER TABLE ONLY`), which its partitions
@@ -159,6 +160,32 @@ is the unsound direction, so what the reader cannot follow loses facts rather th
   makes the domain's default count as a sequence's.
 
 The DDL is taken as what the database ran, every statement in it having succeeded.
+
+### `CHECK` and `FOREIGN KEY` constraints
+
+The plan carries both, for `sqleq-cvc5` alone (`lib::attach_constraints`): `sqleq-solver`, the QED
+prover and the JVM bridge read none of it. Each shrinks the instances a cvc5 proof quantifies over,
+so only what Postgres holds every row to after every statement is carried, and anything else is left
+out, which costs proofs and nothing more.
+
+- A `CHECK (c)` is the condition of `SELECT 1 FROM t WHERE NOT (c)`, lowered through the whole
+  pipeline after the pair's own DDL, and no row meets it. Postgres refuses a row on which `c` is
+  false and takes one on which it is NULL, which are exactly the rows that query returns and those
+  it does not: a `CHECK (a > 0)` over a nullable `a` admits a NULL. Left out: a `CHECK` added
+  `NOT VALID`, which the rows before it may break; one that does not lower; and one that reads a
+  subquery, a function outside a short list Postgres marks `IMMUTABLE`, a cast to anything but a
+  number or a boolean, `||`, or a `timestamptz` column. Postgres checks a row when it is written,
+  under that session's clock and settings: `CHECK (d >= CURRENT_DATE)` held of a row then, not at the
+  query, and `CHECK (z > '2020-01-01')` over a `timestamptz` read the literal in that session's
+  `TimeZone`.
+- A `FOREIGN KEY` is read as `MATCH SIMPLE`, the default: a row whose referencing columns are all
+  non-NULL has a parent row holding those values. `MATCH FULL` holds a row to more, so this holds of
+  it too. Left out: a `DEFERRABLE` one, checked at commit, so a query inside the transaction can read
+  a row with no parent; one added `NOT VALID`; one whose parent no longer has a key on exactly the
+  referenced columns, since dropping the key `CASCADE`s to the reference; one whose parent the reader
+  does not read; and one between columns not of one type whose `=` is identity under the default
+  collation (integers, booleans, dates, times, timestamps and text).
+- Neither is read on a table another inherits from, whose scans read its children's rows.
 
 ### Dates and timestamps are not one integer
 

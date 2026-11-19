@@ -1731,6 +1731,8 @@ pub fn build_inferred(
             // No DDL was read, so no column declares a collation: the synthesized schema is one
             // in which every string has the database's default.
             collations: vec![crate::collation::Collation::Default; n],
+            checks: Vec::new(),
+            references: Vec::new(),
         });
     }
     Ok(Catalog { tables, unread: Vec::new() })

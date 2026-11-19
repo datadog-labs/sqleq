@@ -1271,7 +1271,7 @@ mod tests {
     use serde_json::json;
 
     fn one_table(types: Vec<Type>) -> Vec<Schema> {
-        vec![Schema { name: "t0".to_string(), types, key: vec![], nullable: vec![], opaque_identity: vec![] }]
+        vec![Schema { name: "t0".to_string(), types, key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] }]
     }
 
     #[test]
@@ -1280,8 +1280,8 @@ mod tests {
         // the derived table's filter names `t.x` as column 0, from the enclosing base, not as
         // column 2 after `s`; the join condition sees `s ++ t`.
         let schemas = vec![
-            Schema { name: "s".to_string(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
-            Schema { name: "t".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "s".to_string(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
         ];
         let col = |index| Expr::Column { index, ty: Type::Integer };
         let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
@@ -1315,8 +1315,8 @@ mod tests {
         // the filter's `t.c` is column 2 from the enclosing base. Numbering the right input from
         // after `s` would not refuse this one: it would read column 2 as `t.b`.
         let schemas = vec![
-            Schema { name: "s".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
-            Schema { name: "t".to_string(), types: vec![Type::Integer; 3], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "s".to_string(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
+            Schema { name: "t".to_string(), types: vec![Type::Integer; 3], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
         ];
         let col = |index| Expr::Column { index, ty: Type::Integer };
         let eq = |a, b| Expr::Call { operator: "=".to_string(), ty: Type::Boolean, operand: vec![a, b] };
@@ -1528,8 +1528,8 @@ mod tests {
     #[test]
     fn in_is_unknown_when_only_a_null_could_match() {
         let schemas = vec![
-            Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
-            Schema { name: "s".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+            Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
+            Schema { name: "s".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
         ];
         let e = Expr::Subquery {
             operator: "IN".into(),
@@ -1599,8 +1599,8 @@ mod tests {
         /// `s`: (TRUE, UNKNOWN).
         fn truths(cond: serde_json::Value, contents: &[Vec<UConst>]) -> Vec<(i64, i64)> {
             let schemas = vec![
-                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
-                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![] },
+                Schema { name: "t".into(), types: vec![Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
+                Schema { name: "s".into(), types: vec![Type::Integer, Type::Integer], key: vec![], nullable: vec![], opaque_identity: vec![], violations: vec![], references: vec![] },
             ];
             let e = Expr::parse(&cond, 2).unwrap();
             let mut t = Translator::new(&schemas);

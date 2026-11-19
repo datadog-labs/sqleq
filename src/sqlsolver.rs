@@ -171,6 +171,8 @@ fn ddl_from_ir(input: &Value) -> (String, bool) {
             has_trigger: false,
             n_declared,
             collations: vec![crate::collation::Collation::Default; n_declared],
+            checks: Vec::new(),
+            references: Vec::new(),
         });
     }
     emit_mysql(&Catalog { tables, unread: Vec::new() })

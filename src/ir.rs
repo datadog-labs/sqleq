@@ -590,12 +590,29 @@ pub struct Schema {
     /// the same value. Absent, short, or on any other type it means `false`: VARBINARY also stands
     /// for `double precision`, `jsonb` and `numeric[]`, whose `=` is not identity.
     pub opaque_identity: Vec<bool>,
+    /// Conditions over the table's columns that no row meets: each the frontend's lowering of
+    /// `NOT (c)` for a `CHECK (c)` Postgres holds every row to, so a row meeting one is a row Postgres
+    /// refused (`lib::attach_constraints`). Read by `sqleq-cvc5` alone. Absent means none; one this
+    /// reader cannot read is left out, which only widens the instances a proof quantifies over.
+    pub violations: Vec<Expr>,
+    /// The table's `FOREIGN KEY`s, read by `sqleq-cvc5` alone. Absent means none; one naming a table
+    /// or a column the input does not have is left out.
+    pub references: Vec<Reference>,
+}
+
+/// A `FOREIGN KEY` of a table: a row whose `columns` are all non-NULL has, in the schema at index
+/// `table`, a row whose `to` columns hold the same values. `{"columns": [..], "table": i, "to": [..]}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub columns: Vec<usize>,
+    pub table: usize,
+    pub to: Vec<usize>,
 }
 
 impl Schema {
-    fn parse(v: &Value, index: usize) -> Result<Schema, TranslateError> {
+    fn parse(v: &Value, index: usize, schema_count: usize) -> Result<Schema, TranslateError> {
         let name = v.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("t{index}"));
-        let types = array(field(v, "types")?)?
+        let types: Vec<Type> = array(field(v, "types")?)?
             .iter()
             .map(|t| {
                 t.as_str()
@@ -624,7 +641,34 @@ impl Schema {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
             .unwrap_or_default();
-        Ok(Schema { name, types, key, nullable, opaque_identity })
+        let width = types.len();
+        let violations = v
+            .get("violations")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|e| Expr::parse(e, schema_count).ok()).collect())
+            .unwrap_or_default();
+        let indices = |v: Option<&Value>| -> Option<Vec<usize>> {
+            v?.as_array()?.iter().map(|i| i.as_u64().and_then(|n| usize::try_from(n).ok())).collect()
+        };
+        let references = v
+            .get("references")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        let columns = indices(r.get("columns"))?;
+                        let to = indices(r.get("to"))?;
+                        let table = usize::try_from(r.get("table")?.as_u64()?).ok()?;
+                        let ok = !columns.is_empty()
+                            && columns.len() == to.len()
+                            && table < schema_count
+                            && columns.iter().all(|&c| c < width);
+                        ok.then_some(Reference { columns, table, to })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Schema { name, types, key, nullable, opaque_identity, violations, references })
     }
 
     /// The key groups Postgres enforces on every row: non-empty, with every column NOT NULL. A
@@ -683,15 +727,14 @@ impl Input {
         if depth(v, MAX_DEPTH) > MAX_DEPTH {
             return Err(TranslateError::TooDeep);
         }
-        let schemas: Vec<Schema> = v
-            .get("schemas")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-            .iter()
-            .enumerate()
-            .map(|(i, s)| Schema::parse(s, i))
-            .collect::<Result<_, _>>()?;
+        let raw = v.get("schemas").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let mut schemas: Vec<Schema> =
+            raw.iter().enumerate().map(|(i, s)| Schema::parse(s, i, raw.len())).collect::<Result<_, _>>()?;
+        // A reference's parent columns are read against the parent, once every schema is.
+        let widths: Vec<usize> = schemas.iter().map(|s| s.types.len()).collect();
+        for s in &mut schemas {
+            s.references.retain(|r| r.to.iter().all(|&c| c < widths[r.table]));
+        }
         let n = schemas.len();
 
         let queries = array(field(v, "queries")?)?;

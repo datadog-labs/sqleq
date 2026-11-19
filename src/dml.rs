@@ -1637,6 +1637,8 @@ mod tests {
                 has_trigger: false,
                 n_declared: cols.len(),
                 collations: vec![crate::collation::Collation::Default; cols.len()],
+                checks: Vec::new(),
+                references: Vec::new(),
             }],
             unread: Vec::new(),
         }

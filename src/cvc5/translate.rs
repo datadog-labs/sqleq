@@ -51,7 +51,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use cvc5::{Kind, Solver, Sort, Term, TermManager};
-use crate::ir::{AggCall, Expr, Input, JoinKind, Relation, Schema, SortKey, TranslateError, Type};
+use crate::ir::{AggCall, Expr, Input, JoinKind, Reference, Relation, Schema, SortKey, TranslateError, Type};
 
 /// Bag semantics, SQL's own, where a row's multiplicity is how often it occurs; or set semantics,
 /// an approximation under which `UNION ALL`, `EXCEPT ALL` and duplicates in general collapse, which
@@ -256,6 +256,9 @@ struct Encoder {
     sorts: HashMap<&'static str, Sort>,
     /// Every assertion but the final disequality, with the comment that explains it.
     constraints: Vec<(String, Term)>,
+    /// The references (`FOREIGN KEY`s, by schema and position) asserted, once both their tables are
+    /// scanned.
+    referenced: BTreeSet<(usize, usize)>,
     /// The SMT-LIB preamble: logic and options, as set.
     prologue: Vec<String>,
     /// Declarations in order, as SMT-LIB text.
@@ -306,6 +309,7 @@ impl Encoder {
             funs: HashMap::new(),
             sorts: HashMap::new(),
             constraints: Vec::new(),
+            referenced: BTreeSet::new(),
             prologue,
             declarations: Vec::new(),
             vars: Vec::new(),
@@ -1077,7 +1081,77 @@ impl Encoder {
                 ));
             }
         }
+        // A CHECK: no row meets its violation, the condition of `WHERE NOT (c)` (`Schema::violations`),
+        // since Postgres refused every row on which `c` is false. One the encoding cannot read is left
+        // out, which only widens the instances.
+        let nonnull: Vec<bool> = s.nullable.iter().map(|n| !n).collect();
+        for (k, v) in s.violations.iter().enumerate() {
+            let broken = self.filter(v, t.clone(), 0, nonnull.clone(), schemas);
+            if let Ok(none) = broken.and_then(|r| self.is_empty(r.term)) {
+                self.constraints.push((format!("{name}: CHECK {k}: no row breaks it"), none));
+            }
+        }
+        self.assert_references(schemas);
         Ok(Rel { term: t })
+    }
+
+    /// Each `FOREIGN KEY` (`Schema::references`) both of whose tables are scanned, once. A reference
+    /// to a table no query reads constrains nothing the queries see: any rows of the referencing
+    /// table have a parent that holds them.
+    fn assert_references(&mut self, schemas: &[Schema]) {
+        for (j, s) in schemas.iter().enumerate() {
+            let Some((child_name, child)) = self.tables.get(j).cloned().flatten() else { continue };
+            for (k, r) in s.references.iter().enumerate() {
+                if self.referenced.contains(&(j, k)) {
+                    continue;
+                }
+                let Some((parent_name, parent)) = self.tables.get(r.table).cloned().flatten() else { continue };
+                self.referenced.insert((j, k));
+                if let Ok(inclusion) = self.reference(&child, &parent, r) {
+                    let cols = |c: &[usize]| c.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ");
+                    self.constraints.push((
+                        format!(
+                            "{child_name}: columns ({}) reference {parent_name} ({}): every non-null value is the parent's",
+                            cols(&r.columns),
+                            cols(&r.to)
+                        ),
+                        inclusion,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// `MATCH SIMPLE`: the values of the referencing columns, on the rows where none is NULL, are
+    /// among the values of the referenced columns,
+    ///   `(bag.subbag (bag.setof ((_ table.project cols) (bag.filter none-null child)))
+    ///                (bag.setof ((_ table.project to) parent)))`,
+    /// or `set.subset` of the two under sets.
+    fn reference(&mut self, child: &Term, parent: &Term, r: &Reference) -> R<Term> {
+        let elem = self.elem_of(child)?;
+        let x = self.var(elem, "f")?;
+        let mut some = Vec::with_capacity(r.columns.len());
+        for &c in &r.columns {
+            let cell = self.select(x.clone(), c)?;
+            some.push(self.is_some(cell)?);
+        }
+        let body = self.and(some)?;
+        let p = self.lambda(&[x], body)?;
+        let referencing = self.tm.mk_term(self.filter_kind(), &[p, child.clone()])?;
+        let cols: Vec<u32> = r.columns.iter().map(|&c| c as u32).collect();
+        let to: Vec<u32> = r.to.iter().map(|&c| c as u32).collect();
+        let from = self.project(&cols, referencing)?;
+        let into = self.project(&to, parent.clone())?;
+        if from.sort() != into.sort() {
+            return Err(unsupported("a reference between columns of two sorts"));
+        }
+        Ok(match self.sem {
+            Semantics::Bags => {
+                let (a, b) = (self.distinct(from)?, self.distinct(into)?);
+                self.tm.mk_term(Kind::BagSubbag, &[a, b])?
+            }
+            Semantics::Sets => self.tm.mk_term(Kind::SetSubset, &[from, into])?,
+        })
     }
 
     /// `(= (bag.count (tuple null) ((_ table.project j) T)) 0)`, or under sets that the null tuple

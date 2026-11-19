@@ -415,3 +415,57 @@ fn negating_an_opaque_value_is_refused_like_any_arithmetic_on_one() {
         }
     }
 }
+
+#[test]
+fn a_check_is_asserted_as_the_rows_it_rejects() {
+    // `t(id, a)` with `CHECK (a > 0)`, which the frontend writes as the condition no row meets,
+    // `a <= 0` (`Schema::violations`)
+    let le0 = pred("<=", vec![col(1, "INTEGER"), lit("0", "INTEGER")]);
+    let with_check = |nullable_a: bool| {
+        let mut s = table("t", &["INTEGER", "INTEGER"], &[false, nullable_a], &[&[0]]);
+        s["violations"] = json!([le0]);
+        vec![s]
+    };
+    let all = project(scan(0), vec![col(0, "INTEGER")]);
+    let positive =
+        project(filter(scan(0), pred(">", vec![col(1, "INTEGER"), lit("0", "INTEGER")])), vec![col(0, "INTEGER")]);
+    for sem in [Semantics::Bags, Semantics::Sets] {
+        assert_eq!(run(sem, with_check(false), positive.clone(), all.clone()), Ok(Outcome::Equivalent), "{sem:?}");
+    }
+    // Without it, a row with `a = 0` tells the two apart.
+    let plain = vec![table("t", &["INTEGER", "INTEGER"], &[false, false], &[&[0]])];
+    assert!(matches!(run(Semantics::Bags, plain, positive.clone(), all.clone()), Ok(Outcome::Different { exact: true, .. })));
+    // The CHECK passes a NULL `a`, and so does the condition: a row with one tells them apart.
+    match run(Semantics::Bags, with_check(true), positive, all) {
+        Ok(Outcome::Different { model, exact: true }) => assert!(model.summary().contains("NULL"), "{}", model.summary()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_reference_is_asserted_between_two_scanned_tables() {
+    // `p(k)`, a key, and `c(id, a)` whose `a` references it (`Schema::references`)
+    let tables = |nullable_a: bool| {
+        let p = table("p", &["INTEGER"], &[false], &[&[0]]);
+        let mut c = table("c", &["INTEGER", "INTEGER"], &[false, nullable_a], &[&[0]]);
+        c["references"] = json!([{ "columns": [1], "table": 0, "to": [0] }]);
+        vec![p, c]
+    };
+    let joined = project(
+        join(scan(1), scan(0), "INNER", pred("=", vec![col(1, "INTEGER"), col(2, "INTEGER")])),
+        vec![col(0, "INTEGER")],
+    );
+    let all = project(scan(1), vec![col(0, "INTEGER")]);
+    for sem in [Semantics::Bags, Semantics::Sets] {
+        assert_eq!(run(sem, tables(false), joined.clone(), all.clone()), Ok(Outcome::Equivalent), "{sem:?}");
+    }
+    // A NULL `a` needs no parent: the join drops that row.
+    match run(Semantics::Bags, tables(true), joined.clone(), all.clone()) {
+        Ok(Outcome::Different { model, exact: true }) => assert!(model.summary().contains("NULL"), "{}", model.summary()),
+        other => panic!("{other:?}"),
+    }
+    // Without the reference, a row of `c` with no parent tells them apart.
+    let mut bare = tables(false);
+    bare[1].as_object_mut().unwrap().remove("references");
+    assert!(matches!(run(Semantics::Bags, bare, joined, all), Ok(Outcome::Different { exact: true, .. })));
+}
