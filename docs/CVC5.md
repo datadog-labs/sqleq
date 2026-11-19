@@ -290,6 +290,21 @@ driver therefore reports whether the problem was exact (`model_exact`), and the 
 `model` only then. A model under uninterpreted symbols is a candidate, kept in the `no-proof`
 note as `candidate model, under uninterpreted symbols: ...`, for a person or for `sqleq-fuzz`.
 
+A date literal is not one: the frontend spells `'2019-07-27'` read as a `DATE` as the conversion
+`q_conv_varchar_date` of its text, and when that text is a literal in the ISO form `Y-M-D`, which
+every `DateStyle` reads alike, the encoding writes the day it names, counted from 1970-01-01:
+
+```smt2
+; '2019-07-01' in WHERE d >= '2019-07-01', which was
+;   (|q_conv_varchar_date(VARCHAR)->DATE| "2019-07-01")
+(nullable.some 18078)
+```
+
+So `d >= '2019-07-01'` and `d > '2019-06-30'` are proved equivalent, and a model of a pair that
+differs on a date is a database, not a candidate.
+
+Any other text, and the conversion of a value that is not a literal, stays uninterpreted.
+
 ## Known limits
 
 * **The time limit is polled.** cvc5 honours `tlimit-per` where it spends resources, and a long

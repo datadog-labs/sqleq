@@ -17,7 +17,8 @@
 //!   (`q_conv_*`, `q_arith_*`, `q_cast_*`, `QCASTn`, and the handful `sqleq-solver` lists), and
 //!   otherwise a function over the nullable sorts, which assumes nothing about NULL. An
 //!   uninterpreted symbol cannot license a false proof, because the real function is one of its
-//!   interpretations; it can only cost a proof, or admit a model Postgres would not.
+//!   interpretations; it can only cost a proof, or admit a model Postgres would not. One
+//!   conversion is interpreted: an ISO date literal read as a DATE is the day it names.
 //! * **`NOT NULL` is a constraint, not a sort.** Java declares a table with the column sorts the
 //!   schema gives and maps it back to nullable columns; here every column of every table is
 //!   `Nullable`, and a `NOT NULL` column is asserted to hold no null
@@ -2294,6 +2295,17 @@ impl Encoder {
                 })
             }
             ("ABS", 1) if matches!(ty, Type::Integer | Type::Real) && self.numeric(&args[0])? => self.lift(Kind::Abs, &args),
+            // A date literal: the frontend spells `'2019-07-27'` read as a DATE as the conversion of
+            // its text, and a DATE is a count of days, so the literal is the day it names, counted
+            // from 1970-01-01. Only the ISO form, which every DateStyle reads alike; any other text,
+            // and any text that is not a literal, stays the uninterpreted conversion.
+            ("q_conv_varchar_date", 1) if ty == Type::Date => match &operand[0] {
+                Expr::Literal { value, ty: Type::Varchar } if iso_day(value).is_some() => {
+                    let day = self.tm.mk_integer(iso_day(value).unwrap_or_default());
+                    self.some(day)
+                }
+                _ => self.strict_fun(op, ty, operand, &args),
+            },
             ("LIKE", 2) => match (&operand[1], self.all_strings(&args)?) {
                 (Expr::Literal { value, ty: Type::Varchar }, true) => {
                     let re = self.like_regex(value)?;
@@ -2988,6 +3000,32 @@ fn strict_function(op: &str) -> bool {
         || op.starts_with("q_cast_")
 }
 
+/// The day an ISO date `Y-M-D` names (a four-digit year, a month and a day of one or two digits),
+/// counted from 1970-01-01, in the proleptic Gregorian calendar Postgres uses; `None` for any other
+/// text and for a day that does not exist, which Postgres refuses.
+fn iso_day(text: &str) -> Option<i64> {
+    let mut parts = text.split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |p: &str, lo: usize, hi: usize| (lo..=hi).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit());
+    if parts.next().is_some() || !digits(y, 4, 4) || !digits(m, 1, 2) || !digits(d, 1, 2) {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in_month = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month[(m - 1) as usize] {
+        return None;
+    }
+    // days from civil (Howard Hinnant): the year starts in March, so the leap day ends it
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// The name of an uninterpreted symbol for `op` over `operand`'s IR types, with result type `ty`:
 /// Postgres resolves a function by its name and argument types, so the symbol carries them.
 fn typed_symbol(op: &str, operand: &[Expr], ty: Type) -> String {
@@ -3045,6 +3083,20 @@ mod tests {
         assert!(!strict_function("QCAST"));
         assert!(!strict_function("POWER"));
         assert!(!strict_function("QP1"));
+    }
+
+    #[test]
+    fn an_iso_date_is_the_day_it_names() {
+        assert_eq!(iso_day("1970-01-01"), Some(0));
+        assert_eq!(iso_day("2019-07-27"), Some(18104));
+        assert_eq!(iso_day("2019-7-5"), iso_day("2019-07-05"));
+        assert_eq!(iso_day("2000-02-29"), Some(11016));
+        assert_eq!(iso_day("1969-12-31"), Some(-1));
+        // not a day, or not the ISO form: left to the uninterpreted conversion
+        for t in ["2019-02-29", "1900-02-29", "2019-13-01", "2019-00-10", "2019-07-32", " 2019-07-27",
+                  "2019-07-27 10:00", "19-07-27", "2019/07/27", "today", "infinity", "+2019-07-27"] {
+            assert_eq!(iso_day(t), None, "{t}");
+        }
     }
 
     #[test]

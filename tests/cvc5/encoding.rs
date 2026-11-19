@@ -162,6 +162,27 @@ fn an_uninterpreted_function_proves_but_only_offers_a_candidate_model() {
 }
 
 #[test]
+fn a_date_literal_is_the_day_it_names() {
+    // `s(d DATE)`, and a literal read as a DATE, which the frontend spells as the conversion of its
+    // text. An ISO literal is the day it names, so the next day is one more, two spellings of one
+    // day are equal, and a pair that differs on a day has an exact model.
+    let s = vec![table("s", &["DATE"], &[true], &[])];
+    let day = |text: &str| call("q_conv_varchar_date", "DATE", vec![lit(text, "VARCHAR")]);
+    let on = |op: &str, text: &str| filter(scan(0), pred(op, vec![col(0, "DATE"), day(text)]));
+    assert_eq!(run(Semantics::Bags, s.clone(), on(">=", "2019-07-01"), on(">", "2019-06-30")), Ok(Outcome::Equivalent));
+    assert_eq!(run(Semantics::Bags, s.clone(), on("=", "2019-7-5"), on("=", "2019-07-05")), Ok(Outcome::Equivalent));
+    assert!(matches!(
+        run(Semantics::Bags, s.clone(), on("=", "2019-07-05"), on("=", "2019-07-06")),
+        Ok(Outcome::Different { exact: true, .. })
+    ));
+    // Text in any other form stays the uninterpreted conversion: no proof, and no exact model.
+    match run(Semantics::Bags, s, on("=", "July 5, 2019"), on("=", "2019-07-05")) {
+        Ok(Outcome::Different { exact: false, .. }) | Ok(Outcome::Unknown(_)) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn integer_division_truncates_toward_zero() {
     // `a + 10 / 2` against `a + 5`, with the division as the frontend names it.
     let div = call("q_arith_div_integer_integer", "INTEGER", vec![lit("10", "INTEGER"), lit("2", "INTEGER")]);
