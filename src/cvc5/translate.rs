@@ -91,11 +91,14 @@ pub struct Options {
     /// `check-models`: have cvc5 verify every model against the assertions before it is reported.
     /// On by default, because a model is a claim the harness acts on.
     pub check_models: bool,
+    /// Bounded model finding ([`check_bounded`]): the most rows a table holds. `None` leaves the
+    /// tables unbounded, the encoding [`check`] proves under.
+    pub bound: Option<u32>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { semantics: Semantics::Bags, timeout_ms: None, cvc5_options: Vec::new(), check_models: true }
+        Options { semantics: Semantics::Bags, timeout_ms: None, cvc5_options: Vec::new(), check_models: true, bound: None }
     }
 }
 
@@ -217,9 +220,95 @@ pub fn check(input: &Input, opts: &Options) -> R<Outcome> {
     e.check(input)
 }
 
-/// The problem [`check`] would solve, as SMT-LIB text, for re-checking with the `cvc5` binary.
+/// What bounded model finding said of a pair: a model with at most `rows` rows in each table, none
+/// up to the bound, or no answer for some sizes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bounded {
+    /// `sat` with at most `rows` rows a table, and none with fewer. As [`Outcome::Different`].
+    Different { model: Model, exact: bool, rows: u32 },
+    /// `unsat` for every table of at most `rows` rows: no database that small distinguishes the two
+    /// encodings. Not a proof.
+    NoModel { rows: u32 },
+    /// `unknown` for some sizes, with cvc5's explanation, and `unsat` for every table of at most
+    /// `checked` rows.
+    Unknown { why: String, checked: Option<u32> },
+    /// As [`Outcome::Incomparable`].
+    Incomparable(String),
+}
+
+/// Bounded model finding: [`check`] with each table the two queries read a bag of exactly so many
+/// rows, every size from 0 up to `opts.bound` (1 if unset), the smaller databases first, each
+/// check within what is left of `opts.timeout_ms`, until one is `sat`. A model is therefore as
+/// small as the encoding allows. The sizes go up a level at a time: at level `k`, every
+/// assignment of 0 to `k` rows to the tables with one table at `k`.
+pub fn check_bounded(input: &Input, opts: &Options) -> R<Bounded> {
+    let t0 = std::time::Instant::now();
+    let n = opts.bound.unwrap_or(1).max(1);
+    // The tables the queries read, from an encoding with every table empty: a size is chosen for
+    // each of them, and for no other table of the schema.
+    let mut probe = Encoder::new(&Options { timeout_ms: None, ..opts.clone() })?;
+    probe.sizes = vec![0; input.schemas.len()];
+    if let Some(note) = probe.problem(input)? {
+        return Ok(Bounded::Incomparable(note));
+    }
+    let read: Vec<usize> = probe.tables.iter().enumerate().filter(|(_, t)| t.is_some()).map(|(i, _)| i).collect();
+    drop(probe);
+    let (mut unknown, mut checked) = (None, None);
+    for k in 0..=n {
+        let mut level_unknown = false;
+        for sizes in level(read.len(), k) {
+            let mut o = opts.clone();
+            if let Some(ms) = opts.timeout_ms {
+                let left = ms.saturating_sub(t0.elapsed().as_millis() as u64);
+                if left == 0 {
+                    return Ok(Bounded::Unknown { why: "TIMEOUT".into(), checked });
+                }
+                o.timeout_ms = Some(left);
+            }
+            let mut e = Encoder::new(&o)?;
+            e.sizes = vec![0; input.schemas.len()];
+            for (t, size) in read.iter().zip(&sizes) {
+                e.sizes[*t] = *size;
+            }
+            match e.check(input)? {
+                Outcome::Equivalent => {}
+                Outcome::Different { model, exact } => return Ok(Bounded::Different { model, exact, rows: k }),
+                Outcome::Unknown(why) => {
+                    level_unknown = true;
+                    unknown = Some(why);
+                }
+                Outcome::Incomparable(note) => return Ok(Bounded::Incomparable(note)),
+            }
+        }
+        if !level_unknown && unknown.is_none() {
+            checked = Some(k);
+        }
+    }
+    Ok(match unknown {
+        Some(why) => Bounded::Unknown { why, checked },
+        None => Bounded::NoModel { rows: n },
+    })
+}
+
+/// The sizes of `tables` tables at level `k`: each 0 to `k`, one of them `k`, fewer rows in all
+/// first. Level 0 is the one database of empty tables.
+fn level(tables: usize, k: u32) -> Vec<Vec<u32>> {
+    let mut out: Vec<Vec<u32>> = vec![Vec::new()];
+    for _ in 0..tables {
+        out = out.into_iter().flat_map(|v| (0..=k).map(move |x| [v.clone(), vec![x]].concat())).collect();
+    }
+    out.retain(|v| v.iter().max().copied().unwrap_or(0) == k);
+    out.sort_by_key(|v| v.iter().sum::<u32>());
+    out
+}
+
+/// The problem [`check`] would solve, as SMT-LIB text, for re-checking with the `cvc5` binary;
+/// under `opts.bound`, the largest one [`check_bounded`] would, every table at the bound.
 pub fn smt2(input: &Input, opts: &Options) -> R<String> {
     let mut e = Encoder::new(opts)?;
+    if let Some(n) = opts.bound {
+        e.sizes = vec![n.max(1); input.schemas.len()];
+    }
     e.problem(input)?;
     Ok(e.smt2())
 }
@@ -266,6 +355,9 @@ struct Encoder {
     sides: Option<(Term, Term)>,
     /// Whether no uninterpreted symbol has been declared: see [`Outcome::Different`].
     exact: bool,
+    /// Under bounded model finding, the rows each table holds, by schema index: a table of `n` rows
+    /// is `n` row constants ([`Encoder::bounded_table`]). Empty when the tables are unbounded.
+    sizes: Vec<u32>,
     /// The rows of the queries enclosing the subquery being translated, innermost last: a column
     /// below the subquery's base is one of theirs (a correlated subquery).
     outer: Vec<Row>,
@@ -311,6 +403,7 @@ impl Encoder {
             vars: Vec::new(),
             sides: None,
             exact: true,
+            sizes: Vec::new(),
             outer: Vec::new(),
             depth: 0,
         })
@@ -1051,6 +1144,11 @@ impl Encoder {
         let row = self.row_sort(&s.types)?;
         let table_sort = self.table_sort(row.clone())?;
         let name = s.name.clone();
+        if let Some(&n) = self.sizes.get(i) {
+            let t = self.bounded_table(&name, &row, table_sort, n, s)?;
+            self.tables[i] = Some((name, t.clone()));
+            return Ok(Rel { term: t });
+        }
         let t = self.tm.mk_const(table_sort.clone(), &name)?;
         self.declarations.push(format!("(declare-const {t} {table_sort})"));
         self.tables[i] = Some((name.clone(), t.clone()));
@@ -1084,6 +1182,49 @@ impl Encoder {
             }
         }
         Ok(Rel { term: t })
+    }
+
+    /// A table of exactly `n` rows, for bounded model finding: `n` row constants `T__r1 .. T__rn`,
+    ///   `(bag.union_disjoint (bag T__r1 1) .. (bag T__rn 1))`,
+    /// which may be equal, so a row may repeat. Its constraints hold row by row: a NOT NULL column
+    /// holds a value in every row, and no two rows agree on a key. The multiplicities are
+    /// constants, which lets the rewriter evaluate the operators over the table: with a symbolic
+    /// multiplicity, even one row of `GROUP BY .. HAVING COUNT(*) >= 3` runs out of time.
+    fn bounded_table(&mut self, name: &str, row: &Sort, table_sort: Sort, n: u32, s: &Schema) -> R<Term> {
+        let width = s.types.len();
+        let keys: Vec<Vec<usize>> = s.enforced_keys().filter(|k| k.iter().all(|c| *c < width)).cloned().collect();
+        let one = self.tm.mk_integer(1);
+        let mut rows: Vec<Term> = Vec::new();
+        let mut table = self.empty_table(table_sort)?;
+        for i in 1..=n {
+            let r = self.tm.mk_const(row.clone(), &format!("{name}__r{i}"))?;
+            self.declarations.push(format!("(declare-const {r} {row})"));
+            let mut c = Vec::new();
+            for (j, nullable) in s.nullable.iter().enumerate().take(width) {
+                if !nullable {
+                    let cell = self.select(r.clone(), j)?;
+                    c.push(self.is_some(cell)?);
+                }
+            }
+            for r0 in &rows {
+                for key in &keys {
+                    let idx: Vec<u32> = key.iter().map(|c| *c as u32).collect();
+                    let op = self.tm.mk_op(Kind::TupleProject, &idx)?;
+                    let a = self.tm.mk_term_from_op(op.clone(), std::slice::from_ref(&r))?;
+                    let b = self.tm.mk_term_from_op(op, std::slice::from_ref(r0))?;
+                    let same = self.tm.mk_term(Kind::Equal, &[a, b])?;
+                    c.push(self.not(same)?);
+                }
+            }
+            if !c.is_empty() {
+                let c = self.and(c)?;
+                self.constraints.push((format!("{name}: row {i} of {n}"), c));
+            }
+            let part = self.tm.mk_term(Kind::BagMake, &[r.clone(), one.clone()])?;
+            table = if i == 1 { part } else { self.tm.mk_term(Kind::BagUnionDisjoint, &[table, part])? };
+            rows.push(r);
+        }
+        Ok(table)
     }
 
     /// `(= (bag.count (tuple null) ((_ table.project j) T)) 0)`, or under sets that the null tuple

@@ -131,6 +131,43 @@ is `src/main.rs`'s module doc.
 | `timeout` | `HANG`, or anything but a claim cut off at the cap | |
 | `error` | `ERROR`, or the driver died | A cvc5 call failed, or cvc5 aborted: a model that failed its own check ends the process, which is recorded here rather than as a `model`. |
 
+## The cvc5-bounded axis: small databases
+
+`--cvc5-bounded` asks the same binary, under `--bound=N`, for a **small database** instead of a
+proof. Each table the queries read is a bag of exactly so many symbolic rows, each row once:
+
+```smt2
+; emp with 2 rows; equal rows are a repeated row
+(declare-const emp__r1 (Tuple (Nullable Int) (Nullable String)))
+(declare-const emp__r2 (Tuple (Nullable Int) (Nullable String)))
+(bag.union_disjoint (bag emp__r1 1) (bag emp__r2 1))   ; stands for the table emp
+(assert (nullable.is_some ((_ tuple.select 0) emp__r1)))   ; column 0 is NOT NULL
+(assert (and (nullable.is_some ((_ tuple.select 0) emp__r2))
+             (not (= ((_ tuple.project 0) emp__r2) ((_ tuple.project 0) emp__r1)))))   ; and a key
+```
+
+Each size from 0 to `N` rows a table is tried, the smaller databases first (all empty, then one
+table at 1 row, ...), until one is `sat`. The multiplicities are constants, so cvc5's rewriter
+evaluates the queries over the rows: `GROUP BY .. HAVING COUNT(*) >= 3` over one row of symbolic
+multiplicity times out, and over `(bag r 1)` is `unsat` in 0.03 s. Unlike VeriEQL's lists of
+tuples, a table is still a bag, and the whole encoding above is unchanged.
+
+```sh
+sqleq-check --portfolio --axes sqleq-solver,cvc5,cvc5-bounded,fuzz --cvc5-bound 3 -t 10 pairs/
+```
+
+| bucket | the driver said | meaning |
+|---|---|---|
+| `model` | `NEQ` with an exact model | As the cvc5 axis's `model`, with at most `N` rows a table: the same refutation of the plan, an alarm against a proof over it. |
+| `no-model` | `BOUNDED` | No database of at most `N` rows a table tells the two encodings apart. **Not a proof**: a pair may differ only on more rows. |
+| `unknown` | `UNKNOWN`; `NEQ` under uninterpreted symbols or with no model | cvc5 gave up on some size (the note says up to which size every database was `unsat`), or a candidate model, or rows the encoding cannot compare. |
+| `proved-literal` | `EQ`, `literal` | The two plans are one. |
+
+`unsupported`, `timeout` and `error` are the cvc5 axis's. The axis shares `--cvc5-bin`,
+`--cvc5-opt`, `--cvc5-timeout` and `--cvc5-mem-gib` with it, always encodes under bags, and reads
+the same job: under `--portfolio` both run beside the other backends on each case. Like the cvc5
+axis it decides no verdict alone: a pair only it refutes is `undecided`.
+
 ## The encoding
 
 A table is a constant of sort `(Bag (Tuple (Nullable T1) ... (Nullable Tn)))` -- `(Set ...)` under

@@ -39,6 +39,15 @@ pub fn status_rank(status: &str) -> usize {
     STATUS_ORDER.iter().position(|s| *s == status).unwrap_or(99)
 }
 
+/// One cvc5 axis's fields of a case, borrowed together.
+pub struct Cvc5Slot<'a> {
+    pub bucket: &'a mut Option<String>,
+    pub verdict: &'a mut Option<String>,
+    pub ms: &'a mut Option<Value>,
+    pub note: &'a mut String,
+    pub raw: &'a mut Option<Value>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Case {
     /// Display name (path relative to a common root).
@@ -83,6 +92,12 @@ pub struct Case {
     pub c_verdict: Option<String>,
     pub c_ms: Option<Value>,
     pub c_note: String,
+    // The cvc5-bounded axis, only when it is asked: the same, for sqleq-cvc5 under `--bound`, which
+    // looks for a small database on which the two encodings differ instead of a proof.
+    pub b_bucket: Option<String>,
+    pub b_verdict: Option<String>,
+    pub b_ms: Option<Value>,
+    pub b_note: String,
     // The Lean axis, only when it is asked: sqleq-lean's own verdict on the pair file (it reads the
     // .sql itself, so it answers whatever the frontend did).
     pub l_verdict: Option<String>,
@@ -110,6 +125,8 @@ pub struct Case {
     pub s_raw: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c_raw: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b_raw: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l_raw: Option<Value>,
     /// The end of the prover's stdout and stderr when it crashed: the signature a crash is told
@@ -163,6 +180,10 @@ impl Case {
             c_verdict: None,
             c_ms: None,
             c_note: String::new(),
+            b_bucket: None,
+            b_verdict: None,
+            b_ms: None,
+            b_note: String::new(),
             l_verdict: None,
             l_reason: String::new(),
             l_shape: String::new(),
@@ -175,12 +196,27 @@ impl Case {
             f_raw: None,
             s_raw: None,
             c_raw: None,
+            b_raw: None,
             l_raw: None,
             q_tail: String::new(),
             q_rc: None,
             qed_unasked: None,
             row: None,
         }
+    }
+
+    /// The fields of one of the two cvc5 axes: `cvc5`'s, or `cvc5-bounded`'s when `bounded`.
+    pub fn cvc5_slot(&mut self, bounded: bool) -> Cvc5Slot<'_> {
+        if bounded {
+            Cvc5Slot { bucket: &mut self.b_bucket, verdict: &mut self.b_verdict, ms: &mut self.b_ms, note: &mut self.b_note, raw: &mut self.b_raw }
+        } else {
+            Cvc5Slot { bucket: &mut self.c_bucket, verdict: &mut self.c_verdict, ms: &mut self.c_ms, note: &mut self.c_note, raw: &mut self.c_raw }
+        }
+    }
+
+    /// The bucket of one of the two cvc5 axes, as [`Case::cvc5_slot`] picks it.
+    pub fn cvc5_bucket(&self, bounded: bool) -> Option<&str> {
+        if bounded { self.b_bucket.as_deref() } else { self.c_bucket.as_deref() }
     }
 
     pub fn of(item: &Item) -> Case {
@@ -376,8 +412,11 @@ pub struct Stage {
     pub smt_timeout_ms: Option<u64>,
     pub keep_dir: Option<PathBuf>,
     pub ss_dir: Option<PathBuf>,
-    /// The directory the cvc5 axis's jobs are kept in, when that axis is asked.
+    /// The directory the cvc5 axes' jobs are kept in, when one is asked: one job a case, which
+    /// both read.
     pub cvc5_dir: Option<PathBuf>,
+    /// Which of the two cvc5 axes are asked: `cvc5`, and `cvc5-bounded`.
+    pub cvc5_axes: [bool; 2],
     /// `--catalog`: the catalog a case is lowered against when its header names none.
     pub catalog: Option<String>,
     /// `--qed-mem-gib`, in bytes.
@@ -420,8 +459,11 @@ pub fn run_case(item: &Item, st: &Stage) -> Case {
     // before the prover runs, like the SQLSolver axis's, so a prover timeout costs it nothing.
     if let Some(job) = &cvc5_job {
         if let Err(e) = crate::check::axes::cvc5::write_job(name, &wd.path.join(&json_name), job) {
-            case.c_bucket = Some(s(crate::check::axes::cvc5::ERROR));
-            case.c_note = format!("could not write the cvc5 job: {e}");
+            for bounded in [false, true].into_iter().filter(|b| st.cvc5_axes[usize::from(*b)]) {
+                let slot = case.cvc5_slot(bounded);
+                *slot.bucket = Some(s(crate::check::axes::cvc5::ERROR));
+                *slot.note = format!("could not write the cvc5 job: {e}");
+            }
         }
     }
 

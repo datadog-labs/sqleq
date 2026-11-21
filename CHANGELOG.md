@@ -7,6 +7,14 @@ the command line, the IR or the library's API.
 
 ## [Unreleased]
 
+### Added
+
+- **The `cvc5-bounded` axis** (`sqleq-check --cvc5-bounded`, `--cvc5-bound N`, default 3): cvc5 as
+  a model finder. `sqleq-cvc5 --bound=N` makes each table a bag of exactly 0 to `N` symbolic rows,
+  the smaller databases first, and reports the first database on which the two encodings differ.
+  `no-model` (none that small) is no proof. Under `--portfolio` it runs beside the cvc5 axis on the
+  same plan; its model is an alarm against a proof, and decides nothing alone. See `docs/CVC5.md`.
+
 ## [0.1.0] - 2026-11-13
 
 The first release, published on crates.io as `sqleq`: `cargo install --locked sqleq`.

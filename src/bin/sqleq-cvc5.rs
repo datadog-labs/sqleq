@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! sqleq-cvc5 <ir.jobs.jsonl> <results.jsonl> [--timeout-ms=N] [--grace-ms=N] [--semantics=bags|sets]
-//!            [--opt=NAME=VALUE]... [--no-check-models] [--smt2=DIR] [--dry-run]
+//!            [--opt=NAME=VALUE]... [--bound=N] [--no-check-models] [--smt2=DIR] [--dry-run]
 //! sqleq-cvc5 --plan <input.json> [--name=N] [the same options]
 //! ```
 //!
@@ -31,6 +31,12 @@
 //! `--opt` is a further cvc5 `set-option`, `--opt=bags-deq-decompose=false` say; `--smt2=DIR` also
 //! writes each row's problem as `DIR/<name>.smt2`, for re-checking with the `cvc5` binary.
 //!
+//! `--bound=N` finds models instead of proofs: each table is a bag of exactly so many symbolic rows,
+//! every size from 0 to `N`, smaller databases first, and the first `sat` is the row's `NEQ`, its
+//! `bound` the most rows a table holds in it. `unsat` for them all is `BOUNDED`, with `bound: N`:
+//! no database that small tells the two queries apart, which is no proof. `UNKNOWN`'s `bound` is the
+//! largest size every database up to which was `unsat`. Bags only.
+//!
 //! `--plan` takes one `Input` JSON instead of a jobs file and prints the row to stdout.
 
 use std::io::{BufRead, Write};
@@ -41,12 +47,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sqleq::cvc5::{check, smt2, Failure, Model, Options, Outcome, Semantics};
+use sqleq::cvc5::{check, check_bounded, smt2, Bounded, Failure, Model, Options, Outcome, Semantics};
 use sqleq::ir::{self, Input};
 use sqleq::ir::identical_sides;
 
 const USAGE: &str = "usage: sqleq-cvc5 <ir.jobs.jsonl> <results.jsonl> [--timeout-ms=N] [--grace-ms=N] [--semantics=bags|sets] \
-[--opt=NAME=VALUE]... [--no-check-models] [--smt2=DIR] [--dry-run]
+[--opt=NAME=VALUE]... [--bound=N] [--no-check-models] [--smt2=DIR] [--dry-run]
        sqleq-cvc5 --plan <input.json> [--name=N] [the same options]";
 
 #[derive(Serialize)]
@@ -76,6 +82,10 @@ struct Row {
     model_exact: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     counterexample: Option<String>,
+    /// Under `--bound`: the rows a table held in the model (`NEQ`), the bound no model was found
+    /// within (`BOUNDED`), or the last bound with none (`UNKNOWN`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +133,7 @@ fn text_depth(text: &str) -> usize {
 
 enum Done {
     Outcome(Result<Outcome, Failure>),
+    Bounded(Result<Bounded, Failure>),
     Translated,
     Panic(String),
 }
@@ -148,6 +159,8 @@ fn main() -> ExitCode {
         } else if let Some(v) = a.strip_prefix("--opt=") {
             let (k, val) = v.split_once('=').unwrap_or_else(|| usage_error(a));
             cfg.opts.cvc5_options.push((k.to_string(), val.to_string()));
+        } else if let Some(v) = a.strip_prefix("--bound=") {
+            cfg.opts.bound = Some(v.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| usage_error(a)));
         } else if let Some(v) = a.strip_prefix("--smt2=") {
             cfg.smt2_dir = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--plan=") {
@@ -178,6 +191,10 @@ fn main() -> ExitCode {
         }
     }
     cfg.opts.timeout_ms = cfg.cap_ms;
+    if cfg.opts.bound.is_some() && cfg.opts.semantics != Semantics::Bags {
+        eprintln!("--bound finds databases under bags, SQL's own semantics, not under sets\n{USAGE}");
+        return ExitCode::from(2);
+    }
     if let Some(d) = &cfg.smt2_dir {
         if let Err(e) = std::fs::create_dir_all(d) {
             eprintln!("cannot create {}: {e}", d.display());
@@ -307,6 +324,7 @@ fn blank(name: String, verdict: &'static str, sem: Semantics) -> Row {
         model: None,
         model_exact: None,
         counterexample: None,
+        bound: None,
     }
 }
 
@@ -367,6 +385,9 @@ fn run(name: String, job: serde_json::Value, cfg: &Config) -> (Row, bool) {
                     Err(e) => Done::Outcome(Err(e)),
                 };
             }
+            if opts.bound.is_some() {
+                return Done::Bounded(check_bounded(&input, &opts));
+            }
             Done::Outcome(check(&input, &opts))
         }));
         let done = done.unwrap_or_else(|p| {
@@ -415,9 +436,30 @@ fn run(name: String, job: serde_json::Value, cfg: &Config) -> (Row, bool) {
             row.model = Some(model);
             row.model_exact = Some(exact);
         }
-        Done::Outcome(Ok(Outcome::Incomparable(note))) => {
+        Done::Outcome(Ok(Outcome::Incomparable(note))) | Done::Bounded(Ok(Bounded::Incomparable(note))) => {
             row.verdict = "NEQ";
             row.incomparable = Some(note);
+        }
+        Done::Bounded(Err(Failure::Refused(r))) => {
+            row.verdict = "NOTRANS";
+            row.refused = Some(r.to_string());
+        }
+        Done::Bounded(Err(Failure::Cvc5(e))) => row.error = Some(e),
+        Done::Bounded(Ok(Bounded::Different { model, exact, rows })) => {
+            row.verdict = "NEQ";
+            row.counterexample = Some(model.summary());
+            row.model = Some(model);
+            row.model_exact = Some(exact);
+            row.bound = Some(rows);
+        }
+        Done::Bounded(Ok(Bounded::NoModel { rows })) => {
+            row.verdict = "BOUNDED";
+            row.bound = Some(rows);
+        }
+        Done::Bounded(Ok(Bounded::Unknown { why, checked })) => {
+            row.verdict = "UNKNOWN";
+            row.unknown = Some(why);
+            row.bound = checked;
         }
     }
     (row, false)

@@ -29,6 +29,8 @@ pub struct Env {
     pub prover: Option<String>,
     pub ss: Option<SsDriver>,
     pub cvc5: Option<Cvc5Driver>,
+    /// The cvc5-bounded axis's driver: sqleq-cvc5 under `--bound`.
+    pub cvc5_bounded: Option<Cvc5Driver>,
     pub fuzz: Option<String>,
     pub lean: Option<String>,
     pub items: Vec<Item>,
@@ -100,6 +102,16 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     } else {
         None
     };
+    // Always under bags: a bounded model is a database to run the pair on, and a set has no
+    // duplicate rows to find one with.
+    let cvc5_bounded = if has("cvc5-bounded") {
+        let mut d = discover::discover_cvc5(args.cvc5_bin.as_deref(), bin_dir, "bags", &args.cvc5_opt)?;
+        d.mem_bytes = gib(args.cvc5_mem_gib);
+        d.bound = Some(args.cvc5_bound);
+        Some(d)
+    } else {
+        None
+    };
     let fuzz = if has("fuzz") { Some(discover::discover_fuzz(args.fuzz_bin.as_deref(), bin_dir)?) } else { None };
     let lean = if has("lean") { Some(discover::discover_lean(args.lean_bin.as_deref(), bin_dir)?) } else { None };
 
@@ -150,8 +162,10 @@ pub fn setup(args: &Args) -> Result<Env, String> {
     if let Some(d) = ss.as_ref().filter(|d| d.imp == "sqleq-solver") {
         bins.push(&d.location);
     }
-    if let Some(d) = &cvc5 {
-        bins.push(&d.bin);
+    for d in [&cvc5, &cvc5_bounded].into_iter().flatten() {
+        if !bins.contains(&d.bin.as_str()) {
+            bins.push(&d.bin);
+        }
     }
     for b in bins {
         if let Some(why) = discover::stale_build(b) {
@@ -163,7 +177,7 @@ pub fn setup(args: &Args) -> Result<Env, String> {
             eprintln!("warning: {why}; its answers may not be this tree's");
         }
     }
-    Ok(Env { axes, frontend, prover, ss, cvc5, fuzz, lean, items })
+    Ok(Env { axes, frontend, prover, ss, cvc5, cvc5_bounded, fuzz, lean, items })
 }
 
 /// GiB as bytes, for an address-space cap.
@@ -367,9 +381,10 @@ pub fn main(args: Args) -> i32 {
         }
     };
 
-    // One directory for the cvc5 axis's jobs, likewise: a plan per case, and the driver's row.
+    // One directory for the cvc5 axes' jobs, likewise: a plan per case, which both axes read, and
+    // each driver's row.
     let mut cvc5_tmp: Option<crate::check::util::TempDir> = None;
-    let cvc5_dir: Option<PathBuf> = match &env.cvc5 {
+    let cvc5_dir: Option<PathBuf> = match env.cvc5.as_ref().or(env.cvc5_bounded.as_ref()) {
         None => None,
         Some(_) if args.portfolio => None,
         Some(_) => {
@@ -410,7 +425,7 @@ pub fn main(args: Args) -> i32 {
             let label = if d.imp == "sqleq-solver" { "sqleq-solver:" } else { "JVM fork:" };
             println!("{}", c.dim(&format!("{label:<14}{}", d.location)));
         }
-        if let Some(d) = &env.cvc5 {
+        for d in [&env.cvc5, &env.cvc5_bounded].into_iter().flatten() {
             println!("{}", c.dim(&format!("{:<14}{}", format!("{}:", d.describe()), d.bin)));
         }
         if let Some(f) = &env.fuzz {
@@ -449,6 +464,7 @@ pub fn main(args: Args) -> i32 {
         keep_dir: keep_dir.clone(),
         ss_dir: ss_dir.clone(),
         cvc5_dir: cvc5_dir.clone(),
+        cvc5_axes: [env.cvc5.is_some(), env.cvc5_bounded.is_some()],
         catalog: args.catalog.map(|c| c.name().to_string()),
         qed_mem: gib(args.qed_mem_gib),
     };
@@ -465,6 +481,8 @@ pub fn main(args: Args) -> i32 {
         "lean"
     } else if env.fuzz.is_some() {
         "fuzz"
+    } else if env.cvc5_bounded.is_some() {
+        "cvc5-bounded"
     } else if env.cvc5.is_some() {
         "cvc5"
     } else if env.ss.is_some() {
@@ -480,6 +498,7 @@ pub fn main(args: Args) -> i32 {
         ss_cap_ms: args.sqleq_solver_timeout.filter(|t| *t > 0),
         cvc5: env.cvc5.as_ref(),
         cvc5_cap_ms,
+        cvc5_bounded: env.cvc5_bounded.as_ref(),
         fuzz: env.fuzz.as_deref(),
         lean: env.lean.as_deref(),
         timeout: args.timeout,
@@ -645,35 +664,48 @@ pub fn main(args: Args) -> i32 {
         }
     }
 
-    // The cvc5 axis, over the plans packaged for it: one driver per case, in parallel, each within
-    // its own budget -- timed apart from the passes above for the same reason.
+    // The cvc5 axes, over the plans packaged for them: one driver per case, in parallel, each within
+    // its own budget -- timed apart from the passes above for the same reason. cvc5 first, then
+    // cvc5-bounded over the same jobs.
     let mut cvc5_stats = None;
-    if args.portfolio {
-        cvc5_stats = env.cvc5.as_ref().map(|_| cvc5::Stats { rows: cases.iter().filter(|x| x.c_bucket.is_some()).count(), wall_s: None });
-    } else if let (Some(driver), Some(dir)) = (&env.cvc5, &cvc5_dir) {
-        if !args.quiet {
-            if live {
-                progress(&" ".repeat(30));
+    let mut cvc5_bounded_stats = None;
+    for (driver, pass, bounded) in [(&env.cvc5, "cvc5", false), (&env.cvc5_bounded, "cvc5-bounded", true)] {
+        let Some(driver) = driver else { continue };
+        let stats = if args.portfolio {
+            cvc5::Stats { rows: cases.iter().filter(|x| x.cvc5_bucket(bounded).is_some()).count(), wall_s: None }
+        } else if let Some(dir) = &cvc5_dir {
+            if !args.quiet {
+                if live {
+                    progress(&" ".repeat(30));
+                }
+                let n = cases.iter().filter(|x| x.cvc5_bucket(bounded).is_none() && x.lowered).count();
+                println!(
+                    "{}",
+                    c.dim(&format!("  asking {} about {n} case(s), {} at a time, {}s each…", driver.describe(), args.jobs, report::fmt_secs(cvc5_timeout_s)))
+                );
             }
-            let n = cases.iter().filter(|x| x.c_bucket.is_none() && x.lowered).count();
-            println!(
-                "{}",
-                c.dim(&format!("  asking {} about {n} case(s), {} at a time, {}s each…", driver.describe(), args.jobs, report::fmt_secs(cvc5_timeout_s)))
-            );
-        }
-        let emitted: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
-        let done = |x: &Case| {
-            if last_pass == "cvc5" {
-                stream.emit(x);
-                emitted.lock().unwrap_or_else(|e| e.into_inner()).insert(x.name.clone());
+            let emitted: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+            let done = |x: &Case| {
+                if last_pass == pass {
+                    stream.emit(x);
+                    emitted.lock().unwrap_or_else(|e| e.into_inner()).insert(x.name.clone());
+                }
+            };
+            let st = cvc5::run_cvc5(&mut cases, dir, driver, args.jobs, cvc5_cap_ms, cvc5_timeout_s, &done);
+            // A case with no cvc5 job -- never lowered, or one whose job could not be written -- has
+            // nothing more to say either, and is written now, so that `--resume` does not run it again.
+            if last_pass == pass {
+                let emitted = emitted.into_inner().unwrap_or_else(|e| e.into_inner());
+                cases.iter().filter(|x| !emitted.contains(&x.name)).for_each(|x| stream.emit(x));
             }
+            st
+        } else {
+            continue;
         };
-        cvc5_stats = Some(cvc5::run_cvc5(&mut cases, dir, driver, args.jobs, cvc5_cap_ms, cvc5_timeout_s, &done));
-        // A case with no cvc5 job -- never lowered, or one whose job could not be written -- has
-        // nothing more to say either, and is written now, so that `--resume` does not run it again.
-        if last_pass == "cvc5" {
-            let emitted = emitted.into_inner().unwrap_or_else(|e| e.into_inner());
-            cases.iter().filter(|x| !emitted.contains(&x.name)).for_each(|x| stream.emit(x));
+        if bounded {
+            cvc5_bounded_stats = Some(stats);
+        } else {
+            cvc5_stats = Some(stats);
         }
     }
 
@@ -791,6 +823,9 @@ pub fn main(args: Args) -> i32 {
         if let (Some(st), Some(d)) = (&cvc5_stats, &env.cvc5) {
             report::print_cvc5(c, &cases, st, &d.describe());
         }
+        if let (Some(st), Some(d)) = (&cvc5_bounded_stats, &env.cvc5_bounded) {
+            report::print_cvc5_bounded(c, &cases, st, &d.describe());
+        }
         if let Some(st) = &fuzz_stats {
             report::print_fuzz(c, &cases, st);
         }
@@ -832,6 +867,15 @@ pub fn main(args: Args) -> i32 {
             semantics: d.semantics.clone(),
             options: d.options.clone(),
             timeout_ms: cvc5_cap_ms,
+            bound: None,
+        }),
+        cvc5_bounded: env.cvc5_bounded.as_ref().map(|d| Cvc5Meta {
+            stats: cvc5_bounded_stats.clone().unwrap_or_default(),
+            bin: d.bin.clone(),
+            semantics: d.semantics.clone(),
+            options: d.options.clone(),
+            timeout_ms: cvc5_cap_ms,
+            bound: d.bound,
         }),
         lean: env.lean.as_ref().map(|b| LeanMeta { stats: lean_stats.clone().unwrap_or_default(), bin: b.clone() }),
         pinned: pinned_mode.then(|| PinnedMeta {
@@ -875,7 +919,7 @@ pub fn main(args: Args) -> i32 {
         }
     }
     if let Some(path) = &args.csv {
-        if let Err(e) = report::write_csv(path, &cases, args.portfolio, env.cvc5.is_some()) {
+        if let Err(e) = report::write_csv(path, &cases, args.portfolio, env.cvc5.is_some(), env.cvc5_bounded.is_some()) {
             eprintln!("error: {path}: {e}");
             return 2;
         }

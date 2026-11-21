@@ -8,7 +8,7 @@
 //! refuses, and where the two semantics part.
 
 use serde_json::{json, Value};
-use sqleq::cvc5::{check, smt2, Failure, Options, Outcome, Refusal, Semantics};
+use sqleq::cvc5::{check, check_bounded, smt2, Bounded, Failure, Options, Outcome, Refusal, Semantics};
 use sqleq::ir::{Input, TranslateError};
 
 fn table(name: &str, types: &[&str], nullable: &[bool], key: &[&[usize]]) -> Value {
@@ -432,4 +432,52 @@ fn an_aggregate_without_group_by_has_one_row_over_an_empty_table_and_one_by_a_ke
         let keyed = run(sem, schemas.clone(), one(0, vec![col(1, "VARCHAR")]), one(1, vec![col(1, "VARCHAR")]));
         assert!(matches!(keyed, Ok(Outcome::Different { .. }) | Ok(Outcome::Unknown(_))), "{sem:?}: {keyed:?}");
     }
+}
+
+fn bounded(schemas: Vec<Value>, a: Value, b: Value, bound: u32) -> Result<Bounded, Failure> {
+    let input = Input::parse(&json!({ "schemas": schemas, "queries": [a, b] })).expect("well-formed");
+    check_bounded(&input, &Options { bound: Some(bound), ..opts(Semantics::Bags) })
+}
+
+/// The smallest database comes first: `COUNT(*)` and `COUNT(a)` part on one row with a null `a`,
+/// which the bounded tables find where the unbounded encoding's fold reasoning may not.
+#[test]
+fn bounded_tables_find_the_smallest_model() {
+    let star = group(scan(0), vec![col(1, "VARCHAR")], vec![agg("COUNT", "INTEGER", vec![])]);
+    let of_a = group(scan(0), vec![col(1, "VARCHAR")], vec![agg("COUNT", "INTEGER", vec![col(0, "INTEGER")])]);
+    match bounded(t(), star, of_a, 3) {
+        Ok(Bounded::Different { model, exact: true, rows: 1 }) => {
+            assert_eq!(model.tables[0].rows.len(), 1, "{}", model.summary());
+            assert!(model.tables[0].rows[0].0[0].is_none(), "{}", model.summary());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `SELECT DISTINCT a` and `SELECT a` part only on two rows with one `a`: no model with one row a
+/// table, which is no proof, and a model with two.
+#[test]
+fn a_bounded_table_repeats_a_row_and_no_model_is_no_proof() {
+    let a = project(scan(0), vec![col(0, "INTEGER")]);
+    let distinct = json!({ "distinct": a.clone() });
+    assert_eq!(bounded(t(), a.clone(), distinct.clone(), 1), Ok(Bounded::NoModel { rows: 1 }));
+    match bounded(t(), a, distinct, 2) {
+        Ok(Bounded::Different { model, exact: true, rows: 2 }) => {
+            let rows = &model.tables[0].rows;
+            let n: u64 = rows.iter().map(|(_, m)| m).sum();
+            assert_eq!(n, 2, "{}", model.summary());
+            assert!(rows.len() == 1 || rows[0].0[0] == rows[1].0[0], "one `a` twice: {}", model.summary());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A key holds row by row: two rows of a keyed table differ on the key, so `DISTINCT` over a key
+/// changes nothing up to the bound.
+#[test]
+fn a_bounded_table_keeps_its_key() {
+    let keyed = vec![table("t", &["INTEGER", "VARCHAR"], &[false, true], &[&[0]])];
+    let a = project(scan(0), vec![col(0, "INTEGER")]);
+    let distinct = json!({ "distinct": a.clone() });
+    assert_eq!(bounded(keyed, a, distinct, 3), Ok(Bounded::NoModel { rows: 3 }));
 }

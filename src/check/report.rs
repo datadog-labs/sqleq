@@ -138,6 +138,8 @@ fn print_portfolio_line(c: Color, case: &Case, o: &portfolio::Outcome, name_w: u
         tail += &format!("  {}", c.dim(&format!("— {}", case.f_note)));
     } else if case.c_bucket.as_deref() == Some(cvc5::MODEL) && !case.c_note.is_empty() {
         tail += &format!("  {}", c.dim(&format!("— cvc5 model {}", case.c_note)));
+    } else if case.b_bucket.as_deref() == Some(cvc5::MODEL) && !case.b_note.is_empty() {
+        tail += &format!("  {}", c.dim(&format!("— cvc5-bounded model {}", case.b_note)));
     } else if !portfolio::decisive(&o.verdict) {
         let last = suite::splitlines(&case.message).into_iter().map(str::trim).rfind(|l| !l.is_empty());
         if let Some(l) = last {
@@ -662,6 +664,41 @@ pub fn print_cvc5(c: Color, cases: &[Case], stats: &cvc5::Stats, driver: &str) {
     );
 }
 
+pub fn print_cvc5_bounded(c: Color, cases: &[Case], stats: &cvc5::Stats, driver: &str) {
+    let scored: Vec<&Case> = cases.iter().filter(|x| x.b_bucket.is_some()).collect();
+    if scored.is_empty() {
+        return;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for x in &scored {
+        *counts.entry(x.b_bucket.as_deref().unwrap_or("")).or_default() += 1;
+    }
+    println!();
+    println!("{}{}", c.bold("  cvc5-bounded axis"), c.dim(&format!("  — {driver}, over the lowered IR; experimental")));
+    println!("{}", rule(c));
+    for b in cvc5::BOUNDED_ORDER {
+        if let Some(n) = counts.get(b).filter(|n| **n > 0) {
+            println!("  {b:<22} {n:>5}");
+        }
+    }
+    println!("{}", rule(c));
+    for x in scored.iter().filter(|x| x.b_bucket.as_deref() == Some(cvc5::MODEL)) {
+        let note = if x.b_note.is_empty() { String::new() } else { format!("  — {}", x.b_note) };
+        println!("{}", c.dim(&format!("  {:<22}       {}{note}", "model", x.name)));
+    }
+    if let Some(w) = stats.wall_s {
+        println!("{}", c.dim(&format!("  {:<22} {w:.2}s over {} row(s)", "wall time", stats.rows)));
+    }
+    println!(
+        "{}",
+        c.dim(
+            "  note  `model` is the cvc5 axis's, found with every table at most the bound's\n        rows: a refutation \
+             of the plan, not of the pair. `no-model` says no database\n        that small tells the two encodings apart, \
+             which is no proof."
+        )
+    );
+}
+
 pub fn print_lean(c: Color, cases: &[Case], stats: &lean::Stats) {
     let scored: Vec<&Case> = cases.iter().filter(|x| x.l_verdict.is_some()).collect();
     if scored.is_empty() {
@@ -802,6 +839,9 @@ pub struct Cvc5Meta {
     pub semantics: String,
     pub options: Vec<String>,
     pub timeout_ms: Option<u64>,
+    /// cvc5-bounded's: the most rows a table holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -896,6 +936,8 @@ pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cvc5: Option<Cvc5Meta>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvc5_bounded: Option<Cvc5Meta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lean: Option<LeanMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub portfolio: Option<PortfolioMeta>,
@@ -920,7 +962,7 @@ pub fn write_json(path: &str, cases: &[Case], meta: &Meta) -> std::io::Result<()
     std::fs::write(path, text)
 }
 
-pub fn write_csv(path: &str, cases: &[Case], portfolio: bool, cvc5: bool) -> std::io::Result<()> {
+pub fn write_csv(path: &str, cases: &[Case], portfolio: bool, cvc5: bool, cvc5_bounded: bool) -> std::io::Result<()> {
     let mut cols = vec![
         "name",
         "status",
@@ -953,6 +995,9 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool, cvc5: bool) -> std
     }
     if cvc5 {
         cols.extend(["c_bucket", "c_verdict", "c_ms", "c_note"]);
+    }
+    if cvc5_bounded {
+        cols.extend(["b_bucket", "b_verdict", "b_ms", "b_note"]);
     }
     let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_path(path)?;
     w.write_record(&cols)?;
@@ -996,6 +1041,9 @@ pub fn write_csv(path: &str, cases: &[Case], portfolio: bool, cvc5: bool) -> std
         }
         if cvc5 {
             row.extend([opt(&x.c_bucket), opt(&x.c_verdict), num(&x.c_ms), x.c_note.clone()]);
+        }
+        if cvc5_bounded {
+            row.extend([opt(&x.b_bucket), opt(&x.b_verdict), num(&x.b_ms), x.b_note.clone()]);
         }
         w.write_record(&row)?;
     }
