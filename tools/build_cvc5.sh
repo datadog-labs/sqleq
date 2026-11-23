@@ -35,14 +35,16 @@ case "${1-}" in
     *) echo "$usage" >&2; exit 2 ;;
 esac
 
-# The commit the axis was measured against, the tip of `bags-algebra-partition`; bump it to take a
-# newer one. That branch is `bags-algebra` merged with cvc5's main, where an empty table has no group
+# The commit the axis was measured against, on `bags-algebra-partition`; bump it to take a newer
+# one. That branch is `bags-algebra` merged with cvc5's main, where an empty table has no group
 # (cvc5/cvc5#13151): the encoding of GROUP BY relies on that, so `bags-algebra` itself, or any cvc5
-# before it, gives wrong answers. At this commit the keys of tables rewrite the assertions in cvc5's
-# learned-rewrite pass, which the axis turns on, and the rewrite EQ_EMPTY_ARG, with which the bag
-# solver could answer sat with a model that check-models rejects, is gone.
+# before it, gives wrong answers. At this commit the keys and NOT NULL columns of tables are lemmas
+# of cvc5's static learning, on by default, and the rewrite EQ_EMPTY_ARG, with which the bag solver
+# could answer sat with a model that check-models rejects, is gone. It has cvc5's main up to #13183
+# only: #13178 removes cvc5_term_get_string_value and cvc5_mk_string_from_wchar, which the Rust
+# bindings (cvc5 0.6.1) call.
 repo=${SQLEQ_CVC5_REPO:-https://github.com/mudathirmahgoub/cvc5.git}
-commit=${SQLEQ_CVC5_COMMIT:-4e408a18c414404f440994362d9c19f3542f50c3}
+commit=${SQLEQ_CVC5_COMMIT:-7ac6afe3bb8fec8fce517db9a444262847f78922}
 jobs=${SQLEQ_CVC5_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
 for tool in git cmake python3; do

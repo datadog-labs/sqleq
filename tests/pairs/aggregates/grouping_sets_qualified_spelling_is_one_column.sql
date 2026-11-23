@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: model
 -- expect lean: unsupported
 -- origin: PR #209 review: grouping expressions were matched by their text, so a and t.a were two
 --   columns, and the select list's a was nulled in the set that grouped by t.a

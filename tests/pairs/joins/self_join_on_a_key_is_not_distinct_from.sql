@@ -8,7 +8,6 @@
 -- expect fuzz: no-counterexample
 -- expect qed: proved
 -- expect sqleq-solver: proved
--- expect cvc5: proved
 -- expect lean: unsupported
 -- catalog: inferred-seeded
 -- origin: issue #241: IS NOT DISTINCT FROM was a sum of two cases, both NULL or both not and equal. In a join it split

@@ -188,7 +188,7 @@ drift between reviews. The last time every axis was blessed together:
 * **sqleq-solver**, **frontend**, **fuzz**, **lean** — this tree; the solver on Z3 5.1.0 and Lean on
   the toolchain `lean/lean-toolchain` names, as in CI.
 * **cvc5** — `sqleq-cvc5` of this tree on the `bags-algebra-partition` branch of cvc5 at the commit
-  `tools/build_cvc5.sh` pins (`4e408a18`), under bag semantics, 60 s per case with 8 cases at a
+  `tools/build_cvc5.sh` pins (`7ac6afe3`), under bag semantics, 60 s per case with 8 cases at a
   time. A pair cvc5 answers only past that budget carries no cvc5 pin: a timeout is never pinned,
   and a pin blessed with a longer budget would fail wherever the budget is the default one. Such a
   pair shows `⏱` in every run of `--expect pinned --axes cvc5`, which therefore exits 1 even when

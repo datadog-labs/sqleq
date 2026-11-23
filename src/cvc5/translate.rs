@@ -289,10 +289,6 @@ impl Encoder {
             ("uf-lazy-ll".into(), "true".into()),
             ("fmf-bound".into(), "true".into()),
             ("strings-exp".into(), "true".into()),
-            // The keys of the tables, which the constraints state, rewrite the assertions: cvc5's
-            // learned-rewrite pass reads them off the constraints, a learned literal each, and the
-            // rewriter of the theory does not know them.
-            ("learned-rewrite".into(), "true".into()),
         ];
         if let Some(ms) = opts.timeout_ms {
             options.push(("tlimit-per".into(), ms.to_string()));
@@ -689,9 +685,9 @@ impl Encoder {
         Ok(v)
     }
 
-    /// `(lambda vars body)`. The body is not rewritten here: cvc5's learned-rewrite pass rewrites
-    /// the assertions, lambda bodies included, by the keys it reads off the constraints, and a body
-    /// rewritten before would keep a form that it may not match.
+    /// `(lambda vars body)`. The body is not rewritten here: cvc5 rewrites the assertions, lambda
+    /// bodies included, and draws the lemmas of the keys from the rewritten terms, and a body
+    /// rewritten before would keep a form that its rules may not match.
     fn lambda(&mut self, vars: &[Term], body: Term) -> R<Term> {
         let list = self.tm.mk_term(Kind::VariableList, vars)?;
         Ok(self.tm.mk_term(Kind::Lambda, &[list, body])?)

@@ -37,11 +37,10 @@ bindings need `libclang` to generate their FFI.
 The axis is written against the `bags-algebra` branch of cvc5
 ([mudathirmahgoub/cvc5#27](https://github.com/mudathirmahgoub/cvc5/pull/27)), whose bag reasoning it
 exercises: normal forms for the relational terms the encoding builds, the keys and `NOT NULL`
-columns of the tables read off their constraints (the `learned-rewrite` preprocessing pass, which
-the axis turns on), and lemmas
-for folds, maps and disequalities. No cvc5 release has it yet, so one script fetches that branch at
-a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the axis against
-it:
+columns of the tables read off their constraints (lemmas of cvc5's static learning, on by
+default), and lemmas for folds, maps and disequalities. No cvc5 release has it yet, so one script
+fetches that branch at a pinned commit, builds it, installs it under `target/cvc5/install`, and
+builds the axis against it:
 
 ```sh
 sh tools/build_cvc5.sh            # once; then, like the other features:
@@ -200,9 +199,9 @@ Where this encoding departs from the Java translator, deliberately:
   operator in a lambda with fresh variables each time. The bags solver relates two maps or filters
   by the identity of their functions and does not rewrite under the binder before comparing them,
   so two sides that compute `a + 5` the same way must be one term. No body is rewritten before it
-  is bound: cvc5's `learned-rewrite` pass rewrites the assertions, lambda bodies included, by the
-  keys it reads off the constraints, and a body rewritten earlier would keep a form that pass may
-  not match; `a + 10 / 2` and `a + 5` meet there.
+  is bound: cvc5 rewrites the assertions, lambda bodies included, and draws the lemmas of the keys
+  from the rewritten terms, and a body rewritten earlier would keep a form its rules may not match;
+  `a + 10 / 2` and `a + 5` meet there.
 
 ## What the encoding approximates
 
@@ -263,14 +262,13 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
 * **A model that fails `check-models` aborts cvc5**, and the driver with it (cvc5 raises an
   internal error through the C API). The harness records the case as an `error`; what it says is
   that cvc5 found a model its own checker rejects, which is the checker doing its job. It has
-  been seen on `set.filter` lambdas under set semantics, and under bags on a `bag.map` whose
-  lambda applies an uninterpreted function to constants alone, as
-  `types/string_order_under_database_default` compares two strings under a collation: with
-  `uf-lazy-ll`, cvc5's model gives the function a value its other constraints exclude, on cvc5's
-  main branch too, through the API only. The pinned pairs that meet it are pinned `error`. The
-  rewrite `EQ_EMPTY_ARG` of the `bags-algebra` branch, which gave the same error on a `bag.map` of
-  a constant row, as `SELECT DISTINCT 0 ... GROUP BY a` maps every group to, is gone from the
-  pinned commit.
+  been seen on `set.filter` lambdas under set semantics. Two causes under bags are gone from the
+  pinned commit:
+  - lambda lifting defined a skolem as `true`, which left it free in the model, in cvc5's main
+    too (fixed by cvc5/cvc5#13186): `types/string_order_under_database_default`, which compares
+    two strings under a collation, now gets a model;
+  - the rewrite `EQ_EMPTY_ARG` of the `bags-algebra` branch, on a `bag.map` of a constant row, as
+    `SELECT DISTINCT 0 ... GROUP BY a` maps every group to.
 * **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
   without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
   duplicate removal or bare sorts of those), an aggregate other than
