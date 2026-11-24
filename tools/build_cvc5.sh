@@ -39,12 +39,13 @@ esac
 # one. That branch is `bags-algebra` merged with cvc5's main, where an empty table has no group
 # (cvc5/cvc5#13151): the encoding of GROUP BY relies on that, so `bags-algebra` itself, or any cvc5
 # before it, gives wrong answers. At this commit the keys and NOT NULL columns of tables are lemmas
-# of cvc5's static learning, on by default, and the rewrite EQ_EMPTY_ARG, with which the bag solver
-# could answer sat with a model that check-models rejects, is gone. It has cvc5's main up to #13183
-# only: #13178 removes cvc5_term_get_string_value and cvc5_mk_string_from_wchar, which the Rust
-# bindings (cvc5 0.6.1) call.
+# of cvc5's static learning, on by default, and so is the rule EQ_EMPTY_ARG, a map or a bag.setof
+# that is empty when its argument is: as a rewrite, which the bag solver also applied to its own
+# lemmas, it could answer sat with a model that check-models rejects. It has cvc5's main up to
+# #13183 only: #13178 removes cvc5_term_get_string_value and cvc5_mk_string_from_wchar, which the
+# Rust bindings (cvc5 0.6.1) call.
 repo=${SQLEQ_CVC5_REPO:-https://github.com/mudathirmahgoub/cvc5.git}
-commit=${SQLEQ_CVC5_COMMIT:-7ac6afe3bb8fec8fce517db9a444262847f78922}
+commit=${SQLEQ_CVC5_COMMIT:-28dd06432d623fd09592c994f2b5218885071647}
 jobs=${SQLEQ_CVC5_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
 for tool in git cmake python3; do

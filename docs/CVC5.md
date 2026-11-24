@@ -268,7 +268,8 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
     too (fixed by cvc5/cvc5#13186): `types/string_order_under_database_default`, which compares
     two strings under a collation, now gets a model;
   - the rewrite `EQ_EMPTY_ARG` of the `bags-algebra` branch, on a `bag.map` of a constant row, as
-    `SELECT DISTINCT 0 ... GROUP BY a` maps every group to.
+    `SELECT DISTINCT 0 ... GROUP BY a` maps every group to. The rule is now a lemma of static
+    learning, for the terms of the input only, so the solver's own lemmas are not rewritten by it.
 * **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
   without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
   duplicate removal or bare sorts of those), an aggregate other than
