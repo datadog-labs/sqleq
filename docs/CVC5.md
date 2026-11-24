@@ -149,8 +149,10 @@ proof. Each table the queries read is a bag of exactly so many symbolic rows, ea
 Each size from 0 to `N` rows a table is tried, the smaller databases first (all empty, then one
 table at 1 row, ...), until one is `sat`. The multiplicities are constants, so cvc5's rewriter
 evaluates the queries over the rows: `GROUP BY .. HAVING COUNT(*) >= 3` over one row of symbolic
-multiplicity times out, and over `(bag r 1)` is `unsat` in 0.03 s. Unlike VeriEQL's lists of
-tuples, a table is still a bag, and the whole encoding above is unchanged.
+multiplicity times out, and over `(bag r 1)` is `unsat` in 0.03 s. The pinned cvc5 also writes out
+the `table.group` and `table.aggr` of such a table (cvc5/cvc5#13196), filtered or not, so GROUP BY
+and aggregates are evaluated over the rows too. Unlike VeriEQL's lists of tuples, a table is still a
+bag, and the whole encoding above is unchanged.
 
 ```sh
 sqleq-check --portfolio --axes sqleq-solver,cvc5,cvc5-bounded,fuzz --cvc5-bound 3 -t 10 pairs/

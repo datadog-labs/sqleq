@@ -41,11 +41,15 @@ esac
 # before it, gives wrong answers. At this commit the keys and NOT NULL columns of tables are lemmas
 # of cvc5's static learning, on by default, and so is the rule EQ_EMPTY_ARG, a map or a bag.setof
 # that is empty when its argument is: as a rewrite, which the bag solver also applied to its own
-# lemmas, it could answer sat with a model that check-models rejects. It has cvc5's main up to
-# #13183 only: #13178 removes cvc5_term_get_string_value and cvc5_mk_string_from_wchar, which the
+# lemmas, it could answer sat with a model that check-models rejects. Its rewriter writes out the
+# table.group and table.aggr of a table of known rows, a union of `(bag x c)` with c constant,
+# where the row a filter keeps, `(bag x (ite p c 0))`, counts too (cvc5/cvc5#13196, and c445480c
+# for the filter): the cvc5-bounded axis's tables are such unions, so GROUP BY and aggregates are
+# evaluated over their rows. It has cvc5's main up
+# to #13183 only: #13178 removes cvc5_term_get_string_value and cvc5_mk_string_from_wchar, which the
 # Rust bindings (cvc5 0.6.1) call.
 repo=${SQLEQ_CVC5_REPO:-https://github.com/mudathirmahgoub/cvc5.git}
-commit=${SQLEQ_CVC5_COMMIT:-28dd06432d623fd09592c994f2b5218885071647}
+commit=${SQLEQ_CVC5_COMMIT:-c445480cf9e6ded3176236fb383f45375dabb769}
 jobs=${SQLEQ_CVC5_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 
 for tool in git cmake python3; do
