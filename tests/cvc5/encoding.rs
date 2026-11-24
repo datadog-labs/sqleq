@@ -8,7 +8,7 @@
 //! refuses, and where the two semantics part.
 
 use serde_json::{json, Value};
-use sqleq::cvc5::{check, smt2, Failure, Options, Outcome, Refusal, Semantics};
+use sqleq::cvc5::{check, check_bounded, smt2, Bounded, Failure, Options, Outcome, Refusal, Semantics};
 use sqleq::ir::{Input, TranslateError};
 
 fn table(name: &str, types: &[&str], nullable: &[bool], key: &[&[usize]]) -> Value {
@@ -157,6 +157,27 @@ fn an_uninterpreted_function_proves_but_only_offers_a_candidate_model() {
     let b = project(scan(0), vec![col(1, "VARCHAR")]);
     match run(Semantics::Bags, t(), a, b) {
         Ok(Outcome::Different { exact: false, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_date_literal_is_the_day_it_names() {
+    // `s(d DATE)`, and a literal read as a DATE, which the frontend spells as the conversion of its
+    // text. An ISO literal is the day it names, so the next day is one more, two spellings of one
+    // day are equal, and a pair that differs on a day has an exact model.
+    let s = vec![table("s", &["DATE"], &[true], &[])];
+    let day = |text: &str| call("q_conv_varchar_date", "DATE", vec![lit(text, "VARCHAR")]);
+    let on = |op: &str, text: &str| filter(scan(0), pred(op, vec![col(0, "DATE"), day(text)]));
+    assert_eq!(run(Semantics::Bags, s.clone(), on(">=", "2019-07-01"), on(">", "2019-06-30")), Ok(Outcome::Equivalent));
+    assert_eq!(run(Semantics::Bags, s.clone(), on("=", "2019-7-5"), on("=", "2019-07-05")), Ok(Outcome::Equivalent));
+    assert!(matches!(
+        run(Semantics::Bags, s.clone(), on("=", "2019-07-05"), on("=", "2019-07-06")),
+        Ok(Outcome::Different { exact: true, .. })
+    ));
+    // Text in any other form stays the uninterpreted conversion: no proof, and no exact model.
+    match run(Semantics::Bags, s, on("=", "July 5, 2019"), on("=", "2019-07-05")) {
+        Ok(Outcome::Different { exact: false, .. }) | Ok(Outcome::Unknown(_)) => {}
         other => panic!("{other:?}"),
     }
 }
@@ -414,4 +435,70 @@ fn negating_an_opaque_value_is_refused_like_any_arithmetic_on_one() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+#[test]
+fn an_aggregate_without_group_by_has_one_row_over_an_empty_table_and_one_by_a_key_none() {
+    // `SELECT 1 FROM (SELECT COUNT(*) FROM t)` has one row whatever t holds, so it is the same
+    // query over another table s; with `GROUP BY b` the two differ when one table is empty.
+    let schemas = vec![
+        table("t", &["INTEGER", "VARCHAR"], &[true, true], &[]),
+        table("s", &["INTEGER", "VARCHAR"], &[true, true], &[]),
+    ];
+    let one = |i: usize, keys: Vec<Value>| {
+        project(group(scan(i), keys, vec![agg("COUNT", "INTEGER", vec![])]), vec![lit("1", "INTEGER")])
+    };
+    for sem in [Semantics::Bags, Semantics::Sets] {
+        assert_eq!(run(sem, schemas.clone(), one(0, vec![]), one(1, vec![])), Ok(Outcome::Equivalent), "{sem:?}");
+        let keyed = run(sem, schemas.clone(), one(0, vec![col(1, "VARCHAR")]), one(1, vec![col(1, "VARCHAR")]));
+        assert!(matches!(keyed, Ok(Outcome::Different { .. }) | Ok(Outcome::Unknown(_))), "{sem:?}: {keyed:?}");
+    }
+}
+
+fn bounded(schemas: Vec<Value>, a: Value, b: Value, bound: u32) -> Result<Bounded, Failure> {
+    let input = Input::parse(&json!({ "schemas": schemas, "queries": [a, b] })).expect("well-formed");
+    check_bounded(&input, &Options { bound: Some(bound), ..opts(Semantics::Bags) })
+}
+
+/// The smallest database comes first: `COUNT(*)` and `COUNT(a)` part on one row with a null `a`,
+/// which the bounded tables find where the unbounded encoding's fold reasoning may not.
+#[test]
+fn bounded_tables_find_the_smallest_model() {
+    let star = group(scan(0), vec![col(1, "VARCHAR")], vec![agg("COUNT", "INTEGER", vec![])]);
+    let of_a = group(scan(0), vec![col(1, "VARCHAR")], vec![agg("COUNT", "INTEGER", vec![col(0, "INTEGER")])]);
+    match bounded(t(), star, of_a, 3) {
+        Ok(Bounded::Different { model, exact: true, rows: 1 }) => {
+            assert_eq!(model.tables[0].rows.len(), 1, "{}", model.summary());
+            assert!(model.tables[0].rows[0].0[0].is_none(), "{}", model.summary());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `SELECT DISTINCT a` and `SELECT a` part only on two rows with one `a`: no model with one row a
+/// table, which is no proof, and a model with two.
+#[test]
+fn a_bounded_table_repeats_a_row_and_no_model_is_no_proof() {
+    let a = project(scan(0), vec![col(0, "INTEGER")]);
+    let distinct = json!({ "distinct": a.clone() });
+    assert_eq!(bounded(t(), a.clone(), distinct.clone(), 1), Ok(Bounded::NoModel { rows: 1 }));
+    match bounded(t(), a, distinct, 2) {
+        Ok(Bounded::Different { model, exact: true, rows: 2 }) => {
+            let rows = &model.tables[0].rows;
+            let n: u64 = rows.iter().map(|(_, m)| m).sum();
+            assert_eq!(n, 2, "{}", model.summary());
+            assert!(rows.len() == 1 || rows[0].0[0] == rows[1].0[0], "one `a` twice: {}", model.summary());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A key holds row by row: two rows of a keyed table differ on the key, so `DISTINCT` over a key
+/// changes nothing up to the bound.
+#[test]
+fn a_bounded_table_keeps_its_key() {
+    let keyed = vec![table("t", &["INTEGER", "VARCHAR"], &[false, true], &[&[0]])];
+    let a = project(scan(0), vec![col(0, "INTEGER")]);
+    let distinct = json!({ "distinct": a.clone() });
+    assert_eq!(bounded(keyed, a, distinct, 3), Ok(Bounded::NoModel { rows: 3 }));
 }

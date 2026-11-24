@@ -68,11 +68,14 @@ pub fn observe(case: &Case, axes: &[&str]) -> HashMap<String, (String, String)> 
             }
         }
     }
-    if axes.contains(&"cvc5") {
-        if no_plan {
-            put("cvc5", "no-plan", "");
-        } else {
-            put("cvc5", case.c_bucket.as_deref().unwrap_or(crate::check::axes::cvc5::MISSING), &case.c_note);
+    for (axis, bounded) in [("cvc5", false), ("cvc5-bounded", true)] {
+        if axes.contains(&axis) {
+            if no_plan {
+                put(axis, "no-plan", "");
+            } else {
+                let note = if bounded { &case.b_note } else { &case.c_note };
+                put(axis, case.cvc5_bucket(bounded).unwrap_or(crate::check::axes::cvc5::MISSING), note);
+            }
         }
     }
     if axes.contains(&"fuzz") {

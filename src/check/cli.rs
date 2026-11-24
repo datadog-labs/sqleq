@@ -203,7 +203,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Expect::Equivalent)]
     pub expect: Expect,
 
-    /// Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, cvc5, lean
+    /// Comma-separated axes to run: frontend, fuzz, qed, sqleq-solver, sqlsolver-jvm, cvc5,
+    /// cvc5-bounded, lean
     /// (default: frontend,sqleq-solver). A prover axis brings in frontend; at most one SQLSolver
     /// per run. sqlsolver-rust is the old name of sqleq-solver.
     #[arg(long, value_name = "LIST")]
@@ -318,9 +319,21 @@ pub struct Args {
 
     /// Per-case cap for the cvc5 axis, in ms (default: --timeout): cvc5's own time limit on its
     /// check, with the process killed at the case's deadline as the backstop. Under --portfolio it
-    /// is also capped by what is left of the case's deadline.
+    /// is also capped by what is left of the case's deadline. It caps cvc5-bounded too.
     #[arg(long, value_name = "MS")]
     pub cvc5_timeout: Option<u64>,
+
+    /// Also ask cvc5 for a small database on which the two queries differ: sqleq-cvc5 --bound,
+    /// every table a bag of at most --cvc5-bound symbolic rows, tried from 1 row up. Its `model`
+    /// is the cvc5 axis's, a refutation of the plan; `no-model` (none that small) is no proof. It
+    /// shares --cvc5-bin, --cvc5-opt, --cvc5-timeout and --cvc5-mem-gib, and always encodes under
+    /// bags. The same as adding `cvc5-bounded` to --axes. See docs/CVC5.md.
+    #[arg(long)]
+    pub cvc5_bounded: bool,
+
+    /// The most rows a table holds under cvc5-bounded.
+    #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+    pub cvc5_bound: u32,
 
     /// Also run the Lean axis (sqleq-lean) over the .sql cases and corpus rows: INSERT ... VALUES
     /// vs INSERT ... SELECT * FROM unnest(..) pairs, proved under the gather rule. The same as
@@ -391,6 +404,9 @@ pub fn resolve_axes(args: &Args) -> Result<Vec<&'static str>, String> {
     }
     if args.cvc5 {
         axes.push("cvc5".into());
+    }
+    if args.cvc5_bounded {
+        axes.push("cvc5-bounded".into());
     }
     if args.lean {
         axes.push("lean".into());
@@ -479,6 +495,8 @@ mod tests {
         assert_eq!(axes(&["--cvc5"]).unwrap(), ["frontend", "sqleq-solver", "cvc5"]);
         assert_eq!(axes(&["--axes", "cvc5"]).unwrap(), ["frontend", "cvc5"], "a prover brings in the frontend");
         assert_eq!(axes(&["--axes", "cvc5,sqleq-solver"]).unwrap(), ["frontend", "sqleq-solver", "cvc5"]);
+        assert_eq!(axes(&["--cvc5-bounded"]).unwrap(), ["frontend", "sqleq-solver", "cvc5-bounded"]);
+        assert_eq!(axes(&["--axes", "cvc5-bounded"]).unwrap(), ["frontend", "cvc5-bounded"], "it reads the plan too");
     }
 
     #[test]

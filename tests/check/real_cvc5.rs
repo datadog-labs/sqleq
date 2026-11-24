@@ -30,7 +30,7 @@ fn sqleq_cvc5() -> Option<Cvc5Driver> {
         None => ["release", "debug"].iter().map(|p| repo().join("target").join(p).join("sqleq-cvc5")).find(|b| is_exe(b))?,
     };
     let bin = bin.canonicalize().unwrap().to_string_lossy().into_owned();
-    Some(Cvc5Driver { bin, semantics: "bags".into(), options: Vec::new(), mem_bytes: None })
+    Some(Cvc5Driver { bin, semantics: "bags".into(), options: Vec::new(), mem_bytes: None, bound: None })
 }
 
 #[test]
@@ -76,4 +76,40 @@ fn rows_are_bucketed() {
     assert_eq!(stats.rows, 4);
     assert!(cases[2].c_note.starts_with("t=["), "{}", cases[2].c_note);
     assert_eq!(cases[3].c_note, "unsupported-sort");
+}
+
+/// The bounded driver over the same jobs, into the cvc5-bounded axis's fields: a model where the
+/// plans differ, `no-model` where no small database tells them apart (the sorted scan, which is the
+/// same bag), and the cvc5 axis's fields left alone.
+#[test]
+fn bounded_rows_are_bucketed_into_their_own_fields() {
+    let Some(mut driver) = sqleq_cvc5() else {
+        eprintln!("skipped: sqleq-cvc5 is not built (set $SQLEQ_CVC5_BIN to require it)");
+        return;
+    };
+    driver.bound = Some(2);
+    let dir = TempDir::new("sqleq-cvc5-bounded-test-").unwrap();
+    let d = dir.path();
+    let schema = json!([{"name": "t", "types": ["INTEGER"], "key": [], "nullable": [true]}]);
+    let scan = json!({"scan": 0});
+    let one = json!({"operator": "1", "operand": [], "type": "INTEGER"});
+    let col = json!({"column": 0, "type": "INTEGER"});
+    let filtered = json!({"filter": {"source": scan, "condition": {"operator": "=", "type": "BOOLEAN", "operand": [col, one]}}});
+    let sorted = json!({"sort": {"source": scan, "collation": [[0, "INTEGER", "ASCENDING NULLS LAST"]]}});
+    let mut cases = Vec::new();
+    for (name, ir) in [
+        ("same", json!({"schemas": schema, "queries": [scan, scan]})),
+        ("sorted", json!({"schemas": schema, "queries": [scan, sorted]})),
+        ("differs", json!({"schemas": schema, "queries": [scan, filtered]})),
+    ] {
+        let plan = d.join(format!("{name}.json"));
+        std::fs::write(&plan, ir.to_string()).unwrap();
+        cvc5::write_job(name, &plan, &d.join(format!("{}.job.jsonl", ss_slug(name)))).unwrap();
+        cases.push(Case::new(name, name));
+    }
+    run_cvc5(&mut cases, d, &driver, 2, Some(20_000), 30.0, &|_| {});
+    let got: Vec<(&str, &str)> = cases.iter().map(|c| (c.name.as_str(), c.b_bucket.as_deref().unwrap_or("-"))).collect();
+    assert_eq!(got, [("same", cvc5::PROVED_LITERAL), ("sorted", cvc5::NO_MODEL), ("differs", cvc5::MODEL)]);
+    assert_eq!(cases[1].b_note, "none with at most 2 rows a table");
+    assert!(cases.iter().all(|c| c.c_bucket.is_none()));
 }

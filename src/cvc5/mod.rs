@@ -26,4 +26,4 @@
 
 pub mod translate;
 
-pub use translate::{check, smt2, Failure, Model, Options, Outcome, Refusal, Semantics};
+pub use translate::{check, check_bounded, smt2, Bounded, Failure, Model, Options, Outcome, Refusal, Semantics};

@@ -44,9 +44,10 @@ pub const NOT_EQUIVALENT: &str = "not-equivalent";
 pub const TRUTHS: [&str; 2] = [EQUIVALENT, NOT_EQUIVALENT];
 
 /// Canonical order: the order `--bless` inserts missing lines in, and the table's column order.
-pub const AXES: [&str; 7] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "cvc5", "lean"];
-/// The axes handed the frontend's plan, so asking one asks the frontend.
-pub const PROVERS: [&str; 4] = ["qed", "sqleq-solver", "sqlsolver-jvm", "cvc5"];
+pub const AXES: [&str; 8] = ["frontend", "fuzz", "qed", "sqleq-solver", "sqlsolver-jvm", "cvc5", "cvc5-bounded", "lean"];
+/// The axes handed the frontend's plan, so asking one asks the frontend. cvc5-bounded proves
+/// nothing, but it reads the plan as the provers do.
+pub const PROVERS: [&str; 5] = ["qed", "sqleq-solver", "sqlsolver-jvm", "cvc5", "cvc5-bounded"];
 
 /// An axis name as [`AXES`] spells it. `sqlsolver-rust` is sqleq-solver's axis from before the
 /// rename, still read wherever an axis is named -- `--axes` and `expect` lines -- so a pin or a
@@ -135,6 +136,10 @@ pub fn words(axis: &str) -> &'static [&'static str] {
         // The pins are bags answers: `--expect pinned` refuses `--cvc5-semantics sets`, whose
         // `proved-sets` and `model-sets` are about an approximation and so are no pin's words.
         "cvc5" => &["proved", "proved-literal", "model", "no-proof", "unsupported", "no-plan", "error"],
+        // cvc5 under `--bound`: `model` as above, found with at most the bound's rows a table, and
+        // `no-model` when there is none that small, which is no proof. Its only proof is a literal
+        // one, the two plans being one.
+        "cvc5-bounded" => &["proved-literal", "model", "no-model", "unknown", "unsupported", "no-plan", "error"],
         // `no-witness` is a kernel proof too, only possibly vacuous, so it is a claim of
         // equivalence.
         "lean" => &[
@@ -163,6 +168,7 @@ pub fn claims_equivalent(axis: &str, binding: &str) -> &'static [&'static str] {
     }
     match axis {
         "qed" | "sqleq-solver" | "sqlsolver-jvm" | "cvc5" => &PROVED_WORDS,
+        "cvc5-bounded" => &["proved-literal"],
         "frontend" => &FRONTEND_SAME,
         "lean" => &["proved-gather", "no-witness"],
         _ => &[],
@@ -192,13 +198,13 @@ pub fn evidence_equivalent(axis: &str, binding: &str) -> &'static [&'static str]
 
 /// The answers that claim the opposite of equivalence under `binding`: a counterexample found
 /// with `$N` bound alike on both sides, or one found with the `unnest` side's arrays gathered from
-/// the `VALUES` side's values; and under the plan's own reading ([`IR`]) cvc5's `model`, a
-/// database on which its two encodings of the plan differ.
+/// the `VALUES` side's values; and under the plan's own reading ([`IR`]) a `model` of either cvc5
+/// axis, a database on which its two encodings of the plan differ.
 pub fn refutes(axis: &str, binding: &str) -> &'static [&'static str] {
     match (axis, binding) {
         ("fuzz", INDEX) => &["counterexample"],
         ("fuzz", GATHER) => &["counterexample-gather"],
-        ("cvc5", IR) => &["model"],
+        ("cvc5" | "cvc5-bounded", IR) => &["model"],
         _ => &[],
     }
 }

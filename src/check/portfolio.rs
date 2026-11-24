@@ -6,8 +6,8 @@
 //! Portfolio solving: every backend at once on each case, under one deadline, and one verdict.
 //!
 //! `--portfolio` starts sqleq-fuzz and Lean on a case the moment it is picked up, beside the
-//! frontend, and the QED prover, sqleq-solver and cvc5 as soon as the frontend has lowered and
-//! packaged the pair. Every one of them gets whatever is left of the case's `--timeout`, and what is still
+//! frontend, and the QED prover, sqleq-solver, cvc5 and cvc5-bounded as soon as the frontend has
+//! lowered and packaged the pair. Every one of them gets whatever is left of the case's `--timeout`, and what is still
 //! running when it passes is killed with its process group. No backend is stopped because another
 //! answered: a proof and a counterexample on the same pair is a soundness alarm in one of them, and
 //! a run that stopped at the first answer could not see it.
@@ -128,9 +128,10 @@ pub fn verdict(observed: &HashMap<String, (String, String)>) -> (&'static str, V
             return (v, evidence, pending);
         }
     }
-    // A cvc5 timeout alone leaves the case undecided rather than timed out: the axis decides
-    // nothing, so more time for it could only ever find an alarm, which is no reason to retry.
-    let deciding = pending.iter().any(|a| a != "cvc5");
+    // A cvc5 timeout alone leaves the case undecided rather than timed out: neither cvc5 axis
+    // decides anything, so more time for one could only ever find an alarm, which is no reason to
+    // retry.
+    let deciding = pending.iter().any(|a| a != "cvc5" && a != "cvc5-bounded");
     (if deciding { TIMEOUT } else { UNDECIDED }, Vec::new(), pending)
 }
 
@@ -151,8 +152,10 @@ pub struct Ctx<'a> {
     /// `--sqleq-solver-timeout`: a cap within the deadline, when one was given.
     pub ss_cap_ms: Option<u64>,
     pub cvc5: Option<&'a Cvc5Driver>,
-    /// `--cvc5-timeout`, likewise.
+    /// `--cvc5-timeout`, likewise; it caps cvc5-bounded too.
     pub cvc5_cap_ms: Option<u64>,
+    /// `--cvc5-bounded`: sqleq-cvc5 under `--bound`.
+    pub cvc5_bounded: Option<&'a Cvc5Driver>,
     pub fuzz: Option<&'a str>,
     pub lean: Option<&'a str>,
     pub timeout: f64,
@@ -339,19 +342,28 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                             s.spawn(move || (ss_one(d, &name, &job, &out, ctx.ss_cap_ms, ctx.ss_mem, deadline), since(t0)))
                         })
                     });
-                    // The cvc5 axis's job: the plan under the case's name, in the case's directory.
-                    let cv = ctx.cvc5.and_then(|d| {
-                        let job = workdir.join("cvc5.job.jsonl");
-                        let out = workdir.join("cvc5.results.jsonl");
+                    // The cvc5 axes' job: the plan under the case's name, in the case's directory,
+                    // one for both, each writing its row to a file of its own.
+                    let job = workdir.join("cvc5.job.jsonl");
+                    let drivers: Vec<&Cvc5Driver> = [ctx.cvc5, ctx.cvc5_bounded].into_iter().flatten().collect();
+                    if !drivers.is_empty() {
                         if let Err(e) = cvc5::write_job(name, &workdir.join(&json), &job) {
-                            case.c_bucket = Some(cvc5::ERROR.into());
-                            case.c_note = format!("could not write the cvc5 job: {e}");
+                            for d in &drivers {
+                                let slot = case.cvc5_slot(d.bound.is_some());
+                                *slot.bucket = Some(cvc5::ERROR.into());
+                                *slot.note = format!("could not write the cvc5 job: {e}");
+                            }
                         }
-                        case.c_bucket.is_none().then(|| {
-                            let name = name.to_string();
-                            s.spawn(move || (cvc5::cvc5_one(d, &name, &job, &out, ctx.cvc5_cap_ms, left(deadline)), since(t0)))
+                    }
+                    let cv: Vec<_> = drivers
+                        .into_iter()
+                        .filter(|d| case.cvc5_bucket(d.bound.is_some()).is_none())
+                        .map(|d| {
+                            let (name, job) = (name.to_string(), job.clone());
+                            let out = cvc5::results_path(&workdir, &name, d);
+                            (d, s.spawn(move || (cvc5::cvc5_one(d, &name, &job, &out, ctx.cvc5_cap_ms, left(deadline)), since(t0))))
                         })
-                    });
+                        .collect();
                     match ctx.prover {
                         Some(p) => {
                             if left(deadline) > 0.0 {
@@ -364,10 +376,10 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                         }
                         None => case.status = LOWERED.into(),
                     }
-                    if let Some(h) = cv {
+                    for (d, h) in cv {
                         if let Ok((answer, t)) = h.join() {
-                            cvc5::settle(&mut case, answer, ctx.cvc5.is_some_and(|d| d.sets()));
-                            done.insert("cvc5".into(), t);
+                            cvc5::settle(&mut case, answer, d);
+                            done.insert(if d.bound.is_some() { "cvc5-bounded" } else { "cvc5" }.into(), t);
                         }
                     }
                     if let Some(h) = ss {
@@ -494,6 +506,15 @@ mod tests {
             // cvc5 out of time alone is no reason to call the case timed out, and retry it.
             ("cvc5 timed out", vec![("qed", "no-proof"), ("cvc5", "timeout"), ("fuzz", "no-counterexample")], UNDECIDED),
             ("qed timed out beside cvc5", vec![("qed", "timeout"), ("cvc5", "timeout"), ("fuzz", "no-counterexample")], TIMEOUT),
+            // cvc5-bounded's model is cvc5's: an alarm against a proof, nothing alone. Its
+            // `no-model` claims nothing, and its timeout is no reason to retry either.
+            ("a bounded model", vec![("qed", "no-proof"), ("cvc5-bounded", "model"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("a proof and a bounded model", vec![("sqleq-solver", "proved"), ("cvc5-bounded", "model")], ALARM),
+            ("a cvc5 proof and a bounded model", vec![("cvc5", "proved"), ("cvc5-bounded", "model")], ALARM),
+            ("no bounded model", vec![("qed", "no-proof"), ("cvc5-bounded", "no-model"), ("fuzz", "no-counterexample")], UNDECIDED),
+            ("no bounded model and a counterexample", vec![("cvc5-bounded", "no-model"), ("fuzz", "counterexample")], NOT_EQUIVALENT),
+            ("a bounded literal proof", vec![("cvc5-bounded", "proved-literal"), ("fuzz", "counterexample")], ALARM),
+            ("cvc5-bounded timed out", vec![("qed", "no-proof"), ("cvc5-bounded", "timeout"), ("cvc5", "timeout")], UNDECIDED),
         ];
         for (label, observed, want) in rows {
             assert_eq!(v(&observed).0, want, "{label}");

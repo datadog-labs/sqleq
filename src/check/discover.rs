@@ -196,12 +196,15 @@ pub struct Cvc5Driver {
     pub options: Vec<String>,
     /// `--cvc5-mem-gib`: the address space each sqleq-cvc5 process is capped at, if any.
     pub mem_bytes: Option<u64>,
+    /// The cvc5-bounded axis's driver: the most rows a table holds (`--bound`).
+    pub bound: Option<u32>,
 }
 
 impl Cvc5Driver {
     /// The command up to the driver's positional arguments.
     pub fn cmd(&self) -> Vec<String> {
         let mut cmd = vec![self.bin.clone(), format!("--semantics={}", self.semantics)];
+        cmd.extend(self.bound.map(|n| format!("--bound={n}")));
         cmd.extend(self.options.iter().map(|o| format!("--opt={o}")));
         cmd
     }
@@ -214,11 +217,10 @@ impl Cvc5Driver {
     /// What the header line and the report call this configuration: `sqleq-cvc5 (bags)`, with the
     /// options when there are any.
     pub fn describe(&self) -> String {
-        if self.options.is_empty() {
-            format!("sqleq-cvc5 ({})", self.semantics)
-        } else {
-            format!("sqleq-cvc5 ({}, {})", self.semantics, self.options.join(" "))
-        }
+        let mut what = vec![self.semantics.clone()];
+        what.extend(self.bound.map(|n| format!("at most {n} row{} a table", if n == 1 { "" } else { "s" })));
+        what.extend((!self.options.is_empty()).then(|| self.options.join(" ")));
+        format!("sqleq-cvc5 ({})", what.join(", "))
     }
 }
 
@@ -241,7 +243,7 @@ pub fn discover_cvc5(flag: Option<&str>, bin_dir: Option<&str>, semantics: &str,
     if let Some(bad) = options.iter().find(|o| !o.contains('=') || o.starts_with('=')) {
         return Err(format!("error: --cvc5-opt takes NAME=VALUE, not `{bad}`"));
     }
-    Ok(Cvc5Driver { bin, semantics: semantics.to_string(), options: options.to_vec(), mem_bytes: None })
+    Ok(Cvc5Driver { bin, semantics: semantics.to_string(), options: options.to_vec(), mem_bytes: None, bound: None })
 }
 
 /// The JVM driver (`tools/sqlsolver/IrDriver.java`) over the de-Calcited fork: the original

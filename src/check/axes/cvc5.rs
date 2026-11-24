@@ -20,6 +20,13 @@
 //! (`suite::IR`), where every prover's proof also claims: a model and a proof over one plan are an
 //! alarm, and a model alone decides no verdict.
 //!
+//! The **cvc5-bounded** axis asks the same driver under `--bound=N` (`--cvc5-bounded`): every
+//! table holds at most `k` rows, for `k` from 1 to `N`, and the first `sat` is its `model`, a
+//! database that small -- under the encoding's readings, like the cvc5 axis's model, and so the same
+//! refutation of the plan. `unsat` up to `N` is `no-model`, which is no proof: a pair may differ
+//! only on a bigger database. It is a model finder beside the prover, as sqleq-fuzz is beside
+//! sqleq-solver, but over bags of symbolic rows rather than executed trials.
+//!
 //! The driver is cheap to start and stops on its own at cvc5's time limit, so the axis runs one
 //! process per case, in parallel like sqleq-fuzz, with the case's deadline as the backstop: cvc5
 //! does not always notice its limit inside a long rewrite, and a process can be killed where a
@@ -60,6 +67,13 @@ pub const ERROR: &str = "error";
 pub const MISSING: &str = "missing";
 pub const ORDER: [&str; 10] =
     [PROVED, PROVED_LITERAL, MODEL, PROVED_SETS, MODEL_SETS, NO_PROOF, UNSUPPORTED, TIMEOUT, ERROR, MISSING];
+/// cvc5-bounded: no database with at most the bound's rows in each table tells the two encodings
+/// apart. Not a proof.
+pub const NO_MODEL: &str = "no-model";
+/// cvc5-bounded: `unknown` before the bound was reached, a candidate model under uninterpreted
+/// symbols, or rows the encoding cannot compare.
+pub const UNKNOWN: &str = "unknown";
+pub const BOUNDED_ORDER: [&str; 8] = [PROVED_LITERAL, MODEL, NO_MODEL, UNKNOWN, UNSUPPORTED, TIMEOUT, ERROR, MISSING];
 
 /// The driver's raw verdicts, bucketed. `NEQ` is a `model` only with an exact model: one found
 /// with no uninterpreted symbol in the problem, so that it is a database and nothing more. A model
@@ -91,6 +105,56 @@ pub fn answered(path: &Path) -> std::collections::HashMap<String, Value> {
         }
     }
     out
+}
+
+/// A cvc5-bounded row's bucket: `BOUNDED` is `no-model`, and `EQ` only a literal proof, the two
+/// plans being one; any other `EQ` is a driver that did not bound the tables, an error.
+fn bounded_bucket_of(rec: &Value) -> &'static str {
+    let exact = rec.get("model_exact").is_none_or(crate::check::util::truthy);
+    let literal = rec.get("literal").is_some_and(crate::check::util::truthy);
+    match rec.get("verdict").and_then(Value::as_str).unwrap_or("") {
+        "EQ" if literal => PROVED_LITERAL,
+        "NEQ" if rec.get("model").is_some() && exact => MODEL,
+        "BOUNDED" => NO_MODEL,
+        "NEQ" | "UNKNOWN" => UNKNOWN,
+        "NOTRANS" | "NOIR" => UNSUPPORTED,
+        "TIMEOUT" | "HANG" => TIMEOUT,
+        _ => ERROR,
+    }
+}
+
+/// One cvc5-bounded row, bucketed onto its case.
+pub fn attach_bounded(case: &mut Case, rec: &Value) {
+    let slot = case.cvc5_slot(true);
+    *slot.raw = Some(rec.clone());
+    *slot.verdict = rec.get("verdict").and_then(Value::as_str).map(str::to_string);
+    *slot.ms = rec.get("ms").cloned();
+    let mut bucket = bounded_bucket_of(rec);
+    if rec.get("killed").is_some_and(crate::check::util::truthy) && !matches!(bucket, PROVED_LITERAL | MODEL | NO_MODEL) {
+        bucket = TIMEOUT;
+    }
+    let text = |k: &str| rec.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let bound = rec.get("bound").and_then(Value::as_u64);
+    let rows = |n: u64| if n == 1 { "1 row".to_string() } else { format!("{n} rows") };
+    *slot.note = match bucket {
+        MODEL => text("counterexample").unwrap_or_default(),
+        NO_MODEL => format!("none with at most {} a table", rows(bound.unwrap_or(0))),
+        UNKNOWN if rec.get("model").is_some() => {
+            format!("candidate model, under uninterpreted symbols: {}", text("counterexample").unwrap_or_default())
+        }
+        UNKNOWN | TIMEOUT => {
+            let why = text("incomparable").or_else(|| text("unknown")).unwrap_or_default();
+            match bound.filter(|n| *n > 0) {
+                Some(n) => format!("{why}, after none with at most {} a table", rows(n)).trim_start_matches(", ").to_string(),
+                None => why,
+            }
+        }
+        UNSUPPORTED => text("refused").unwrap_or_default(),
+        PROVED_LITERAL => String::new(),
+        _ if rec.get("verdict").and_then(Value::as_str) == Some("EQ") => "the driver proved: it was not run with --bound".into(),
+        _ => text("error").or_else(|| text("refused")).map(|s| tail(&s)).unwrap_or_default(),
+    };
+    *slot.bucket = Some(bucket.to_string());
 }
 
 /// One answered row, bucketed onto its case, the driver having been asked to encode under set
@@ -188,19 +252,31 @@ pub fn cvc5_one(driver: &Cvc5Driver, name: &str, job: &Path, out: &Path, cap_ms:
     Answer::Failed(if why.is_empty() { format!("sqleq-cvc5 exit {}", r.rc) } else { why })
 }
 
-/// An answer onto its case, from a driver asked under set semantics (`sets`) or bags.
-pub fn settle(case: &mut Case, answer: Answer, sets: bool) {
+/// An answer onto its case, into the fields of the axis `driver` is: cvc5-bounded's when it
+/// bounds the tables.
+pub fn settle(case: &mut Case, answer: Answer, driver: &Cvc5Driver) {
+    let bounded = driver.bound.is_some();
     match answer {
-        Answer::Row(row) => attach(case, &row, sets),
+        Answer::Row(row) if bounded => attach_bounded(case, &row),
+        Answer::Row(row) => attach(case, &row, driver.sets()),
         Answer::CutOff => {
-            case.c_bucket = Some(TIMEOUT.into());
-            case.c_note = "still running at the deadline".into();
+            let slot = case.cvc5_slot(bounded);
+            *slot.bucket = Some(TIMEOUT.into());
+            *slot.note = "still running at the deadline".into();
         }
         Answer::Failed(why) => {
-            case.c_bucket = Some(ERROR.into());
-            case.c_note = why;
+            let slot = case.cvc5_slot(bounded);
+            *slot.bucket = Some(ERROR.into());
+            *slot.note = why;
         }
     }
+}
+
+/// The file a driver writes its row for a case to, in `dir`: the two cvc5 axes read one job, and
+/// each writes a file of its own.
+pub fn results_path(dir: &Path, name: &str, driver: &Cvc5Driver) -> std::path::PathBuf {
+    let slug = ss_slug(name);
+    dir.join(if driver.bound.is_some() { format!("{slug}.bounded.jsonl") } else { format!("{slug}.results.jsonl") })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -211,8 +287,9 @@ pub struct Stats {
 }
 
 /// Ask cvc5 about every case whose plan was packaged in `dir`, `jobs` at a time, each within
-/// `timeout_s`, and attach the answers in place, calling `done` on each case as its answer lands.
-/// A case with no job -- refused, or not lowered -- is `unsupported`, with the frontend's reason.
+/// `timeout_s`, and attach the answers in place -- into the fields of the axis `driver` is --
+/// calling `done` on each case as its answer lands. A case with no job -- refused, or not lowered --
+/// is `unsupported`, with the frontend's reason.
 pub fn run_cvc5(
     cases: &mut [Case],
     dir: &Path,
@@ -223,15 +300,18 @@ pub fn run_cvc5(
     done: &(dyn Fn(&Case) + Sync),
 ) -> Stats {
     let t0 = Instant::now();
+    let bounded = driver.bound.is_some();
     for case in cases.iter_mut() {
         let job = dir.join(format!("{}.job.jsonl", ss_slug(&case.name)));
-        if !job.exists() && case.c_bucket.is_none() {
-            case.c_bucket = Some(UNSUPPORTED.into());
+        if !job.exists() && case.cvc5_bucket(bounded).is_none() {
             let why = tail(&case.message);
-            case.c_note = if why.is_empty() { "no plan to encode".into() } else { why };
+            let slot = case.cvc5_slot(bounded);
+            *slot.bucket = Some(UNSUPPORTED.into());
+            *slot.note = if why.is_empty() { "no plan to encode".into() } else { why };
         }
     }
-    let todo: Vec<Mutex<&mut Case>> = cases.iter_mut().filter(|c| c.c_bucket.is_none()).map(Mutex::new).collect();
+    let todo: Vec<Mutex<&mut Case>> =
+        cases.iter_mut().filter(|c| c.cvc5_bucket(bounded).is_none()).map(Mutex::new).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..jobs.max(1).min(todo.len().max(1)) {
@@ -239,11 +319,10 @@ pub fn run_cvc5(
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 let Some(slot) = todo.get(k) else { break };
                 let mut c = slot.lock().unwrap_or_else(|e| e.into_inner());
-                let slug = ss_slug(&c.name);
-                let job = dir.join(format!("{slug}.job.jsonl"));
-                let out = dir.join(format!("{slug}.results.jsonl"));
+                let job = dir.join(format!("{}.job.jsonl", ss_slug(&c.name)));
+                let out = results_path(dir, &c.name, driver);
                 let a = cvc5_one(driver, &c.name, &job, &out, cap_ms, timeout_s);
-                settle(&mut c, a, driver.sets());
+                settle(&mut c, a, driver);
                 done(&c);
             });
         }
@@ -302,6 +381,35 @@ mod tests {
             let mut c = Case::new("x", "x");
             attach(&mut c, &rec, sets);
             assert_eq!(c.c_bucket.as_deref(), Some(want), "{rec} sets={sets}");
+        }
+    }
+
+    /// Under `--bound` only a model refutes; `BOUNDED` is `no-model`, which claims nothing, and an
+    /// `EQ` is a proof only when the two plans are one.
+    #[test]
+    fn bounded_rows_bucket_into_their_own_fields() {
+        let rows = [
+            (json!({"verdict": "NEQ", "model": {"tables": []}, "model_exact": true, "counterexample": "t=[(1)]", "bound": 1}), MODEL, "t=[(1)]"),
+            (json!({"verdict": "BOUNDED", "bound": 3}), NO_MODEL, "none with at most 3 rows a table"),
+            (json!({"verdict": "BOUNDED", "bound": 1}), NO_MODEL, "none with at most 1 row a table"),
+            (json!({"verdict": "UNKNOWN", "unknown": "TIMEOUT", "bound": 2}), UNKNOWN, "TIMEOUT, after none with at most 2 rows a table"),
+            (json!({"verdict": "UNKNOWN", "unknown": "TIMEOUT", "bound": 0}), UNKNOWN, "TIMEOUT"),
+            (json!({"verdict": "UNKNOWN", "killed": true, "bound": 1}), TIMEOUT, "after none with at most 1 row a table"),
+            (
+                json!({"verdict": "NEQ", "model": {"tables": []}, "model_exact": false, "counterexample": "t=[(1)]"}),
+                UNKNOWN,
+                "candidate model, under uninterpreted symbols: t=[(1)]",
+            ),
+            (json!({"verdict": "EQ", "literal": true}), PROVED_LITERAL, ""),
+            (json!({"verdict": "EQ"}), ERROR, "the driver proved: it was not run with --bound"),
+            (json!({"verdict": "NOTRANS", "refused": "correlated"}), UNSUPPORTED, "correlated"),
+        ];
+        for (rec, want, note) in rows {
+            let mut c = Case::new("x", "x");
+            attach_bounded(&mut c, &rec);
+            assert_eq!(c.b_bucket.as_deref(), Some(want), "{rec}");
+            assert_eq!(c.b_note, note, "{rec}");
+            assert!(c.c_bucket.is_none(), "{rec}: the cvc5 axis's fields are left alone");
         }
     }
 

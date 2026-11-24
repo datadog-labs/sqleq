@@ -37,10 +37,10 @@ bindings need `libclang` to generate their FFI.
 The axis is written against the `bags-algebra` branch of cvc5
 ([mudathirmahgoub/cvc5#27](https://github.com/mudathirmahgoub/cvc5/pull/27)), whose bag reasoning it
 exercises: normal forms for the relational terms the encoding builds, the keys and `NOT NULL`
-columns of the tables read off their constraints (a preprocessing pass, `bags-facts`), and lemmas
-for folds, maps and disequalities. No cvc5 release has it yet, so one script fetches that branch at
-a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the axis against
-it:
+columns of the tables read off their constraints (lemmas of cvc5's static learning, on by
+default), and lemmas for folds, maps and disequalities. No cvc5 release has it yet, so one script
+fetches that branch at a pinned commit, builds it, installs it under `target/cvc5/install`, and
+builds the axis against it:
 
 ```sh
 sh tools/build_cvc5.sh            # once; then, like the other features:
@@ -55,7 +55,10 @@ A second run with the same commit only rebuilds the axis. `.cargo/config.toml` p
 `CVC5_LIB_DIR` at the install, so cargo needs no environment; to build against a cvc5 of your own,
 set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../include` or
 `$CVC5_INCLUDE_DIR`), or `SQLEQ_CVC5_REPO` and `SQLEQ_CVC5_COMMIT` to have the script build another
-commit. Any cvc5 from 1.4.0 on runs the encoding, but proves far fewer pairs without the branch.
+commit. The cvc5 must have cvc5/cvc5#13151 (in `main` since 2026-11-14): before it, the aggregate of
+an empty table had one row of initial values where SQL's `GROUP BY` has none, and this encoding
+relies on its having none. So the pinned commit is on `bags-algebra-partition`, which is
+`bags-algebra` merged with `main`. It proves far fewer pairs without the branch.
 The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.
@@ -128,6 +131,45 @@ is `src/main.rs`'s module doc.
 | `timeout` | `HANG`, or anything but a claim cut off at the cap | |
 | `error` | `ERROR`, or the driver died | A cvc5 call failed, or cvc5 aborted: a model that failed its own check ends the process, which is recorded here rather than as a `model`. |
 
+## The cvc5-bounded axis: small databases
+
+`--cvc5-bounded` asks the same binary, under `--bound=N`, for a **small database** instead of a
+proof. Each table the queries read is a bag of exactly so many symbolic rows, each row once:
+
+```smt2
+; emp with 2 rows; equal rows are a repeated row
+(declare-const emp__r1 (Tuple (Nullable Int) (Nullable String)))
+(declare-const emp__r2 (Tuple (Nullable Int) (Nullable String)))
+(bag.union_disjoint (bag emp__r1 1) (bag emp__r2 1))   ; stands for the table emp
+(assert (nullable.is_some ((_ tuple.select 0) emp__r1)))   ; column 0 is NOT NULL
+(assert (and (nullable.is_some ((_ tuple.select 0) emp__r2))
+             (not (= ((_ tuple.project 0) emp__r2) ((_ tuple.project 0) emp__r1)))))   ; and a key
+```
+
+Each size from 0 to `N` rows a table is tried, the smaller databases first (all empty, then one
+table at 1 row, ...), until one is `sat`. The multiplicities are constants, so cvc5's rewriter
+evaluates the queries over the rows: `GROUP BY .. HAVING COUNT(*) >= 3` over one row of symbolic
+multiplicity times out, and over `(bag r 1)` is `unsat` in 0.03 s. The pinned cvc5 also writes out
+the `table.group` and `table.aggr` of such a table (cvc5/cvc5#13196), filtered or not, so GROUP BY
+and aggregates are evaluated over the rows too. Unlike VeriEQL's lists of tuples, a table is still a
+bag, and the whole encoding above is unchanged.
+
+```sh
+sqleq-check --portfolio --axes sqleq-solver,cvc5,cvc5-bounded,fuzz --cvc5-bound 3 -t 10 pairs/
+```
+
+| bucket | the driver said | meaning |
+|---|---|---|
+| `model` | `NEQ` with an exact model | As the cvc5 axis's `model`, with at most `N` rows a table: the same refutation of the plan, an alarm against a proof over it. |
+| `no-model` | `BOUNDED` | No database of at most `N` rows a table tells the two encodings apart. **Not a proof**: a pair may differ only on more rows. |
+| `unknown` | `UNKNOWN`; `NEQ` under uninterpreted symbols or with no model | cvc5 gave up on some size (the note says up to which size every database was `unsat`), or a candidate model, or rows the encoding cannot compare. |
+| `proved-literal` | `EQ`, `literal` | The two plans are one. |
+
+`unsupported`, `timeout` and `error` are the cvc5 axis's. The axis shares `--cvc5-bin`,
+`--cvc5-opt`, `--cvc5-timeout` and `--cvc5-mem-gib` with it, always encodes under bags, and reads
+the same job: under `--portfolio` both run beside the other backends on each case. Like the cvc5
+axis it decides no verdict alone: a pair only it refutes is `undecided`.
+
 ## The encoding
 
 A table is a constant of sort `(Bag (Tuple (Nullable T1) ... (Nullable Tn)))` -- `(Set ...)` under
@@ -152,7 +194,7 @@ Each relational operator is one term over its inputs:
 | `intersectAll`, `exceptAll` | `bag.inter_min`, `bag.difference_subtract` | refused: multiplicities, which a set has not got |
 | `union` (always `UNION ALL`) | `bag.union_disjoint` | `set.union` |
 | `group` with no call | `bag.setof` of a projection | a projection |
-| `group` with calls | `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`), with a hidden count of the group's rows when there are keys, since `table.aggr` folds the empty table as one empty group: its row is the one with count 0, filtered out before the counter is projected away | `rel.aggr` |
+| `group` with calls | with keys, `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`): one row per group, and none for an empty table; without keys, one row, `(bag (bag.fold f init T) 1)`, also for an empty table | `rel.aggr`; without keys, `(set.singleton (set.fold f init T))` |
 | `values` | `bag.union_disjoint` of `(bag row 1)` | `set.union` of `set.singleton` |
 | `sort` | the source, when it has no `offset` or `limit`; `LIMIT 0` the empty bag; a row slice under an `ORDER BY` whose keys contain a key of the rows, so that no two rows tie, a `bag.filter` keeping the rows whose place -- a `bag.fold` counting the rows sorted before them -- lies in `[offset, offset + limit)`; refused under possible ties, for a computed size, and when `offset + limit` overflows an i64 | the source, or the empty set for `LIMIT 0`; a slice is refused |
 | `EXISTS q` | `(distinct q bag.empty)` | |
@@ -196,9 +238,9 @@ Where this encoding departs from the Java translator, deliberately:
   operator in a lambda with fresh variables each time. The bags solver relates two maps or filters
   by the identity of their functions and does not rewrite under the binder before comparing them,
   so two sides that compute `a + 5` the same way must be one term. No body is rewritten before it
-  is bound: cvc5 rewrites the assertions, lambda bodies included, after its `bags-facts` pass has
-  read the keys and `NOT NULL` columns off the constraints, and a body rewritten earlier would keep
-  a form that pass has not seen; `a + 10 / 2` and `a + 5` meet there.
+  is bound: cvc5 rewrites the assertions, lambda bodies included, and draws the lemmas of the keys
+  from the rewritten terms, and a body rewritten earlier would keep a form its rules may not match;
+  `a + 10 / 2` and `a + 5` meet there.
 
 ## What the encoding approximates
 
@@ -250,6 +292,21 @@ driver therefore reports whether the problem was exact (`model_exact`), and the 
 `model` only then. A model under uninterpreted symbols is a candidate, kept in the `no-proof`
 note as `candidate model, under uninterpreted symbols: ...`, for a person or for `sqleq-fuzz`.
 
+A date literal is not one: the frontend spells `'2019-07-27'` read as a `DATE` as the conversion
+`q_conv_varchar_date` of its text, and when that text is a literal in the ISO form `Y-M-D`, which
+every `DateStyle` reads alike, the encoding writes the day it names, counted from 1970-01-01:
+
+```smt2
+; '2019-07-01' in WHERE d >= '2019-07-01', which was
+;   (|q_conv_varchar_date(VARCHAR)->DATE| "2019-07-01")
+(nullable.some 18078)
+```
+
+So `d >= '2019-07-01'` and `d > '2019-06-30'` are proved equivalent, and a model of a pair that
+differs on a date is a database, not a candidate.
+
+Any other text, and the conversion of a value that is not a literal, stays uninterpreted.
+
 ## Known limits
 
 * **The time limit is polled.** cvc5 honours `tlimit-per` where it spends resources, and a long
@@ -259,9 +316,14 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
 * **A model that fails `check-models` aborts cvc5**, and the driver with it (cvc5 raises an
   internal error through the C API). The harness records the case as an `error`; what it says is
   that cvc5 found a model its own checker rejects, which is the checker doing its job. It has
-  been seen on `set.filter` lambdas under set semantics, and under bags on a `bag.map` whose
-  lambda ignores its argument: a constant row, as `SELECT DISTINCT 0 ... GROUP BY a` maps every
-  group to, or one computed from constants alone. The pinned pairs that meet it are pinned `error`.
+  been seen on `set.filter` lambdas under set semantics. Two causes under bags are gone from the
+  pinned commit:
+  - lambda lifting defined a skolem as `true`, which left it free in the model, in cvc5's main
+    too (fixed by cvc5/cvc5#13186): `types/string_order_under_database_default`, which compares
+    two strings under a collation, now gets a model;
+  - the rewrite `EQ_EMPTY_ARG` of the `bags-algebra` branch, on a `bag.map` of a constant row, as
+    `SELECT DISTINCT 0 ... GROUP BY a` maps every group to. The rule is now a lemma of static
+    learning, for the terms of the input only, so the solver's own lemmas are not rewritten by it.
 * **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
   without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
   duplicate removal or bare sorts of those), an aggregate other than
