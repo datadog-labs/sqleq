@@ -14,8 +14,9 @@ proof of equivalence under the encoding: `proved`. `sat` comes with a model, a d
 cvc5's encodings of the two queries differ: `model`. The second refutes **the plan**, not the pair:
 it is a database under the encoding's readings of the types ([below](#what-the-encoding-approximates))
 and under the plan's constraints alone, and the frontend drops the constraints it cannot carry (an
-expression or opclass unique index, `UNIQUE NULLS NOT DISTINCT`, a foreign key), so the database may
-be one the DDL forbids. cvc5 checks it against its own assertions (`check-models`), but it is not
+expression or opclass unique index, `UNIQUE NULLS NOT DISTINCT`, a `DEFERRABLE` or `NOT VALID`
+`CHECK` or foreign key, see [SOUNDNESS.md](SOUNDNESS.md#check-and-foreign-key-constraints)), so the
+database may be one the DDL forbids. cvc5 checks it against its own assertions (`check-models`), but it is not
 an executed counterexample as `sqleq-fuzz`'s is, and the harness keeps the two words apart: a
 `model` contradicts a proof over the same plan -- that is an alarm, and the cross-check this axis
 adds -- and decides no portfolio verdict on its own. It is claimed only from an **exact** problem,
@@ -139,6 +140,39 @@ T)) 0)`, and a key one too: `(= (bag.setof ((_ table.project K) T)) ((_ table.pr
 the key's values form a set, so no two rows agree on it. The keys are the frontend's (`UNIQUE` over
 `NOT NULL` columns only, see `docs/SQLSOLVER.md`); under set semantics no key is asserted, since a
 set cannot repeat a row and the rest of the constraint would need cardinalities.
+
+A `CHECK` is a constraint as well. The plan carries `CHECK (a > 0)` as the condition no row meets,
+`NOT (a > 0)` as the frontend lowers it, `a <= 0` (`Schema::violations`), and the rows passing it are
+none (the printed problem's `let`s inlined):
+
+```smt2
+; t: CHECK 0: no row breaks it
+(assert (= (bag.filter
+             (lambda ((t__0 (Tuple (Nullable Int) (Nullable Int))))
+               (let ((a ((_ tuple.select 1) t__0)))
+                 (let ((le (ite (nullable.is_null a)
+                                (as nullable.null (Nullable Bool))
+                                (nullable.some (<= (nullable.val a) 0)))))
+                   (and (nullable.is_some le) (nullable.val le)))))
+             t)
+           (as bag.empty (Bag (Tuple (Nullable Int) (Nullable Int))))))
+```
+
+So is a `FOREIGN KEY` (`Schema::references`), once the queries read both its tables: the values of
+the referencing columns, on the rows where none is NULL, are among the referenced ones.
+
+```smt2
+; orders: columns (1) reference customers (0): every non-null value is the parent's
+(assert (bag.subbag
+  (bag.setof ((_ table.project 1)
+    (bag.filter (lambda ((f__0 (Tuple (Nullable Int) (Nullable Int))))
+                  (nullable.is_some ((_ tuple.select 1) f__0)))
+                orders)))
+  (bag.setof ((_ table.project 0) customers))))
+```
+
+Under set semantics the two are `set.filter` and `set.subset`. A constraint the encoding cannot read
+is left out of the problem, which only widens the databases it ranges over.
 
 Each relational operator is one term over its inputs:
 

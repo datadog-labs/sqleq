@@ -443,3 +443,126 @@ fn a_rule_in_raw_ddl_is_read_off_its_head() {
     let ddl = format!(r#"{table}; CREATE RULE "_RETURN" AS ON SELECT TO t DO INSTEAD SELECT 1 AS id, 2 AS a;"#);
     expect_refusal(raw(&ddl, "SELECT a FROM t WHERE a > 1", "SELECT a FROM t WHERE 1 < a"), UNREAD, &ddl);
 }
+
+/// The `violations` and `references` `ddl` gives table `name`, read both ways off a pair over
+/// `t(id, a)`, `Null` where the schema has none.
+fn constraints(ddl: &str, name: &str) -> (Value, Value) {
+    let [a, b] = lowered(ddl, "SELECT id FROM t", "SELECT id FROM t WHERE a > 1");
+    let read = |v: &Value| (schema(v, name)["violations"].clone(), schema(v, name)["references"].clone());
+    assert_eq!(read(&a), read(&b), "the two inputs disagree\n{ddl}");
+    read(&a)
+}
+
+/// The condition of `SELECT id FROM t WHERE <cond>` as the frontend lowers it, over `ddl`.
+fn condition(ddl: &str, cond: &str) -> Value {
+    let [v, _] = lowered(ddl, &format!("SELECT id FROM t WHERE {cond}"), "SELECT 1 FROM t");
+    v["queries"][0]["project"]["source"]["filter"]["condition"].clone()
+}
+
+#[test]
+fn a_check_reaches_the_plan_as_the_rows_it_rejects() {
+    // Postgres refuses a row the CHECK is false on: the rows `WHERE NOT (c)` keeps, not those on
+    // which `c` is not true (a NULL `a` passes `CHECK (a > 0)`).
+    let plain = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);";
+    let rejected = json!([condition(plain, "NOT (a > 0)")]);
+    for ddl in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CHECK (a > 0));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CONSTRAINT positive CHECK (a > 0));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER); ALTER TABLE t ADD CONSTRAINT positive CHECK (a > 0);",
+        // a rename keeps it, and so does a drop of some other name
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CONSTRAINT p CHECK (a > 0), CONSTRAINT q CHECK (id > 0));
+         ALTER TABLE t RENAME CONSTRAINT p TO r; ALTER TABLE t DROP CONSTRAINT q;",
+        // an immutable function, and a cast to a number
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (abs(a) > 0 AND a::numeric > 0));",
+    ] {
+        let (violations, references) = constraints(ddl, "t");
+        assert_eq!(violations.as_array().map(Vec::len), Some(1), "{ddl}");
+        assert_eq!(references, Value::Null, "{ddl}");
+        if ddl.contains("CHECK (a > 0)") {
+            assert_eq!(violations, rejected, "{ddl}");
+        }
+    }
+}
+
+#[test]
+fn a_check_postgres_may_not_hold_at_the_query_is_left_out() {
+    for ddl in [
+        // added NOT VALID: the rows before it may break it
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER); ALTER TABLE t ADD CONSTRAINT p CHECK (a > 0) NOT VALID;",
+        // dropped, by its name or by a name the reader does not know, which may be the one Postgres
+        // generated for an unnamed one
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CONSTRAINT p CHECK (a > 0)); ALTER TABLE t DROP CONSTRAINT p;",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0)); ALTER TABLE t DROP CONSTRAINT t_a_check;",
+        // checked when the row is written: the clock then, a random draw, a date cast to text
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d DATE CHECK (d >= CURRENT_DATE));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > random()));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d DATE CHECK (d::text <> ''));",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d DATE CHECK (d || '' <> ''));",
+        // the session's TimeZone then: a timestamptz compared with a literal or a timestamp
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, z TIMESTAMPTZ CHECK (z > '2020-01-01 00:00'));",
+        // a function of the same name in a schema of the user's
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (public.abs(a) > 0));",
+        // a table another inherits from reads its children's rows, which a NO INHERIT one does not hold
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0) NO INHERIT); CREATE TABLE c () INHERITS (t);",
+    ] {
+        assert_eq!(constraints(ddl, "t").0, Value::Null, "{ddl}");
+    }
+}
+
+#[test]
+fn a_foreign_key_reaches_the_plan_as_columns_of_the_parent() {
+    // `p` is the schema at index 0: `t(id, a)`'s column 1 references `p`'s column 0
+    let reference = json!([{ "columns": [1], "table": 0, "to": [0] }]);
+    for ddl in [
+        "CREATE TABLE p (k INTEGER PRIMARY KEY); CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k));",
+        "CREATE TABLE p (k INTEGER PRIMARY KEY); CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p);",
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, FOREIGN KEY (a) REFERENCES p (k));",
+        "CREATE TABLE p (k INTEGER UNIQUE NOT NULL); CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);
+         ALTER TABLE t ADD CONSTRAINT r FOREIGN KEY (a) REFERENCES p (k);",
+        // the parent renamed: the reference follows it, whatever takes the old name
+        "CREATE TABLE p (k INTEGER PRIMARY KEY); CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k));
+         ALTER TABLE p RENAME TO q; CREATE TABLE p (k INTEGER PRIMARY KEY);",
+    ] {
+        let [v, _] = lowered(ddl, "SELECT id FROM t", "SELECT id FROM t WHERE a > 1");
+        let refs = &schema(&v, "t")["references"];
+        let parent = v["schemas"][refs[0]["table"].as_u64().unwrap() as usize]["name"].clone();
+        assert_eq!(parent, if ddl.contains("RENAME TO q") { json!("q") } else { json!("p") }, "{ddl}");
+        if !ddl.contains("RENAME TO q") {
+            assert_eq!(constraints(ddl, "t").1, reference, "{ddl}");
+        }
+    }
+}
+
+#[test]
+fn a_foreign_key_postgres_may_not_hold_is_left_out() {
+    for ddl in [
+        // checked at commit, so a query inside the transaction can read a row that breaks it
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k) DEFERRABLE INITIALLY DEFERRED);",
+        "CREATE TABLE p (k INTEGER PRIMARY KEY); CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);
+         ALTER TABLE t ADD CONSTRAINT r FOREIGN KEY (a) REFERENCES p (k) NOT VALID;",
+        // dropped, by name or by a name the reader does not know
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CONSTRAINT r REFERENCES p (k)); ALTER TABLE t DROP CONSTRAINT r;",
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k)); ALTER TABLE t DROP CONSTRAINT t_a_fkey;",
+        // the parent's key dropped, which takes the reference with it, or the parent dropped
+        "CREATE TABLE p (k INTEGER, CONSTRAINT pk PRIMARY KEY (k));
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k)); ALTER TABLE p DROP CONSTRAINT pk CASCADE;",
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k)); DROP TABLE p CASCADE;",
+        // a parent whose columns the reader no longer knows
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k)); ALTER TABLE p ADD COLUMN z INTEGER;",
+        // a text reference under a column collation, whose `=` need not be identity
+        "CREATE TABLE p (k TEXT COLLATE \"C\" PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT COLLATE \"C\" REFERENCES p (k));",
+        // a table another inherits from: its children's rows hold no reference
+        "CREATE TABLE p (k INTEGER PRIMARY KEY);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p (k)); CREATE TABLE c () INHERITS (t);",
+    ] {
+        assert_eq!(constraints(ddl, "t").1, Value::Null, "{ddl}");
+    }
+}

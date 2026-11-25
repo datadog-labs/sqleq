@@ -132,6 +132,31 @@ pub struct Table {
     /// names none. A column under a collation the IR cannot carry has the type
     /// [`COLLATED`][crate::collation::COLLATED] instead; see [`crate::collation`].
     pub collations: Vec<Collation>,
+    /// The expressions of the table's `CHECK` constraints that Postgres holds every row to, as the
+    /// DDL writes them. Postgres refuses a row whose `CHECK` is false, and takes one where it is
+    /// NULL. Not a `CHECK` added `NOT VALID`, which rows before it may break, nor `NOT ENFORCED`,
+    /// nor any on a table another inherits from, whose scans read rows a `NO INHERIT` one does not
+    /// hold.
+    ///
+    /// Direction matters for soundness, as for [`Table::nullable`]: a `CHECK` here that Postgres does
+    /// not enforce shrinks the instances a prover quantifies over. Read by the frontend only to
+    /// lower each into a condition no row meets (`lib::attach_constraints`).
+    pub checks: Vec<sqlparser::ast::Expr>,
+    /// The table's `FOREIGN KEY` constraints that hold after every statement: not `DEFERRABLE`, not
+    /// `NOT VALID`, not `NOT ENFORCED`, and only to a parent that still has a key on exactly the
+    /// referenced columns (dropping that key `CASCADE`s to the reference). None on a table another
+    /// inherits from, whose scans read its children's rows, which no reference holds.
+    pub references: Vec<Reference>,
+}
+
+/// A `FOREIGN KEY`: a row of the table whose `cols` are all non-NULL has, in the table at index
+/// `table` of the catalog, a row whose `to` columns hold the same values (`MATCH SIMPLE`, the
+/// default; `MATCH FULL` holds a row to more, so this holds of it too).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reference {
+    pub cols: Vec<usize>,
+    pub table: usize,
+    pub to: Vec<usize>,
 }
 
 impl Table {
@@ -150,6 +175,7 @@ impl Table {
 }
 
 /// All tables declared by the input's `CREATE TABLE`s, in declaration order (the scan index).
+#[derive(Clone)]
 pub struct Catalog {
     pub tables: Vec<Table>,
     /// The relations the DDL creates whose columns are not read: views, a table created without a
@@ -592,7 +618,7 @@ pub fn build(ddl: &[Ddl]) -> Catalog {
         }
     }
     let created = crate::collation::created(parsed.iter().copied());
-    let mut b = Builder { rels: Vec::new(), created, domains };
+    let mut b = Builder { rels: Vec::new(), created, domains, next_id: 0 };
     for (d, losses) in ddl.iter().zip(rejected) {
         match d {
             Ddl::Parsed(st) => b.statement(st),
@@ -607,6 +633,9 @@ pub fn build(ddl: &[Ddl]) -> Catalog {
 struct Rel {
     path: Vec<String>,
     table: Option<Building>,
+    /// Never reused, so a reference to the relation survives a rename of it and a removal of
+    /// another (`rels` shifts when a relation is dropped).
+    id: usize,
 }
 
 /// A table while [`build`] reads the statements about it: a [`Table`] whose nullability, keys and
@@ -623,9 +652,13 @@ struct Building {
     /// every row of a statement ([`Domains::volatile_default`]).
     domain_default: Vec<bool>,
     keys: Vec<Key>,
-    /// The names of its `CHECK`, `FOREIGN KEY` and `EXCLUDE` constraints, whose dropping changes
-    /// nothing read here.
+    /// The names of its `CHECK`, `FOREIGN KEY` and `EXCLUDE` constraints.
     others: Vec<String>,
+    /// The `CHECK`s [`Table::checks`] keeps, with their names (`None` for an unnamed one, whose
+    /// name Postgres generates).
+    checks: Vec<(Option<String>, sqlparser::ast::Expr)>,
+    /// The `FOREIGN KEY`s that may become [`Table::references`].
+    references: Vec<PendingReference>,
     /// `PARTITION BY`: its rows are its partitions'.
     partitioned: bool,
     /// Another table inherits from it, so a scan of it reads that table's rows too.
@@ -642,6 +675,23 @@ enum ColumnDefault {
     Own(bool),
     /// An identity column, or a generated one.
     Generated,
+}
+
+/// A `FOREIGN KEY` while [`build`] reads the DDL: the parent is resolved when the statement that
+/// declares it is read, as Postgres resolves it, and its columns only at the end.
+struct PendingReference {
+    name: Option<String>,
+    cols: Vec<usize>,
+    parent: Parent,
+    /// The parent's columns, as Postgres folds their names; empty for its primary key.
+    to: Vec<String>,
+}
+
+enum Parent {
+    /// As the statement names it, until [`Builder::resolve_references`] reads it.
+    Named(ObjectName),
+    /// The [`Rel::id`] it names.
+    Rel(usize),
 }
 
 /// A `PRIMARY KEY` or `UNIQUE` constraint, or a unique index.
@@ -663,6 +713,8 @@ struct Builder {
     rels: Vec<Rel>,
     created: crate::collation::Created,
     domains: Domains,
+    /// The next [`Rel::id`].
+    next_id: usize,
 }
 
 impl Builder {
@@ -766,7 +818,10 @@ impl Builder {
         let Some(path) = rel_path(name) else { return self.unread_all() };
         match self.rels.iter().position(|r| r.path == path) {
             Some(i) => self.unread(i),
-            None => self.rels.push(Rel { path, table: None }),
+            None => {
+                let id = self.new_id();
+                self.rels.push(Rel { path, table: None, id })
+            }
         }
     }
 
@@ -799,7 +854,36 @@ impl Builder {
         // A name read again replaces an unread one. A table declared twice is kept twice, so that
         // `Catalog::check_case_collisions` refuses it.
         self.rels.retain(|r| r.path != path || r.table.is_some());
-        self.rels.push(Rel { path, table: Some(table) });
+        let id = self.new_id();
+        self.rels.push(Rel { path, table: Some(table), id });
+        self.resolve_references();
+    }
+
+    fn new_id(&mut self) -> usize {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// The parent of each `FOREIGN KEY` the statement just read declared, resolved as Postgres
+    /// resolves it when it runs the statement; one that resolves to no relation is no reference.
+    fn resolve_references(&mut self) {
+        let mut resolved = Vec::new();
+        for (i, r) in self.rels.iter().enumerate() {
+            for (k, pending) in r.table.iter().flat_map(|t| t.references.iter().enumerate()) {
+                if let Parent::Named(name) = &pending.parent {
+                    resolved.push((i, k, self.resolve(name).map(|j| self.rels[j].id)));
+                }
+            }
+        }
+        for (i, k, id) in resolved.into_iter().rev() {
+            let Some(t) = self.rels[i].table.as_mut() else { continue };
+            match id {
+                Some(id) => t.references[k].parent = Parent::Rel(id),
+                None => {
+                    t.references.remove(k);
+                }
+            }
+        }
     }
 
     fn read_create_table(&self, ct: &CreateTable, path: Vec<String>) -> Building {
@@ -817,12 +901,16 @@ impl Builder {
                 row_determined: Vec::new(),
                 n_declared: ct.columns.len(),
                 collations: Vec::new(),
+                checks: Vec::new(),
+                references: Vec::new(),
             },
             not_null: Vec::new(),
             defaults: Vec::new(),
             domain_default: Vec::new(),
             keys: Vec::new(),
             others: Vec::new(),
+            checks: Vec::new(),
+            references: Vec::new(),
             partitioned: ct.partition_by.is_some(),
             inherited: false,
         };
@@ -863,13 +951,29 @@ impl Builder {
                         index: false,
                     }),
                     ColumnOption::NotNull => b.not_null[idx] = true,
-                    ColumnOption::Check(_) | ColumnOption::ForeignKey(_) => b.others.extend(name),
+                    ColumnOption::Check(c) => {
+                        b.others.extend(name.clone());
+                        if c.enforced != Some(false) {
+                            b.checks.push((name, (*c.expr).clone()));
+                        }
+                    }
+                    ColumnOption::ForeignKey(f) => {
+                        b.others.extend(name.clone());
+                        if enforced_per_statement(f.characteristics.as_ref()) {
+                            b.references.push(PendingReference {
+                                name,
+                                cols: vec![idx],
+                                parent: Parent::Named(f.foreign_table.clone()),
+                                to: f.referred_columns.iter().map(crate::dml::fold_ident).collect(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
         }
         for con in &ct.constraints {
-            b.add_constraint(con);
+            b.add_constraint(con, false);
         }
         b
     }
@@ -908,7 +1012,9 @@ impl Builder {
             use AlterTableOperation as Op;
             match op {
                 // A key added to a partitioned table alone is not on its partitions.
-                Op::AddConstraint { constraint, .. } if !(at.only && t.partitioned) => t.add_constraint(constraint),
+                Op::AddConstraint { constraint, not_valid } if !(at.only && t.partitioned) => {
+                    t.add_constraint(constraint, *not_valid)
+                }
                 Op::AddConstraint { .. } => {}
                 Op::AlterColumn { column_name, op } => {
                     let name = crate::dml::fold_ident(column_name);
@@ -956,6 +1062,11 @@ impl Builder {
                     for o in t.others.iter_mut().filter(|o| **o == old) {
                         *o = new.clone();
                     }
+                    for n in t.checks.iter_mut().map(|(n, _)| n).chain(t.references.iter_mut().map(|r| &mut r.name)) {
+                        if n.as_deref() == Some(old.as_str()) {
+                            *n = Some(new.clone());
+                        }
+                    }
                 }
                 // The new name is in the table's schema; a name already taken is one Postgres
                 // refuses.
@@ -986,6 +1097,7 @@ impl Builder {
         if unmodeled {
             self.read_as_rejected(at);
         }
+        self.resolve_references();
     }
 
     /// `DROP TABLE` or `DROP VIEW` of `name`: gone, if it resolves; else each relation of that bare
@@ -1056,11 +1168,46 @@ impl Builder {
     }
 
     fn finish(self) -> Catalog {
+        // The index each read table takes in the catalog, by its relation's id, and what a reference
+        // to it reads: its columns, the sorted column sets of its keys that hold at every statement,
+        // and its primary key.
+        let mut index = HashMap::new();
+        for r in self.rels.iter().filter(|r| r.table.is_some()) {
+            index.insert(r.id, index.len());
+        }
+        let parents: HashMap<usize, ParentFacts> = self
+            .rels
+            .iter()
+            .filter_map(|r| {
+                let t = r.table.as_ref()?;
+                let keys = t
+                    .keys
+                    .iter()
+                    .filter(|k| k.enforced)
+                    .map(|k| {
+                        let mut c = k.cols.clone();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let primary = t.keys.iter().find(|k| k.primary && k.enforced).map(|k| k.cols.clone()).unwrap_or_default();
+                Some((r.id, ParentFacts { cols: t.table.cols.iter().map(|(n, _)| n.clone()).collect(), keys, primary }))
+            })
+            .collect();
         let mut tables = Vec::new();
         let mut unread = Vec::new();
         for r in self.rels {
             match r.table {
-                Some(t) => tables.push(t.finish()),
+                Some(t) => {
+                    let references = if t.inherited {
+                        Vec::new()
+                    } else {
+                        t.references.iter().filter_map(|p| resolve_reference(p, &index, &parents)).collect()
+                    };
+                    let mut table = t.finish();
+                    table.references = references;
+                    tables.push(table)
+                }
                 None => unread.push(r.path),
             }
         }
@@ -1068,9 +1215,45 @@ impl Builder {
     }
 }
 
+/// What a `FOREIGN KEY` reads of its parent: see [`Builder::finish`].
+struct ParentFacts {
+    cols: Vec<String>,
+    keys: Vec<Vec<usize>>,
+    primary: Vec<usize>,
+}
+
+/// A [`PendingReference`] as a [`Reference`]: to a parent the DDL still has, read, over columns it
+/// has (its primary key when the reference names none), as many as the reference's own, on which the
+/// parent still has a key that holds at every statement. Postgres takes a reference only to such a
+/// key, and dropping the key drops the reference with it (`CASCADE`), so a parent without one is a
+/// reference Postgres no longer has.
+fn resolve_reference(
+    p: &PendingReference,
+    index: &HashMap<usize, usize>,
+    parents: &HashMap<usize, ParentFacts>,
+) -> Option<Reference> {
+    let Parent::Rel(id) = p.parent else { return None };
+    let table = *index.get(&id)?;
+    let parent = parents.get(&id)?;
+    let to: Vec<usize> = if p.to.is_empty() {
+        parent.primary.clone()
+    } else {
+        p.to.iter().map(|n| parent.cols.iter().position(|c| c == n)).collect::<Option<_>>()?
+    };
+    let mut set = to.clone();
+    set.sort_unstable();
+    set.dedup();
+    if to.is_empty() || to.len() != p.cols.len() || set.len() != to.len() || !parent.keys.contains(&set) {
+        return None;
+    }
+    Some(Reference { cols: p.cols.clone(), table, to })
+}
+
 impl Building {
-    /// A table constraint, from the `CREATE TABLE` or an `ALTER TABLE … ADD`.
-    fn add_constraint(&mut self, con: &TableConstraint) {
+    /// A table constraint, from the `CREATE TABLE` or an `ALTER TABLE … ADD`. A `CHECK` or a
+    /// `FOREIGN KEY` added `NOT VALID` holds only of the rows written after it, so it is kept by
+    /// name alone.
+    fn add_constraint(&mut self, con: &TableConstraint, not_valid: bool) {
         let lower = |n: &Option<sqlparser::ast::Ident>| n.as_ref().map(key_name);
         let (name, parts, primary, enforced) = match con {
             TableConstraint::Unique(uc) => {
@@ -1093,8 +1276,28 @@ impl Building {
                 }
                 return;
             }
-            TableConstraint::Check(c) => return self.others.extend(lower(&c.name)),
-            TableConstraint::ForeignKey(f) => return self.others.extend(lower(&f.name)),
+            TableConstraint::Check(c) => {
+                self.others.extend(lower(&c.name));
+                if !not_valid && c.enforced != Some(false) {
+                    self.checks.push((lower(&c.name), (*c.expr).clone()));
+                }
+                return;
+            }
+            TableConstraint::ForeignKey(f) => {
+                self.others.extend(lower(&f.name));
+                let names: Vec<String> = f.columns.iter().map(crate::dml::fold_ident).collect();
+                let cols: Option<Vec<usize>> =
+                    names.iter().map(|n| self.table.cols.iter().position(|(c, _)| c == n)).collect();
+                if let Some(cols) = cols.filter(|_| !not_valid && enforced_per_statement(f.characteristics.as_ref())) {
+                    self.references.push(PendingReference {
+                        name: lower(&f.name),
+                        cols,
+                        parent: Parent::Named(f.foreign_table.clone()),
+                        to: f.referred_columns.iter().map(crate::dml::fold_ident).collect(),
+                    });
+                }
+                return;
+            }
             TableConstraint::Exclude(e) => return self.others.extend(lower(&e.name)),
             _ => return,
         };
@@ -1103,22 +1306,29 @@ impl Building {
         }
     }
 
-    /// `DROP CONSTRAINT name`. A name the reader does not know may be an unnamed key's, which
-    /// Postgres generated, or from Postgres 18 a `NOT NULL`'s, so the table keeps no key and no
-    /// `NOT NULL`.
+    /// `DROP CONSTRAINT name`. A name the reader does not know may be an unnamed key's, `CHECK`'s or
+    /// `FOREIGN KEY`'s, which Postgres generated, or from Postgres 18 a `NOT NULL`'s, so the table
+    /// keeps no key, no `NOT NULL`, no `CHECK` and no reference.
     fn drop_constraint(&mut self, name: &str) {
         if self.keys.iter().any(|k| k.name.as_deref() == Some(name)) {
             self.keys.retain(|k| k.name.as_deref() != Some(name));
         } else if self.others.iter().any(|o| o == name) {
             self.others.retain(|o| o != name);
+            self.checks.retain(|(n, _)| n.as_deref() != Some(name));
+            self.references.retain(|r| r.name.as_deref() != Some(name));
         } else {
             self.keys.clear();
             self.not_null.iter_mut().for_each(|n| *n = false);
+            self.checks.clear();
+            self.references.clear();
         }
     }
 
     fn finish(self) -> Table {
-        let Building { mut table, not_null, defaults, domain_default, keys, inherited, .. } = self;
+        let Building { mut table, not_null, defaults, domain_default, keys, inherited, checks, .. } = self;
+        // A table another inherits from is read with its children's rows, which a `NO INHERIT`
+        // `CHECK` does not hold.
+        table.checks = if inherited { Vec::new() } else { checks.into_iter().map(|(_, e)| e).collect() };
         let in_primary = |i: usize| keys.iter().any(|k| k.primary && k.cols.contains(&i));
         table.nullable = (0..table.cols.len()).map(|i| inherited || !(not_null[i] || in_primary(i))).collect();
         table.row_determined = defaults

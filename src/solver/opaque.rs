@@ -75,7 +75,7 @@ pub fn abstract_opaque(input: &Input, depth: usize) -> Option<Input> {
     for (i, l) in left.iter().enumerate() {
         let types = l.output_types(&schemas).into_iter().collect::<Option<Vec<_>>>()?;
         let nullable = vec![true; types.len()];
-        schemas.push(Schema { name: format!("#opaque{i}"), types, key: Vec::new(), nullable, opaque_identity: Vec::new() });
+        schemas.push(Schema { name: format!("#opaque{i}"), types, key: Vec::new(), nullable, opaque_identity: Vec::new(), violations: Vec::new(), references: Vec::new() });
     }
     let replace = |q: &Relation, table: &dyn Fn(usize) -> usize| {
         let mut q = q.clone();

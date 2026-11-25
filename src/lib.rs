@@ -243,6 +243,19 @@ fn lower_inner(
     ddl_catalog: Option<catalog::Catalog>,
     source: CatalogSource,
 ) -> Result<Value> {
+    let (mut input, declared) = lower_pair(src, ddl_catalog.clone(), source)?;
+    // 7. The constraints of the tables the plan holds that no prover reads off the keys and
+    //    nullability: `CHECK` and `FOREIGN KEY`.
+    attach_constraints(&mut input, src, ddl_catalog, &declared, source);
+    Ok(input)
+}
+
+/// Steps 1-6 of [`lower_inner`]: the plan, and the declared catalog it was lowered against.
+fn lower_pair(
+    src: &str,
+    ddl_catalog: Option<catalog::Catalog>,
+    source: CatalogSource,
+) -> Result<(Value, catalog::Catalog)> {
     // 1-2. Split out the `declare ... function` DSL lines, parse, build the declared catalog, reduce
     //      the DML, collect the two queries.
     let (fns, declared, queries, seen, stores) = parse_input(src, ddl_catalog, source.seeds_declared())?;
@@ -254,7 +267,144 @@ fn lower_inner(
     if let Some(e) = misaligned {
         return Err(e);
     }
-    Ok(input)
+    Ok((input, declared))
+}
+
+/// The `CHECK` and `FOREIGN KEY` constraints of the tables in `input`'s schemas, as two fields of each
+/// table's schema (`ir::Schema`), which only `sqleq-cvc5` reads. Each field is emitted only where it is
+/// not empty, so every other schema is what it always was.
+///
+/// * `violations`: for each `CHECK (c)` of the table ([`catalog::Table::checks`]), the condition of
+///   `SELECT 1 FROM t WHERE NOT (c)` as the frontend lowers it. Postgres refuses a row on which `c` is
+///   false, which is a row that query returns, so no row of the table meets the condition. Lowered
+///   through the whole pipeline, after the pair's own DDL, so it is read as a query is: every refusal a
+///   query's condition meets, it meets (the two queries differ, so none is relaxed for being one
+///   plan), and a `WHERE` that a rewrite reads two-valued is still exactly the rows `c` is false on.
+///   One that does not lower, or that reads a function Postgres may not evaluate alike on every call
+///   ([`immutable_check`]), is left out.
+/// * `references`: for each `FOREIGN KEY` ([`catalog::Table::references`]) to a table in the plan, its
+///   columns and the parent's, where each pair of columns has one IR type whose `=` is identity under
+///   the default collation, as the reference's equality is.
+///
+/// Leaving a constraint out only widens the instances a proof quantifies over.
+fn attach_constraints(
+    input: &mut Value,
+    src: &str,
+    ddl_catalog: Option<catalog::Catalog>,
+    declared: &catalog::Catalog,
+    source: CatalogSource,
+) {
+    let names: Vec<Option<String>> = input["schemas"]
+        .as_array()
+        .map(|a| a.iter().map(|s| s["name"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let at = |name: &str| names.iter().position(|n| n.as_deref() == Some(name));
+    let Some(prefix) = ddl_prefix(src) else { return };
+    for t in &declared.tables {
+        let Some(si) = at(&t.name) else { continue };
+        let violations: Vec<Value> = t
+            .checks
+            .iter()
+            .filter(|c| immutable_check(c, t))
+            .filter_map(|c| check_violation(prefix, t, c, ddl_catalog.clone(), source))
+            .collect();
+        let mut references = Vec::new();
+        for r in &t.references {
+            let Some(parent) = declared.tables.get(r.table) else { continue };
+            let Some(pi) = at(&parent.name) else { continue };
+            let identity = r.cols.iter().zip(&r.to).all(|(&c, &p)| {
+                let (ct, pt) = (&input["schemas"][si]["types"][c], &input["schemas"][pi]["types"][p]);
+                ct == pt
+                    && matches!(ct.as_str(), Some("INTEGER" | "BOOLEAN" | "DATE" | "TIME" | "TIMESTAMP" | "VARCHAR"))
+                    && t.collations.get(c) == Some(&collation::Collation::Default)
+                    && parent.collations.get(p) == Some(&collation::Collation::Default)
+            });
+            if identity {
+                references.push(json!({ "columns": r.cols, "table": pi, "to": r.to }));
+            }
+        }
+        if !violations.is_empty() {
+            input["schemas"][si]["violations"] = json!(violations);
+        }
+        if !references.is_empty() {
+            input["schemas"][si]["references"] = json!(references);
+        }
+    }
+}
+
+/// The pair file's text before its two statements: its DDL, `declare` lines and comments.
+fn ddl_prefix(src: &str) -> Option<&str> {
+    let parts = split::statements(src).ok()?;
+    let first = parts.get(parts.len().checked_sub(2)?)?;
+    let offset = (first.as_ptr() as usize).checked_sub(src.as_ptr() as usize)?;
+    src.get(..offset)
+}
+
+/// The lowered condition of `SELECT 1 FROM t WHERE NOT (check)`: see [`attach_constraints`].
+fn check_violation(
+    prefix: &str,
+    t: &catalog::Table,
+    check: &sqlparser::ast::Expr,
+    ddl_catalog: Option<catalog::Catalog>,
+    source: CatalogSource,
+) -> Option<Value> {
+    let table = t.path.iter().map(|p| format!("\"{}\"", p.replace('"', "\"\""))).collect::<Vec<_>>().join(".");
+    let sql = format!(
+        "{prefix}\nSELECT 1 FROM {table} WHERE NOT ({check});\nSELECT 2 FROM {table} WHERE NOT ({check});\n"
+    );
+    let (ir, _) = lower_pair(&sql, ddl_catalog, source).ok()?;
+    let filter = ir["queries"][0].get("project")?.get("source")?.get("filter")?;
+    let scan = usize::try_from(filter.get("source")?.get("scan")?.as_u64()?).ok()?;
+    if ir["schemas"][scan]["name"].as_str() != Some(t.name.as_str()) {
+        return None;
+    }
+    filter.get("condition").cloned()
+}
+
+/// Whether a `CHECK` of `t` reads only what is the same on every call: no subquery (Postgres takes
+/// none in a `CHECK`), no function but a short list Postgres marks `IMMUTABLE` (unqualified or in
+/// `pg_catalog`), no cast but to a number or a boolean, no `||`, and no `timestamptz` column.
+/// Postgres checks a row when it is written, under that session's settings; a `CHECK` that reads the
+/// clock, casts a date to text under the `DateStyle` of the day, or compares a `timestamptz` under the
+/// `TimeZone` of the day can hold of a row then and not at the query.
+fn immutable_check(check: &sqlparser::ast::Expr, t: &catalog::Table) -> bool {
+    use sqlparser::ast::{visit_expressions, BinaryOperator, Expr, InTarget};
+    use std::ops::ControlFlow;
+    const IMMUTABLE: [&str; 24] = [
+        "abs", "length", "char_length", "character_length", "octet_length", "lower", "upper", "btrim", "ltrim",
+        "rtrim", "coalesce", "nullif", "greatest", "least", "round", "floor", "ceil", "ceiling", "mod", "sign",
+        "position", "strpos", "substr", "replace",
+    ];
+    let numeric_cast = |t: &sqlparser::ast::DataType| {
+        let t = t.to_string().to_ascii_uppercase();
+        ["INT", "BIGINT", "SMALLINT", "NUMERIC", "DECIMAL", "REAL", "DOUBLE", "FLOAT", "BOOL"].iter().any(|p| t.starts_with(p))
+    };
+    let zoned = |name: &str| t.cols.iter().any(|(c, ty)| ty == "TIMESTAMPTZ" && c.eq_ignore_ascii_case(name));
+    visit_expressions(check, |e| match e {
+        Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::In { target: InTarget::Subquery(_) | InTarget::Table { .. }, .. }
+        | Expr::BinaryOp { op: BinaryOperator::StringConcat, .. } => ControlFlow::Break(()),
+        Expr::Function(f) => {
+            let parts: Vec<String> =
+                f.name.0.iter().filter_map(|p| p.as_ident()).map(|i| i.value.to_ascii_lowercase()).collect();
+            let known = match parts.as_slice() {
+                [n] => IMMUTABLE.contains(&n.as_str()),
+                [s, n] => s == "pg_catalog" && IMMUTABLE.contains(&n.as_str()),
+                _ => false,
+            };
+            if known && parts.len() == f.name.0.len() {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+        Expr::Cast { data_type, .. } if !numeric_cast(data_type) => ControlFlow::Break(()),
+        Expr::Identifier(i) if zoned(&i.value) => ControlFlow::Break(()),
+        Expr::CompoundIdentifier(is) if is.last().is_some_and(|i| zoned(&i.value)) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_continue()
 }
 
 /// Whether a run performs the parameter-alignment checks of [`params`].
