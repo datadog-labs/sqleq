@@ -393,8 +393,9 @@ pub struct Unique {
     pub partial: bool,
     /// A partial index's predicate, where it is nothing but `IS [NOT] NULL` tests on the table's
     /// columns joined by `AND` (`null_tests`): each column and whether its test is `IS NULL`,
-    /// sorted. `None` for a total index, and for a partial one whose predicate is anything else,
-    /// which is then never an arbiter.
+    /// sorted. `None` for a total index, and for a partial one whose predicate is anything else:
+    /// that one is never the witness's arbiter, though Postgres may infer it, so a target that
+    /// could imply it gets no witness (`translate::conflict`).
     pub pred: Option<Vec<(usize, bool)>>,
     /// On expressions rather than bare columns: `cols` are the columns the expressions read.
     /// Never inferred as an arbiter.
@@ -416,6 +417,11 @@ pub struct Unique {
 /// target's. So the index's tests being among the target's is exactly when it is an arbiter, and
 /// the order and the parentheses pg_dump adds do not matter. Any other predicate (a comparison, a
 /// call, an `OR`) would need Postgres's own prover to compare, and is left out.
+///
+/// An unquoted word that Postgres does not take as a column's name (`idents::keyword`) is not a
+/// column: `current_role IS NULL` tests the function's result, whatever columns the table has,
+/// and only `"current_role" IS NULL` the column. sqlparser reads some such words as calls and
+/// hands the rest back as identifiers, so they are told apart here.
 pub(crate) fn null_tests(e: &Expr, ident: &dyn Fn(&Ident) -> String) -> Option<Vec<(String, bool)>> {
     fn walk(e: &Expr, ident: &dyn Fn(&Ident) -> String, out: &mut Vec<(String, bool)>) -> Option<()> {
         match e {
@@ -430,6 +436,9 @@ pub(crate) fn null_tests(e: &Expr, ident: &dyn Fn(&Ident) -> String) -> Option<V
                     col = inner;
                 }
                 let Expr::Identifier(id) = col else { return None };
+                if id.quote_style.is_none() && crate::lean::idents::keyword(&id.value.to_ascii_lowercase()) {
+                    return None;
+                }
                 out.push((ident(id), matches!(e, Expr::IsNull(_))));
                 Some(())
             }
@@ -1233,5 +1242,15 @@ mod fresh_defaults {
         for other in ["b > 0", "b IS NULL OR c IS NULL", "NOT (b IS NULL)", "t.b IS NULL", "lower(b) IS NULL", "b IS NOT TRUE"] {
             assert_eq!(read(other), None, "{other}");
         }
+        // An unquoted keyword is not a column, whether sqlparser reads it as a call
+        // (`current_user`) or hands it back as an identifier (`current_role`). Quoted, it is one.
+        for word in ["current_role", "CURRENT_ROLE", "current_schema", "system_user", "current_user", "user"] {
+            assert_eq!(read(&format!("{word} IS NULL")), None, "{word}");
+            assert_eq!(read(&format!("b IS NULL AND {word} IS NOT NULL")), None, "{word}");
+        }
+        assert_eq!(read("\"current_role\" IS NULL"), Some(vec![("current_role".to_string(), true)]));
+        assert_eq!(read("\"user\" IS NOT NULL"), Some(vec![("user".to_string(), false)]));
+        // A word Postgres takes as a column's name stays one.
+        assert_eq!(read("timestamp IS NULL"), Some(vec![("timestamp".to_string(), true)]));
     }
 }

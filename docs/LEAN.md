@@ -186,14 +186,21 @@ The model covers:
   when the target's predicate implies the index's. Both are read where they are nothing but
   `IS [NOT] NULL` tests on columns joined by `AND`, and then the index is the arbiter exactly when
   each of its tests is among the target's, whatever the order and the parentheses (pg_dump writes
-  `((x IS NOT NULL) AND (y IS NULL))`). A target predicate of any other form is `unsupported`; an
-  index predicate of any other form is never an arbiter. A total unique index on the same columns
-  is an arbiter under any target predicate, as in Postgres. The witness does not evaluate the
-  predicate: it reads a partial index as total, which only adds collisions. So under `DO UPDATE`
-  a run it finds is one with no collision at all, and under `DO NOTHING` with only a partial
-  arbiter it asks for the same, since it could not tell a row the arbiter skips from one Postgres
-  inserts or raises on. Where two proposed rows share a key that Postgres would keep apart by the
-  predicate, the pair is `no-witness`, and the reason says the index was read as total;
+  `((x IS NOT NULL) AND (y IS NULL))`). An unquoted word Postgres does not take as a column's name
+  (`current_role`) is no column in either predicate. A target predicate of any other form is
+  `unsupported`. An index predicate of any other form is not read, and such an index is never the
+  witness's arbiter. Postgres may still infer it (`b IS NULL` implies `b IS NULL OR c IS NULL`),
+  so where a target with a `WHERE` finds no arbiter the witness can read while such an index is on
+  its columns, the pair gets no witness, with that as the reason, and no claim that the statement
+  fails. A total unique index on the same columns is an arbiter under any target predicate, as in
+  Postgres. The witness does not evaluate the predicate: it reads a partial index as total, which
+  only adds collisions. So under `DO UPDATE` a run it finds is one with no collision at all, and
+  under `DO NOTHING` with only a partial arbiter it asks for the same, since it could not tell a
+  row the arbiter skips from one Postgres inserts or raises on. Where two proposed rows share a
+  key that Postgres would keep apart by the predicate, the pair is `no-witness`, and the reason
+  says the index was read as total. Under `DO NOTHING` with only a partial arbiter a collision on
+  any other key is the witness's as well, and the reason says it does not model the arbiter:
+  Postgres asks the arbiter first, and a row it skips never reaches the other key;
 - `GENERATED ALWAYS` columns.
 
 CHECK and foreign-key constraints are not modelled; a record carries `unmodelled` when the target
@@ -218,7 +225,7 @@ credit or withhold credit wrongly.
 | verdict | meaning |
 |---|---|
 | `proved-gather` | The kernel proved `EquivGather` and checked a witness. The credited verdict. |
-| `no-witness` | The kernel proved `EquivGather`, but the `VALUES` side fails every run with non-NULL parameters, or its table's DDL could not be read reliably enough to tell. The proof may be vacuous, so it is not credited as evidence, though it is still a claim. |
+| `no-witness` | The kernel proved `EquivGather`, but the `VALUES` side fails every run with non-NULL parameters, or the witness model cannot tell: its table's DDL could not be read reliably enough, or the statement's arbiter is a partial index the model does not evaluate. The proof may be vacuous, so it is not credited as evidence, though it is still a claim. |
 | `proved-gather-generated` | The kernel proved `EquivGatherGen`, the weaker claim for generated cells, and checked a witness. Credited under its own name, for a pair whose truth is stated in that weaker form. |
 | `no-witness-generated` | The kernel proved `EquivGatherGen`, but no witness shows the `VALUES` side can succeed. A claim, not credited, as `no-witness` is. |
 | `unsupported` | Outside the fragment above. Not a claim about the pair. |

@@ -874,6 +874,9 @@ mod tests {
         for sql in [
             "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b > 0 DO NOTHING",
             "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b IS NULL OR a IS NULL DO NOTHING",
+            // An unquoted keyword is the function, not a column of that name (#300's review).
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE current_role IS NULL DO NOTHING",
+            "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) WHERE b IS NULL AND current_user IS NULL DO NOTHING",
         ] {
             assert!(
                 matches!(rec(sql), Err(Refusal::Unsupported(r)) if r.contains("ON CONFLICT target predicate other than")),
