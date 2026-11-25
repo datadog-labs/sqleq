@@ -296,7 +296,8 @@ needs no feature: it runs each backend as a subprocess.
   PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS on x86_64 and arm64, which it runs pairs
   on. Its other engine, DuckDB (`--engine duckdb`), is the `duckdb` feature, off by default: that
   build downloads DuckDB's release library (~40 MB), or links the libduckdb `DUCKDB_LIB_DIR` names,
-  which the build script checks before it considers downloading anything. To run
+  which the build script checks before it considers downloading anything. From cargo 1.100 the
+  download fails, and `DUCKDB_LIB_DIR` is the way (`.cargo/config.toml` says how). To run
   pairs on a PostgreSQL 17 of your own, set `SQLEQ_PG_BIN` to its `bin` directory, and
   `SQLEQ_PG_DOWNLOAD=0` to skip the download. On Linux the fetched PostgreSQL uses the system's
   OpenSSL 3, libxml2, Kerberos, zstd and lz4 libraries; where one is missing it cannot start, and
