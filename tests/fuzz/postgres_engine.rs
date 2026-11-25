@@ -949,6 +949,44 @@ fn parameters_bound_to_one_row_reach_a_row_several_filters_must_select() {
 }
 
 #[test]
+fn parameters_are_bound_whatever_the_spelling_of_the_columns() {
+    // #301's review. The same pair with every name quoted, as an ORM or pg_dump writes it, and
+    // with every column qualified by a quoted alias. The parameters are linked to their columns
+    // off the parsed statements, where a pattern over the text read neither.
+    for (a, b) in [
+        (
+            r#"SELECT "id" FROM "t" WHERE "tenant" = $1 AND "status" = $2 AND "kind" = $3 AND "created_at"::date = $4"#,
+            r#"SELECT "id" FROM "t" WHERE "tenant" = $1 AND "status" = $2 AND "kind" = $3
+               AND ("created_at" >= $4::date AND "created_at" < ($4::date + 1))"#,
+        ),
+        (
+            r#"SELECT "x"."id" FROM "t" AS "x" WHERE "x"."tenant" = $1 AND "x"."status" = $2 AND "x"."kind" = $3
+               AND "x"."created_at"::date = $4"#,
+            r#"SELECT "x"."id" FROM "t" AS "x" WHERE "x"."tenant" = $1 AND "x"."status" = $2 AND "x"."kind" = $3
+               AND ("x"."created_at" >= $4::date AND "x"."created_at" < ($4::date + 1))"#,
+        ),
+    ] {
+        assert_kind!(a, b, FILTERED, "NOT-EQUIVALENT");
+    }
+}
+
+#[test]
+fn a_parameter_is_bound_through_a_cast_of_its_column() {
+    // `$4` meets `created_at` only under a cast, on both sides. Postgres makes it a `date`, which
+    // reads the timestamp the row holds, so it is bound from the row with the other three, and the
+    // column takes its special values in the row trials. The two differ at an infinite date:
+    // `infinity + 1` is `infinity`, which nothing is below.
+    assert_kind!(
+        "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 AND created_at::date = $4",
+        "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 \
+         AND created_at::date >= $4 AND created_at::date < $4 + 1",
+        FILTERED,
+        "NOT-EQUIVALENT"
+    );
+}
+
+
+#[test]
 fn parameters_bound_to_one_row_refute_nothing_equivalent() {
     for (ddl, a, b) in [
         (
@@ -956,11 +994,35 @@ fn parameters_bound_to_one_row_refute_nothing_equivalent() {
             "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND kind = $3 AND created_at >= $4",
             "SELECT id FROM t WHERE kind = $3 AND NOT (created_at < $4) AND status = $2 AND tenant = $1",
         ),
-        // A date parameter takes the row's timestamp, which it reads as that timestamp's date.
+        // A date parameter takes the row's timestamp, which it reads as that timestamp's date:
+        // through a cast of the column, and compared with the column itself.
         (
             FILTERED,
             "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND created_at::date = $3",
             "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND created_at::date >= $3 AND created_at::date <= $3",
+        ),
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE tenant = $1 AND status = $2 AND created_at >= $3::date",
+            "SELECT id FROM t WHERE status = $2 AND tenant = $1 AND NOT (created_at < $3::date)",
+        ),
+        // A range over one column: the bound that holds of the row's own value is bound from it.
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE tenant = $1 AND created_at >= $2 AND created_at < $3",
+            "SELECT id FROM t WHERE tenant = $1 AND NOT (created_at < $2) AND $3 > created_at",
+        ),
+        // Quoted and qualified names.
+        (
+            FILTERED,
+            r#"SELECT "x"."id" FROM "t" "x" WHERE "x"."tenant" = $1 AND "x"."status" = $2 AND "x"."kind" = $3"#,
+            r#"SELECT "id" FROM "t" WHERE "kind" = $3 AND "status" = $2 AND "tenant" = $1"#,
+        ),
+        // One column alone, which no row trial is run for.
+        (
+            FILTERED,
+            "SELECT id FROM t WHERE created_at >= $1 AND created_at < $2",
+            "SELECT id FROM t WHERE NOT (created_at < $1) AND created_at < $2",
         ),
         // An array parameter takes the row's value as an element.
         (

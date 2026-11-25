@@ -50,6 +50,7 @@ use crate::fuzz::gen::{
     CastTarget, Val,
 };
 use crate::fuzz::limits::{self, Count};
+use crate::fuzz::links;
 use crate::fuzz::literals;
 use crate::fuzz::pair::{is_query, small_size, Config, Verdict, SMALL_STREAM};
 
@@ -604,12 +605,16 @@ fn msg(e: &postgres::Error) -> String {
 pub struct Timing {
     pub ddl_ms: f64,
     pub trial_ms: Vec<f64>,
-    /// The trials the pair was given: [`Config::total_trials`], the literal trials where a column
-    /// is compared with a literal, the special-value trials where a column or a parameter is of a
-    /// type that has special values, the trials of the wider reading of the literals where it
-    /// finds a value the literal trials have not got, and the row trials where a table has two
-    /// parameters or more to bind to one of its rows.
+    /// The trials the pair was given whose agreement counts toward its verdict:
+    /// [`Config::total_trials`], the literal trials where a column is compared with a literal, the
+    /// special-value trials where a column or a parameter is of a type that has special values,
+    /// and the trials of the wider reading of the literals where it finds a value the literal
+    /// trials have not got.
     pub trials: usize,
+    /// The row trials the pair was given after those, where a table has two columns or more to
+    /// bind parameters from one of its rows. Apart from `trials`: a row trial can only add a
+    /// counterexample, and is never one of the trials a pair is said to agree on.
+    pub row_trials: usize,
     pub rows_tried: usize,
     pub rows_kept: usize,
     /// Per table: the rows drawn for it over every trial, and the ones Postgres accepted.
@@ -1173,6 +1178,83 @@ fn compatible(p: VType, l: VType) -> bool {
 /// `compatible`, which decides what every other trial draws and must go on saying what it said.
 fn row_fits(p: VType, l: VType) -> bool {
     compatible(p, l) || (p == VType::Date && matches!(l, VType::Timestamp | VType::TimestampTz))
+}
+
+/// One parameter a row trial binds from a row of its table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Binding {
+    param: u32,
+    /// The index, among the table's columns, of the one it takes the row's value of.
+    col: usize,
+    param_array: bool,
+    col_array: bool,
+    /// Whether the comparison holds where the parameter is the column's own value
+    /// ([`links::Link::selects`]).
+    selects: bool,
+}
+
+impl Binding {
+    /// Whether row trial `k` of the block binds this parameter.
+    ///
+    /// One whose comparison holds of the row's own value, always: that is what selects the row.
+    /// One under `<`, `>`, `<>` or `IS DISTINCT FROM`, in every other trial. The row's own value
+    /// is the one such a comparison excludes, and a boundary in its own right: a guard
+    /// `c IS DISTINCT FROM $1` tells two statements apart exactly where `$1` is what the row
+    /// holds. But bound there every time, `created_at >= $2 AND created_at < $3` is an empty
+    /// range on every row trial, so in the other half `$3` stays as it was drawn.
+    fn binds_in(&self, k: usize) -> bool {
+        self.selects || k % 2 == 1
+    }
+}
+
+/// What the row trials bind: per table, each parameter with the column it takes a row's value of.
+///
+/// From the comparisons the statements make ([`links::row_links`]), the ones that qualify:
+///
+/// * **The parameter's type reads the value**, as Postgres typed the parameter ([`row_fits`]). One
+///   Postgres did not type is taken to be of its column's type, unless a cast stands between them.
+/// * **Not a parameter that counts rows** (`neutral`), which no column's value is a value of.
+/// * **Parameters are compared with two or more of the table's columns.** One column alone is
+///   what every other trial draws toward already, so `a >= $1 AND a < $2` is no table to run row
+///   trials for, however many parameters meet that column.
+fn row_bindings(
+    links: Vec<links::Link>,
+    scan: &Schema,
+    loaded: &[String],
+    neutral: &HashMap<u32, Val>,
+    pgtypes: &HashMap<u32, (VType, bool)>,
+    parray: &BTreeSet<u32>,
+) -> BTreeMap<String, Vec<Binding>> {
+    let mut bound: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
+    for link in links {
+        let Some(col) = scan.get(&link.table).and_then(|t| t.cols.get(link.col)) else { continue };
+        if !loaded.contains(&link.table) || neutral.contains_key(&link.param) {
+            continue;
+        }
+        let pg = pgtypes.get(&link.param).copied();
+        let fits = match pg {
+            Some((p, _)) => row_fits(p, col.vt),
+            None => !link.cast,
+        };
+        if !fits {
+            continue;
+        }
+        let param_array = pg.map_or_else(|| link.array || parray.contains(&link.param), |(_, arr)| arr);
+        let params = bound.entry(link.table).or_default();
+        // One parameter met twice by one column is bound once, as the comparison that selects.
+        match params.iter_mut().find(|b| b.param == link.param && b.col == link.col) {
+            Some(b) => b.selects |= link.selects,
+            None => params.push(Binding {
+                param: link.param,
+                col: link.col,
+                param_array,
+                col_array: col.array,
+                selects: link.selects,
+            }),
+        }
+    }
+    bound.retain(|_, params| params.iter().map(|b| b.col).collect::<BTreeSet<_>>().len() >= 2);
+    bound
 }
 
 static PREPARED: AtomicUsize = AtomicUsize::new(0);
@@ -2416,7 +2498,7 @@ fn run_pair(
     // Each parameter is drawn on its own: toward a value its column holds, not toward the values
     // of one row. So where a difference shows only on a row that several parameters must select,
     // `tenant = $1 AND status = $2 AND kind = $3 AND created_at::date = $4`, the chance that they
-    // agree on one falls with every parameter. Where two or more parameters are compared with
+    // agree on one falls with every parameter. Where parameters are compared with two or more
     // columns of one table, a last `--trials / 4` trials, from a stream of their own after every
     // other, bind them to the values of one row the table holds. The columns they are bound from
     // take their special values there as well, since the row that tells two statements apart is
@@ -2424,21 +2506,15 @@ fn run_pair(
     // parameters are the rows a statement stores and are drawn to meet none; nor for a pair whose
     // parameters do not line up.
     //
-    // Per table: each such parameter, the column it is compared with, and whether the parameter
-    // and the column are arrays.
-    let mut row_links: BTreeMap<String, Vec<(u32, usize, bool, bool)>> = BTreeMap::new();
-    if gathered.is_none() && misaligned.is_none() {
-        for &n in &pnums {
-            let Some((t, idx, vt, col_array)) = pcol.get(&n).and_then(|c| colloc.get(c)) else { continue };
-            let pg = pgtypes.get(&n).copied();
-            if neutral.contains_key(&n) || !pg.is_none_or(|(p, _)| row_fits(p, *vt)) {
-                continue;
-            }
-            let is_array = pg.map_or_else(|| parray.contains(&n), |(_, arr)| arr);
-            row_links.entry(t.clone()).or_default().push((n, *idx, is_array, *col_array));
-        }
-        row_links.retain(|_, params| params.len() >= 2);
-    }
+    // Which column a parameter is compared with is read off the parsed statements
+    // (`links::row_links`), not off `pcol`, which goes by a bare word beside `$N`: it reads no
+    // quoted name, and takes the first table that has a column of that name. Which of those
+    // comparisons bind is `row_bindings`'s to say, and in which of the trials, `Binding::binds_in`'s.
+    let row_links = if gathered.is_none() && misaligned.is_none() {
+        row_bindings(links::row_links(pa, pb, &scan), &scan, &loaded, &neutral, &pgtypes, &parray)
+    } else {
+        BTreeMap::new()
+    };
     // The pools a row trial draws from: a column's literals, as a wide or else a literal trial
     // draws them, and for a column a parameter is bound from its special values too. A column no
     // parameter is bound from takes none, so that a test of it (`deleted_at IS NULL`) keeps the
@@ -2450,7 +2526,7 @@ fn run_pair(
             let pools: Vec<Vec<Val>> = (0..tables[t].cols.len())
                 .map(|j| {
                     let mut pool = literals.map_or(Vec::new(), |p| p[j].clone());
-                    if row_links.get(t).is_some_and(|ps| ps.iter().any(|(_, idx, _, _)| *idx == j)) {
+                    if row_links.get(t).is_some_and(|ps| ps.iter().any(|b| b.col == j)) {
                         for v in special_pools.get(t).map_or(&[][..], |p| p[j].as_slice()) {
                             if !pool.contains(v) {
                                 pool.push(v.clone());
@@ -2466,7 +2542,8 @@ fn run_pair(
         }
     }
     let row_trials = if row_links.is_empty() { 0 } else { cfg.trials / 4 };
-    timing.trials = cfg.total_trials() + literal_trials + special_trials + wide_trials + row_trials;
+    timing.trials = cfg.total_trials() + literal_trials + special_trials + wide_trials;
+    timing.row_trials = row_trials;
 
     let mut full_rng = StdRng::seed_from_u64(cfg.seed);
     let mut small_rng = StdRng::seed_from_u64(cfg.seed ^ SMALL_STREAM);
@@ -2490,12 +2567,17 @@ fn run_pair(
         return Verdict::Error(e);
     }
 
-    for i in 0..timing.trials {
+    // What the trials before the row trials found, which the row trials leave as it is.
+    let mut before_rows: Option<(Option<String>, usize)> = None;
+    for i in 0..timing.trials + row_trials {
         let block = trial_block(i, cfg.total_trials(), literal_trials, special_trials, wide_trials);
         let (literal, special, wide, row) =
             (block == Block::Literal, block == Block::Special, block == Block::Wide, block == Block::Row);
         if (special && special_over) || (row && row_over) {
             continue;
+        }
+        if row && before_rows.is_none() {
+            before_rows = Some((last_err.clone(), ok_trials));
         }
         let t_trial = Instant::now();
         // By the trial's number, not the generator, so every value drawn is the one it would be.
@@ -2780,7 +2862,11 @@ fn run_pair(
             .iter()
             .filter_map(|(k, t)| insert_sql(t, &rowdata[k].iter().collect::<Vec<_>>()))
             .collect();
-        timing.rows_tried += rowdata.values().map(Vec::len).sum::<usize>();
+        // A row trial's rows are not counted among the ones the verdict rests on, here and below:
+        // whether a table was empty on every trial is said of the trials that count.
+        if !row {
+            timing.rows_tried += rowdata.values().map(Vec::len).sum::<usize>();
+        }
         let batched = all.is_empty()
             || db
                 .exec(&format!("SAVEPOINT ins; {}; RELEASE SAVEPOINT ins", all.join("; ")))
@@ -2818,11 +2904,13 @@ fn run_pair(
         for t in &loaded {
             kept.entry(t.clone()).or_default();
         }
-        timing.rows_kept += kept.values().map(Vec::len).sum::<usize>();
-        for t in &loaded {
-            let e = timing.rows_by_table.entry(t.clone()).or_default();
-            e.0 += rowdata.get(t).map_or(0, Vec::len);
-            e.1 += kept.get(t).map_or(0, Vec::len);
+        if !row {
+            timing.rows_kept += kept.values().map(Vec::len).sum::<usize>();
+            for t in &loaded {
+                let e = timing.rows_by_table.entry(t.clone()).or_default();
+                e.0 += rowdata.get(t).map_or(0, Vec::len);
+                e.1 += kept.get(t).map_or(0, Vec::len);
+            }
         }
 
         // A row trial: the parameters compared with one table's columns take the values of one row
@@ -2830,13 +2918,19 @@ fn run_pair(
         // of those the ones with the fewest NULLs in the columns bound from, since a parameter is
         // left as it was drawn where the row holds NULL, which no comparison selects.
         if row {
+            // Which of the block's row trials this is, which decides whether the parameters whose
+            // comparison excludes the row's own value are bound too (`Binding::binds_in`).
+            let k = i - timing.trials;
             for (t, params) in &row_links {
                 let rows = &kept[t];
-                let nulls = |r: &Vec<Val>| params.iter().filter(|(_, idx, _, _)| r[*idx] == Val::Null).count();
+                let nulls = |r: &Vec<Val>| params.iter().filter(|b| r[b.col] == Val::Null).count();
                 let Some(fewest) = rows.iter().map(nulls).min() else { continue };
                 let candidates: Vec<&Vec<Val>> = rows.iter().filter(|r| nulls(r) == fewest).collect();
                 let chosen = candidates[rng.random_range(0..candidates.len())];
-                for &(n, idx, param_array, col_array) in params {
+                // The ones that select the row last, so that a parameter met both ways keeps the
+                // value that selects.
+                let in_order = params.iter().filter(|b| !b.selects).chain(params.iter().filter(|b| b.selects));
+                for &Binding { param: n, col: idx, param_array, col_array, .. } in in_order.filter(|b| b.binds_in(k)) {
                     // A date parameter given a timestamp's text reads its date: say so in the
                     // value, so that a counterexample shows what the statement compared.
                     let as_param = |v: &Val| match (v, pgtypes.get(&n)) {
@@ -3039,7 +3133,11 @@ fn run_pair(
                         }
                         Err(e) => {
                             unknown = true;
-                            last_err = Some(format!("uncomparable: {e}"));
+                            // Not from a row trial, which leaves the verdict of the trials before
+                            // it as it found it.
+                            if !row {
+                                last_err = Some(format!("uncomparable: {e}"));
+                            }
                         }
                     },
                     _ => unknown = true,
@@ -3053,6 +3151,8 @@ fn run_pair(
                 verdict = Some(Verdict::NotEquivalentGather(w));
             } else if real {
                 verdict = Some(Verdict::NotEquivalent(describe(&binds, &kept, clock)));
+            } else if row {
+                // Counted for the trials before it only.
             } else if unknown {
                 timing.uncomparable += 1;
             } else {
@@ -3069,6 +3169,11 @@ fn run_pair(
         }
     }
     timing.typed_params = typed.len();
+    // A row trial adds a counterexample or nothing: what the earlier trials found stands.
+    debug_assert!(
+        before_rows.as_ref().is_none_or(|(err, ok)| *err == last_err && *ok == ok_trials),
+        "a row trial changed what the trials before it found"
+    );
 
     if let Some(why) = &probe {
         return Verdict::NotComparable(format!("gather: {why}"));
@@ -3351,6 +3456,83 @@ create table "s"."t" ("a" INTEGER);"#;
             let placed = place_tables(other, other);
             assert!(placed.starts_with("CREATE TABLE \"s\".t (id int);"), "{placed}");
         }
+    }
+
+    #[test]
+    fn a_row_trial_binds_the_parameters_compared_with_two_columns_or_more() {
+        // #301's review. What each statement binds per table, as `(parameter, column)`: first in
+        // every row trial, then in every other one as well.
+        let schema = parse_schema(
+            "CREATE TABLE t (id int PRIMARY KEY, tenant text, status text, created_at timestamp, tags text[]); \
+             CREATE TABLE u (uid int, tenant text)",
+        );
+        let loaded = vec!["t".to_string(), "u".to_string()];
+        type Bound = Vec<(u32, String)>;
+        let bound = |sql: &str, pg: &[(u32, VType)], neutral: &[u32]| -> Vec<(String, Bound, Bound)> {
+            let pgtypes: HashMap<u32, (VType, bool)> = pg.iter().map(|(n, vt)| (*n, (*vt, false))).collect();
+            let neutral: HashMap<u32, Val> = neutral.iter().map(|n| (*n, Val::Int(1))).collect();
+            row_bindings(links::row_links(sql, "", &schema), &schema, &loaded, &neutral, &pgtypes, &BTreeSet::new())
+                .into_iter()
+                .map(|(t, ps)| {
+                    let named = |k: usize| -> Bound {
+                        ps.iter().filter(|b| b.binds_in(k)).map(|b| (b.param, schema[&t].cols[b.col].name.clone())).collect()
+                    };
+                    // An even trial and an odd one stand for all of theirs.
+                    assert_eq!((named(0), named(1)), (named(28), named(29)));
+                    let (always, every_other) = (named(0), named(1));
+                    let also = every_other.into_iter().filter(|b| !always.contains(b)).collect();
+                    (t, always, also)
+                })
+                .collect()
+        };
+        let on = |t: &str, always: &[(u32, &str)], also: &[(u32, &str)]| {
+            let named = |ps: &[(u32, &str)]| ps.iter().map(|(n, c)| (*n, c.to_string())).collect::<Bound>();
+            (t.to_string(), named(always), named(also))
+        };
+        let text = VType::Varchar;
+
+        // A range: the bound that holds of the row's own value in every row trial, and the strict
+        // one in every other, so the range is not empty on all of them.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant = $1 AND created_at >= $2 AND created_at < $3", &[], &[]),
+            vec![on("t", &[(1, "tenant"), (2, "created_at")], &[(3, "created_at")])]
+        );
+        // Both ends where both hold of it.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant = $1 AND created_at BETWEEN $2 AND $3", &[], &[]),
+            vec![on("t", &[(1, "tenant"), (2, "created_at"), (3, "created_at")], &[])]
+        );
+        // A guard that excludes the row's own value is bound to it in every other trial: that
+        // value is where `status IS DISTINCT FROM $2` tells two statements apart.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant = $1 AND status IS DISTINCT FROM $2", &[], &[]),
+            vec![on("t", &[(1, "tenant")], &[(2, "status")])]
+        );
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant NOT IN ($1) AND status <> $2", &[], &[]),
+            vec![on("t", &[], &[(1, "tenant"), (2, "status")])]
+        );
+        // A parameter one column meets both ways is bound as the one that selects.
+        assert_eq!(
+            bound("SELECT id FROM t WHERE tenant = $1 AND (status = $2 OR status <> $2)", &[], &[]),
+            vec![on("t", &[(1, "tenant"), (2, "status")], &[])]
+        );
+        // One column alone is no table to run row trials for, however many parameters meet it.
+        assert_eq!(bound("SELECT id FROM t WHERE created_at >= $1 AND created_at < $2", &[], &[]), vec![]);
+        assert_eq!(bound("SELECT id FROM t WHERE tenant = $1 OR tenant = $2 OR tenant <> $3", &[], &[]), vec![]);
+        // Each table by its own columns.
+        assert_eq!(
+            bound("SELECT 1 FROM t JOIN u ON u.tenant = t.tenant WHERE t.tenant = $1 AND t.status = $2 AND u.uid = $3", &[], &[]),
+            vec![on("t", &[(1, "tenant"), (2, "status")], &[])]
+        );
+        // Through a cast of the column, where Postgres gave the parameter a type that reads the
+        // value: a `date` reads a timestamp, an integer does not, and untyped it is not bound.
+        let cast = "SELECT id FROM t WHERE tenant = $1 AND created_at::date = $2";
+        assert_eq!(bound(cast, &[(1, text), (2, VType::Date)], &[]), vec![on("t", &[(1, "tenant"), (2, "created_at")], &[])]);
+        assert_eq!(bound(cast, &[(1, text), (2, VType::Integer)], &[]), vec![]);
+        assert_eq!(bound(cast, &[], &[]), vec![]);
+        // A parameter that counts rows is none of a column's values.
+        assert_eq!(bound("SELECT id FROM t WHERE tenant = $1 AND id = $2", &[], &[2]), vec![]);
     }
 
     #[test]
