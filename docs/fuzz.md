@@ -417,6 +417,46 @@ after every other, draw from both. The literal trials keep their own pools, so a
 only gain a counterexample. A boundary an expression moves is not found: `c + 5 <= -2` and
 `c + 5 < -2` differ at `c = -7`, and `-7` is nowhere in the pair.
 
+Each parameter is drawn on its own: toward a value its column holds, and not toward the values of
+one row. Where a difference shows only on a row that several parameters must select, `tenant = $1
+AND status = $2 AND kind = $3 AND created_at::date = $4`, the chance that they agree on one falls
+with every parameter. So on the Postgres engine, where parameters are compared with two or more
+columns of one table, a last `--trials / 4` trials, from a stream of their own after every other,
+bind them to the values of one row the table holds. One column alone, however many parameters
+meet it, is what every other trial draws toward already, and gets none:
+
+- the row is one Postgres accepted, and among those one with the fewest NULLs in the columns the
+  parameters are compared with; a parameter keeps the value it was drawn where the row holds NULL;
+- a parameter whose comparison holds of the column's own value is bound in every one of these
+  trials: `=`, `>=`, `<=`, `IS NOT DISTINCT FROM`, and a `BETWEEN`, `IN`, `= ANY` or `LIKE` that is
+  not negated. One under `<`, `>`, `<>` or `IS DISTINCT FROM` is bound in every other one. The
+  row's value is the one such a comparison excludes, which is a boundary of its own: a guard
+  `c IS DISTINCT FROM $1` tells two statements apart where `$1` is what the row holds. Bound there
+  every time, `created_at >= $2 AND created_at < $3` would be an empty range on every trial, so
+  in the other half `$3` stays as it was drawn;
+- a date parameter takes a timestamp column's value, whose date it reads; an array parameter takes
+  the row's value as an element;
+- the columns the parameters are bound from take their special values in these trials too, since
+  the row that tells two statements apart is often one that holds one; other columns do not, so a
+  test of them (`deleted_at IS NULL`) keeps its odds;
+- parameters compared with two tables each take a row of their own table, which is exact for one
+  table and no worse than before for a join.
+
+Which column a parameter is compared with is read off the parsed statements for these trials, as
+Postgres resolves a column reference, and not by a name in the text as everywhere else here. So a
+quoted name is read (`"tenant" = $1`), a qualified one goes to the table its qualifier names in the
+nearest `FROM`, by alias where there is one, and a bare one to the one table there that has the
+column. A reference to a derived table, a CTE or a function, and a bare name two tables of the
+`FROM` have, bind nothing, and neither does a statement that does not parse. A column read through
+a cast is bound from as well (`created_at::date = $4`), where the value it holds is one the type
+Postgres gave the parameter reads. An assignment (`SET status = $1`) is no comparison, and binds
+nothing.
+
+A trial of these in which a statement raises, or does not finish in time, is not reported, and
+none is counted among the trials that ran, in the pair's verdict or in the trials and rows the
+run reports: a pair can only gain a counterexample. Not under the gather rule, whose parameters
+are the rows a statement stores.
+
 ## Validation
 
 `cargo test` runs a self-contained suite (no corpus) covering the bag-semantics, uniqueness-recovery,

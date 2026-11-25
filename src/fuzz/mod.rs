@@ -43,6 +43,7 @@ pub mod gather;
 pub mod gen;
 pub mod lex;
 pub mod limits;
+pub mod links;
 pub mod literals;
 pub mod pair;
 pub mod patterns;
