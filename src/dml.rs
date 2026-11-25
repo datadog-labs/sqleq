@@ -1469,6 +1469,11 @@ pub struct Stores {
 }
 
 impl Stores {
+    /// Whether the query is a reduced `INSERT` or `UPDATE`: some output of it is stored.
+    pub(crate) fn stores_any(&self) -> bool {
+        self.columns.iter().any(Option::is_some)
+    }
+
     /// Each expression of the reduced query `q` whose value the statement stores in a column, with
     /// the type the DDL declares for that column. Postgres gives a bare parameter stored in a
     /// column the column's type, which is what the cast rewrite reads this for

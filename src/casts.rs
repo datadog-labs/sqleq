@@ -30,16 +30,27 @@
 //! `n = ANY($1::int[]) AND name = ANY($1::text[])` the parameter is an `int[]`, and with the two
 //! conjuncts the other way round it is a `text[]`: two statements that differ.
 //!
-//! For a target inference has a type for, the test is inference's own: the cast must state the
-//! type the parameter was inferred to have. For a target it has none for (an array, `uuid`,
-//! `jsonb`, a float, a range, an enum), inference says nothing, and the rule asks every use of the
-//! parameter instead ([`stated_types`]): the cast is dropped only where each of them, in both
-//! queries, states that one type. A use states a type when it is a cast, a comparison with a
-//! column, or a value stored in a column, and the DDL says what the column is. A use that states
-//! none (`SELECT $1`, an argument of a function) leaves the parameter's type to an order of
-//! reading the frontend does not follow, and the pair is refused. A typmod is no part of the type
-//! a use states, and a cast that carries one (`$1::bit(3)`) is a computation whatever its uses
-//! say, which rule 5b keeps.
+//! So the rule asks every use of the parameter, in both queries, what type it states
+//! ([`stated_types`]), and drops the cast only where each of them is a use it reads and states the
+//! cast's type. That holds whatever the type is: one inference has a class for, where its own
+//! test (the cast must state the type the parameter was inferred to have) is kept as well, or one
+//! it has none for (an array, `uuid`, `jsonb`, a float, a range, an enum).
+//!
+//! * **A use that states another type** makes the cast a conversion. In `ts = $1::date` beside
+//!   `ts = $1` over a `timestamp` column the parameter is a `date` in one statement and a
+//!   `timestamp` in the other, and the cast truncates what the bare one holds. Inference keeps the
+//!   temporal classes apart in a comparison, so its test does not see this.
+//! * **A use that states none** (an argument of a function, an operand of arithmetic, a branch of
+//!   a `CASE`) leaves the parameter's type to an order of reading the frontend does not follow:
+//!   `abs($1)` makes `$1` a `double precision`, which `$1::int` rounds. Inference reads no type
+//!   off such a use, so there too its test passes where the cast converts.
+//!
+//! The uses that are read are the ones Postgres has a plain rule for: a cast; a comparison with a
+//! column, a cast or a constant, a `BETWEEN`, an `IN` list or a `LIKE` over one; a `LIMIT` count;
+//! a value stored in a column, where the DDL says what the column is; and a bare item of a select
+//! list, which is a `text`, or in a set operation what the other branch's item is. A typmod is no
+//! part of the type a use states, and a cast that carries one (`$1::bit(3)`) is a computation
+//! whatever its uses say, which rule 5b keeps.
 //!
 //! ## Why rule 5b cannot license a false proof
 //!
@@ -101,7 +112,7 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     visit_expressions, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Query,
-    Statement, TimezoneInfo, Value as SqlValue, VisitMut, VisitorMut,
+    SetExpr, Statement, TimezoneInfo, Value as SqlValue, VisitMut, Visitor, VisitorMut,
 };
 
 use crate::catalog::{obj_name, Catalog, FnDecl};
@@ -288,31 +299,74 @@ enum Use {
     Fits,
 }
 
-/// For each parameter, the one type every use of it states, in either query: `Some(key)` when each
-/// use states `key` or fits any type and at least one states it, `None` when two uses state two
-/// types or some use states none.
+/// What the uses of one parameter state between them, in both queries.
+#[derive(Clone, Debug, Default)]
+struct Uses {
+    /// The types its uses state, each once.
+    keys: Vec<TypeKey>,
+    /// Whether some use states no type.
+    silent: bool,
+}
+
+impl Uses {
+    /// Whether every use states `key`: none states another type and none is silent.
+    fn all_state(&self, key: &TypeKey) -> bool {
+        !self.silent && self.keys.as_slice() == std::slice::from_ref(key)
+    }
+}
+
+/// For each parameter, what its uses state, in either query.
 ///
 /// A use states a type when it is
 /// * the operand of a cast: the target;
-/// * compared with a bare column by `=`, `<>`, `<`, `<=`, `>`, `>=` or `IS [NOT] DISTINCT FROM`, or
-///   a bound of its `BETWEEN`: the column's declared type, which is the type Postgres resolves the
-///   parameter to there;
-/// * an item of a bare column's `IN` list that no other item can widen: the column's declared type
-///   ([`in_list`]). The parameters of one list are held to one type between them ([`pool`]);
+/// * compared by `=`, `<>`, `<`, `<=`, `>`, `>=` or `IS [NOT] DISTINCT FROM` with an operand whose
+///   type is read: a bare column (its declared type), a cast (its target, so in `ts::date = $1` the
+///   parameter is a `date`), `date(x)`, or a constant (a number's or a boolean's own type, and
+///   `text` for a string, since Postgres compares two operands of unknown type as text). That is
+///   the type Postgres resolves the parameter to there. Two rows are compared field by field, and
+///   two bare parameters are `text` and tied ([`compared`]);
+/// * a bound of such an operand's `BETWEEN`: the operand's type. Or the subject of a `BETWEEN`
+///   whose two bounds are read as one type: theirs;
+/// * an item of such an operand's `IN` list that no other item can widen: the operand's type
+///   ([`in_list`]). The parameters of one list are held to one type between them ([`pool`]). Or
+///   the subject of an `IN` list whose items are all read as one type: theirs;
+/// * the pattern of a `LIKE`, `ILIKE` or `SIMILAR TO` over an operand read as `text`, or the
+///   operand of one whose pattern is: `text`;
 /// * the array of `col <op> ANY/ALL($N)`: the array of the column's declared type;
-/// * the value a reduced `INSERT` or `UPDATE` stores in a column: that column's declared type.
+/// * the count of a `LIMIT`, `OFFSET` or `FETCH`: `bigint`;
+/// * the value a reduced `INSERT` or `UPDATE` stores in a column: that column's declared type;
+/// * an item of a select list, bare ([`SelectItems`]): `text`, which is what Postgres makes of an
+///   output column it has no type for; or, in a set operation of two branches, the type of the
+///   other branch's item, which it is resolved against.
 ///
-/// `$N IS [NOT] NULL` types nothing and agrees with the rest. Any other use (a select item, a
-/// function's argument, an operand of arithmetic) states none. Postgres does type the parameter
-/// there, by rules this does not model, so nothing is assumed.
-fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap<u32, Option<TypeKey>> {
+/// `$N IS [NOT] NULL` types nothing and agrees with the rest. Any other use (a function's
+/// argument, an operand of arithmetic or of another operator, a branch of a `CASE` or an argument
+/// of `COALESCE`) states none. Postgres does type the parameter there, by rules this does not
+/// model, so nothing is assumed, and a cast of that parameter is refused.
+fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap<u32, Uses> {
+    use sqlparser::ast::UnaryOperator;
     // The address of a placeholder -> what the expression around it says.
     let mut stated: HashMap<usize, Use> = HashMap::new();
     let (cols, uf) = (&inf.col, &mut inf.uf);
-    let mut column = |e: &Expr| -> Option<Use> {
+    // The type an operand a parameter meets is read as.
+    let mut partner = |e: &Expr| -> Option<Use> {
         let e = unwrap_nested(e);
-        if !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            return None;
+        match e {
+            Expr::Cast { data_type, .. } => return Some(Use::Stated(type_key(&data_type.to_string()))),
+            Expr::TypedString(t) => return Some(Use::Stated(type_key(&t.data_type.to_string()))),
+            // `date(x)` is a cast to `date` written as a call, whatever `x` is. No other call is
+            // read: most take their result's type from their arguments (`lower` of a range).
+            Expr::Function(f) if is_date_call(f) => return Some(Use::Stated(TypeKey::Scalar(Ty::Date))),
+            Expr::Value(v) if plain_string(&v.value) => return Some(Use::Stated(TypeKey::Scalar(Ty::Str))),
+            Expr::Value(v) => return literal_key(&v.value).map(Use::Stated),
+            Expr::UnaryOp { op: UnaryOperator::Minus | UnaryOperator::Plus, expr } => {
+                return match unwrap_nested(expr) {
+                    Expr::Value(v) if matches!(v.value, SqlValue::Number(..)) => literal_key(&v.value).map(Use::Stated),
+                    _ => None,
+                }
+            }
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {}
+            _ => return None,
         }
         let Atom::Col(table, col) = cols.get(&nid(e))? else { return None };
         Some(match ctx.declared.and_then(|cat| crate::infer::declared_type(cat, table, col)) {
@@ -325,50 +379,70 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
             },
         })
     };
-    fn note(stated: &mut HashMap<usize, Use>, param: &Expr, says: Option<Use>) {
-        let p = unwrap_nested(param);
-        if let (Some(_), Some(u)) = (placeholder_index(p), says) {
-            stated.entry(nid(p)).or_insert(u);
-        }
-    }
     let array = |u: Option<Use>| {
         u.map(|u| match u {
             Use::Stated(k) => Use::Stated(TypeKey::Array(Box::new(k))),
             Use::Fits => Use::Fits,
         })
     };
+    // `LIKE` and its kin are operators over `text` where one operand is: Postgres finds no
+    // `varchar ~~ varchar` and takes `text ~~ text`. Over any other type nothing is read.
+    let text = |u: Option<Use>| match u {
+        Some(Use::Stated(TypeKey::Scalar(Ty::Str))) | Some(Use::Fits) => u,
+        _ => None,
+    };
     // The parameters of each `IN` list, which take one type between them.
     let mut ties: Vec<Vec<u32>> = Vec::new();
     for q in queries {
+        let counts = crate::infer::pagination_count_ids(q);
         let _ = sweep(q, |e| {
             use sqlparser::ast::{BinaryOperator as B, InTarget};
+            // A count is a `bigint`. Under a cast it is the cast's operand, which the cast types.
+            if counts.contains(&nid(e)) {
+                note(&mut stated, e, Some(Use::Stated(TypeKey::Scalar(Ty::Int))));
+            }
             match e {
                 Expr::Cast { expr, data_type, .. } => {
                     note(&mut stated, expr, Some(Use::Stated(type_key(&data_type.to_string()))))
                 }
                 Expr::BinaryOp { left, op: B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq, right } => {
-                    note(&mut stated, left, column(right));
-                    note(&mut stated, right, column(left));
+                    compared(&mut stated, &mut ties, &mut partner, left, right);
                 }
                 Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
-                    note(&mut stated, a, column(b));
-                    note(&mut stated, b, column(a));
+                    compared(&mut stated, &mut ties, &mut partner, a, b);
                 }
                 Expr::IsNull(x) | Expr::IsNotNull(x) => note(&mut stated, x, Some(Use::Fits)),
                 Expr::In { expr, target: InTarget::List(list), .. } => {
-                    let subject = column(expr);
-                    let (says, params) = in_list(subject, list, &mut column);
+                    let subject = partner(expr);
+                    let (says, params) = in_list(subject, list, &mut partner);
                     for p in &params {
                         note(&mut stated, p, says.clone());
                     }
                     ties.push(params.iter().filter_map(|p| placeholder_index(p)).collect());
+                    // The subject, where it is the parameter. Postgres compares it with each column
+                    // among the items in turn and resolves it with the rest together, and either
+                    // way it is of their type where they have one between them.
+                    if placeholder_index(unwrap_nested(expr)).is_some() {
+                        note(&mut stated, expr, one_type(list.iter().map(&mut partner)));
+                    }
                 }
                 Expr::Between { expr, low, high, .. } => {
-                    note(&mut stated, low, column(expr));
-                    note(&mut stated, high, column(expr));
+                    note(&mut stated, low, partner(expr));
+                    note(&mut stated, high, partner(expr));
+                    // `$1 BETWEEN lo AND hi` is `$1 >= lo AND $1 <= hi`: the low bound types it,
+                    // and the high bound is asked to agree.
+                    if placeholder_index(unwrap_nested(expr)).is_some() {
+                        note(&mut stated, expr, one_type([partner(low), partner(high)]));
+                    }
+                }
+                Expr::Like { expr, pattern, any: false, .. }
+                | Expr::ILike { expr, pattern, any: false, .. }
+                | Expr::SimilarTo { expr, pattern, .. } => {
+                    note(&mut stated, pattern, text(partner(expr)));
+                    note(&mut stated, expr, text(partner(pattern)));
                 }
                 Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-                    note(&mut stated, right, array(column(left)))
+                    note(&mut stated, right, array(partner(left)))
                 }
                 _ => {}
             }
@@ -383,29 +457,235 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
         }
     }
 
-    // `None` once two uses disagree or one states nothing; `Some(None)` while every use so far
-    // only fits.
-    let mut agreed: HashMap<u32, Option<Option<TypeKey>>> = HashMap::new();
+    // The select lists. Last, so that a value a reduced statement stores keeps the type of its
+    // column.
+    for (i, q) in queries.iter().enumerate() {
+        let mut items = SelectItems {
+            reduced: ctx.stores.is_some_and(|s| s.get(i).is_some_and(|s| s.stores_any())).then_some(q as *const Query),
+            operands: HashSet::new(),
+            partner: &mut partner,
+            stated: &mut stated,
+        };
+        let ControlFlow::Continue(()) = sqlparser::ast::Visit::visit(q, &mut items);
+    }
+
+    let mut uses: HashMap<u32, Uses> = HashMap::new();
     for q in queries {
         let _ = sweep(q, |e| {
             let Some(n) = placeholder_index(e) else { return Ok(()) };
-            let so_far = agreed.entry(n).or_insert(Some(None));
-            *so_far = match (so_far.take(), stated.get(&nid(e))) {
-                (Some(k), Some(Use::Fits)) => Some(k),
-                (Some(None), Some(Use::Stated(k))) => Some(Some(k.clone())),
-                (Some(Some(have)), Some(Use::Stated(k))) if have == *k => Some(Some(have)),
-                _ => None,
-            };
+            let u = uses.entry(n).or_default();
+            match stated.get(&nid(e)) {
+                Some(Use::Stated(k)) => {
+                    if !u.keys.contains(k) {
+                        u.keys.push(k.clone());
+                    }
+                }
+                Some(Use::Fits) => {}
+                None => u.silent = true,
+            }
             Ok(())
         });
     }
-    pool(&ties, &mut agreed, |a, b| match (a, b) {
-        (Some(Some(a)), Some(Some(b))) if a != b => None,
-        (Some(None), other) | (other, Some(None)) => other.clone(),
-        (Some(a), Some(_)) => Some(a.clone()),
-        _ => None,
+    pool(&ties, &mut uses, |a, b| {
+        let mut both = a.clone();
+        both.keys.extend(b.keys.iter().filter(|k| !a.keys.contains(k)).cloned());
+        both.silent |= b.silent;
+        both
     });
-    agreed.into_iter().map(|(n, k)| (n, k.flatten())).collect()
+    uses
+}
+
+/// Record what the expression around `param` says of it, where `param` is a bare parameter and
+/// nothing closer to it has said anything yet.
+fn note(stated: &mut HashMap<usize, Use>, param: &Expr, says: Option<Use>) {
+    let p = unwrap_nested(param);
+    if let (Some(_), Some(u)) = (placeholder_index(p), says) {
+        stated.entry(nid(p)).or_insert(u);
+    }
+}
+
+/// What the two operands of a comparison say of a bare parameter among them.
+///
+/// * **A parameter beside an operand that is read** takes its type (`partner`).
+/// * **Two bare parameters** are one type between them, so they are tied (`ties`, for [`pool`]):
+///   Postgres compares two operands of unknown type as `text`, and where another use typed one of
+///   them first, the other takes that type. In `a = $1 AND $1 = $2 AND s = $2::text` over an
+///   integer `a`, `$2` is an integer, and the cast converts it. So each states `text`, and a
+///   cast of either is dropped only where no use of either says otherwise.
+/// * **Two rows** of as many fields are compared field by field: `(s, a) = ($1, $2)` types `$1` by
+///   `s` and `$2` by `a`.
+fn compared(
+    stated: &mut HashMap<usize, Use>,
+    ties: &mut Vec<Vec<u32>>,
+    partner: &mut dyn FnMut(&Expr) -> Option<Use>,
+    left: &Expr,
+    right: &Expr,
+) {
+    let (l, r) = (unwrap_nested(left), unwrap_nested(right));
+    match (l, r) {
+        (Expr::Tuple(ls), Expr::Tuple(rs)) if ls.len() == rs.len() => {
+            for (l, r) in ls.iter().zip(rs) {
+                compared(stated, ties, partner, l, r);
+            }
+        }
+        _ => match (placeholder_index(l), placeholder_index(r)) {
+            (Some(a), Some(b)) => {
+                let text = Use::Stated(TypeKey::Scalar(Ty::Str));
+                note(stated, l, Some(text.clone()));
+                note(stated, r, Some(text));
+                ties.push(vec![a, b]);
+            }
+            _ => {
+                note(stated, l, partner(r));
+                note(stated, r, partner(l));
+            }
+        },
+    }
+}
+
+/// The one type a parameter is read as beside `others`, where each of them is read and they
+/// state one type between them. A column of unknown type fits whatever the rest state.
+fn one_type(others: impl IntoIterator<Item = Option<Use>>) -> Option<Use> {
+    let mut one = None;
+    for other in others {
+        one = match (one, other?) {
+            (None, u) | (Some(Use::Fits), u) => Some(u),
+            (Some(have), Use::Fits) => Some(have),
+            (Some(Use::Stated(have)), Use::Stated(k)) if have == k => Some(Use::Stated(have)),
+            _ => return None,
+        };
+    }
+    one
+}
+
+/// Whether a call is `date(x)`: Postgres's `date` over one argument, which is a `date` for a
+/// timestamp, a `timestamptz`, a `date` or a string alike.
+fn is_date_call(f: &Function) -> bool {
+    let name = obj_name(&f.name).to_lowercase();
+    let one_plain_argument = match &f.args {
+        FunctionArguments::List(l) => {
+            l.duplicate_treatment.is_none()
+                && l.clauses.is_empty()
+                && matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Expr(_))])
+        }
+        _ => false,
+    };
+    matches!(name.as_str(), "date" | "pg_catalog.date")
+        && one_plain_argument
+        && f.over.is_none()
+        && f.filter.is_none()
+        && f.within_group.is_empty()
+}
+
+/// Whether a constant is a plain string, which has no type until its context gives it one.
+/// `B'..'`, `X'..'` and `N'..'` have one.
+fn plain_string(v: &SqlValue) -> bool {
+    matches!(
+        v,
+        SqlValue::SingleQuotedString(_)
+            | SqlValue::DollarQuotedString(_)
+            | SqlValue::EscapedStringLiteral(_)
+            | SqlValue::UnicodeStringLiteral(_)
+    )
+}
+
+/// What the select lists of a query, at any depth, say of the bare parameters among their items.
+///
+/// Postgres resolves an output column of unknown type to `text` once it has read the query, in a
+/// statement's own list and in a subquery's, a derived table's and a CTE's alike: `a IN (SELECT $1)`
+/// over an integer `a` compares an integer with a `text`, and does not prepare. Two lists are read
+/// otherwise:
+///
+/// * **The branches of a set operation** are resolved against each other first, column by column,
+///   so a bare parameter takes the type of the other branch's item, and `text` where that has none
+///   either. Read for two branches that are plain `SELECT`s of as many items. A longer chain is
+///   resolved pair by pair from the left, and is not read.
+/// * **The query a reduced `INSERT` or `UPDATE` became** stores its items in columns, which is
+///   what types them (`Stores::stored_values`). Its own list is not read here.
+struct SelectItems<'a> {
+    /// The query a reduced `INSERT` or `UPDATE` became, where this is one.
+    reduced: Option<*const Query>,
+    /// The parenthesised queries that are an operand of a set operation.
+    operands: HashSet<*const Query>,
+    partner: &'a mut dyn FnMut(&Expr) -> Option<Use>,
+    stated: &'a mut HashMap<usize, Use>,
+}
+
+impl SelectItems<'_> {
+    /// The expressions of a select list by position, or nothing where it has a wildcard, which is
+    /// as many positions as a table has columns.
+    fn items(select: &sqlparser::ast::Select) -> Option<Vec<&Expr>> {
+        use sqlparser::ast::SelectItem;
+        select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn operands(&mut self, body: &SetExpr) {
+        match body {
+            SetExpr::Query(q) => {
+                self.operands.insert(&**q as *const Query);
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.operands(left);
+                self.operands(right);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type the item of the other branch gives a bare parameter.
+    fn across(&mut self, other: &Expr) -> Option<Use> {
+        match unwrap_nested(other) {
+            Expr::Value(v) if matches!(v.value, SqlValue::Null | SqlValue::Placeholder(_)) => {
+                Some(Use::Stated(TypeKey::Scalar(Ty::Str)))
+            }
+            other => (self.partner)(other),
+        }
+    }
+}
+
+impl Visitor for SelectItems<'_> {
+    type Break = std::convert::Infallible;
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+        let this = q as *const Query;
+        if self.reduced == Some(this) {
+            return ControlFlow::Continue(());
+        }
+        match &*q.body {
+            SetExpr::Select(select) if !self.operands.contains(&this) => {
+                use sqlparser::ast::SelectItem;
+                for item in &select.projection {
+                    if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                        note(self.stated, e, Some(Use::Stated(TypeKey::Scalar(Ty::Str))));
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.operands(left);
+                self.operands(right);
+                if let (SetExpr::Select(l), SetExpr::Select(r)) = (&**left, &**right) {
+                    if let (Some(l), Some(r)) = (Self::items(l), Self::items(r)) {
+                        if l.len() == r.len() {
+                            for (a, b) in l.into_iter().zip(r) {
+                                let (for_a, for_b) = (self.across(b), self.across(a));
+                                note(self.stated, a, for_a);
+                                note(self.stated, b, for_b);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// What an `IN` list says of the bare parameters among its items, and which items they are.
@@ -752,15 +1032,18 @@ fn decide(
             // `numeric` and `$1::int` rounds it, and dropping the cast made the query one plan with
             // `n = $1 AND $1 = 0`.
             //
-            // A target inference has no type for (an array, `uuid`, `jsonb`, a float) is asked of
-            // every use of the parameter instead: see the module docs. One with a typmod, on itself
-            // (`$1::bit(3)`) or on its element (`$1::varchar(1)[]`), computes something even where
-            // every use agrees on the type, and takes rule 5b like any other qualified cast.
+            // Inference's test is not enough, since it reads no type off many uses and keeps some
+            // types apart that it should not. So whatever the target, every use of the parameter, in
+            // both queries, has to be one that states the cast's type: see the module docs. A use
+            // that states another type makes the parameter that type in its statement, and this
+            // cast a conversion. A use that states none leaves the parameter's type to an order of
+            // reading the frontend does not follow. One with a typmod, on itself (`$1::bit(3)`) or
+            // on its element (`$1::varchar(1)[]`), computes something even where every use agrees
+            // on the type, and takes rule 5b like any other qualified cast.
             let key = type_key(&txt);
-            let modelled = matches!(key, TypeKey::Scalar(_));
             let typmod = has_typmod(&txt);
-            if let Some(n) = placeholder_index(op).filter(|_| !modelled) {
-                if uses.get(&n).is_none_or(|agreed| agreed.as_ref() != Some(&key)) && rw.mistyped.is_none() {
+            if let Some(n) = placeholder_index(op) {
+                if !uses.get(&n).is_some_and(|u| u.all_state(&key)) && rw.mistyped.is_none() {
                     rw.mistyped = Some(unsupported(format!(
                         "${n} is cast to {txt}, but not every use of ${n} states that type: Postgres \
                          types an untyped parameter at its first use, and a cast to another type \
@@ -1736,5 +2019,142 @@ mod tests {
         )
         .expect("rewrites");
         assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
+    }
+
+    #[test]
+    fn a_cast_beside_a_use_that_states_another_type_is_refused_whatever_the_target() {
+        // #299. A bare parameter among the items of a select list is a `text`, so a cast of it to
+        // anything else on the other side is a cast to another type. A subquery's list is no
+        // different: Postgres makes the item of `t.a IN (SELECT $1)` a `text` once it has read the
+        // subquery, whatever it is then compared with, so over an integer `a` that statement does
+        // not even prepare (`operator does not exist: integer = text`).
+        for sql in [
+            "SELECT t.id, ($1)::bigint AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id, $1::timestamptz AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id FROM t WHERE t.a IN (SELECT $1::bigint); SELECT t.id FROM t WHERE t.a IN (SELECT $1)",
+            "SELECT t.id FROM t, (SELECT $1::int AS x) AS s WHERE t.a = s.x; SELECT t.id FROM t, (SELECT $1 AS x) AS s WHERE t.a = s.x",
+            "SELECT t.id FROM t WHERE EXISTS (SELECT $1::int); SELECT t.id FROM t WHERE EXISTS (SELECT $1)",
+        ] {
+            let err = run(sql).expect_err(sql).to_string();
+            assert!(err.contains("not every use of $1 states that type"), "{sql}: {err}");
+        }
+        // The same use, stating the cast's own type; and a comparison with a cast, whose target is
+        // what the parameter is there.
+        for sql in [
+            "SELECT t.id, $1::text AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id, $1::varchar AS x FROM t; SELECT t.id, $1 AS x FROM t",
+            "SELECT t.id FROM t WHERE t.s IN (SELECT $1::text); SELECT t.id FROM t WHERE t.s IN (SELECT $1)",
+            "SELECT t.id FROM t WHERE t.ts::date = $1::date; SELECT t.id FROM t WHERE t.ts::date = $1",
+            // A branch of a set operation takes its type from the other branch's item.
+            "SELECT $1::bigint AS x UNION ALL SELECT t.a::bigint FROM t; SELECT $1 AS x UNION ALL SELECT t.a::bigint FROM t",
+            "SELECT t.id, 'x' FROM t UNION ALL SELECT 1, $1::text; SELECT t.id, 'x' FROM t UNION ALL SELECT 1, $1",
+            "SELECT t.id, $1::text FROM t UNION SELECT 1, $2::text; SELECT t.id, $1 FROM t UNION SELECT 1, $2",
+        ] {
+            // The cast over the parameter is gone, so the two sides are one query.
+            let (q, _) = run(sql).expect(sql);
+            assert_eq!(q[0], q[1], "{sql}");
+        }
+        // And a branch whose other branch's item is of another type, or is not read.
+        for sql in [
+            "SELECT $1::text AS x UNION ALL SELECT t.a::bigint FROM t; SELECT $1 AS x UNION ALL SELECT t.a::bigint FROM t",
+            "SELECT t.id, $1::bigint FROM t UNION ALL SELECT t.id, 'a' FROM t; SELECT t.id, $1 FROM t UNION ALL SELECT t.id, 'a' FROM t",
+            "SELECT $1::int AS x UNION ALL SELECT abs(t.a) FROM t; SELECT $1 AS x UNION ALL SELECT abs(t.a) FROM t",
+            // Three branches are resolved pair by pair from the left, which is not read.
+            "SELECT t.id, $1::int FROM t UNION ALL SELECT t.id, 1 FROM t UNION ALL SELECT t.id, 2 FROM t; \
+             SELECT t.id, $1 FROM t UNION ALL SELECT t.id, 1 FROM t UNION ALL SELECT t.id, 2 FROM t",
+            // A branch in parentheses is a query of its own, and still no plain select list.
+            "(SELECT t.id, $1::int FROM t) UNION ALL (SELECT t.id, 1 FROM t); (SELECT t.id, $1 FROM t) UNION ALL (SELECT t.id, 1 FROM t)",
+        ] {
+            let err = run(sql).expect_err(sql).to_string();
+            assert!(err.contains("not every use of $1 states that type"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_cast_is_dropped_only_where_every_use_of_the_parameter_is_read() {
+        // #302's review. For a target inference has a class for, a use that states no type used
+        // to leave the decision to inference, whose type for the parameter is not Postgres's
+        // where the use is one it reads nothing off. Each pair here was one plan, and Postgres
+        // tells its sides apart: `abs($1)` makes `$1` a `double precision`, `$1 = '01'` a `text`.
+        for sql in [
+            "SELECT t.id FROM t WHERE abs($1) < 1 AND t.a = $1::int; SELECT t.id FROM t WHERE abs($1) < 1 AND t.a = $1",
+            "SELECT t.id FROM t WHERE $1 = '01' AND t.a = $1::int; SELECT t.id FROM t WHERE $1 = '1' AND t.a = $1::int",
+            "SELECT t.id FROM t WHERE t.a + $1 > 0 AND t.b = $1::int; SELECT t.id FROM t WHERE t.a + $1 > 0 AND t.b = $1",
+            "SELECT t.id FROM t WHERE coalesce($1, t.a) > 0 AND t.b = $1::int; SELECT t.id FROM t WHERE coalesce($1, t.a) > 0 AND t.b = $1",
+            "SELECT t.id FROM t WHERE CASE WHEN t.a > 0 THEN $1 ELSE t.b END > 0 AND t.b = $1::int; \
+             SELECT t.id FROM t WHERE CASE WHEN t.a > 0 THEN $1 ELSE t.b END > 0 AND t.b = $1",
+            // Read, and of another type than the cast's.
+            "SELECT t.id FROM t WHERE t.s LIKE $1 AND t.a = $1::int; SELECT t.id FROM t WHERE t.s LIKE $1 AND t.a = $1",
+            "SELECT t.id FROM t WHERE $1 > 5 AND t.s = $1::text; SELECT t.id FROM t WHERE $1 > 5 AND t.s = $1",
+            "SELECT t.id FROM t WHERE $1 = 2.5 AND t.a = $1::int; SELECT t.id FROM t WHERE $1 = 2.5 AND t.a = $1",
+            "SELECT t.id FROM t WHERE $1 IN ('a', 'b') AND t.a = $1::int; SELECT t.id FROM t WHERE $1 IN ('a', 'b') AND t.a = $1",
+            "SELECT t.id FROM t WHERE $1 BETWEEN 1 AND 10 AND t.s = $1::text; SELECT t.id FROM t WHERE $1 BETWEEN 1 AND 10 AND t.s = $1",
+            "SELECT t.id FROM t WHERE $1 > DATE '2020-01-01' AND t.a = $1::int; SELECT t.id FROM t WHERE $1 > DATE '2020-01-01' AND t.a = $1",
+            // A subject whose items, or bounds, are not of one type between them.
+            "SELECT t.id FROM t WHERE $1 IN (1, 'a') AND t.a = $1::int; SELECT t.id FROM t WHERE $1 IN (1, 'a') AND t.a = $1",
+            "SELECT t.id FROM t WHERE $1 BETWEEN 1 AND 2.5 AND t.a = $1::int; SELECT t.id FROM t WHERE $1 BETWEEN 1 AND 2.5 AND t.a = $1",
+            // `B'..'` and `N'..'` are typed constants this does not read.
+            "SELECT t.id FROM t WHERE $1 = B'101' AND t.a = $1::int; SELECT t.id FROM t WHERE $1 = B'101' AND t.a = $1",
+            // Two parameters compared with each other are one type between them: here `$2` is
+            // whatever `t.u = $1` makes `$1`, a `uuid`, and `$2::jsonb` converts it.
+            "SELECT t.id FROM t WHERE t.u = $1::uuid AND $1 = $2 AND t.j = $2::jsonb; \
+             SELECT t.id FROM t WHERE t.u = $1::uuid AND $1 = $2 AND t.j = $2",
+            "SELECT t.id FROM t WHERE $1 = $2 AND t.a = $1::int; SELECT t.id FROM t WHERE $1 = $2 AND t.a = $1",
+            // Two rows of different lengths, and a row against something that is not one.
+            "SELECT t.id FROM t WHERE (t.u, t.a) = ($1::uuid, $2, 1); SELECT t.id FROM t WHERE (t.u, t.a) = ($1, $2, 1)",
+            // The argument of `date`, which Postgres makes a `timestamptz`; and any other call.
+            "SELECT t.id FROM t WHERE date(t.ts) = date($1) AND t.d = $1::date; SELECT t.id FROM t WHERE date(t.ts) = date($1) AND t.d = $1",
+            "SELECT t.id FROM t WHERE date_trunc('day', t.ts) = $1 AND t.d = $1::date; \
+             SELECT t.id FROM t WHERE date_trunc('day', t.ts) = $1 AND t.d = $1",
+            "SELECT t.id FROM t WHERE date(t.ts, 1) = $1 AND t.d = $1::date; SELECT t.id FROM t WHERE date(t.ts, 1) = $1 AND t.d = $1",
+        ] {
+            let err = run(sql).expect_err(sql).to_string();
+            assert!(err.contains("not every use of $1 states that type"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn each_use_that_is_read_leaves_a_cast_to_its_type_dropped() {
+        // The cast side against the bare side, for each use Postgres has a plain rule for.
+        for sql in [
+            // A constant: an integer, a `numeric`, a boolean, and `text` for a string, since two
+            // operands of unknown type are compared as text.
+            "SELECT t.id FROM t WHERE $1::int = 5 AND t.id = $1; SELECT t.id FROM t WHERE $1 = 5 AND t.id = $1",
+            "SELECT t.id FROM t WHERE $1::bigint > -5; SELECT t.id FROM t WHERE $1 > -5",
+            "SELECT t.id FROM t WHERE $1::numeric < 2.5; SELECT t.id FROM t WHERE $1 < 2.5",
+            "SELECT t.id FROM t WHERE $1::boolean = true; SELECT t.id FROM t WHERE $1 = true",
+            "SELECT t.id FROM t WHERE $1::text = 'x'; SELECT t.id FROM t WHERE $1 = 'x'",
+            "SELECT t.id FROM t WHERE $1::date > DATE '2020-01-01'; SELECT t.id FROM t WHERE $1 > DATE '2020-01-01'",
+            // `LIKE` and its kin, either way round.
+            "SELECT t.id FROM t WHERE t.s LIKE $1::text; SELECT t.id FROM t WHERE t.s LIKE $1",
+            "SELECT t.id FROM t WHERE t.s NOT ILIKE $1::varchar; SELECT t.id FROM t WHERE t.s NOT ILIKE $1",
+            "SELECT t.id FROM t WHERE t.s SIMILAR TO $1::text; SELECT t.id FROM t WHERE t.s SIMILAR TO $1",
+            "SELECT t.id FROM t WHERE $1::text LIKE 'a%'; SELECT t.id FROM t WHERE $1 LIKE 'a%'",
+            // The subject of a `BETWEEN` and of an `IN` list.
+            "SELECT t.id FROM t WHERE $1::int BETWEEN 1 AND 10; SELECT t.id FROM t WHERE $1 BETWEEN 1 AND 10",
+            "SELECT t.id FROM t WHERE $1::date BETWEEN t.lo::date AND t.hi::date; SELECT t.id FROM t WHERE $1 BETWEEN t.lo::date AND t.hi::date",
+            "SELECT t.id FROM t WHERE $1::int IN (1, 2, 3); SELECT t.id FROM t WHERE $1 IN (1, 2, 3)",
+            "SELECT t.id FROM t WHERE $1::text IN ('a', 'b'); SELECT t.id FROM t WHERE $1 IN ('a', 'b')",
+            "SELECT t.id FROM t WHERE $1::uuid NOT IN (t.u::uuid, t.v::uuid); SELECT t.id FROM t WHERE $1 NOT IN (t.u::uuid, t.v::uuid)",
+            // A count.
+            "SELECT t.id FROM t LIMIT $1::bigint OFFSET $2::int; SELECT t.id FROM t LIMIT $1 OFFSET $2",
+            "SELECT t.id FROM t WHERE t.a IN (SELECT u.a FROM u LIMIT $1::int); SELECT t.id FROM t WHERE t.a IN (SELECT u.a FROM u LIMIT $1)",
+            // `IS NULL` beside any of them.
+            "SELECT t.id FROM t WHERE ($1::int IS NULL OR t.id > $1::int); SELECT t.id FROM t WHERE ($1 IS NULL OR t.id > $1::int)",
+            // Two bare parameters are compared as `text`, and are one type between them.
+            "SELECT t.id FROM t WHERE t.s = $1::text AND $1 = $2; SELECT t.id FROM t WHERE t.s = $1 AND $1 = $2",
+            "SELECT t.id FROM t WHERE $1::text <> $2::text; SELECT t.id FROM t WHERE $1 <> $2",
+            "SELECT t.id FROM t WHERE $1::text IS DISTINCT FROM $2; SELECT t.id FROM t WHERE $1 IS DISTINCT FROM $2",
+            // Two rows are compared field by field.
+            "SELECT t.id FROM t WHERE (t.u, t.a) = ($1::uuid, $2::bigint); SELECT t.id FROM t WHERE (t.u, t.a) = ($1, $2)",
+            "SELECT t.id FROM t WHERE ($1::text, 5) < ('a', $2::int); SELECT t.id FROM t WHERE ($1, 5) < ('a', $2)",
+            // `date(x)` is a `date`, whatever `x` is.
+            "SELECT t.id FROM t WHERE DATE(t.ts) = $1::date; SELECT t.id FROM t WHERE DATE(t.ts) = $1",
+            "SELECT t.id FROM t WHERE $1::date >= pg_catalog.date(t.ts); SELECT t.id FROM t WHERE $1 >= pg_catalog.date(t.ts)",
+        ] {
+            // The cast over the parameter is gone, so the two sides are one query.
+            let (q, _) = run(sql).expect(sql);
+            assert_eq!(q[0], q[1], "{sql}");
+        }
     }
 }
