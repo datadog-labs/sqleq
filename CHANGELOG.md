@@ -13,6 +13,14 @@ the command line, the IR or the library's API.
   1.20001). A verdict from `--engine duckdb` is a claim about the engine's own semantics, and
   names the version. The build puts the library in `target/<profile>/`, beside the binaries, where
   it was under `deps/`.
+- **The cvc5 axis needs a cvc5 where an empty table has no group** (cvc5/cvc5#13151), and
+  `tools/build_cvc5.sh` builds one, `28dd0643` on `bags-algebra-partition`. `GROUP BY` is now a
+  bare `table.aggr`, and an aggregate without it a fold, one row also over an empty table. On the
+  previous cvc5 this encoding gives false proofs, so `cargo build --features cvc5` refuses a cvc5
+  the script installed at another commit: run the script again after a pull that moves the pin.
+  The axis's answers are not comparable with the previous pin's: the pinned pairs
+  `joins/self_join_on_a_key_is_not_distinct_from`, `windows/rank_partitioned` and
+  `windows/rank_two_keys` are no longer proved.
 
 ### Fixed
 

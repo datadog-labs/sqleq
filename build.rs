@@ -6,7 +6,8 @@
 //! The build steps of the two features that link a native library; with neither, it does nothing.
 //!
 //! For `fuzz`: puts `libduckdb` where the executables find it at run time, and fetches the
-//! PostgreSQL they run pairs on. For `cvc5`: puts the cvc5 library's directory in their rpath.
+//! PostgreSQL they run pairs on. For `cvc5`: puts the cvc5 library's directory in their rpath, and
+//! checks that it is the cvc5 `tools/build_cvc5.sh` pins.
 //!
 //! `libduckdb-sys` fetches DuckDB's release library and keeps a copy in its own build directory,
 //! which cargo puts on the loader's path for what it runs itself. That is why `cargo test` passes
@@ -35,7 +36,8 @@
 //! variable nothing is added, and cvc5 is found wherever the system linker looks. A directory that
 //! does not exist is not added either -- `.cargo/config.toml` names one under `target/` whether or
 //! not `tools/build_cvc5.sh` has run -- and the build says so, since the binary will then load
-//! whichever cvc5 the loader finds, if any.
+//! whichever cvc5 the loader finds, if any. A cvc5 that the script installed at another commit than
+//! the one it pins fails the build (`check_cvc5_commit`): the encoding gives false proofs on it.
 
 #[cfg(feature = "fuzz")]
 use std::io::Read;
@@ -279,6 +281,7 @@ fn unpack(archive: &[u8], dest: &Path, name: &str) -> Result<(), String> {
 #[cfg(feature = "cvc5")]
 fn cvc5() {
     println!("cargo:rerun-if-env-changed=CVC5_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=SQLEQ_CVC5_COMMIT");
     let Ok(dir) = std::env::var("CVC5_LIB_DIR") else { return };
     if dir.is_empty() {
         return;
@@ -286,10 +289,76 @@ fn cvc5() {
     println!("cargo:rerun-if-changed={dir}");
     if std::path::Path::new(&dir).is_dir() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+        check_cvc5_commit(std::path::Path::new(&dir));
     } else {
         println!(
             "cargo:warning=CVC5_LIB_DIR={dir} does not exist, so it is not in the rpath; run \
              `sh tools/build_cvc5.sh`, or set CVC5_LIB_DIR to a cvc5 install's lib directory"
         );
     }
+}
+
+/// Fails the build when the cvc5 in `lib` is not the commit `tools/build_cvc5.sh` pins.
+///
+/// The encoding needs that commit: on a cvc5 without cvc5/cvc5#13151 an empty table has a group,
+/// and the encoding of `GROUP BY` gives false proofs. The script writes the commit it installed in
+/// `<prefix>/.sqleq-cvc5-commit`, beside `lib`. A cvc5 the script did not install has no such
+/// record, so it is only warned about. `SQLEQ_CVC5_COMMIT`, which has the script build another
+/// commit, names the commit to expect here too.
+#[cfg(feature = "cvc5")]
+fn check_cvc5_commit(lib: &std::path::Path) {
+    let prefix = lib.parent().unwrap_or(lib);
+    let stamp = prefix.join(".sqleq-cvc5-commit");
+    let Ok(installed) = std::fs::read_to_string(&stamp) else {
+        println!(
+            "cargo:warning=the cvc5 in {} was not installed by `tools/build_cvc5.sh`, so the build \
+             cannot tell which commit it is; the cvc5 axis needs one with cvc5/cvc5#13151 \
+             (docs/CVC5.md)",
+            lib.display()
+        );
+        return;
+    };
+    // Only paths that exist: one that does not would rerun this script on every build.
+    println!("cargo:rerun-if-changed={}", stamp.display());
+    let installed = installed.trim();
+    let pinned = match std::env::var("SQLEQ_CVC5_COMMIT") {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            let script = std::path::Path::new("tools/build_cvc5.sh");
+            let pin = std::fs::read_to_string(script).ok().and_then(|s| pinned_cvc5_commit(&s));
+            let Some(pin) = pin else {
+                println!(
+                    "cargo:warning={} names no pinned cvc5 commit, so the cvc5 in {} is not \
+                     checked against it",
+                    script.display(),
+                    lib.display()
+                );
+                return;
+            };
+            println!("cargo:rerun-if-changed={}", script.display());
+            pin
+        }
+    };
+    if installed != pinned {
+        eprintln!(
+            "the cvc5 in {} is commit {installed}, and the cvc5 axis is built for {pinned}, the \
+             commit tools/build_cvc5.sh pins. On another cvc5 its encoding of GROUP BY can give \
+             false proofs (docs/CVC5.md). Run `sh tools/build_cvc5.sh` to install the pinned one, \
+             or set SQLEQ_CVC5_COMMIT={installed} to build against this one anyway.",
+            prefix.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// The commit in `commit=${SQLEQ_CVC5_COMMIT:-<commit>}`, the line of `tools/build_cvc5.sh` that
+/// pins it.
+#[cfg(feature = "cvc5")]
+fn pinned_cvc5_commit(script: &str) -> Option<String> {
+    script.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("commit=${SQLEQ_CVC5_COMMIT:-")?;
+        let commit = rest.strip_suffix('}')?;
+        let hex = !commit.is_empty() && commit.bytes().all(|b| b.is_ascii_hexdigit());
+        hex.then(|| commit.to_string())
+    })
 }

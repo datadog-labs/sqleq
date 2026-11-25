@@ -59,6 +59,20 @@ commit. The cvc5 must have cvc5/cvc5#13151 (in `main` since 2026-11-14): before 
 an empty table had one row of initial values where SQL's `GROUP BY` has none, and this encoding
 relies on its having none. So the pinned commit is on `bags-algebra-partition`, which is
 `bags-algebra` merged with `main`. It proves far fewer pairs without the branch.
+
+The build checks the install against the pin. The script records the commit it installed in
+`target/cvc5/install/.sqleq-cvc5-commit`, and `cargo build --features cvc5` fails when that is not
+the commit the script pins, as after a pull that moved the pin:
+
+```
+the cvc5 in target/cvc5/install is commit 249a95c0..., and the cvc5 axis is built for 28dd0643...,
+the commit tools/build_cvc5.sh pins. ... Run `sh tools/build_cvc5.sh` to install the pinned one, or
+set SQLEQ_CVC5_COMMIT=249a95c0... to build against this one anyway.
+```
+
+A cvc5 of your own, in a `CVC5_LIB_DIR` the script did not fill, has no record: the build warns that
+it cannot tell which commit it is, and builds.
+
 The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.
