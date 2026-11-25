@@ -5,19 +5,14 @@
 
 # With the `duckdb` feature, DuckDB comes from the project's own release library rather than from a
 # source build: the `libduckdb-sys` build script downloads it once into `target/duckdb-download/`
-# and links it.
+# and links it, and build.rs copies it beside the executables.
 # That library already has the icu, json and parquet extensions compiled in, which the crates.io
 # `bundled` amalgamation does not -- see src/fuzz/duck.rs for why the oracle needs them.
+# `libduckdb-sys` downloads by default where its crate pins a DuckDB release; the setting below
+# asks for it whatever the crate's default is.
 #
 # To build against a libduckdb you already have, set DUCKDB_LIB_DIR; the build script checks it
 # before it considers downloading anything.
-#
-# From cargo 1.100 that is the only way: `libduckdb-sys` 1.10506 reads where its download belongs
-# off cargo's OUT_DIR, whose layout changed, and fails the build with "Could not determine DuckDB
-# download directory". Unpack the libduckdb archive of that DuckDB version (1.10506 is DuckDB
-# 1.5.6) from https://github.com/duckdb/duckdb/releases, point DUCKDB_LIB_DIR at the directory, and
-# have that directory on the loader's path (LD_LIBRARY_PATH, or DYLD_LIBRARY_PATH on macOS) when the
-# executables run. CI's fuzz job does exactly this.
 #
 # sqleq-cvc5 links the cvc5 library that `sh tools/build_cvc5.sh` installs under target/cvc5/, so
 # `cargo build --features cvc5` and `cargo test --features cvc5` find it without further setup. A
