@@ -1472,11 +1472,6 @@ impl Stores {
     /// branches of a `UNION ALL`, the rows of a `VALUES`, the items of a projection, and under a
     /// guard the `THEN` of the `CASE` an `UPDATE`'s `WHERE` became. A column no DDL spelled a
     /// type for gives nothing.
-    /// Whether the query is a reduced `INSERT` or `UPDATE`: some output of it is stored.
-    pub(crate) fn stores_any(&self) -> bool {
-        self.columns.iter().any(Option::is_some)
-    }
-
     pub(crate) fn stored_values<'q>(&self, q: &'q Query) -> Vec<(&'q Expr, &str)> {
         let mut out = Vec::new();
         self.stored_in(&q.body, &mut out);
