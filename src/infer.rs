@@ -1357,7 +1357,7 @@ fn fold_numeric(types: &[Ty]) -> Option<Ty> {
 /// borrow with no lifetime relation to the visitor, so references cannot escape it — and because
 /// [`sweep`] is then the natural way to get from an id back to the expression, which is what
 /// [`side_key`] needs.
-fn pagination_count_ids(q: &Query) -> HashSet<usize> {
+pub(crate) fn pagination_count_ids(q: &Query) -> HashSet<usize> {
     use sqlparser::ast::LimitClause;
 
     struct Counts(HashSet<usize>);

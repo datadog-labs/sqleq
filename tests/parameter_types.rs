@@ -128,12 +128,18 @@ fn a_parameter_postgres_types_as_an_integer_still_lowers() {
         r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1::int AND $1::int <= 0"#,
     );
     lowers_in(seeded, q0, q1);
-    // One bare use is enough for the order to matter again.
-    refused_in(
-        seeded,
+    // One bare use is enough for the order to matter again. The cast rule sees it first: the bare
+    // `$1` meets arithmetic, which states no type, so `$1::int` is no cast every use states.
+    let (q0, q1) = (
         r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1 AND $1::int < 1"#,
         r#"SELECT "id" FROM "t" WHERE "n" * 2 = $1 AND $1::int <= 0"#,
     );
+    match lower_with(&pair(q0, q1), seeded) {
+        Err(FrontendError::Unsupported(m)) => {
+            assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 #[test]
@@ -425,6 +431,34 @@ fn a_misaligned_pair_is_still_refused_as_misaligned() {
     }
 }
 
+/// Temporal columns, for the tests of #299.
+const TEMPORAL: &str = r#"create table "t" ("id" INTEGER PRIMARY KEY, "ts" TIMESTAMP, "tz" TIMESTAMPTZ, "d" DATE, "s" TEXT);"#;
+
+/// A cast over a parameter is a conversion wherever some other use makes the parameter another
+/// type, a type inference has a class for included: it keeps the temporal classes apart in a
+/// comparison, so its own test did not see these.
+#[test]
+fn a_temporal_cast_beside_a_column_of_another_temporal_type_is_refused() {
+    for (q0, q1) in [
+        // A `date` drops what a `timestamp` parameter holds.
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::date"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        // A `timestamptz` reads an offset that a `timestamp` drops.
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::timestamptz"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "d" = $1::timestamp"#, r#"SELECT "id" FROM "t" WHERE "d" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "ts" BETWEEN $1::date AND $2"#, r#"SELECT "id" FROM "t" WHERE "ts" BETWEEN $1 AND $2"#),
+        // A bare select item is a `text`.
+        (r#"SELECT "id", $1::timestamptz AS "at" FROM "t""#, r#"SELECT "id", $1 AS "at" FROM "t""#),
+        (r#"SELECT "id", ($1)::bigint AS "x" FROM "t""#, r#"SELECT "id", $1 AS "x" FROM "t""#),
+    ] {
+        match lower_with(&format!("{TEMPORAL}\n{q0};\n{q1};"), CatalogSource::InferredSeeded) {
+            Err(FrontendError::Unsupported(m)) => {
+                assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}\n{q0}\n{q1}")
+            }
+            other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}
+
 const V: &str = r#"create type public.mood as enum ('sad', 'ok');
 create table "w" ("x" INTEGER, "y" REAL);
 create table "t" ("id" INTEGER PRIMARY KEY, "b" BIT(3), "b5" BIT(5), "b1" BIT, "vb" BIT VARYING, "z" TIME WITH TIME ZONE, "m" public.mood, "r" REAL, "r2" REAL, "f" DOUBLE PRECISION, "u" UUID, "v" UUID, "tags" VARCHAR(3) ARRAY);"#;
@@ -502,5 +536,163 @@ fn a_use_the_column_does_not_type_states_nothing() {
             }
             other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
         }
+    }
+}
+
+#[test]
+fn a_temporal_cast_to_the_type_its_other_uses_state_is_still_one_plan() {
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "ts" = $1::timestamp"#, r#"SELECT "id" FROM "t" WHERE "ts" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "tz" = $1::timestamptz"#, r#"SELECT "id" FROM "t" WHERE "tz" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "d" = $1::date"#, r#"SELECT "id" FROM "t" WHERE "d" = $1"#),
+        // Compared with a cast, the parameter has the cast's type.
+        (r#"SELECT "id" FROM "t" WHERE "ts"::date = $1::date"#, r#"SELECT "id" FROM "t" WHERE "ts"::date = $1"#),
+        (r#"SELECT "id", $1::text AS "x" FROM "t""#, r#"SELECT "id", $1 AS "x" FROM "t""#),
+        // A branch of a set operation is typed by the other branch, not as a select item.
+        (r#"SELECT $1::text AS "s" UNION ALL SELECT "s" FROM "t""#, r#"SELECT $1 AS "s" UNION ALL SELECT "s" FROM "t""#),
+        (r#"UPDATE "t" SET "ts" = $1::timestamp WHERE "id" = $2"#, r#"UPDATE "t" SET "ts" = $1 WHERE "id" = $2"#),
+    ] {
+        let v = lower_with(&format!("{TEMPORAL}\n{q0};\n{q1};"), CatalogSource::InferredSeeded)
+            .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
+    }
+}
+
+/// The tables of #302's review.
+const W: &str = r#"create table "u" ("x" INTEGER, "y" DATE);
+create table "t" ("id" INTEGER PRIMARY KEY, "a" INTEGER, "b" INTEGER, "s" TEXT, "d" DATE, "d2" DATE, "ts" TIMESTAMP, "lo" TIMESTAMP, "hi" TIMESTAMP);"#;
+
+/// A cast over a parameter is dropped only where every use of the parameter is one that is read
+/// and states the cast's type, whatever the type (#302's review). A use that is not read used to
+/// leave the decision to inference where it has a class for the type, and inference reads no type
+/// off these. Each pair was one plan, and Postgres tells its two sides apart.
+#[test]
+fn a_cast_beside_a_use_that_is_not_read_is_refused() {
+    for (q0, q1) in [
+        // (a) A column of a derived table.
+        (
+            r#"SELECT "q"."id" FROM (SELECT "id", "ts" FROM "t") AS "q" WHERE "q"."ts" = $1::date"#,
+            r#"SELECT "q"."id" FROM (SELECT "id", "ts" FROM "t") AS "q" WHERE "q"."ts" = $1"#,
+        ),
+        // (b) The subject of a `BETWEEN` over timestamps: a `timestamp`, which `$1::date` truncates.
+        (
+            r#"SELECT "id" FROM "t" WHERE $1 BETWEEN "lo" AND "hi" AND "d" = $1::date"#,
+            r#"SELECT "id" FROM "t" WHERE $1 BETWEEN "lo" AND "hi" AND "d" = $1"#,
+        ),
+        // (c) Compared with a string, a `text`: `'1'` is not `'01'`, though `1` is `01`.
+        (
+            r#"SELECT "id" FROM "t" WHERE $1 = '01' AND "a" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE $1 = '1' AND "a" = $1::int"#,
+        ),
+        // (d) An argument of a function: `abs` makes it a `double precision`.
+        (
+            r#"SELECT "id" FROM "t" WHERE abs($1) < 1 AND "a" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE abs($1) < 1 AND "a" = $1"#,
+        ),
+        // (e), (f) An `IN` list another item widens, to a `timestamp` and to a `numeric`.
+        (
+            r#"SELECT "id" FROM "t" WHERE "d" IN ($1, $2::timestamp) AND "d2" = $1::date"#,
+            r#"SELECT "id" FROM "t" WHERE "d" IN ($1, $2::timestamp) AND "d2" = $1"#,
+        ),
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" NOT IN ($1, 2.5) AND "b" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE "a" NOT IN ($1, 2.5) AND "b" = $1"#,
+        ),
+        // (g) A value stored after a wildcard.
+        (
+            r#"INSERT INTO "t" ("id", "d", "ts") SELECT "u".*, $1::date FROM "u""#,
+            r#"INSERT INTO "t" ("id", "d", "ts") SELECT "u".*, $1 FROM "u""#,
+        ),
+        // An operand of arithmetic, an argument of `coalesce`, a branch of a longer set operation,
+        // and an item after a wildcard in a branch.
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" + $1 > 0 AND "b" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE "a" + $1 > 0 AND "b" = $1"#,
+        ),
+        (
+            r#"SELECT "id" FROM "t" WHERE coalesce($1, "a") > 0 AND "b" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE coalesce($1, "a") > 0 AND "b" = $1"#,
+        ),
+        (
+            r#"SELECT $1::int AS "x" UNION ALL SELECT "a" FROM "t" UNION ALL SELECT "b" FROM "t""#,
+            r#"SELECT $1 AS "x" UNION ALL SELECT "a" FROM "t" UNION ALL SELECT "b" FROM "t""#,
+        ),
+        (
+            r#"SELECT "u".*, $1::int FROM "u" UNION ALL SELECT "u".*, "x" FROM "u""#,
+            r#"SELECT "u".*, $1 FROM "u" UNION ALL SELECT "u".*, "x" FROM "u""#,
+        ),
+        // Read, and another type than the cast's: a pattern is a `text`, and a subquery's bare
+        // item a `text` whatever it is compared with.
+        (
+            r#"SELECT "id" FROM "t" WHERE "s" LIKE $1 AND "a" = $1::int"#,
+            r#"SELECT "id" FROM "t" WHERE "s" LIKE $1 AND "a" = $1"#,
+        ),
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" IN (SELECT $1::bigint)"#,
+            r#"SELECT "id" FROM "t" WHERE "a" IN (SELECT $1)"#,
+        ),
+        // The argument of `date`, which Postgres makes a `timestamptz`.
+        (
+            r#"SELECT "id" FROM "t" WHERE date("ts") = date($1) AND "d" = $1::date"#,
+            r#"SELECT "id" FROM "t" WHERE date("ts") = date($1) AND "d" = $1"#,
+        ),
+    ] {
+        match lower_with(&format!("{W}\n{q0};\n{q1};"), CatalogSource::InferredSeeded) {
+            Err(FrontendError::Unsupported(m)) => {
+                assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}\n{q0}\n{q1}")
+            }
+            other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}
+
+/// The uses that are read, each beside a cast to the type it states: the pair stays one plan.
+#[test]
+fn a_cast_beside_uses_that_are_read_and_state_its_type_is_one_plan() {
+    for (q0, q1) in [
+        // A count is a `bigint`.
+        (
+            r#"SELECT "id" FROM "t" WHERE "a" = $1 ORDER BY "id" LIMIT $2::bigint OFFSET $3::int"#,
+            r#"SELECT "id" FROM "t" WHERE "a" = $1 ORDER BY "id" LIMIT $2 OFFSET $3"#,
+        ),
+        // A pattern is a `text`.
+        (r#"SELECT "id" FROM "t" WHERE "s" LIKE $1::text"#, r#"SELECT "id" FROM "t" WHERE "s" LIKE $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "s" NOT ILIKE $1::varchar"#, r#"SELECT "id" FROM "t" WHERE "s" NOT ILIKE $1"#),
+        // A constant: a number is its own type, a string makes the comparison one of `text`.
+        (r#"SELECT "id" FROM "t" WHERE $1::int = 5 AND "id" = $1"#, r#"SELECT "id" FROM "t" WHERE $1 = 5 AND "id" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE $1::text = 'x' AND "s" = $1"#, r#"SELECT "id" FROM "t" WHERE $1 = 'x' AND "s" = $1"#),
+        // The subject of a `BETWEEN` and of an `IN` list.
+        (
+            r#"SELECT "id" FROM "t" WHERE $1::timestamp BETWEEN "lo" AND "hi" AND "ts" = $1"#,
+            r#"SELECT "id" FROM "t" WHERE $1 BETWEEN "lo" AND "hi" AND "ts" = $1"#,
+        ),
+        (r#"SELECT "id" FROM "t" WHERE $1::int IN ("a", "b")"#, r#"SELECT "id" FROM "t" WHERE $1 IN ("a", "b")"#),
+        (r#"SELECT "id" FROM "t" WHERE $1::date NOT IN ("d", "d2")"#, r#"SELECT "id" FROM "t" WHERE $1 NOT IN ("d", "d2")"#),
+        // An item of a select list is a `text`, in a subquery too; in a set operation of two
+        // branches it is what the other branch's item is.
+        (r#"SELECT "id" FROM "t" WHERE "s" IN (SELECT $1::text)"#, r#"SELECT "id" FROM "t" WHERE "s" IN (SELECT $1)"#),
+        (r#"SELECT $1::int AS "x" UNION ALL SELECT "a" FROM "t""#, r#"SELECT $1 AS "x" UNION ALL SELECT "a" FROM "t""#),
+        (r#"SELECT "d" FROM "t" UNION SELECT $1::date"#, r#"SELECT "d" FROM "t" UNION SELECT $1"#),
+        // Two parameters compared with each other are `text`, and one type between them.
+        (
+            r#"SELECT "id" FROM "t" WHERE "s" = $1::text AND $1 = $2"#,
+            r#"SELECT "id" FROM "t" WHERE "s" = $1 AND $1 = $2"#,
+        ),
+        // Two rows are compared field by field.
+        (
+            r#"SELECT "id" FROM "t" WHERE ("d", "a") = ($1::date, $2::int)"#,
+            r#"SELECT "id" FROM "t" WHERE ("d", "a") = ($1, $2)"#,
+        ),
+        // `date(x)` is a `date`.
+        (r#"SELECT "id" FROM "t" WHERE date("ts") = $1::date"#, r#"SELECT "id" FROM "t" WHERE date("ts") = $1"#),
+        // `IS NULL` types nothing.
+        (
+            r#"SELECT "id" FROM "t" WHERE ("d" = $1::date OR $1 IS NULL)"#,
+            r#"SELECT "id" FROM "t" WHERE ("d" = $1 OR $1 IS NULL)"#,
+        ),
+    ] {
+        let v = lower_with(&format!("{W}\n{q0};\n{q1};"), CatalogSource::InferredSeeded)
+            .unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
     }
 }

@@ -222,9 +222,11 @@ fn a_refusal_of_input_postgres_accepts_is_unsupported() {
         r#"SELECT "a" FROM "t" WHERE "a" = $2 AND "b" = $1"#, "type conflict", "both sides prepare");
     assert_refused(typed, &conflict, &[CatalogSource::InferredSeeded]);
     // Postgres types `$1` at its first use: a text on the left, the regular-expression form of
-    // `substring`, and an integer on the right. Inference gives it one type, the integer.
+    // `substring`, and an integer on the right. Inference gives it one type, the integer. The bare
+    // use is an argument of a function, which states no type, so the cast is refused before the
+    // check of `substring`'s own arguments is reached.
     let position = row(Unsupported, r#"SELECT SUBSTRING("b" FROM $1) FROM "t""#,
-        r#"SELECT SUBSTRING("b" FROM $1::integer) FROM "t""#, "is the position or length of a SUBSTRING",
+        r#"SELECT SUBSTRING("b" FROM $1::integer) FROM "t""#, "not every use of $1 states that type",
         "both sides prepare");
     assert_refused(typed, &position, &[CatalogSource::InferredSeeded]);
     // Postgres types `$1` a `real` on the left and a `double precision` on the right, and both
