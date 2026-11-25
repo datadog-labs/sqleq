@@ -1104,6 +1104,7 @@ fn update_pair(cat: &Catalog, a: &Update, b: &Update) -> Result<(Query, Query, [
             .chain((0..t.n_declared).map(|k| sets.iter().any(|(c, _)| *c == cols[k]).then(|| Store::of(t, k))))
             .collect(),
         guarded: pred.is_some(),
+        insert: false,
     };
     let stored = [stores(&sets_a, pred_a), stores(&sets_b, pred_b)];
     // Without a `RETURNING` clause the final table is the whole observable and one goal says it all.
@@ -1448,7 +1449,7 @@ fn insert_pair(cat: &Catalog, a: &Insert, b: &Insert) -> Result<(Query, Query, [
     }
     let columns: Vec<Option<Store>> =
         ca.iter().map(|c| declared.iter().position(|(d, _)| d == c).map(|k| Store::of(t, k))).collect();
-    let stored = Stores { columns, guarded: false };
+    let stored = Stores { columns, guarded: false, insert: true };
     Ok((sa.clone(), sb.clone(), [stored.clone(), stored]))
 }
 
@@ -1462,6 +1463,69 @@ pub struct Stores {
     /// Whether each stored value is the `THEN` of the `CASE` an `UPDATE`'s `WHERE` became
     /// ([`project`]): the `ELSE` is the column's old value, which is not stored anew.
     guarded: bool,
+    /// Whether the query is an `INSERT`'s own source, as the statement wrote it, and not the
+    /// blocks an `UPDATE` was reduced to.
+    insert: bool,
+}
+
+impl Stores {
+    /// Each expression of the reduced query `q` whose value the statement stores in a column, with
+    /// the type the DDL declares for that column. Postgres gives a bare parameter stored in a
+    /// column the column's type, which is what the cast rewrite reads this for
+    /// ([`crate::casts`]). The shapes are the ones [`stored_at`] reads off the lowered query: the
+    /// branches of a `UNION ALL`, the rows of a `VALUES`, the items of a projection, and under a
+    /// guard the `THEN` of the `CASE` an `UPDATE`'s `WHERE` became. A column no DDL spelled a
+    /// type for gives nothing.
+    ///
+    /// Two shapes give nothing because the column is not what types the value there:
+    /// * a select item after a wildcard. `u.*` is as many outputs as `u` has columns, so the
+    ///   items after it are stored in columns this does not count to;
+    /// * a branch of a set operation an `INSERT` selects from. Postgres resolves the branches
+    ///   against each other first, so a bare parameter in one takes the type of the other's
+    ///   item, and the column converts the result. The blocks an `UPDATE` reduces to are this
+    ///   crate's own `UNION ALL`, of one projection, and are read.
+    pub(crate) fn stored_values<'q>(&self, q: &'q Query) -> Vec<(&'q Expr, &str)> {
+        let mut out = Vec::new();
+        self.stored_in(&q.body, &mut out);
+        out
+    }
+
+    fn stored_in<'q, 's>(&'s self, body: &'q SetExpr, out: &mut Vec<(&'q Expr, &'s str)>) {
+        let mut push = |k: usize, e: &'q Expr| {
+            if let Some(Some(store)) = self.columns.get(k) {
+                if !store.declared.is_empty() {
+                    out.push((e, store.declared.as_str()));
+                }
+            }
+        };
+        match body {
+            SetExpr::Query(q) => self.stored_in(&q.body, out),
+            SetExpr::SetOperation { left, right, .. } if !self.insert => {
+                self.stored_in(left, out);
+                self.stored_in(right, out);
+            }
+            SetExpr::Values(v) => {
+                for row in &v.rows {
+                    row.iter().enumerate().for_each(|(k, e)| push(k, e));
+                }
+            }
+            SetExpr::Select(s) => {
+                for (k, item) in s.projection.iter().enumerate() {
+                    let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else {
+                        break;
+                    };
+                    match e {
+                        Expr::Case { operand: None, conditions, .. } if self.guarded && conditions.len() == 1 => {
+                            push(k, &conditions[0].result)
+                        }
+                        _ if self.guarded => {}
+                        _ => push(k, e),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A column a reduction stores a value in.

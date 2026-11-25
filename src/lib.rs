@@ -324,12 +324,20 @@ fn pipeline(
             Err(e) => return Err(params::root_cause(arity, e, &queries, seeds)),
         };
         let cast_typed = casts::cast_everywhere(&queries);
-        let rw = casts::rewrite_casts(&mut queries, &mut inf)?;
+        let mut rw =
+            casts::rewrite_casts(&mut queries, &mut inf, &casts::Context { declared: seeds, stores: Some(stores) })?;
         // The only window where both facts hold: rule 1 has hoisted `$N::T` to a bare `$N`, and the
         // substitution below has not yet deleted the attribution the role check reads. `arity` first,
         // the order the two sub-reasons have always had.
         if matches!(align, Align::Check(_)) {
             misaligned = arity.or_else(|| params::check_roles(&queries, &inf).err());
+        }
+        // A cast over a parameter whose uses state two types, or none: refused, unless the pair is
+        // misaligned. Two uses of `$N` in a pair that numbers its parameters differently are two
+        // parameters, so there the disagreement is the misalignment's doing and that is what the
+        // row reports, as before. A counterfactual run checks no alignment and raises it.
+        if let (Some(mistyped), None) = (rw.mistyped.take(), &misaligned) {
+            return Err(mistyped);
         }
         casts::substitute_params(&mut queries, &mut inf)?;
         let mut synth = casts::declarations(&queries, &mut inf, &rw)?;
