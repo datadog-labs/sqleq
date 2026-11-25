@@ -7,6 +7,21 @@ the command line, the IR or the library's API.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `duckdb` feature links DuckDB 2.0.1,** where it linked 1.5.6 (the `duckdb` crate, now
+  1.20001). A verdict from `--engine duckdb` is a claim about the engine's own semantics, and
+  names the version. The build puts the library in `target/<profile>/`, beside the binaries, where
+  it was under `deps/`.
+
+### Fixed
+
+- **A build from a checkout with cargo 1.100 or later finds the PostgreSQL it fetched.** Cargo
+  1.100 changed where a build script's output goes, and the build script counted directories up
+  from it: the PostgreSQL landed under `target/<profile>/build/`, where `sqleq-fuzz` and its tests
+  did not look, so they fell back to the one on `PATH` or reported none. The `duckdb` feature did
+  not build on that cargo at all before the move to DuckDB 2.0 above.
+
 ## [0.1.0] - 2026-11-13
 
 The first release, published on crates.io as `sqleq`: `cargo install --locked sqleq`.

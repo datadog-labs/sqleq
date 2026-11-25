@@ -72,7 +72,9 @@ it needs:
   `/usr/lib/postgresql/17/bin`.
 
 `--features duckdb` adds `sqleq-fuzz`'s DuckDB engine, linked against the libduckdb that
-`DUCKDB_LIB_DIR` names, which must also be on the system's library path at run time. The Lean and
+`DUCKDB_LIB_DIR` names, which must also be on the system's library path at run time. Without
+`DUCKDB_LIB_DIR` the build downloads a libduckdb into its own build directory, which
+`cargo install` deletes, and the installed `sqleq-fuzz` does not start. The Lean and
 cvc5 axes build from a checkout only (see [Building](#building)), and the QED prover is a separate
 project.
 
@@ -295,7 +297,7 @@ needs no feature: it runs each backend as a subprocess.
 * **`sqleq-fuzz`** — the `fuzz` feature, on by default. Its first build downloads a prebuilt
   PostgreSQL 17 (~12 MB, digest-pinned) for Linux and macOS on x86_64 and arm64, which it runs pairs
   on. Its other engine, DuckDB (`--engine duckdb`), is the `duckdb` feature, off by default: that
-  build downloads DuckDB's release library (~40 MB), or links the libduckdb `DUCKDB_LIB_DIR` names,
+  build downloads DuckDB's release library (~30 MB), or links the libduckdb `DUCKDB_LIB_DIR` names,
   which the build script checks before it considers downloading anything. To run
   pairs on a PostgreSQL 17 of your own, set `SQLEQ_PG_BIN` to its `bin` directory, and
   `SQLEQ_PG_DOWNLOAD=0` to skip the download. On Linux the fetched PostgreSQL uses the system's

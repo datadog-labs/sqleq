@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, HashMap};
 use sqlparser::ast::{ConflictTarget, OnConflictAction, OnInsert, Statement};
 
 use crate::lean::recognize::{recognize, Cell, GenKind, Parts, Refusal, Seq, Source, Tail, GENERATORS, SEQUENCE_TYPES};
-use crate::lean::schema::{fold, last_name, type_key, DefaultKind, DefaultSource, Schema, Table, TypeKey, Unique};
+use crate::lean::schema::{
+    fold, last_name, null_tests, type_key, DefaultKind, DefaultSource, Schema, Table, TypeKey, Unique,
+};
 
 /// The `VALUES` side's sub-shape, reported so that one shape cannot hide inside another's numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +137,11 @@ pub struct LeanPair {
     /// The input's first statement was the `unnest` side.
     pub flipped: bool,
     pub witness: Witness,
+    /// The partial unique index Postgres arbitrates by where the witness was given no arbiter, as
+    /// an index into `unique_names`: `ON CONFLICT (cols) WHERE pred DO NOTHING` whose only arbiter
+    /// is partial. A run the witness fails on a collision is then one Postgres may complete, by
+    /// skipping the row first, and the failure is worded as the witness's.
+    pub unmodelled_arbiter: Option<usize>,
     /// The `VALUES` side has generated cells, so the pair is checked by `checkGatherGen`.
     pub generated: Option<GenSummary>,
     /// Constraints the witness model does not check: `check`, `foreign-key`.
@@ -164,8 +171,26 @@ pub struct Replay {
     pub widened: Vec<usize>,
 }
 
+/// How a partial unique index is named in a witness's failure (`LeanPair::unique_names`). A
+/// collision on one is the witness's, which reads the index as total, and not always Postgres's,
+/// which checks it only for the rows its predicate holds of; the failure is worded accordingly.
+pub const PARTIAL_INDEX: &str = "partial unique index";
+
 /// Resolve the conflict clause to what the witness model needs: which unique constraint is the
 /// arbiter, the way Postgres infers it.
+///
+/// A column target takes every unique index on exactly its columns that is not on expressions and
+/// whose predicate the target's `WHERE` implies. A total index has no predicate to imply, so it is
+/// taken under any target predicate. A partial one is taken when its predicate and the target's
+/// are both chains of `IS [NOT] NULL` tests and each of the index's is among the target's
+/// (`schema::null_tests`); a target with no `WHERE` therefore takes no partial index.
+///
+/// The witness reads a partial index as total: it does not evaluate the predicate. That only adds
+/// collisions, and under `DO UPDATE` or with no arbiter a collision fails the run, so a run that
+/// succeeds has none, in the witness or in Postgres. Under `DO NOTHING` a collision on the arbiter
+/// skips the row, which would be wrong of a partial one: Postgres skips only a row the predicate
+/// holds of. So a total arbiter is named where there is one, and a partial arbiter alone is
+/// `LConflict::None`, under which any collision fails the run.
 ///
 /// Postgres never takes a deferrable constraint as an arbiter. Where it would have to, it raises
 /// before inserting a row ("ON CONFLICT does not support deferrable unique constraints/exclusion
@@ -176,56 +201,122 @@ pub struct Replay {
 ///   deferrable twin on the same columns does not matter);
 /// - a target-less `DO NOTHING` on a table with any deferrable unique constraint, since without a
 ///   target every unique index is an arbiter.
-fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
-    let Some(on) = on else { return LConflict::None };
-    let OnInsert::OnConflict(oc) = on else { return LConflict::NoArbiter };
+///
+/// `Err` is a clause this cannot resolve, with the reason: a target with a `WHERE` that finds no
+/// arbiter while a partial unique index on its columns has a predicate that was not read
+/// (`Unique::pred`). Postgres may well infer that index (`b IS NULL` implies
+/// `b IS NULL OR c IS NULL`), so neither an arbiter nor its absence can be claimed.
+fn conflict(on: &Option<OnInsert>, table: &Table) -> Result<Arbiter, String> {
+    let plain = |conflict: LConflict| Ok(Arbiter { conflict, unmodelled: None });
+    let Some(on) = on else { return plain(LConflict::None) };
+    let OnInsert::OnConflict(oc) = on else { return plain(LConflict::NoArbiter) };
     let arbiter = match &oc.conflict_target {
         None => {
             if table.uniques.iter().any(|u| u.deferrable) {
-                return LConflict::NoArbiter;
+                return plain(LConflict::NoArbiter);
             }
             None
         }
-        Some(ConflictTarget::Columns { columns: ids, .. }) => {
+        Some(ConflictTarget::Columns { columns: ids, predicate }) => {
             let mut want: Vec<usize> = Vec::new();
             for id in ids {
                 match table.column(&fold(id)) {
                     Some(i) => want.push(i),
-                    None => return LConflict::NoArbiter,
+                    None => return plain(LConflict::NoArbiter),
                 }
             }
             want.sort_unstable();
-            // Inference: a unique index on exactly these columns, not partial (Postgres needs a
-            // matching `WHERE`, which this fragment never has) and not on expressions.
+            // The target's own tests: none without a `WHERE`. A predicate `recognize` let through
+            // is a chain of `IS [NOT] NULL` tests; one on a column the table has not got is an
+            // error in Postgres.
+            let tests: Vec<(usize, bool)> = match predicate {
+                None => Vec::new(),
+                Some(p) => {
+                    let read = null_tests(p, &fold).and_then(|ts| {
+                        ts.into_iter().map(|(c, null)| table.column(&c).map(|i| (i, null))).collect::<Option<Vec<_>>>()
+                    });
+                    match read {
+                        Some(ts) => ts,
+                        None => return plain(LConflict::NoArbiter),
+                    }
+                }
+            };
+            // Inference, as Postgres does it: every unique index on exactly these columns, not on
+            // expressions, whose predicate the target's implies. A total index has none to imply. A
+            // partial one is implied when each of its tests is among the target's (`null_tests`),
+            // and one whose predicate is not such tests is not taken here: see below for what is
+            // said where nothing else is.
             let matches = |u: &&Unique| {
                 let mut c = u.cols.clone();
                 c.sort_unstable();
-                !u.partial && !u.expr && c == want
+                let implied = match &u.pred {
+                    _ if !u.partial => true,
+                    Some(p) => p.iter().all(|t| tests.contains(t)),
+                    None => false,
+                };
+                !u.expr && c == want && implied
             };
             if table.uniques.iter().filter(matches).any(|u| u.deferrable) {
-                return LConflict::NoArbiter;
+                return plain(LConflict::NoArbiter);
             }
-            match table.uniques.iter().position(|u| matches(&u)) {
+            // A total index, where there is one: the witness reads a partial index as total, so
+            // only a total arbiter is one whose every collision is the arbiter's.
+            let total = table.uniques.iter().position(|u| matches(&u) && !u.partial);
+            match total.or_else(|| table.uniques.iter().position(|u| matches(&u))) {
                 Some(u) => Some(u),
-                None => return LConflict::NoArbiter,
+                None => {
+                    // A target with no `WHERE` infers no partial index, whatever its predicate.
+                    // One with a `WHERE` may imply a predicate this did not read.
+                    let unread = |u: &Unique| {
+                        let mut c = u.cols.clone();
+                        c.sort_unstable();
+                        u.partial && u.pred.is_none() && !u.expr && c == want
+                    };
+                    if predicate.is_some() && table.uniques.iter().any(unread) {
+                        return Err("schema: a partial unique index on the conflict target's columns has a \
+                                    predicate that is not read, so whether Postgres infers it is not known"
+                            .into());
+                    }
+                    return plain(LConflict::NoArbiter);
+                }
             }
         }
         Some(ConflictTarget::OnConstraint(name)) => {
             let want = last_name(name);
             match table.uniques.iter().position(|u| u.name.is_some() && u.name == want) {
-                Some(u) if table.uniques[u].deferrable => return LConflict::NoArbiter,
+                Some(u) if table.uniques[u].deferrable => return plain(LConflict::NoArbiter),
                 Some(u) => Some(u),
-                None => return LConflict::NoArbiter,
+                None => return plain(LConflict::NoArbiter),
             }
         }
     };
     match (&oc.action, arbiter) {
-        (OnConflictAction::DoNothing, None) => LConflict::Nothing,
-        (OnConflictAction::DoNothing, Some(u)) => LConflict::NothingOn(u),
-        (OnConflictAction::DoUpdate(_), Some(u)) => LConflict::Update(u),
+        (OnConflictAction::DoNothing, None) => plain(LConflict::Nothing),
+        // A partial arbiter skips only a row its predicate holds of, and the witness does not
+        // evaluate the predicate: it reads the index as total, so it would skip a row Postgres
+        // inserts, or one Postgres raises on for another key. With no `ON CONFLICT` at all any
+        // collision fails the witness, and a run with no collision is one the clause never acts
+        // in, so that is what is said: the pair gets a witness only where no row collides. The
+        // arbiter is handed on, since a run the witness fails is then not one Postgres must fail.
+        (OnConflictAction::DoNothing, Some(u)) if table.uniques[u].partial => {
+            Ok(Arbiter { conflict: LConflict::None, unmodelled: Some(u) })
+        }
+        (OnConflictAction::DoNothing, Some(u)) => plain(LConflict::NothingOn(u)),
+        (OnConflictAction::DoUpdate(_), Some(u)) => plain(LConflict::Update(u)),
         // `DO UPDATE` without a target is rejected by Postgres.
-        (OnConflictAction::DoUpdate(_), None) => LConflict::NoArbiter,
+        (OnConflictAction::DoUpdate(_), None) => plain(LConflict::NoArbiter),
     }
+}
+
+/// What [`conflict`] resolves a conflict clause to.
+struct Arbiter {
+    /// The clause as the witness model is given it.
+    conflict: LConflict,
+    /// The partial unique index Postgres arbitrates by where the witness is given no arbiter at
+    /// all, as an index into the table's uniques: `DO NOTHING` whose only arbiter is partial.
+    /// There Postgres skips a row the witness fails on, so a failed witness says nothing of the
+    /// statement.
+    unmodelled: Option<usize>,
 }
 
 /// Above this many `VALUES` rows no witness is attempted, so the pair gets no credit. The canonical
@@ -234,36 +325,42 @@ fn conflict(on: &Option<OnInsert>, table: &Table) -> LConflict {
 /// few hundred rows it takes minutes.
 pub const WITNESS_MAX_ROWS: usize = 500;
 
-fn witness_for(a: &Parts, table: &Table) -> Witness {
+/// The witness to attempt for `a`, and the arbiter it leaves unmodelled where there is one
+/// ([`Arbiter::unmodelled`]).
+fn witness_for(a: &Parts, table: &Table) -> (Witness, Option<usize>) {
+    let skip = |reason: String| (Witness::Skip(reason), None);
     if let Source::Values(rows) = &a.src {
         if rows.len() > WITNESS_MAX_ROWS {
-            return Witness::Skip(format!(
+            return skip(format!(
                 "witness: {} VALUES rows is over the kernel witness limit of {WITNESS_MAX_ROWS}",
                 rows.len()
             ));
         }
     }
     if table.has_exclude {
-        return Witness::Skip("schema: an EXCLUDE constraint on the target table is not modelled".into());
+        return skip("schema: an EXCLUDE constraint on the target table is not modelled".into());
     }
     if table.unread {
-        return Witness::Skip("schema: a DDL statement naming the target table could not be read".into());
+        return skip("schema: a DDL statement naming the target table could not be read".into());
     }
     if table.altered {
-        return Witness::Skip("schema: the DDL alters the target table, and ALTER TABLE is not read".into());
+        return skip("schema: the DDL alters the target table, and ALTER TABLE is not read".into());
     }
     if table.retried {
-        return Witness::Skip(
-            "schema: the table's DDL only parsed after simplification, which can drop NOT NULL".into(),
-        );
+        return skip("schema: the table's DDL only parsed after simplification, which can drop NOT NULL".into());
     }
+    let Arbiter { conflict, unmodelled } = match conflict(&a.on, table) {
+        Ok(arbiter) => arbiter,
+        Err(reason) => return skip(reason),
+    };
     let ins = a.cols.iter().map(|c| table.column(c).expect("resolved above")).collect();
-    Witness::Spec(LSpec {
+    let spec = LSpec {
         cols: table.columns.iter().map(|c| (c.nullable, c.default, c.always)).collect(),
         uniques: table.uniques.iter().map(|u| (u.cols.clone(), u.nnd)).collect(),
         ins,
-        conflict: conflict(&a.on, table),
-    })
+        conflict,
+    };
+    (Witness::Spec(spec), unmodelled)
 }
 
 /// The types `Sqleq.widens` names, in the order of the ids `lean/Sqleq/Check.lean` gives them
@@ -578,13 +675,15 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
     if table.has_trigger {
         unmodelled.push("trigger");
     }
+    let (witness, unmodelled_arbiter) = witness_for(&a, table);
     Ok(LeanPair {
         tys,
         a: la,
         b: lb,
         shape,
         flipped,
-        witness: witness_for(&a, table),
+        witness,
+        unmodelled_arbiter,
         generated,
         unmodelled,
         replay: Replay {
@@ -606,6 +705,7 @@ pub fn translate(first: &Statement, second: &Statement, schema: &Schema) -> Resu
                 let cols: Vec<&str> = u.cols.iter().map(|&i| table.columns[i].name.as_str()).collect();
                 match &u.name {
                     Some(n) => format!("{n} ({})", cols.join(", ")),
+                    None if u.partial => format!("{PARTIAL_INDEX} on ({})", cols.join(", ")),
                     None => format!("unique index on ({})", cols.join(", ")),
                 }
             })
@@ -1139,12 +1239,17 @@ mod tests {
         assert!(r.expect_err("not refused").reason().contains("declares a cast of its own"));
     }
 
-    /// The arbiter the witness model gets for `INSERT INTO t (id, a) … <tail>` over `ddl`.
-    fn conflict_of(ddl: &str, tail: &str) -> LConflict {
+    /// The pair `INSERT INTO t (id, a) … <tail>` over `ddl`, translated.
+    fn pair_of(ddl: &str, tail: &str) -> LeanPair {
         let p = |s: &str| Parser::parse_sql(&crate::internals::DIALECT, s).unwrap().remove(0);
         let a = format!("INSERT INTO t (id, a) VALUES ($1, $2), ($3, $4){tail}");
         let b = format!("INSERT INTO t (id, a) SELECT * FROM unnest($1::int[], $2::int[]){tail}");
-        match translate(&p(&a), &p(&b), &Schema::from_ddl(ddl)).unwrap().witness {
+        translate(&p(&a), &p(&b), &Schema::from_ddl(ddl)).unwrap()
+    }
+
+    /// The arbiter the witness model gets for that pair.
+    fn conflict_of(ddl: &str, tail: &str) -> LConflict {
+        match pair_of(ddl, tail).witness {
             Witness::Spec(s) => s.conflict,
             Witness::Skip(r) => panic!("witness skipped: {r}"),
         }
@@ -1264,5 +1369,95 @@ mod tests {
                 assert!(on(ta, tb).is_ok(), "{ta} | {tb}");
             }
         }
+    }
+
+    #[test]
+    fn a_partial_index_is_the_arbiter_where_the_target_implies_its_predicate() {
+        // #212. Postgres takes a unique index on the target's columns whose predicate the
+        // target's `WHERE` implies; of chains of `IS [NOT] NULL` tests that is when the index's
+        // tests are among the target's. Uniques are numbered in the DDL's order.
+        let live = "CREATE TABLE t (id int, a int, b text, c text); CREATE UNIQUE INDEX t_live ON t (id) WHERE b IS NULL;";
+        for tail in [
+            " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a",
+            // As pg_dump spells the index and a client the target, and a target that says more.
+            " ON CONFLICT (ID) WHERE ((B is null)) DO UPDATE SET a = EXCLUDED.a",
+            " ON CONFLICT (id) WHERE c IS NOT NULL AND b IS NULL DO UPDATE SET a = EXCLUDED.a",
+        ] {
+            assert_eq!(conflict_of(live, tail), LConflict::Update(0), "{tail}");
+        }
+        let dumped = "CREATE TABLE t (id int, a int, b text, c text); \
+                      CREATE UNIQUE INDEX t_live ON public.t USING btree (id) WHERE ((b IS NOT NULL) AND (c IS NULL));";
+        assert_eq!(
+            conflict_of(dumped, " ON CONFLICT (id) WHERE c IS NULL AND b IS NOT NULL DO UPDATE SET a = EXCLUDED.a"),
+            LConflict::Update(0)
+        );
+
+        // No arbiter, which Postgres rejects at planning (42P10): a target that does not imply the
+        // index's predicate, says less than it, or has none; and a test on a column the table has
+        // not got, which it rejects sooner.
+        let or = "CREATE TABLE t (id int, a int, b text, c text); CREATE UNIQUE INDEX t_or ON t (id) WHERE b IS NULL OR c IS NULL;";
+        for (ddl, tail) in [
+            (live, " ON CONFLICT (id) WHERE b IS NOT NULL DO UPDATE SET a = EXCLUDED.a"),
+            (live, " ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a"),
+            (live, " ON CONFLICT (id) DO NOTHING"),
+            (dumped, " ON CONFLICT (id) WHERE c IS NULL DO UPDATE SET a = EXCLUDED.a"),
+            (live, " ON CONFLICT (id) WHERE nope IS NULL DO UPDATE SET a = EXCLUDED.a"),
+            // Another column set.
+            (live, " ON CONFLICT (a) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a"),
+            // An index whose predicate is not such tests, under a target with no `WHERE`, which
+            // implies no predicate at all.
+            (or, " ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a"),
+            (or, " ON CONFLICT (id) DO NOTHING"),
+        ] {
+            assert_eq!(conflict_of(ddl, tail), LConflict::NoArbiter, "{ddl}{tail}");
+        }
+
+        // Under a target with a `WHERE`, such an index may be the arbiter all the same: Postgres
+        // infers `t_or` here, since `b IS NULL` implies `b IS NULL OR c IS NULL`, and the statement
+        // runs. The predicate is not read, so neither an arbiter nor its absence is claimed, and
+        // the pair gets no witness, for that reason.
+        for tail in [
+            " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a",
+            " ON CONFLICT (id) WHERE b IS NULL DO NOTHING",
+            " ON CONFLICT (id) WHERE c IS NOT NULL DO NOTHING",
+        ] {
+            match pair_of(or, tail).witness {
+                Witness::Skip(r) => assert!(r.contains("has a predicate that is not read"), "{tail}: {r}"),
+                Witness::Spec(s) => panic!("{tail}: a witness under {:?}", s.conflict),
+            }
+        }
+        // Beside an index the target does take, the arbiter is that one, as before.
+        let or_and_live = format!("{or} CREATE UNIQUE INDEX t_live ON t (id) WHERE b IS NULL;");
+        assert_eq!(
+            conflict_of(&or_and_live, " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a"),
+            LConflict::Update(1)
+        );
+    }
+
+    #[test]
+    fn a_partial_arbiter_alone_never_skips_a_row() {
+        // The witness reads a partial index as total, so under `DO NOTHING` it would skip a row
+        // Postgres inserts (one the predicate does not hold of) or raises on (one that collides on
+        // another key). With only a partial arbiter the witness is asked for a run with no
+        // collision at all.
+        let live = "CREATE TABLE t (id int, a int, b text); CREATE UNIQUE INDEX t_live ON t (id) WHERE b IS NULL;";
+        assert_eq!(conflict_of(live, " ON CONFLICT (id) WHERE b IS NULL DO NOTHING"), LConflict::None);
+        // The pair remembers the arbiter the witness went without, and only there.
+        assert_eq!(pair_of(live, " ON CONFLICT (id) WHERE b IS NULL DO NOTHING").unmodelled_arbiter, Some(0));
+        assert_eq!(pair_of(live, " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a").unmodelled_arbiter, None);
+        assert_eq!(pair_of(live, " ON CONFLICT DO NOTHING").unmodelled_arbiter, None);
+        // Beside a total index on the same columns, which is an arbiter under any target
+        // predicate, the total one is named: every collision on it is the arbiter's.
+        let both = "CREATE TABLE t (id int, a int, b text); CREATE UNIQUE INDEX t_live ON t (id) WHERE b IS NULL; \
+                    CREATE UNIQUE INDEX t_all ON t (id);";
+        assert_eq!(conflict_of(both, " ON CONFLICT (id) WHERE b IS NULL DO NOTHING"), LConflict::NothingOn(1));
+        assert_eq!(conflict_of(both, " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a"), LConflict::Update(1));
+        // A deferrable constraint on the columns is met by inference too, and Postgres raises.
+        let deferred = "CREATE TABLE t (id int, a int, b text, CONSTRAINT t_def UNIQUE (id) DEFERRABLE); \
+                        CREATE UNIQUE INDEX t_live ON t (id) WHERE b IS NULL;";
+        assert_eq!(
+            conflict_of(deferred, " ON CONFLICT (id) WHERE b IS NULL DO UPDATE SET a = EXCLUDED.a"),
+            LConflict::NoArbiter
+        );
     }
 }

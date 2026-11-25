@@ -87,10 +87,10 @@ const TEMPLATE_FORMAT: u32 = 4;
 /// fetched (`build.rs`) if it runs here, else the `postgres` on `PATH`.
 ///
 /// The fetched one sits under `target/<profile>/postgresql/`, which this executable finds from its
-/// own directory: `target/<profile>/` for a binary, `target/<profile>/deps/` for a test harness, or
-/// wherever a binary was copied together with that `postgresql/` directory. A Linux build of it uses
-/// the system's own OpenSSL, libxml2, Kerberos, zstd and lz4, so on a machine without one of them
-/// it cannot start, and `PATH` is tried instead.
+/// own directory (`fetched_candidates`): `target/<profile>/` for a binary, a directory below it for
+/// a test harness, or wherever a binary was copied together with that `postgresql/` directory. A
+/// Linux build of it uses the system's own OpenSSL, libxml2, Kerberos, zstd and lz4, so on a machine
+/// without one of them it cannot start, and `PATH` is tried instead.
 pub fn bin_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("SQLEQ_PG_BIN") {
         return Ok(PathBuf::from(dir));
@@ -124,13 +124,16 @@ pub fn bin_dir() -> Result<PathBuf, String> {
 fn fetched() -> Option<PathBuf> {
     let rel = option_env!("SQLEQ_PG_FETCHED")?;
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let found = [Some(dir), dir.parent()]
-        .into_iter()
-        .flatten()
-        .map(|d| d.join(rel))
-        .find(|b| b.join("postgres").is_file());
+    let found = fetched_candidates(exe.parent()?, rel).find(|b| b.join("postgres").is_file());
     found
+}
+
+/// Where `rel`, the fetched PostgreSQL's `bin` under `target/<profile>/`, may be, seen from the
+/// directory of an executable: in it, for a binary, and up to four levels above it, for a test
+/// harness. Cargo puts a harness in `target/<profile>/deps/` up to 1.99, one level down, and in
+/// `target/<profile>/build/<package>/<hash>/out/` from 1.100, four levels down.
+fn fetched_candidates<'a>(dir: &'a Path, rel: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+    dir.ancestors().take(5).map(move |d| d.join(rel))
 }
 
 /// The server's version (`17.11`), refusing any major but [`MAJOR`]: a verdict is a claim about one
@@ -2953,6 +2956,21 @@ fn run_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fetched PostgreSQL is under `target/<profile>/`, and an executable looks for it from
+    /// where cargo put it: a binary, a test harness under cargo's layout up to 1.99, and one under
+    /// its layout from 1.100, which counted levels did not reach.
+    #[test]
+    fn the_fetched_postgres_is_found_from_every_place_cargo_puts_an_executable() {
+        let rel = "postgresql/postgresql-17.11.0-x86_64-unknown-linux-gnu/bin";
+        let want = Path::new("/w/target/debug").join(rel);
+        for dir in ["/w/target/debug", "/w/target/debug/deps", "/w/target/debug/build/sqleq/0123456789abcdef/out"] {
+            assert!(fetched_candidates(Path::new(dir), rel).any(|c| c == want), "{dir}");
+        }
+        // Not from any depth: a harness is four levels down at most.
+        let deeper = Path::new("/w/target/debug/build/sqleq/0123456789abcdef/out/more");
+        assert!(!fetched_candidates(deeper, rel).any(|c| c == want));
+    }
 
     /// `tools/lean_replay.py --setup` prepares the database the Lean replay runs in as the template
     /// here is prepared: the same extensions, and the same `uuid-ossp` stand-ins where the

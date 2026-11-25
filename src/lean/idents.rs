@@ -54,7 +54,7 @@ const KEYWORDS: &[&str] = &[
     "where", "window", "with",
 ];
 
-fn keyword(word: &str) -> bool {
+pub(crate) fn keyword(word: &str) -> bool {
     KEYWORDS.binary_search(&word).is_ok()
 }
 

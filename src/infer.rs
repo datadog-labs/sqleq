@@ -673,6 +673,15 @@ pub fn declares(cat: &Catalog, table: &str, col: &str) -> bool {
     cat.find(&key_path(table)).is_some_and(|i| cat.tables[i].cols.iter().any(|(c, _)| c == col))
 }
 
+/// The type the DDL declares for the column `col` of `table`, as it spells it and with a domain
+/// resolved to its base type ([`crate::catalog::Table::declared_types`]). The table and the column
+/// are named as [`declares`] names them. `None` for a column no DDL spelled a type for.
+pub(crate) fn declared_type<'a>(cat: &'a Catalog, table: &str, col: &str) -> Option<&'a str> {
+    let t = &cat.tables[cat.find(&key_path(table))?];
+    let k = t.cols.iter().position(|(c, _)| c == col)?;
+    t.declared_types.get(k).map(String::as_str).filter(|d| !d.is_empty())
+}
+
 impl<'a> Attributor<'a> {
     fn new(prov: Option<&'a Catalog>) -> Self {
         Self {

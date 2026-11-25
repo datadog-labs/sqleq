@@ -27,3 +27,14 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
 ]
+
+# Known advisories, from the RustSec database: CI runs `cargo deny check advisories`. An entry here
+# is an advisory that is known, cannot be acted on yet, and does not bear on what sqleq does. Each
+# says why, and what would let it go.
+[advisories]
+ignore = [
+    # chrono is unmaintained, with no version to move to. It is here through `arrow`, which only
+    # the `duckdb` crate depends on, behind the optional `duckdb` feature; sqleq calls neither. It
+    # goes when the `duckdb` crate depends on an `arrow` without chrono.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained with no fixed version; reached only through arrow, which the optional duckdb feature's crate depends on" },
+]

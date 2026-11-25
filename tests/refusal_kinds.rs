@@ -227,6 +227,13 @@ fn a_refusal_of_input_postgres_accepts_is_unsupported() {
         r#"SELECT SUBSTRING("b" FROM $1::integer) FROM "t""#, "is the position or length of a SUBSTRING",
         "both sides prepare");
     assert_refused(typed, &position, &[CatalogSource::InferredSeeded]);
+    // Postgres types `$1` a `real` on the left and a `double precision` on the right, and both
+    // prepare. The frontend has no class for either, and refuses a cast that not every use of the
+    // parameter states.
+    let floats = r#"create table "t" ("a" INTEGER, "f" DOUBLE PRECISION, unique ("a"));"#;
+    let cast = row(Unsupported, r#"SELECT "a" FROM "t" WHERE "f" = $1::float4"#,
+        r#"SELECT "a" FROM "t" WHERE "f" = $1"#, "not every use of $1 states that type", "both sides prepare");
+    assert_refused(floats, &cast, &[CatalogSource::InferredSeeded]);
     // A name `JOIN ... USING` merged is one column to Postgres.
     let two = r#"create table "t" ("id" INTEGER, "x" INTEGER, unique ("id"));
 create table "u" ("id" INTEGER, "x" INTEGER, unique ("id"));"#;

@@ -5,19 +5,21 @@
 
 //! The build steps of the two features that link a native library; with neither, it does nothing.
 //!
-//! For `fuzz`: tells the executables where to find `libduckdb` at run time, and fetches the
+//! For `fuzz`: puts `libduckdb` where the executables find it at run time, and fetches the
 //! PostgreSQL they run pairs on. For `cvc5`: puts the cvc5 library's directory in their rpath.
 //!
-//! `libduckdb-sys` copies the library it fetched into `target/<profile>/deps` and emits an rpath
-//! for it, but `cargo:rustc-link-arg` from a *dependency's* build script does not reach the final
-//! executable — so without this both the binary and the test harness die at startup with
-//! `libduckdb.so: cannot open shared object file`. Cargo happens to paper over the test case by
-//! setting `LD_LIBRARY_PATH`, which is why `cargo test` passes while `./target/release/sqleq-fuzz`
-//! does not.
+//! `libduckdb-sys` fetches DuckDB's release library and keeps a copy in its own build directory,
+//! which cargo puts on the loader's path for what it runs itself. That is why `cargo test` passes
+//! where `./target/release/sqleq-fuzz` would die at startup with `libduckdb.so: cannot open shared
+//! object file`: nothing tells an executable run directly where the library is, and a
+//! `cargo:rustc-link-arg` from a *dependency's* build script does not reach it. So this script
+//! copies the library into `target/<profile>/`, beside the binaries, and gives every executable an
+//! rpath to that directory.
 //!
-//! The lookup is relative to the executable rather than absolute, so a built tree can be moved:
-//! binaries land in `target/<profile>/` and test harnesses in `target/<profile>/deps/`, which is
-//! why both directories are listed.
+//! The rpath is relative to the executable rather than absolute, so a built tree can be moved. A
+//! binary is in `target/<profile>/` itself. A test harness is one level down up to cargo 1.99
+//! (`deps/`) and four levels down from cargo 1.100 (`build/<package>/<hash>/out/`), which is why
+//! three directories are listed.
 //!
 //! PostgreSQL comes as a prebuilt archive from
 //! [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries), built from
@@ -82,12 +84,26 @@ fn fuzz() {
     println!("cargo:rerun-if-env-changed=SQLEQ_PG_DOWNLOAD");
     // DuckDB's library sits beside the executables only when the `duckdb` feature links it.
     if std::env::var_os("CARGO_FEATURE_DUCKDB").is_some() {
-        match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
-            "linux" => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/deps:$ORIGIN"),
-            "macos" => {
-                println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/deps,-rpath,@loader_path");
+        let library = match std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+            "linux" => {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/..:$ORIGIN/../../../..");
+                Some("libduckdb.so")
             }
-            _ => {}
+            "macos" => {
+                println!(
+                    "cargo:rustc-link-arg=-Wl,-rpath,@loader_path,-rpath,@loader_path/..,-rpath,@loader_path/../../../.."
+                );
+                Some("libduckdb.dylib")
+            }
+            _ => None,
+        };
+        if let Some(library) = library {
+            if let Err(e) = place_duckdb(library) {
+                println!(
+                    "cargo:warning=sqleq-fuzz: libduckdb was not put beside the executables \
+                     ({e}); one run directly needs it on the loader's path"
+                );
+            }
         }
     }
     match fetch_postgres() {
@@ -98,6 +114,53 @@ fn fuzz() {
              SQLEQ_PG_BIN names, or the one on PATH"
         ),
     }
+}
+
+/// Copy the DuckDB library `libduckdb-sys` linked into `target/<profile>/`, where the rpath above
+/// has every executable look.
+///
+/// `libduckdb-sys` says where the library is through `DEP_DUCKDB_INCLUDE`, the directory of the
+/// headers: its own download, which holds the library too, or the one `DUCKDB_LIB_DIR` names.
+/// Cargo passes that only to a crate that depends on `libduckdb-sys` directly, which is why
+/// `Cargo.toml` names it beside `duckdb`, and runs this script after that one. A directory with no
+/// library in it (headers apart from a system libduckdb) is left alone: the loader finds that
+/// library by its own rules.
+///
+/// A build of the published crate is most often a `cargo install`, which copies the binaries out
+/// and deletes this directory. A library downloaded for it is gone with it, so that build is told
+/// to name a libduckdb that stays.
+#[cfg(feature = "fuzz")]
+fn place_duckdb(library: &str) -> Result<(), String> {
+    println!("cargo:rerun-if-env-changed=DEP_DUCKDB_INCLUDE");
+    let Some(dir) = std::env::var_os("DEP_DUCKDB_INCLUDE") else {
+        return Err("libduckdb-sys did not say where it is".into());
+    };
+    let source = Path::new(&dir).join(library);
+    if !source.is_file() {
+        return Ok(());
+    }
+    println!("cargo:rerun-if-changed={}", source.display());
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from).unwrap_or_default();
+    if manifest.join(".cargo_vcs_info.json").is_file() {
+        if std::env::var_os("DUCKDB_LIB_DIR").is_none() {
+            println!(
+                "cargo:warning=sqleq-fuzz: this build downloaded a libduckdb into its own build \
+                 directory, which `cargo install` deletes; set DUCKDB_LIB_DIR to the directory of \
+                 a libduckdb that is on the system's library path"
+            );
+        }
+        return Ok(());
+    }
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
+    let dest = profile_dir(&out).ok_or("unexpected OUT_DIR layout")?.join(library);
+    // By way of a name of its own, renamed into place: an executable started meanwhile loads the
+    // old library or the new one, never part of one.
+    let staging = dest.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::copy(&source, &staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    std::fs::rename(&staging, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("{}: {e}", dest.display())
+    })
 }
 
 /// Fetch and unpack this target's PostgreSQL unless it is already in place, and return its `bin`
@@ -124,9 +187,8 @@ fn fetch_postgres() -> Result<Option<String>, String> {
         .find(|(t, _)| *t == target)
         .map(|(_, d)| *d)
         .ok_or(format!("no prebuilt archive for {target}"))?;
-    // OUT_DIR is target/<profile>/build/<package>-<hash>/out.
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
-    let profile_dir = out.ancestors().nth(3).ok_or("unexpected OUT_DIR layout")?;
+    let profile_dir = profile_dir(&out).ok_or("unexpected OUT_DIR layout")?;
     let name = format!("postgresql-{PG_VERSION}-{target}");
     let rel = format!("postgresql/{name}/bin");
     let bin = profile_dir.join(&rel);
@@ -158,6 +220,16 @@ fn fetch_postgres() -> Result<Option<String>, String> {
         }
     }
     Ok(Some(rel))
+}
+
+/// `target/<profile>/`, where the executables land, from this script's `OUT_DIR`. Cargo has that at
+/// `<profile>/build/<package>-<hash>/out` up to 1.99 and at `<profile>/build/<package>/<hash>/out`
+/// from 1.100, and calls the layout its own to change. So this reads only what the two share: the
+/// profile directory is the one holding the nearest `build` above `OUT_DIR`. Counting levels put
+/// the PostgreSQL under `build/` on cargo 1.100, where no executable looks for it.
+#[cfg(feature = "fuzz")]
+fn profile_dir(out: &Path) -> Option<&Path> {
+    out.ancestors().skip(1).find(|d| d.file_name().is_some_and(|n| n == "build"))?.parent()
 }
 
 #[cfg(feature = "fuzz")]

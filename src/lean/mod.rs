@@ -241,6 +241,29 @@ fn explain(p: &LeanPair, w: &str) -> String {
         "nothingInserted" => "it inserts no row".into(),
         other => format!("the canonical run ends in `{other}`"),
     };
+    // The witness reads a partial unique index as total, so a collision on one is not always one
+    // in Postgres, which checks the index only for the rows its predicate holds of.
+    let on_partial = matches!(tag, "unique" | "secondTime") && uniq(arg).starts_with(translate::PARTIAL_INDEX);
+    if on_partial {
+        return format!(
+            "the witness finds no run of the VALUES side with non-NULL parameters that succeeds: {why}, \
+             which it reads as total"
+        );
+    }
+    // Where the statement's only arbiter is a partial index, the witness has none, and a collision
+    // on any other key fails it. Postgres asks the arbiter first and skips a row it holds of, so
+    // that key may never be looked at: `ON CONFLICT (a) WHERE deleted_at IS NULL DO NOTHING` over
+    // two rows that are one completes, with the second skipped, where the witness sees the
+    // primary key collide. A NULL in a `NOT NULL` column or a value for a `GENERATED ALWAYS` one
+    // is raised before any index is asked, so those stay the statement's.
+    if tag == "unique" {
+        if let Some(arbiter) = p.unmodelled_arbiter.and_then(|u| p.unique_names.get(u)) {
+            return format!(
+                "the witness finds no run of the VALUES side with non-NULL parameters that succeeds: {why}, \
+                 and it does not model the statement's arbiter, the {arbiter}, which may skip the row first"
+            );
+        }
+    }
     format!("the VALUES side fails every run with non-NULL parameters: {why}")
 }
 
@@ -407,4 +430,50 @@ pub fn check(
             (c.name.clone(), rec)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::parser::Parser;
+
+    /// `INSERT INTO w (id, a) … <tail>` as a `VALUES` and an `unnest` statement, over a table with
+    /// a primary key on `id` (unique 0) and a partial unique index on `a` (unique 1).
+    fn pair(tail: &str) -> LeanPair {
+        let ddl = "CREATE TABLE w (id int PRIMARY KEY, a int NOT NULL, deleted_at timestamp); \
+                   CREATE UNIQUE INDEX w_a_live ON w (a) WHERE deleted_at IS NULL;";
+        let p = |s: &str| Parser::parse_sql(&crate::internals::DIALECT, s).unwrap().remove(0);
+        let a = format!("INSERT INTO w (id, a) VALUES ($1, $2), ($1, $2){tail}");
+        let b = format!("INSERT INTO w (id, a) SELECT * FROM unnest($1::int[], $2::int[]){tail}");
+        translate(&p(&a), &p(&b), &Schema::from_ddl(ddl)).unwrap()
+    }
+
+    #[test]
+    fn a_collision_under_an_arbiter_the_witness_went_without_is_the_witnesss() {
+        // #300's review. Under `DO NOTHING` with only a partial arbiter the witness has no arbiter,
+        // so the two equal rows collide on the primary key. Postgres skips the second on the
+        // arbiter before it looks at that key, and the statement completes: the failure is the
+        // witness's, whichever constraint it meets first.
+        let nothing = pair(" ON CONFLICT (a) WHERE deleted_at IS NULL DO NOTHING");
+        let on_key = explain(&nothing, "unique 0");
+        assert!(
+            on_key.starts_with("the witness finds no run")
+                && on_key.contains("collide on w_pkey (id)")
+                && on_key.contains("does not model the statement's arbiter, the partial unique index on (a)"),
+            "{on_key}"
+        );
+        let on_index = explain(&nothing, "unique 1");
+        assert!(on_index.starts_with("the witness finds no run") && on_index.ends_with("which it reads as total"), "{on_index}");
+        // What Postgres raises before it asks any index stays the statement's.
+        assert!(explain(&nothing, "notNull 1").starts_with("the VALUES side fails every run"));
+
+        // With the partial index as the witness's own arbiter, or with no conflict clause, a
+        // collision on another key fails the statement in Postgres too.
+        for tail in [" ON CONFLICT (a) WHERE deleted_at IS NULL DO UPDATE SET id = EXCLUDED.id", ""] {
+            let p = pair(tail);
+            let on_key = explain(&p, "unique 0");
+            assert_eq!(on_key, "the VALUES side fails every run with non-NULL parameters: two of its rows collide on w_pkey (id)", "{tail}");
+            assert!(explain(&p, "unique 1").ends_with("which it reads as total"), "{tail}");
+        }
+    }
 }
