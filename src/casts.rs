@@ -37,7 +37,9 @@
 //! queries, states that one type. A use states a type when it is a cast, a comparison with a
 //! column, or a value stored in a column, and the DDL says what the column is. A use that states
 //! none (`SELECT $1`, an argument of a function) leaves the parameter's type to an order of
-//! reading the frontend does not follow, and the pair is refused.
+//! reading the frontend does not follow, and the pair is refused. A typmod is no part of the type
+//! a use states, and a cast that carries one (`$1::bit(3)`) is a computation whatever its uses
+//! say, which rule 5b keeps.
 //!
 //! ## Why rule 5b cannot license a false proof
 //!
@@ -146,7 +148,8 @@ enum TypeKey {
     /// A type inference has a [`Ty`] for. The class is the key, whatever the spelling and the
     /// typmod: `bigint` and `integer` are one, as they are to [`canon_target`].
     Scalar(Ty),
-    /// A type it has none for, by its spelling as Postgres folds it, typmod included.
+    /// A type it has none for, by its name as Postgres folds it ([`type_name`]). Without a typmod:
+    /// a parameter's type has none, so a `bit(3)` and a `bit(5)` column both make it a `bit`.
     Named(String),
     /// An array of the element's key. Postgres has one array type per element type, however many
     /// dimensions the spelling writes.
@@ -157,13 +160,10 @@ enum TypeKey {
 fn type_key(txt: &str) -> TypeKey {
     let folded = crate::types::fold_type_name(txt);
     let (elem, array) = array_element(&folded);
-    let key = match map_type_name(elem) {
+    let name = type_name(elem);
+    let key = match map_type_name(&name) {
         (Some(ty), _) => TypeKey::Scalar(ty),
-        (None, _) => TypeKey::Named(match elem {
-            "float8" | "double precision" | "float" | "double" => "double precision".to_string(),
-            "float4" | "real" => "real".to_string(),
-            other => other.to_string(),
-        }),
+        (None, _) => TypeKey::Named(name),
     };
     if array {
         TypeKey::Array(Box::new(key))
@@ -172,8 +172,80 @@ fn type_key(txt: &str) -> TypeKey {
     }
 }
 
-/// A folded type spelling without its trailing `[..]` groups, and whether it had any. The
-/// SQL-standard `T ARRAY` is left as it is: a spelling of its own, which matches only itself.
+/// The name a [`TypeKey`] is made of, from a folded element spelling: what is left once everything
+/// that does not tell two types apart is gone. Each step is one Postgres's own reading of a type
+/// name takes, and nothing else is folded, because taking two types for one is the direction that
+/// drops a cast it should not: a spelling this does not know keeps its own key, and a pair that
+/// needs the two to be one type is refused.
+///
+/// * **A typmod goes.** `bit(3)`, `time(0) with time zone` and `geometry(Point,4326)` are the types
+///   `bit`, `time with time zone` and `geometry`; what the modifier computes is [`has_typmod`]'s
+///   business. `float(p)` is the one spelling whose parenthesis picks the type: `real` up to 24 and
+///   `double precision` above.
+/// * **Two names the grammar gives one type are one**: the floats, `time with time zone` and
+///   `timetz`, `bit varying` and `varbit`.
+/// * **`pg_catalog.T` is `T`** for a type Postgres predefines, which is where a bare `T` is looked
+///   up first.
+/// * **`public.T` is `T`** for a type it does not predefine and this crate gives no class: a
+///   pair's enum or other user type, which the DDL declares in `public` and a cast names bare. This
+///   takes the session's search path to find `public`'s type, as [`Catalog::resolve_bare`] does for
+///   a table.
+///
+/// A quoted part keeps its quotes, and any other schema its name, so `"mood"` and `app.mood` are
+/// keys of their own.
+fn type_name(elem: &str) -> String {
+    if let Some(p) = elem.strip_prefix("float(").and_then(|rest| rest.strip_suffix(')')) {
+        return match p.trim().parse::<u32>() {
+            Ok(1..=24) => "real".to_string(),
+            Ok(25..=53) => "double precision".to_string(),
+            _ => elem.to_string(),
+        };
+    }
+    // Every `(..)` group outside double quotes, and the space it leaves beside another.
+    let mut name = String::new();
+    let (mut quoted, mut depth) = (false, 0usize);
+    for c in elem.chars() {
+        match c {
+            '(' if !quoted => depth += 1,
+            ')' if !quoted && depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            ' ' if !quoted && (name.is_empty() || name.ends_with(' ')) => {}
+            _ => {
+                quoted ^= c == '"';
+                name.push(c);
+            }
+        }
+    }
+    let name = name.trim_end();
+    let unqualified = match name.split_once('.') {
+        Some(("pg_catalog", t)) if crate::catalog::PG_CATALOG_TYPES.contains(&t) => t,
+        Some(("public", t)) if user_type_name(t) => t,
+        _ => name,
+    };
+    match unqualified {
+        "float8" | "double precision" | "float" | "double" => "double precision",
+        "float4" | "real" => "real",
+        "time with time zone" => "timetz",
+        "bit varying" => "varbit",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Whether a folded, unqualified name can only be a type the input's DDL creates: one unquoted
+/// identifier that Postgres predefines no type under and that this crate reads as no class.
+fn user_type_name(t: &str) -> bool {
+    let ident = t.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    ident
+        && !crate::catalog::PG_CATALOG_TYPES.contains(&t)
+        && crate::types::scalar_class(t).is_none()
+        && crate::types::temporal_class(&t.to_uppercase()).is_none()
+        && crate::types::unfaithful_type(t).is_none()
+}
+
+/// A folded type spelling without what makes it an array, and whether anything did: its trailing
+/// `[..]` groups, or the SQL-standard `T ARRAY` and `T ARRAY[n]`, which Postgres reads as `T[]`.
 fn array_element(folded: &str) -> (&str, bool) {
     let mut elem = folded.trim_end();
     let mut array = false;
@@ -182,19 +254,25 @@ fn array_element(folded: &str) -> (&str, bool) {
         elem = elem[..open].trim_end();
         array = true;
     }
+    if let Some(of) = elem.strip_suffix(" array") {
+        elem = of.trim_end();
+        array = true;
+    }
     (elem, array)
 }
 
 /// Whether a cast target computes something beyond naming a type: a length, a precision or an
-/// interval's fields, on the type or on an array's element. [`map_type_name`] reports no qualifier
-/// for an array, so `varchar(1)[]`, which truncates each element, is asked about its element.
+/// interval's fields, on the type or on an array's element, whatever the type is. So `bit(3)` and
+/// `timetz(0)` do, as `varchar(3)` does, and so does a type this crate does not know with anything
+/// in parentheses. [`map_type_name`] reports no qualifier for an array, so `varchar(1)[]`, which
+/// truncates each element, is asked about its element.
+///
+/// An unquoted `bit` with no length is `bit(1)` to Postgres's grammar, and truncates like one. The
+/// quoted `"bit"` is the type with no length, and computes nothing.
 fn has_typmod(txt: &str) -> bool {
     let folded = crate::types::fold_type_name(txt);
-    let (elem, array) = array_element(&folded);
-    match map_type_name(elem) {
-        (Some(_), qualified) => qualified,
-        (None, _) => array && elem.contains('('),
-    }
+    let (elem, _) = array_element(&folded);
+    map_type_name(elem).1 || elem == "bit"
 }
 
 /// What one use of a parameter says of its type.
@@ -203,8 +281,10 @@ enum Use {
     /// It states this type: the target of a cast over the parameter, or the declared type of the
     /// column it is compared with or stored in.
     Stated(TypeKey),
-    /// It is compared with a column whose type no DDL declares and inference found nothing for.
-    /// Such a column has whatever type fits the pair, so the use agrees with what the others state.
+    /// It agrees with whatever the other uses state. A comparison with a column whose type no DDL
+    /// declares and inference found nothing for: such a column has whatever type fits the pair.
+    /// And `$N IS [NOT] NULL`, which types nothing: Postgres leaves the parameter to its other
+    /// uses there, and does not prepare a statement in which that test comes first.
     Fits,
 }
 
@@ -214,14 +294,17 @@ enum Use {
 ///
 /// A use states a type when it is
 /// * the operand of a cast: the target;
-/// * compared with a bare column by `=`, `<>`, `<`, `<=`, `>`, `>=` or `IS [NOT] DISTINCT FROM`, an
-///   item of that column's `IN` list or a bound of its `BETWEEN`: the column's declared type, which
-///   is the type Postgres resolves the parameter to there;
+/// * compared with a bare column by `=`, `<>`, `<`, `<=`, `>`, `>=` or `IS [NOT] DISTINCT FROM`, or
+///   a bound of its `BETWEEN`: the column's declared type, which is the type Postgres resolves the
+///   parameter to there;
+/// * an item of a bare column's `IN` list that no other item can widen: the column's declared type
+///   ([`in_list`]). The parameters of one list are held to one type between them ([`pool`]);
 /// * the array of `col <op> ANY/ALL($N)`: the array of the column's declared type;
 /// * the value a reduced `INSERT` or `UPDATE` stores in a column: that column's declared type.
 ///
-/// Any other use (a select item, a function's argument, an operand of arithmetic) states none.
-/// Postgres does type the parameter there, by rules this does not model, so nothing is assumed.
+/// `$N IS [NOT] NULL` types nothing and agrees with the rest. Any other use (a select item, a
+/// function's argument, an operand of arithmetic) states none. Postgres does type the parameter
+/// there, by rules this does not model, so nothing is assumed.
 fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap<u32, Option<TypeKey>> {
     // The address of a placeholder -> what the expression around it says.
     let mut stated: HashMap<usize, Use> = HashMap::new();
@@ -254,6 +337,8 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
             Use::Fits => Use::Fits,
         })
     };
+    // The parameters of each `IN` list, which take one type between them.
+    let mut ties: Vec<Vec<u32>> = Vec::new();
     for q in queries {
         let _ = sweep(q, |e| {
             use sqlparser::ast::{BinaryOperator as B, InTarget};
@@ -269,10 +354,14 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
                     note(&mut stated, a, column(b));
                     note(&mut stated, b, column(a));
                 }
+                Expr::IsNull(x) | Expr::IsNotNull(x) => note(&mut stated, x, Some(Use::Fits)),
                 Expr::In { expr, target: InTarget::List(list), .. } => {
-                    for item in list {
-                        note(&mut stated, item, column(expr));
+                    let subject = column(expr);
+                    let (says, params) = in_list(subject, list, &mut column);
+                    for p in &params {
+                        note(&mut stated, p, says.clone());
                     }
+                    ties.push(params.iter().filter_map(|p| placeholder_index(p)).collect());
                 }
                 Expr::Between { expr, low, high, .. } => {
                     note(&mut stated, low, column(expr));
@@ -310,7 +399,117 @@ fn stated_types(queries: &[Query], inf: &mut Inferred, ctx: &Context) -> HashMap
             Ok(())
         });
     }
+    pool(&ties, &mut agreed, |a, b| match (a, b) {
+        (Some(Some(a)), Some(Some(b))) if a != b => None,
+        (Some(None), other) | (other, Some(None)) => other.clone(),
+        (Some(a), Some(_)) => Some(a.clone()),
+        _ => None,
+    });
     agreed.into_iter().map(|(n, k)| (n, k.flatten())).collect()
+}
+
+/// What an `IN` list says of the bare parameters among its items, and which items they are.
+///
+/// Postgres resolves one common type over the subject and the items that are not columns of the
+/// query, where there are two or more such items, and a bare parameter among them takes it. An
+/// item with no type of its own (a string literal, `NULL`, a parameter nothing has typed yet) adds
+/// nothing to that type. So the list's parameters have the subject's type where every other item
+/// is one of those, a cast or a literal of that type, or a column of it. Any other item may widen
+/// the common type: `r IN ($1, $2::float8)` over a `real` `r` makes `$1` a `double precision`. Then
+/// nothing is said of the parameters.
+///
+/// A sibling parameter that another use typed first widens it as well: in `f = $2 AND r IN ($1, $2)`
+/// over a `float8` `f`, `$2` is a `double precision` by the time the list is read, and makes `$1`
+/// one. So the list's parameters are returned together, for [`pool`] to hold to one type.
+fn in_list<'e>(
+    subject: Option<Use>,
+    items: &'e [Expr],
+    column: &mut dyn FnMut(&Expr) -> Option<Use>,
+) -> (Option<Use>, Vec<&'e Expr>) {
+    use sqlparser::ast::UnaryOperator;
+    let params: Vec<&Expr> =
+        items.iter().map(unwrap_nested).filter(|i| placeholder_index(i).is_some()).collect();
+    let mut says = subject;
+    for item in items.iter().map(unwrap_nested) {
+        // The type an item brings to the common type, where it brings one.
+        let typed = match item {
+            Expr::Value(v) => match &v.value {
+                SqlValue::Placeholder(_) | SqlValue::Null => continue,
+                // A plain string constant has no type until its context gives it one. `B'..'`,
+                // `X'..'` and `N'..'` have one, which is not read.
+                SqlValue::SingleQuotedString(_)
+                | SqlValue::DollarQuotedString(_)
+                | SqlValue::EscapedStringLiteral(_)
+                | SqlValue::UnicodeStringLiteral(_) => continue,
+                other => literal_key(other),
+            },
+            Expr::UnaryOp { op: UnaryOperator::Minus | UnaryOperator::Plus, expr } => match unwrap_nested(expr) {
+                Expr::Value(v) if matches!(v.value, SqlValue::Number(..)) => literal_key(&v.value),
+                _ => None,
+            },
+            Expr::Cast { data_type, .. } => Some(type_key(&data_type.to_string())),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match column(item) {
+                // A column of unknown type fits the list, whatever the list's type is.
+                Some(Use::Fits) => continue,
+                Some(Use::Stated(k)) => Some(k),
+                None => None,
+            },
+            _ => None,
+        };
+        says = match (says, typed) {
+            (Some(Use::Stated(have)), Some(k)) if have == k => Some(Use::Stated(have)),
+            // The subject is a column of unknown type: the list is of the type its items state.
+            (Some(Use::Fits), Some(k)) => Some(Use::Stated(k)),
+            _ => None,
+        };
+        if says.is_none() {
+            break;
+        }
+    }
+    (says, params)
+}
+
+/// The key of the type Postgres gives a number or a boolean constant, where that is one of the
+/// classes: an integer, a `numeric` (a decimal point, an exponent, or digits beyond `bigint`), a
+/// boolean. `None` for any other constant.
+fn literal_key(v: &SqlValue) -> Option<TypeKey> {
+    match v {
+        SqlValue::Number(n, _) => {
+            Some(TypeKey::Scalar(if n.parse::<i64>().is_ok() { Ty::Int } else { Ty::Real }))
+        }
+        SqlValue::Boolean(_) => Some(TypeKey::Scalar(Ty::Bool)),
+        _ => None,
+    }
+}
+
+/// Hold the parameters of each group in `ties` to one answer: `join` of what was found for each.
+/// The groups are closed under sharing a parameter first, so `a IN ($1, $2) AND b IN ($2, $3)`
+/// is one group of three.
+fn pool<T: Clone>(ties: &[Vec<u32>], found: &mut HashMap<u32, T>, join: impl Fn(&T, &T) -> T) {
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for tie in ties.iter().filter(|t| t.len() > 1) {
+        let (mut joined, rest): (Vec<Vec<u32>>, Vec<Vec<u32>>) =
+            groups.into_iter().partition(|g| g.iter().any(|n| tie.contains(n)));
+        joined.push(tie.clone());
+        groups = rest;
+        groups.push(joined.concat());
+    }
+    for group in groups {
+        let mut all: Option<T> = None;
+        for n in &group {
+            if let Some(t) = found.get(n) {
+                all = Some(match &all {
+                    Some(have) => join(have, t),
+                    None => t.clone(),
+                });
+            }
+        }
+        if let Some(all) = all {
+            for n in group {
+                found.insert(n, all.clone());
+            }
+        }
+    }
 }
 
 /// What to do with one cast. Recorded against the cast node's [`nid`] by [`decide`].
@@ -554,12 +753,12 @@ fn decide(
             // `n = $1 AND $1 = 0`.
             //
             // A target inference has no type for (an array, `uuid`, `jsonb`, a float) is asked of
-            // every use of the parameter instead: see the module docs. One with a typmod on its
-            // element, `$1::varchar(1)[]`, computes something even where every use agrees on the
-            // type, and takes rule 5b like any other qualified cast.
+            // every use of the parameter instead: see the module docs. One with a typmod, on itself
+            // (`$1::bit(3)`) or on its element (`$1::varchar(1)[]`), computes something even where
+            // every use agrees on the type, and takes rule 5b like any other qualified cast.
             let key = type_key(&txt);
             let modelled = matches!(key, TypeKey::Scalar(_));
-            let typmod = if modelled { qualified } else { has_typmod(&txt) };
+            let typmod = has_typmod(&txt);
             if let Some(n) = placeholder_index(op).filter(|_| !modelled) {
                 if uses.get(&n).is_none_or(|agreed| agreed.as_ref() != Some(&key)) && rw.mistyped.is_none() {
                     rw.mistyped = Some(unsupported(format!(
@@ -1330,9 +1529,142 @@ mod tests {
         // A quoted name is the name as written.
         assert_ne!(k("\"MyType\""), k("mytype"));
         assert_eq!(k("MyType"), k("mytype"));
+        assert_ne!(k("\"bit\""), k("bit"));
+        assert_ne!(k("\"mood\""), k("mood"));
 
-        assert!(has_typmod("varchar(1)[]") && has_typmod("varchar(3)") && has_typmod("numeric(10,2)[]"));
-        assert!(!has_typmod("varchar[]") && !has_typmod("uuid") && !has_typmod("bigint[]"));
+        // A key has no typmod: a parameter's type has none.
+        assert_eq!(k("bit(3)"), k("bit(5)"));
+        assert_eq!(k("bit(3)"), k("bit"));
+        assert_eq!(k("varbit(5)"), k("varbit"));
+        assert_eq!(k("timetz(0)"), k("timetz"));
+        assert_eq!(k("time (0) with time zone"), k("time with time zone"));
+        assert_eq!(k("geometry(Point,4326)"), k("geometry"));
+        assert_ne!(k("bit"), k("varbit"));
+        // `float(p)` picks the type by its precision.
+        assert_eq!(k("float(24)"), k("real"));
+        assert_eq!(k("float(25)"), k("double precision"));
+        assert_eq!(k("float"), k("float8"));
+        // Two names the grammar gives one type.
+        assert_eq!(k("time with time zone"), k("timetz"));
+        assert_eq!(k("bit varying"), k("varbit"));
+        assert_eq!(k("bit varying(5)[]"), k("varbit[]"));
+        assert_ne!(k("time with time zone"), k("time"));
+        // The SQL-standard array spelling is the array.
+        assert_eq!(k("uuid ARRAY"), k("uuid[]"));
+        assert_eq!(k("varchar(3) ARRAY[4]"), k("text[]"));
+        assert_ne!(k("uuid ARRAY"), k("uuid"));
+        // `pg_catalog.T` is `T` for a type Postgres predefines, and for no other.
+        assert_eq!(k("pg_catalog.uuid"), k("uuid"));
+        assert_eq!(k("pg_catalog.int4"), k("integer"));
+        assert_eq!(k("pg_catalog.float8[]"), k("double precision[]"));
+        assert_ne!(k("pg_catalog.mood"), k("mood"));
+        // `public.T` is `T` for a type the DDL creates, and for no name Postgres or this crate
+        // gives a meaning, where the bare name is `pg_catalog`'s type.
+        assert_eq!(k("public.mood"), k("mood"));
+        assert_eq!(k("public.mood[]"), k("mood[]"));
+        assert_ne!(k("public.uuid"), k("uuid"));
+        assert_ne!(k("public.text"), k("text"));
+        assert_ne!(k("public.integer"), k("integer"));
+        assert_ne!(k("public.real"), k("real"));
+        assert_ne!(k("app.mood"), k("mood"));
+        assert_ne!(k("public.\"Mood\""), k("mood"));
+        assert_ne!(k("\"public\".mood"), k("mood"));
+
+        for typmod in [
+            "varchar(1)[]", "varchar(3)", "numeric(10,2)[]", "bit(3)", "varbit(5)", "timetz(0)",
+            "time(0) with time zone", "geometry(Point,4326)", "varchar(3) ARRAY", "interval day",
+            // An unquoted `bit` is `bit(1)`, alone or as an array's element.
+            "bit", "BIT", "bit[]", "bit ARRAY",
+        ] {
+            assert!(has_typmod(typmod), "{typmod}");
+        }
+        for plain in ["varchar[]", "uuid", "bigint[]", "varbit", "timetz", "\"bit\"", "int ARRAY", "bit varying", "interval"] {
+            assert!(!has_typmod(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_typmod_on_a_type_with_no_ty_keeps_the_cast() {
+        // #298's review. `$1::bit(3)` truncates and `$1::timetz(0)` rounds, as `$1::varchar(3)`
+        // does, and `main` kept them through the flag `map_type_name` reports. Asking only an
+        // array about its element dropped them like `$1::uuid`. An unquoted `bit` is `bit(1)`, and
+        // `varchar(3) ARRAY` is `varchar(3)[]`.
+        for target in ["bit(3)", "timetz(0)", "varbit(5)", "bit", "bit[]", "varchar(3) ARRAY"] {
+            let sql = format!("SELECT t.id FROM t WHERE t.b = $1::{target}; SELECT t.id FROM t WHERE t.b = $1");
+            let (q, rw) = run(&sql).expect(&sql);
+            assert!(q[0].contains("qcast0") && !q[1].contains("qcast"), "{sql}: {q:?}");
+            assert_eq!(rw.qcasts.len(), 1, "{sql}: {:?}", rw.qcasts);
+        }
+        // Two lengths are two functions, and the type with no length is none.
+        let (_, rw) = run("SELECT t.id FROM t WHERE t.b = $1::bit(3); SELECT t.id FROM t WHERE t.b = $1::bit(4)")
+            .expect("rewrites");
+        assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
+        let (q, rw) = run("SELECT t.id FROM t WHERE t.b = $1::varbit; SELECT t.id FROM t WHERE t.b = $1")
+            .expect("rewrites");
+        assert!(rw.qcasts.is_empty() && q[0] == q[1], "{q:?}");
+    }
+
+    #[test]
+    fn an_in_list_states_a_type_only_where_no_item_can_widen_it() {
+        // #298's review. Postgres resolves one common type over the subject and the items, so a
+        // typed item decides what the bare parameters beside it are. No DDL here: the column is of
+        // whatever type fits, and the list is of the type its items state.
+        for sql in [
+            // The cast sibling makes `$1` a `double precision`, and `$1::real` a conversion.
+            "SELECT t.id FROM t WHERE t.r IN ($1, $2::float8) AND t.x = $1::real; \
+             SELECT t.id FROM t WHERE t.r IN ($1, $2::float8) AND t.x = $1",
+            // A sibling parameter another use typed does the same: the list's parameters are one
+            // type between them.
+            "SELECT t.id FROM t WHERE t.f = $2::float8 AND t.r IN ($1, $2) AND t.x = $1::real; \
+             SELECT t.id FROM t WHERE t.f = $2::float8 AND t.r IN ($1, $2) AND t.x = $1",
+            // Through a second list.
+            "SELECT t.id FROM t WHERE t.r IN ($1, $2) AND t.s IN ($2, $3) AND t.x = $1::real AND t.y = $3::float8; \
+             SELECT t.id FROM t WHERE t.r IN ($1, $2) AND t.s IN ($2, $3) AND t.x = $1 AND t.y = $3",
+            // An item that is none of the readable kinds.
+            "SELECT t.id FROM t WHERE t.r IN ($1, abs(t.z)) AND t.x = $1::uuid; \
+             SELECT t.id FROM t WHERE t.r IN ($1, abs(t.z)) AND t.x = $1",
+            "SELECT t.id FROM t WHERE t.r IN ($1, B'101') AND t.x = $1::varbit; \
+             SELECT t.id FROM t WHERE t.r IN ($1, B'101') AND t.x = $1",
+        ] {
+            // Of `$1`, or of the sibling it is read together with.
+            let err = run(sql).expect_err(sql).to_string();
+            assert!(err.contains("but not every use of $") && err.contains("states that type"), "{sql}: {err}");
+        }
+        for sql in [
+            "SELECT t.id FROM t WHERE t.u IN ($1, $2) AND t.v = $1::uuid; \
+             SELECT t.id FROM t WHERE t.u IN ($1, $2) AND t.v = $1",
+            // Items with no type of their own, and one of the type the cast states.
+            "SELECT t.id FROM t WHERE t.u IN ($1, NULL, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ($2)) AND t.v = $1::uuid; \
+             SELECT t.id FROM t WHERE t.u IN ($1, NULL, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ($2)) AND t.v = $1",
+            "SELECT t.id FROM t WHERE t.u IN ($1, $2::uuid) AND t.v = $1::uuid; \
+             SELECT t.id FROM t WHERE t.u IN ($1, $2::uuid) AND t.v = $1",
+            "SELECT t.id FROM t WHERE t.u IN ($1, t.w) AND t.v = $1::uuid; \
+             SELECT t.id FROM t WHERE t.u IN ($1, t.w) AND t.v = $1",
+        ] {
+            let (q, rw) = run(sql).expect(sql);
+            assert!(rw.qcasts.is_empty() && q[0] == q[1], "{sql}: {q:?}");
+        }
+    }
+
+    #[test]
+    fn pooled_groups_are_closed_under_a_shared_member() {
+        let mut found: HashMap<u32, u32> = [(1, 1), (2, 5), (3, 2), (4, 7), (5, 0), (6, 9)].into();
+        pool(&[vec![1, 2], vec![6], vec![4, 5], vec![2, 3]], &mut found, |a, b| *a.max(b));
+        let mut got: Vec<(u32, u32)> = found.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, [(1, 5), (2, 5), (3, 5), (4, 7), (5, 7), (6, 9)]);
+    }
+
+    #[test]
+    fn a_null_test_types_nothing() {
+        // #298's review: `$1 IS NULL` is no use that states another type, or none.
+        for sql in [
+            "SELECT t.id FROM t WHERE (t.u = $1::uuid OR $1 IS NULL); SELECT t.id FROM t WHERE (t.u = $1 OR $1 IS NULL)",
+            "SELECT t.id FROM t WHERE t.u = $1::uuid AND ($1) IS NOT NULL; SELECT t.id FROM t WHERE t.u = $1 AND ($1) IS NOT NULL",
+        ] {
+            let (q, rw) = run(sql).expect(sql);
+            assert!(rw.qcasts.is_empty() && q[0] == q[1], "{sql}: {q:?}");
+        }
     }
 
     #[test]
