@@ -43,9 +43,10 @@ solver = ["dep:z3"]
 # sqleq-fuzz links DuckDB, whose release library its first build downloads, and fetches the
 # PostgreSQL its default engine runs on (build.rs).
 fuzz = ["dep:postgres", "dep:rand", "dep:regex", "dep:ureq", "dep:sha2", "dep:flate2", "dep:tar"]
-# sqleq-fuzz's other engine, DuckDB, off by default: its library is linked from a download that only
-# this repository's .cargo/config.toml asks for, so a build from the published crate would not link.
-duckdb = ["fuzz", "dep:duckdb"]
+# sqleq-fuzz's other engine, DuckDB, off by default: its library is linked from a download into the
+# build directory, which a `cargo install` of the published crate deletes, so that build has to
+# name a libduckdb of its own (`DUCKDB_LIB_DIR`).
+duckdb = ["fuzz", "dep:duckdb", "dep:libduckdb-sys"]
 # sqleq-lean needs a Lean toolchain at run time, and reads the frontend's internals.
 lean = ["internals"]
 # sqleq-cvc5 links a cvc5 library (`CVC5_LIB_DIR`). It reads plans through `ir`, not the solver, so
@@ -106,8 +107,13 @@ serde = { version = "1", features = ["derive"] }
 
 # sqleq-fuzz. DuckDB, linked against the project's own release library -- which, unlike the
 # crates.io `bundled` amalgamation, has the icu, json and parquet extensions compiled into it. The
-# repository's .cargo/config.toml is what tells the build script to fetch it.
-duckdb = { version = "1", optional = true }
+# `libduckdb-sys` build script fetches it. The floor is the first release that finds its download
+# directory under cargo's build layout from 1.100 as well as the one before; it is DuckDB 2.0.
+duckdb = { version = "1.20000.2", optional = true }
+# Named only for build.rs: cargo runs a build script after those of the crates its package depends
+# on directly, and passes it what they report -- here `DEP_DUCKDB_INCLUDE`, the directory of the
+# library build.rs copies beside the executables. `duckdb` pins the version and picks the features.
+libduckdb-sys = { version = "1.20000.2", default-features = false, optional = true }
 # Pattern matching for time-freezing, LIMIT/param detection, and the UNIQUE-INDEX regex fallback.
 regex = { version = "1", optional = true }
 # Deterministic, seedable RNG for instance/parameter generation.
