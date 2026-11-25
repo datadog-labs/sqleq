@@ -425,7 +425,7 @@ pub struct Domains {
 
 /// The types Postgres 17 predefines in `pg_catalog`, but arrays: the names a domain of the same name
 /// does not shadow ([`Domains`]).
-const PG_CATALOG_TYPES: [&str; 80] = [
+pub(crate) const PG_CATALOG_TYPES: [&str; 80] = [
     "aclitem", "bit", "bool", "box", "bpchar", "bytea", "char", "cid", "cidr", "circle", "date", "datemultirange",
     "daterange", "float4", "float8", "gtsvector", "inet", "int2", "int4", "int4multirange", "int4range", "int8",
     "int8multirange", "int8range", "interval", "json", "jsonb", "jsonpath", "line", "lseg", "macaddr", "macaddr8",
