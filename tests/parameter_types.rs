@@ -424,3 +424,83 @@ fn a_misaligned_pair_is_still_refused_as_misaligned() {
         }
     }
 }
+
+const V: &str = r#"create type public.mood as enum ('sad', 'ok');
+create table "w" ("x" INTEGER, "y" REAL);
+create table "t" ("id" INTEGER PRIMARY KEY, "b" BIT(3), "b5" BIT(5), "b1" BIT, "vb" BIT VARYING, "z" TIME WITH TIME ZONE, "m" public.mood, "r" REAL, "r2" REAL, "f" DOUBLE PRECISION, "u" UUID, "v" UUID, "tags" VARCHAR(3) ARRAY);"#;
+
+fn lowered_over(ddl: &str, q0: &str, q1: &str) -> Result<Value, FrontendError> {
+    lower_with(&format!("{ddl}\n{q0};\n{q1};"), CatalogSource::InferredSeeded)
+}
+
+/// A typmod computes something whatever the type: `$1::bit(3)` truncates as `$1::varchar(3)` does.
+/// For a type inference has no class for, only an array was asked about its element's typmod, so
+/// the cast was dropped and the pair was one plan (#298's review). An unquoted `bit` with no length
+/// is `bit(1)`. The type a use states has no typmod, so a `bit(5)` column and `$1::bit(3)` agree on
+/// what the parameter is, and the cast is kept, not refused.
+#[test]
+fn a_typmod_on_a_type_with_no_class_keeps_the_cast() {
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "b" = $1::bit(3)"#, r#"SELECT "id" FROM "t" WHERE "b" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "b5" = $1::bit(3)"#, r#"SELECT "id" FROM "t" WHERE "b5" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "b1" = $1::bit"#, r#"SELECT "id" FROM "t" WHERE "b1" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "vb" = $1::varbit(5)"#, r#"SELECT "id" FROM "t" WHERE "vb" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "z" = $1::timetz(0)"#, r#"SELECT "id" FROM "t" WHERE "z" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "tags" = $1::varchar(3) ARRAY"#, r#"SELECT "id" FROM "t" WHERE "tags" = $1"#),
+    ] {
+        let v = lowered_over(V, q0, q1).unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_ne!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
+    }
+}
+
+/// Pairs #298 refused that Postgres runs as one statement (its review): `$1 IS NULL` types
+/// nothing, and a type is the same type under each name Postgres reads as it.
+#[test]
+fn a_null_test_and_another_spelling_of_the_type_leave_the_cast_dropped() {
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE ("u" = $1::uuid OR $1 IS NULL)"#, r#"SELECT "id" FROM "t" WHERE ("u" = $1 OR $1 IS NULL)"#),
+        (r#"SELECT "id" FROM "t" WHERE "z" = $1::timetz"#, r#"SELECT "id" FROM "t" WHERE "z" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "vb" = $1::varbit"#, r#"SELECT "id" FROM "t" WHERE "vb" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "m" = $1::mood"#, r#"SELECT "id" FROM "t" WHERE "m" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "u" = $1::pg_catalog.uuid"#, r#"SELECT "id" FROM "t" WHERE "u" = $1"#),
+        // An `IN` list no item can widen: its parameters are the column's type.
+        (r#"SELECT "id" FROM "t" WHERE "u" IN ($1, $2) AND "v" = $1::uuid"#, r#"SELECT "id" FROM "t" WHERE "u" IN ($1, $2) AND "v" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "u" IN ($1, $2::uuid, NULL) AND "v" = $1::uuid"#, r#"SELECT "id" FROM "t" WHERE "u" IN ($1, $2::uuid, NULL) AND "v" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "u" IN ($1, "v") AND "v" = $1::uuid"#, r#"SELECT "id" FROM "t" WHERE "u" IN ($1, "v") AND "v" = $1"#),
+        // A value stored where the statement writes each output out.
+        (r#"INSERT INTO "t" ("id", "r", "f") SELECT "w"."x", "w"."y", $1::float8 FROM "w""#, r#"INSERT INTO "t" ("id", "r", "f") SELECT "w"."x", "w"."y", $1 FROM "w""#),
+    ] {
+        let v = lowered_over(V, q0, q1).unwrap_or_else(|e| panic!("expected Ok, got {e}\n{q0}\n{q1}"));
+        assert_eq!(v["queries"][0], v["queries"][1], "{q0}\n{q1}");
+    }
+}
+
+/// Uses that were read as stating the column's type and do not (#298's and #302's reviews). Each
+/// pair was one plan, and Postgres tells its two sides apart.
+#[test]
+fn a_use_the_column_does_not_type_states_nothing() {
+    for (q0, q1) in [
+        // An `IN` list resolves one common type over the column and its items, and a typed item
+        // widens it: `$1` is a `double precision`.
+        (r#"SELECT "id" FROM "t" WHERE "r" IN ($1, $2::float8) AND "r2" = $1::real"#, r#"SELECT "id" FROM "t" WHERE "r" IN ($1, $2::float8) AND "r2" = $1"#),
+        // So does a parameter another use typed first.
+        (r#"SELECT "id" FROM "t" WHERE "f" = $2 AND "r" IN ($1, $2) AND "r2" = $1::real"#, r#"SELECT "id" FROM "t" WHERE "f" = $2 AND "r" IN ($1, $2) AND "r2" = $1"#),
+        // A column of another type among the items.
+        (r#"SELECT "id" FROM "t" WHERE "r" IN ($1, "f") AND "r2" = $1::real"#, r#"SELECT "id" FROM "t" WHERE "r" IN ($1, "f") AND "r2" = $1"#),
+        // `"w".*` is two outputs, so the value after it is stored in `f`, not in `r`.
+        (r#"INSERT INTO "t" ("id", "r", "f") SELECT "w".*, $1::float4 FROM "w""#, r#"INSERT INTO "t" ("id", "r", "f") SELECT "w".*, $1 FROM "w""#),
+        // The other branch of a set operation types the parameter, a `real`, before the column
+        // it is stored in does.
+        (r#"INSERT INTO "t" ("id", "f") SELECT 1, $1::float8 UNION ALL SELECT "x", "y" FROM "w""#, r#"INSERT INTO "t" ("id", "f") SELECT 1, $1 UNION ALL SELECT "x", "y" FROM "w""#),
+        // A name that is not the column's type's: another schema's, and the other float.
+        (r#"SELECT "id" FROM "t" WHERE "m" = $1::app.mood"#, r#"SELECT "id" FROM "t" WHERE "m" = $1"#),
+        (r#"SELECT "id" FROM "t" WHERE "r" = $1::float(25)"#, r#"SELECT "id" FROM "t" WHERE "r" = $1"#),
+    ] {
+        match lowered_over(V, q0, q1) {
+            Err(FrontendError::Unsupported(m)) => {
+                assert!(m.contains("not every use of $1 states that type"), "refused for {m:?}\n{q0}\n{q1}")
+            }
+            other => panic!("expected a refusal, got {other:?}\n{q0}\n{q1}"),
+        }
+    }
+}

@@ -501,8 +501,20 @@ what it is or refused:
   and its kin, `IN`, `BETWEEN`, `= ANY`) or a value stored in one, and the DDL says what the
   column is; a column no DDL declares and inference found nothing for has the type that fits. A
   use that states none, a select item or a function's argument, leaves the type to the order
-  Postgres reads the statement in, which the frontend does not follow. So `u = $1::uuid` and `u =
-  $1` over a `uuid` column are one plan, and `($1)::jsonb` against `($1)::uuid`, `f = $1::float4`
+  Postgres reads the statement in, which the frontend does not follow. Three uses look like the
+  column's and are not. An `IN` list resolves one common type over the column and its items, so
+  `r IN ($1, $2::float8)` over a `real` `r` makes `$1` a `double precision`, and so does a
+  sibling parameter another use typed first: an item states the column's type only where no other
+  item can widen it, and a list's parameters are held to one type between them. A value a select
+  item stores after a wildcard is stored in a column the frontend does not count to. And the
+  branches of a set operation an `INSERT` selects from are resolved against each other before the
+  column is looked at. `$N IS [NOT] NULL` types nothing, and agrees with the rest. The types are
+  compared without a typmod, which a parameter's type has not got, and by the names Postgres
+  reads as one type (`timetz` and `time with time zone`, `public.mood` and `mood`). A cast with a
+  typmod computes something even where every use states its type, whatever the type and whether
+  the typmod is on it or on an array's element (`$1::bit(3)`, `$1::varchar(1)[]`, and an unquoted
+  `$1::bit`, which is `bit(1)`), so it is kept, as a function named after it. So `u = $1::uuid`
+  and `u = $1` over a `uuid` column are one plan, and `($1)::jsonb` against `($1)::uuid`, `f = $1::float4`
   against `f = $1` over a `double precision`, and `n = ANY($1::int[]) AND name = ANY($1::text[])`
   against its two conjuncts the other way round are refused: in the last, `$1` is an `int[]` on
   one side and a `text[]` on the other. A pair that numbers its parameters differently is refused
