@@ -198,42 +198,46 @@ jobs:
           restore-keys: fuzz-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The build script downloads DuckDB's release library and verifies no checksum on it. This
-      # org requires every Action to be pinned to a commit SHA; a 40 MB binary that gets linked
-      # into the test executable deserves the same, so fetch it here and check its digest.
+      # org requires every Action to be pinned to a commit SHA; a 100 MB binary that gets linked
+      # into the test executable deserves the same, so fetch it here and check its digest. The
+      # build script reuses an archive that is already in place, so this only ever replaces its
+      # own download.
       #
-      # The build is then pointed at the unpacked library with DUCKDB_LIB_DIR, which the build
-      # script reads before it considers a download of its own. It has to be: from cargo 1.100,
-      # `libduckdb-sys` 1.10506 cannot tell where its download belongs (it reads the place off
-      # OUT_DIR, whose layout changed) and fails the build. A library DUCKDB_LIB_DIR names is not
-      # copied beside the executables, so it also goes on the loader's path, for the binaries the
-      # last step runs directly.
-      #
-      # The version is derived from Cargo.lock rather than written out: a crate bump then asks for
-      # an archive this digest does not match and fails here, loudly, which is how it should be
-      # found.
+      # The version is derived from Cargo.lock rather than written out, because the build script
+      # looks in a directory named after the DuckDB version its crate pins: a stale path here
+      # would silently fall through to an unverified download instead of failing. Derived, a crate
+      # bump asks for an archive this digest does not match and fails here, loudly, which is how
+      # it should be found. The step after the tests covers the other way to go stale, a crate
+      # that names its directory differently: it fails if the build fetched a library of its own.
+      # For it to tell, what another version left in a restored cache is removed here.
       - name: fetch libduckdb (digest-pinned)
         run: |
           set -euo pipefail
-          # libduckdb-sys 1.MMmmpp.x bundles DuckDB MM.mm.pp: 1.10506.1 is 1.5.6.
+          # libduckdb-sys 1.MMmmpp.x links DuckDB MM.mm.pp: 1.20001.0 is 2.0.1.
           ver=$(awk '/^name = "libduckdb-sys"$/ { getline; split($3, v, "."); e = v[2]
             printf "%d.%d.%d", int(e / 10000), int(e / 100) % 100, e % 100 }' Cargo.lock)
           test -n "$ver"
-          dir="target/duckdb-download/x86_64-unknown-linux-gnu/$ver"
+          dir="target/duckdb-download/x86_64-unknown-linux-gnu/v$ver"
           mkdir -p "$dir"
-          curl -fsSL --retry 3 -o "$dir/libduckdb-linux-amd64.zip" \
-            "https://github.com/duckdb/duckdb/releases/download/v$ver/libduckdb-linux-amd64.zip"
-          echo "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b  $dir/libduckdb-linux-amd64.zip" \
+          find target/duckdb-download -mindepth 2 -maxdepth 2 ! -path "$dir" -exec rm -rf {} +
+          curl -fsSL --retry 3 -o "$dir/duckdb-shared-libs-linux-amd64.tar.gz" \
+            "https://github.com/duckdb/duckdb/releases/download/v$ver/duckdb-shared-libs-linux-amd64.tar.gz"
+          echo "e25502612fed533a243b61f23a2a574daad030e7e88906222a5f0ab30d06769e  $dir/duckdb-shared-libs-linux-amd64.tar.gz" \
             | sha256sum -c -
-          unzip -q -o "$dir/libduckdb-linux-amd64.zip" -d "$dir"
-          test -f "$dir/libduckdb.so" && test -f "$dir/duckdb.h"
-          echo "DUCKDB_LIB_DIR=$PWD/$dir" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$PWD/$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "DUCKDB_VERIFIED_DIR=$dir" >> "$GITHUB_ENV"
 
       # The library's unit tests (sqleq-fuzz's among them), the binaries' and sqleq-fuzz's
       # integration tests. The frontend's and sqleq-check's integration tests run in the frontend job.
       # Built with `duckdb`, which brings `fuzz`, so both engines' tests run. `fuzz` alone, the default
       # without DuckDB that a published build gets, is linted separately.
       - run: cargo test --no-default-features --features duckdb --lib --bins --test 'fuzz_*'
+      # The library those tests linked is the one fetched above: it is unpacked beside that
+      # archive, and there is no other libduckdb under the download directory.
+      - name: the build linked the verified libduckdb
+        run: |
+          set -euo pipefail
+          test "$(find target/duckdb-download -name 'libduckdb.so*')" = "$DUCKDB_VERIFIED_DIR/libduckdb.so"
+          test "$(find target/duckdb-download -name '*.tar.gz')" = "$DUCKDB_VERIFIED_DIR/duckdb-shared-libs-linux-amd64.tar.gz"
       - run: cargo clippy --no-default-features --features duckdb --all-targets -- -D warnings
       - run: cargo clippy --no-default-features --features fuzz --all-targets -- -D warnings
       # As in the frontend job: intra-doc links are checked only when the docs are built. The

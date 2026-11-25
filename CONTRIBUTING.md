@@ -35,7 +35,7 @@ unless `SQLEQ_PG_REQUIRED` is set, as CI sets it. CI uses the fetched one. The e
 
 sqleq is one crate, with a cargo feature for each axis whose build is heavy. The defaults, `fuzz`
 and `solver`, make a bare `cargo build` or `cargo test` slow the first time: the `fuzz` feature
-downloads the PostgreSQL it runs on (the DuckDB engine and its ~40 MB library are the off-by-default
+downloads the PostgreSQL it runs on (the DuckDB engine and its ~30 MB library are the off-by-default
 `duckdb` feature), and
 the `solver` feature compiles Z3 from source, which takes minutes and needs cmake 3.26 or newer
 and a C++20 compiler whose standard library has `<format>` (GCC 13 or newer).
