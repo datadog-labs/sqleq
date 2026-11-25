@@ -199,14 +199,18 @@ jobs:
 
       # The build script downloads DuckDB's release library and verifies no checksum on it. This
       # org requires every Action to be pinned to a commit SHA; a 40 MB binary that gets linked
-      # into the test executable deserves the same, so fetch it here and check its digest. The
-      # build script reuses an archive that is already in place, so this only ever replaces its
-      # own download.
+      # into the test executable deserves the same, so fetch it here and check its digest.
       #
-      # The version is derived from Cargo.lock rather than written out, because the build script
-      # decides to reuse by looking for the *extracted* library: a stale path here would silently
-      # fall through to an unverified download instead of failing. Derived, a crate bump fails the
-      # digest check loudly, which is how it should be found.
+      # The build is then pointed at the unpacked library with DUCKDB_LIB_DIR, which the build
+      # script reads before it considers a download of its own. It has to be: from cargo 1.100,
+      # `libduckdb-sys` 1.10506 cannot tell where its download belongs (it reads the place off
+      # OUT_DIR, whose layout changed) and fails the build. A library DUCKDB_LIB_DIR names is not
+      # copied beside the executables, so it also goes on the loader's path, for the binaries the
+      # last step runs directly.
+      #
+      # The version is derived from Cargo.lock rather than written out: a crate bump then asks for
+      # an archive this digest does not match and fails here, loudly, which is how it should be
+      # found.
       - name: fetch libduckdb (digest-pinned)
         run: |
           set -euo pipefail
@@ -220,6 +224,10 @@ jobs:
             "https://github.com/duckdb/duckdb/releases/download/v$ver/libduckdb-linux-amd64.zip"
           echo "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b  $dir/libduckdb-linux-amd64.zip" \
             | sha256sum -c -
+          unzip -q -o "$dir/libduckdb-linux-amd64.zip" -d "$dir"
+          test -f "$dir/libduckdb.so" && test -f "$dir/duckdb.h"
+          echo "DUCKDB_LIB_DIR=$PWD/$dir" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       # The library's unit tests (sqleq-fuzz's among them), the binaries' and sqleq-fuzz's
       # integration tests. The frontend's and sqleq-check's integration tests run in the frontend job.
