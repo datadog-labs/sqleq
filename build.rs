@@ -16,8 +16,10 @@
 //! does not.
 //!
 //! The lookup is relative to the executable rather than absolute, so a built tree can be moved:
-//! binaries land in `target/<profile>/` and test harnesses in `target/<profile>/deps/`, which is
-//! why both directories are listed.
+//! binaries land in `target/<profile>/` and, up to cargo 1.99, test harnesses in
+//! `target/<profile>/deps/`, which is why both directories are listed. From cargo 1.100 there is no
+//! `deps/`, and `libduckdb-sys` 1.10506 cannot place its download there at all: the library is
+//! then the one `DUCKDB_LIB_DIR` names, found on the system's library path (`.cargo/config.toml`).
 //!
 //! PostgreSQL comes as a prebuilt archive from
 //! [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries), built from
@@ -124,9 +126,8 @@ fn fetch_postgres() -> Result<Option<String>, String> {
         .find(|(t, _)| *t == target)
         .map(|(_, d)| *d)
         .ok_or(format!("no prebuilt archive for {target}"))?;
-    // OUT_DIR is target/<profile>/build/<package>-<hash>/out.
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
-    let profile_dir = out.ancestors().nth(3).ok_or("unexpected OUT_DIR layout")?;
+    let profile_dir = profile_dir(&out).ok_or("unexpected OUT_DIR layout")?;
     let name = format!("postgresql-{PG_VERSION}-{target}");
     let rel = format!("postgresql/{name}/bin");
     let bin = profile_dir.join(&rel);
@@ -158,6 +159,16 @@ fn fetch_postgres() -> Result<Option<String>, String> {
         }
     }
     Ok(Some(rel))
+}
+
+/// `target/<profile>/`, where the executables land, from this script's `OUT_DIR`. Cargo has that at
+/// `<profile>/build/<package>-<hash>/out` up to 1.99 and at `<profile>/build/<package>/<hash>/out`
+/// from 1.100, and calls the layout its own to change. So this reads only what the two share: the
+/// profile directory is the one holding the nearest `build` above `OUT_DIR`. Counting levels put
+/// the PostgreSQL under `build/` on cargo 1.100, where no executable looks for it.
+#[cfg(feature = "fuzz")]
+fn profile_dir(out: &Path) -> Option<&Path> {
+    out.ancestors().skip(1).find(|d| d.file_name().is_some_and(|n| n == "build"))?.parent()
 }
 
 #[cfg(feature = "fuzz")]

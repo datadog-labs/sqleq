@@ -429,7 +429,9 @@ proofs, and what that cross-check has caught, is in [`docs/VALIDATION.md`](VALID
 
 - Clean-room; shares no code with the NonCommercial VeriEQL.
 - DuckDB is linked from its own release library (`duckdb` crate, MIT). The build downloads it once
-  into `target/duckdb-download/`, or links the one `DUCKDB_LIB_DIR` names; `libduckdb-sys` copies it
-  into `target/<profile>/deps`, and the binary finds it there through an rpath relative to itself,
-  so a built tree can be moved. Parsing uses `sqlparser` (the same parser as `sqleq-frontend`);
-  `regex`, `rand`, `csv` and `serde_json` complete the dependency set — all permissive licenses.
+  into `target/duckdb-download/`, or links the one `DUCKDB_LIB_DIR` names; `libduckdb-sys` copies a
+  download into `target/<profile>/deps`, and the binary finds it there through an rpath relative to
+  itself, so a built tree can be moved. From cargo 1.100 the download fails and `DUCKDB_LIB_DIR` is
+  the way, with that directory on the loader's path at run time (`.cargo/config.toml`). Parsing
+  uses `sqlparser` (the same parser as `sqleq-frontend`); `regex`, `rand`, `csv` and `serde_json`
+  complete the dependency set — all permissive licenses.
