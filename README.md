@@ -314,7 +314,7 @@ needs no feature: it runs each backend as a subprocess.
   needs no Mathlib.
 * **`sqleq-cvc5`** — `sh tools/build_cvc5.sh`, once. It needs the bag reasoning of a cvc5 branch
   that no release has yet ([`bags-algebra`](https://github.com/mudathirmahgoub/cvc5/pull/27)), so
-  the script fetches that branch at a pinned commit, builds and installs it under `target/cvc5/`
+  the script fetches that branch, merged with cvc5's main, at a pinned commit, builds and installs it under `target/cvc5/`
   (5 to 15 minutes the first time, by the cores; git, cmake, a C++17 compiler and Python 3), and then runs
   `cargo build --release --features cvc5`. After that, `cargo build --features cvc5` and
   `cargo test --features cvc5` work like the other features: `.cargo/config.toml` points

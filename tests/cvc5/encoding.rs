@@ -415,3 +415,22 @@ fn negating_an_opaque_value_is_refused_like_any_arithmetic_on_one() {
         }
     }
 }
+
+#[test]
+fn an_aggregate_without_group_by_has_one_row_over_an_empty_table_and_one_by_a_key_none() {
+    // `SELECT 1 FROM (SELECT COUNT(*) FROM t)` has one row whatever t holds, so it is the same
+    // query over another table s; with `GROUP BY b` the two differ when one table is empty, and
+    // cvc5 finds such a database, with no uninterpreted symbol in the way.
+    let schemas = vec![
+        table("t", &["INTEGER", "VARCHAR"], &[true, true], &[]),
+        table("s", &["INTEGER", "VARCHAR"], &[true, true], &[]),
+    ];
+    let one = |i: usize, keys: Vec<Value>| {
+        project(group(scan(i), keys, vec![agg("COUNT", "INTEGER", vec![])]), vec![lit("1", "INTEGER")])
+    };
+    for sem in [Semantics::Bags, Semantics::Sets] {
+        assert_eq!(run(sem, schemas.clone(), one(0, vec![]), one(1, vec![])), Ok(Outcome::Equivalent), "{sem:?}");
+        let keyed = run(sem, schemas.clone(), one(0, vec![col(1, "VARCHAR")]), one(1, vec![col(1, "VARCHAR")]));
+        assert!(matches!(keyed, Ok(Outcome::Different { exact: true, .. })), "{sem:?}: {keyed:?}");
+    }
+}

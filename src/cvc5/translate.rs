@@ -570,6 +570,13 @@ impl Encoder {
         }
     }
 
+    fn fold_kind(&self) -> Kind {
+        match self.sem {
+            Semantics::Bags => Kind::BagFold,
+            Semantics::Sets => Kind::SetFold,
+        }
+    }
+
     fn filter_kind(&self) -> Kind {
         match self.sem {
             Semantics::Bags => Kind::BagFilter,
@@ -679,9 +686,8 @@ impl Encoder {
     }
 
     /// `(lambda vars body)`. The body is not rewritten here: cvc5 rewrites the assertions, lambda
-    /// bodies included, after its bags-facts pass has read the keys and NOT NULL columns off the
-    /// constraints, and the rewriter keeps what it rewrote, so a body rewritten before would keep a
-    /// form that does not use them.
+    /// bodies included, and draws the lemmas of the keys from the rewritten terms, and a body
+    /// rewritten before would keep a form that its rules may not match.
     fn lambda(&mut self, vars: &[Term], body: Term) -> R<Term> {
         let list = self.tm.mk_term(Kind::VariableList, vars)?;
         Ok(self.tm.mk_term(Kind::Lambda, &[list, body])?)
@@ -1486,11 +1492,9 @@ impl Encoder {
     /// `GROUP BY` over `child` by the columns `indices`, the calls folding over every row, each
     /// reading column `args[j]` (none for `COUNT(*)`), and `extra[j]` the further columns of a
     /// `COUNT` of several. For `SELECT k, COUNT(*) FROM t GROUP BY k`, k column 0,
-    /// `((_ table.project 0 1) (bag.filter (lambda ((r U)) (>= ((_ tuple.select 2) r) 1))
-    /// ((_ table.aggr 0) (lambda ((x T) (y U)) (tuple ((_ tuple.select 0) x) (nullable.some (+
-    /// (nullable.val ((_ tuple.select 1) y)) 1)) (+ ((_ tuple.select 2) y) 1))) (tuple (as
-    /// nullable.null (Nullable Int)) (nullable.some 0) 0) t)))`: the last column counts the rows of
-    /// the group, and the filter drops the row of initial values `table.aggr` gives an empty `t`.
+    /// `((_ table.aggr 0) (lambda ((x T) (y U)) (tuple ((_ tuple.select 0) x) (nullable.some (+
+    /// (nullable.val ((_ tuple.select 1) y)) 1)))) (tuple (as nullable.null (Nullable Int))
+    /// (nullable.some 0)) t)`: one row per group, and none for an empty `t`, as SQL's `GROUP BY`.
     fn aggregate_over(
         &mut self,
         child: Term,
@@ -1528,15 +1532,8 @@ impl Encoder {
             slot_sorts.extend(s.iter().cloned());
             slots.push(s);
         }
-        // GROUP BY over an empty table has no groups, so SQL answers with no rows, while
-        // table.aggr gives the empty table one empty part folded to a row of initial values. A
-        // hidden counter tells that row apart: it is the one with count 0, filtered out below and
-        // projected away again. (An ite over the whole table would hide the aggregate from the
-        // solver behind a fresh constant.)
-        let counted = !indices.is_empty();
-        if counted {
-            slot_sorts.push(self.tm.integer_sort());
-        }
+        // GROUP BY over an empty table has no groups, so SQL answers with no rows, as does
+        // table.aggr, whose parts are not empty (cvc5/cvc5#13151).
         let y_sort = self.tm.mk_tuple_sort(&slot_sorts)?;
         let x = self.var(x_sort.clone(), "x")?;
         let y = self.var(y_sort.clone(), "y")?;
@@ -1583,35 +1580,22 @@ impl Encoder {
             initial.extend(i);
             at += slots[j].len();
         }
-        if counted {
-            let last = slot_sorts.len() - 1;
-            let acc = self.select(y.clone(), last)?;
-            let one = self.tm.mk_integer(1);
-            elements.push(self.tm.mk_term(Kind::Add, &[acc, one])?);
-            initial.push(self.tm.mk_integer(0));
-        }
         let body = self.tm.mk_tuple(&elements)?;
         let init = self.tm.mk_tuple(&initial)?;
         let f = self.lambda(&[x, y], body)?;
-        let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
-        let mut aggregated = self.tm.mk_term_from_op(op, &[f, init, child.clone()])?;
-        if counted {
-            // keep the groups a row reached, then drop the counter
-            let last = slot_sorts.len() - 1;
-            let r = self.var(y_sort.clone(), "r")?;
-            let cnt = self.select(r.clone(), last)?;
-            let one = self.tm.mk_integer(1);
-            let reached = self.tm.mk_term(Kind::Geq, &[cnt, one])?;
-            let p = self.lambda(&[r], reached)?;
-            aggregated = self.tm.mk_term(self.filter_kind(), &[p, aggregated])?;
-            let keep: Vec<u32> = (0..last as u32).collect();
-            aggregated = self.project(&keep, aggregated)?;
-        }
+        let mut aggregated = if indices.is_empty() {
+            // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*)
+            // FROM empty is 0 -- the fold of all the rows, (bag (bag.fold f i t) 1). table.aggr
+            // by no columns has no row for an empty table, as no part.
+            let fold = self.tm.mk_term(self.fold_kind(), &[f, init, child.clone()])?;
+            self.singleton(fold)?
+        } else {
+            let op = self.tm.mk_op(self.aggregate_kind(), &indices)?;
+            self.tm.mk_term_from_op(op, &[f, init, child.clone()])?
+        };
         if slots.iter().any(|s| s.len() > 1) || int_sums.iter().any(|b| *b) {
             aggregated = self.finish_aggregates(aggregated, indices.len(), calls, &slots, &int_sums)?;
         }
-        // No GROUP BY: SQL asks for exactly one row even over no rows -- SELECT COUNT(*) FROM
-        // empty is 0 -- which is what the fold of a single empty group gives.
         Ok(aggregated)
     }
 

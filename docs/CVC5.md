@@ -37,10 +37,10 @@ bindings need `libclang` to generate their FFI.
 The axis is written against the `bags-algebra` branch of cvc5
 ([mudathirmahgoub/cvc5#27](https://github.com/mudathirmahgoub/cvc5/pull/27)), whose bag reasoning it
 exercises: normal forms for the relational terms the encoding builds, the keys and `NOT NULL`
-columns of the tables read off their constraints (a preprocessing pass, `bags-facts`), and lemmas
-for folds, maps and disequalities. No cvc5 release has it yet, so one script fetches that branch at
-a pinned commit, builds it, installs it under `target/cvc5/install`, and builds the axis against
-it:
+columns of the tables read off their constraints (lemmas of cvc5's static learning, on by
+default), and lemmas for folds, maps and disequalities. No cvc5 release has it yet, so one script
+fetches that branch at a pinned commit, builds it, installs it under `target/cvc5/install`, and
+builds the axis against it:
 
 ```sh
 sh tools/build_cvc5.sh            # once; then, like the other features:
@@ -55,7 +55,24 @@ A second run with the same commit only rebuilds the axis. `.cargo/config.toml` p
 `CVC5_LIB_DIR` at the install, so cargo needs no environment; to build against a cvc5 of your own,
 set `CVC5_LIB_DIR=<prefix>/lib` (the headers are read from `$CVC5_LIB_DIR/../include` or
 `$CVC5_INCLUDE_DIR`), or `SQLEQ_CVC5_REPO` and `SQLEQ_CVC5_COMMIT` to have the script build another
-commit. Any cvc5 from 1.4.0 on runs the encoding, but proves far fewer pairs without the branch.
+commit. The cvc5 must have cvc5/cvc5#13151 (in `main` since 2026-11-14): before it, the aggregate of
+an empty table had one row of initial values where SQL's `GROUP BY` has none, and this encoding
+relies on its having none. So the pinned commit is on `bags-algebra-partition`, which is
+`bags-algebra` merged with `main`. It proves far fewer pairs without the branch.
+
+The build checks the install against the pin. The script records the commit it installed in
+`target/cvc5/install/.sqleq-cvc5-commit`, and `cargo build --features cvc5` fails when that is not
+the commit the script pins, as after a pull that moved the pin:
+
+```
+the cvc5 in target/cvc5/install is commit 249a95c0..., and the cvc5 axis is built for 28dd0643...,
+the commit tools/build_cvc5.sh pins. ... Run `sh tools/build_cvc5.sh` to install the pinned one, or
+set SQLEQ_CVC5_COMMIT=249a95c0... to build against this one anyway.
+```
+
+A cvc5 of your own, in a `CVC5_LIB_DIR` the script did not fill, has no record: the build warns that
+it cannot tell which commit it is, and builds.
+
 The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.
@@ -152,7 +169,7 @@ Each relational operator is one term over its inputs:
 | `intersectAll`, `exceptAll` | `bag.inter_min`, `bag.difference_subtract` | refused: multiplicities, which a set has not got |
 | `union` (always `UNION ALL`) | `bag.union_disjoint` | `set.union` |
 | `group` with no call | `bag.setof` of a projection | a projection |
-| `group` with calls | `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`), with a hidden count of the group's rows when there are keys, since `table.aggr` folds the empty table as one empty group: its row is the one with count 0, filtered out before the counter is projected away | `rel.aggr` |
+| `group` with calls | with keys, `(_ table.aggr k..) f init T`, a fold whose accumulator holds the keys and one slot per call (two for `AVG`): one row per group, and none for an empty table; without keys, one row, `(bag (bag.fold f init T) 1)`, also for an empty table | `rel.aggr`; without keys, `(set.singleton (set.fold f init T))` |
 | `values` | `bag.union_disjoint` of `(bag row 1)` | `set.union` of `set.singleton` |
 | `sort` | the source, when it has no `offset` or `limit`; `LIMIT 0` the empty bag; a row slice under an `ORDER BY` whose keys contain a key of the rows, so that no two rows tie, a `bag.filter` keeping the rows whose place -- a `bag.fold` counting the rows sorted before them -- lies in `[offset, offset + limit)`; refused under possible ties, for a computed size, and when `offset + limit` overflows an i64 | the source, or the empty set for `LIMIT 0`; a slice is refused |
 | `EXISTS q` | `(distinct q bag.empty)` | |
@@ -196,9 +213,9 @@ Where this encoding departs from the Java translator, deliberately:
   operator in a lambda with fresh variables each time. The bags solver relates two maps or filters
   by the identity of their functions and does not rewrite under the binder before comparing them,
   so two sides that compute `a + 5` the same way must be one term. No body is rewritten before it
-  is bound: cvc5 rewrites the assertions, lambda bodies included, after its `bags-facts` pass has
-  read the keys and `NOT NULL` columns off the constraints, and a body rewritten earlier would keep
-  a form that pass has not seen; `a + 10 / 2` and `a + 5` meet there.
+  is bound: cvc5 rewrites the assertions, lambda bodies included, and draws the lemmas of the keys
+  from the rewritten terms, and a body rewritten earlier would keep a form its rules may not match;
+  `a + 10 / 2` and `a + 5` meet there.
 
 ## What the encoding approximates
 
@@ -259,9 +276,14 @@ note as `candidate model, under uninterpreted symbols: ...`, for a person or for
 * **A model that fails `check-models` aborts cvc5**, and the driver with it (cvc5 raises an
   internal error through the C API). The harness records the case as an `error`; what it says is
   that cvc5 found a model its own checker rejects, which is the checker doing its job. It has
-  been seen on `set.filter` lambdas under set semantics, and under bags on a `bag.map` whose
-  lambda ignores its argument: a constant row, as `SELECT DISTINCT 0 ... GROUP BY a` maps every
-  group to, or one computed from constants alone. The pinned pairs that meet it are pinned `error`.
+  been seen on `set.filter` lambdas under set semantics. Two causes under bags are gone from the
+  pinned commit:
+  - lambda lifting defined a skolem as `true`, which left it free in the model, in cvc5's main
+    too (fixed by cvc5/cvc5#13186): `types/string_order_under_database_default`, which compares
+    two strings under a collation, now gets a model;
+  - the rewrite `EQ_EMPTY_ARG` of the `bags-algebra` branch, on a `bag.map` of a constant row, as
+    `SELECT DISTINCT 0 ... GROUP BY a` maps every group to. The rule is now a lemma of static
+    learning, for the terms of the input only, so the solver's own lemmas are not rewritten by it.
 * **Refused**: a scalar subquery that may return more than one row (anything but an aggregate
   without `GROUP BY`, a `VALUES` of one row, a `LIMIT 0` or `1`, and projections, filters,
   duplicate removal or bare sorts of those), an aggregate other than

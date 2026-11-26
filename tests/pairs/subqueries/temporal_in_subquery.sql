@@ -8,6 +8,7 @@
 -- expect fuzz: counterexample
 -- expect qed: no-proof
 -- expect sqleq-solver: no-proof
+-- expect cvc5: no-proof
 -- expect lean: unsupported
 -- origin: a pin for a documented refusal (#68), lifted by issue #92 item 4: a TIMESTAMP IN a subquery
 --   over a DATE column now converts the column, as Postgres does (ts = d::timestamp), and this pair
