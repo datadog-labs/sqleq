@@ -8,8 +8,8 @@
 # The crate has a cargo feature for each heavy build. `duckdb` links DuckDB, whose release library its
 # first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3,
 # `lean` needs a Lean toolchain, the largest download of all, and `cvc5` links a cvc5 that no
-# release has yet, built from source here: the longest build of all, and so cached apart from
-# everything else, to be paid for only when the pinned commit changes. Each job builds with
+# release has yet, built from source here: a quarter of an hour, cached apart from everything
+# else so that it is paid for only when the pinned commit changes. Each job builds with
 # `--no-default-features` plus its own feature, which means the frontend's answer -- the one that
 # gates most changes -- arrives in under a minute, and the caches do not evict each other. Each job
 # lints everything its feature set compiles, so every feature is linted alone. No code is compiled
@@ -529,11 +529,11 @@ jobs:
           restore-keys: cvc5-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
 
       # The cvc5 library, cached apart from the build as the Lean toolchain is: building it takes
-      # longer than the rest of this workflow together, and it changes only with the commit
-      # tools/build_cvc5.sh pins, not with the compiler or Cargo.lock. The key hashes that script,
-      # so a new pin, or a change to how it is built, is a new library; there is no fallback to
-      # another key's, which the script would delete. The runner's image is in the key because the
-      # library links that image's libstdc++ and GMP.
+      # a quarter of an hour here, longer than the rest of this job, and it changes only with the
+      # commit tools/build_cvc5.sh pins, not with the compiler or Cargo.lock. The key hashes that
+      # script, so a new pin, or a change to how it is built, is a new library; there is no
+      # fallback to another key's, which the script would delete. The runner's image is in the key
+      # because the library links that image's libstdc++ and GMP.
       - id: image
         run: echo "os=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -587,9 +587,13 @@ jobs:
       # pairs with no pin use theirs up every time. And two checks that the run saw enough to pass
       # for having found nothing wrong: it judged every pair file, where sqleq-check only warns
       # about a path it cannot read, and cvc5 ran out of time on no more of them than the ceiling.
+      #
+      # The ceiling: a runner saw 17 timeouts when it was set, the 16 pairs with no cvc5 pin and
+      # one pinned pair, and the slower pinned pairs come and go by one or two between machines.
+      # Raise it with the number of pairs that carry no cvc5 pin, not to make a slow run pass.
       - name: pinned pairs (cvc5)
         env:
-          MAX_TIMEOUTS: "40"
+          MAX_TIMEOUTS: "25"
         run: |
           set -uo pipefail
           test -x target/debug/sqleq-cvc5

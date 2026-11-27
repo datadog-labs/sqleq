@@ -79,7 +79,8 @@ plans through the crate's `ir` module rather than through the solver, so `--no-d
 
 **In CI.** The `sqleq-cvc5` job builds cvc5 with the same script, at the pinned commit, and keeps
 the installed library in a cache keyed by the script: a pull request that moves the pin, or
-changes how cvc5 is built, pays for one build of cvc5, and every other run restores it. On that
+changes how cvc5 is built, pays for one build of cvc5, a quarter of an hour on a runner, and
+every other run restores it. On that
 library the job runs the feature's tests, clippy and the docs, the harness test that drives the
 real `sqleq-cvc5`, and the [pinned pairs](../tests/pairs/README.md) on the cvc5 axis. A pin that
 moved, or a proof of a non-equivalent pair, fails it; a pair cvc5 does not answer in time does
