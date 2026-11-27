@@ -23,8 +23,9 @@ resolves to nothing; among `sqleq-check`'s is the hygiene gate over every commit
 [pinned pairs](tests/pairs/README.md) on the frontend, fuzz and sqleq-solver axes, the ones CI runs
 through `sqleq-check`. It needs the `sqleq-frontend`, `sqleq-fuzz` and `sqleq-solver` binaries,
 which the `cargo build` line before it builds: `fuzz` and `solver` are default features. The Lean
-pins are checked by `cargo test --features lean`, and the `qed`, `sqlsolver-jvm` and `cvc5` pins
-only where those tools are installed.
+pins are checked by `cargo test --features lean`, the `cvc5` pins by CI's `sqleq-cvc5` job, which
+builds cvc5 for them ([docs/CVC5.md](docs/CVC5.md)), and the `qed` and `sqlsolver-jvm` pins only
+where those tools are installed.
 
 `sqleq-fuzz` runs pairs on a PostgreSQL 17: the one `SQLEQ_PG_BIN` names, else the one its build
 fetched (for Linux and macOS on x86_64 and arm64; `SQLEQ_PG_DOWNLOAD=0` skips the download), else
@@ -46,8 +47,8 @@ there yourself), and its integration test fails rather than skips without it.
 `cd lean && lake build Sqleq SqleqTest` builds the Lean library and checks its controls. The `cvc5`
 feature is off by default too; it links a cvc5 library ([docs/CVC5.md](docs/CVC5.md)). CI splits
 its jobs along the same lines — the frontend and `sqleq-check` share one, with
-`--no-default-features`, and each feature has its own — and fetches Lean from a digest-pinned
-release archive.
+`--no-default-features`, and each feature has its own — fetches Lean from a digest-pinned
+release archive, and builds cvc5 at the commit `tools/build_cvc5.sh` pins.
 
 ### Licensing
 

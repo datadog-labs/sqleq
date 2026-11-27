@@ -73,9 +73,17 @@ set SQLEQ_CVC5_COMMIT=249a95c0... to build against this one anyway.
 A cvc5 of your own, in a `CVC5_LIB_DIR` the script did not fill, has no record: the build warns that
 it cannot tell which commit it is, and builds.
 
-The `cvc5` feature is off by default, unlike `fuzz` and `solver`, and CI does not build it. It reads
+The `cvc5` feature is off by default, unlike `fuzz` and `solver`. It reads
 plans through the crate's `ir` module rather than through the solver, so `--no-default-features
 --features cvc5` builds the axis without compiling Z3.
+
+**In CI.** The `sqleq-cvc5` job builds cvc5 with the same script, at the pinned commit, and keeps
+the installed library in a cache keyed by the script: a pull request that moves the pin, or
+changes how cvc5 is built, pays for one build of cvc5, and every other run restores it. On that
+library the job runs the feature's tests, clippy and the docs, the harness test that drives the
+real `sqleq-cvc5`, and the [pinned pairs](../tests/pairs/README.md) on the cvc5 axis. A pin that
+moved, or a proof of a non-equivalent pair, fails it; a pair cvc5 does not answer in time does
+not, [as that page explains](../tests/pairs/README.md#last-review-on-every-axis).
 
 **Licences.** cvc5 is BSD-licensed, but it links libraries under the LGPL v3: LibPoly and MPFR,
 which its build downloads and installs beside it in `target/cvc5/install/lib`, and GMP (LGPL v3 or

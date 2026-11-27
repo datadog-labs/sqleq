@@ -23,8 +23,9 @@ row slice and `DISTINCT ON`: a non-equivalent pair that no prover may prove.
 ## Running them
 
 ```sh
-# The axes CI runs, one job per axis there. `cargo build --release` builds the four binaries
-# they need: sqleq-check, the frontend, sqleq-fuzz and sqleq-solver.
+# The axes CI runs as here, one job per axis there, with the exit code as the answer.
+# `cargo build --release` builds the four binaries they need: sqleq-check, the frontend,
+# sqleq-fuzz and sqleq-solver.
 sqleq-check --expect pinned --axes frontend,fuzz,sqleq-solver tests/pairs examples/*.sql
 # The axes CI does not install (one SQLSolver per run). qed needs the prover, found as
 # docs/check.md says; sqlsolver-jvm needs the fork, named by --sqlsolver-tree or
@@ -35,7 +36,8 @@ sqleq-check --expect pinned --axes sqlsolver-jvm tests/pairs examples/*.sql
 sqleq-check --expect pinned --axes lean tests/pairs examples/*.sql
 # The cvc5 axis, which needs sqleq-cvc5 built by `sh tools/build_cvc5.sh` (docs/CVC5.md). Its
 # `model` refutes the plan, not the pair, so an equivalent pair may carry one; a `proved` on a
-# non-equivalent pair is an invariant failure like any prover's:
+# non-equivalent pair is an invariant failure like any prover's. CI runs this too, and reads
+# the run's findings rather than its exit code (the last section says why):
 sqleq-check --expect pinned --axes cvc5 tests/pairs examples/*.sql
 ```
 
@@ -193,8 +195,10 @@ drift between reviews. The last time every axis was blessed together:
   and a pin blessed with a longer budget would fail wherever the budget is the default one. Such a
   pair shows `⏱` in every run of `--expect pinned --axes cvc5`, which therefore exits 1 even when
   every pin holds; on a slower machine, or under load, a few more may join it. Neither is an
-  answer that moved, so read the cvc5 column for `✗` and `‼`, not the exit code, while the axis
-  is experimental and outside CI.
+  answer that moved, so read the cvc5 column for `✗` and `‼`, not the exit code. CI's
+  `sqleq-cvc5` job reads the same from the run's `--json` report: anything the run found that
+  is not a cvc5 timeout fails it, and so do more timeouts than the ceiling the job sets, which
+  would mean cvc5 answered too little for the run to say anything.
 
 The truths of the `binding: gather` pairs were checked on Postgres 16: each side run as a prepared
 statement, the `unnest` side under the gather binding of the `VALUES` side's parameters, once on an

@@ -3,11 +3,13 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
 # Copyright 2026-Present Datadog, Inc.
 
-# Seven jobs, six of them split on build cost rather than on subject.
+# Eight jobs, seven of them split on build cost rather than on subject.
 #
 # The crate has a cargo feature for each heavy build. `duckdb` links DuckDB, whose release library its
-# first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3, and
-# `lean` needs a Lean toolchain, the largest download of all. Each job builds with
+# first build downloads -- a much larger cache than anything else here -- `solver` compiles Z3,
+# `lean` needs a Lean toolchain, the largest download of all, and `cvc5` links a cvc5 that no
+# release has yet, built from source here: the longest build of all, and so cached apart from
+# everything else, to be paid for only when the pinned commit changes. Each job builds with
 # `--no-default-features` plus its own feature, which means the frontend's answer -- the one that
 # gates most changes -- arrives in under a minute, and the caches do not evict each other. Each job
 # lints everything its feature set compiles, so every feature is linted alone. No code is compiled
@@ -15,16 +17,18 @@
 # needs no test job of its own: it would only pay for Z3 a second time. Each job runs the tests of
 # its own component; the frontend job runs the frontend's and the harness's.
 #
-# Three of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
-# build: the frontend, sqleq-fuzz and sqleq-solver. The `sqleq-lean` job checks the Lean pins through
-# that crate's own integration test. The QED prover and the JVM fork of SQLSolver are never
-# installed here, so their pins are checked where those tools exist -- see tests/pairs/README.md.
+# Four of them also run the pinned pairs under tests/pairs through sqleq-check, on the axes they
+# build: the frontend, sqleq-fuzz, sqleq-solver and sqleq-cvc5. The last reads the run's findings
+# and not its exit code, because some pairs cvc5 never answers in time; its job says how. The
+# `sqleq-lean` job checks the Lean pins through that crate's own integration test. The QED prover
+# and the JVM fork of SQLSolver are never installed here, so their pins are checked where those
+# tools exist -- see tests/pairs/README.md.
 #
 # `licenses` builds nothing. It checks that every dependency is under a permissive licence and
 # that LICENSE-3rdparty.csv still matches Cargo.lock, so a dependency cannot change without its
 # attribution changing with it.
 #
-# `package` is the seventh: it builds the default set once, but as `cargo install sqleq` will, from
+# `package` builds the default set once more, but as `cargo install sqleq` will, from
 # the package crates.io would receive, and runs what it installs. It is the only job that would
 # notice a git dependency, a `[patch]`, a file the package leaves out, or a setting only
 # `.cargo/config.toml` supplies.
@@ -494,6 +498,134 @@ jobs:
         run: |
           cargo doc --no-deps --no-default-features --features lean
           cargo doc --no-deps --no-default-features --features lean --document-private-items
+
+  cvc5:
+    name: sqleq-cvc5
+    runs-on: ubuntu-latest
+    # The frontend job's build settings, for the same reasons.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: rustc
+        run: |
+          rustc --version && cargo --version
+          echo "hash=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # `target/debug`, not all of `target/` as in the other jobs: cvc5's sources and its build
+      # tree are under `target/cvc5/src`, hundreds of MB that only a rebuild of cvc5 would read,
+      # and the library it installs has the cache below.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: cvc5-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cvc5-onecrate-lines-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+
+      # The cvc5 library, cached apart from the build as the Lean toolchain is: building it takes
+      # longer than the rest of this workflow together, and it changes only with the commit
+      # tools/build_cvc5.sh pins, not with the compiler or Cargo.lock. The key hashes that script,
+      # so a new pin, or a change to how it is built, is a new library; there is no fallback to
+      # another key's, which the script would delete. The runner's image is in the key because the
+      # library links that image's libstdc++ and GMP.
+      - id: image
+        run: echo "os=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/cvc5/install
+          key: cvc5-install-${{ runner.os }}-${{ steps.image.outputs.os }}-${{ hashFiles('tools/build_cvc5.sh') }}
+
+      # As a user builds it, with nothing set: the script installs under target/cvc5/install, where
+      # .cargo/config.toml points the build, and on a restored library it finds its own record of
+      # the commit and returns at once. The sources are fetched by commit SHA, and cvc5's build
+      # checks a SHA-256 on every dependency it downloads. Those downloads are the one part seen to
+      # fail for no reason of ours (a 503), so a failed build is tried once more, from the start.
+      - name: build cvc5 (commit-pinned)
+        timeout-minutes: 90
+        run: |
+          cmake --version && c++ --version && python3 --version
+          sh tools/build_cvc5.sh --cvc5-only || sh tools/build_cvc5.sh --cvc5-only
+          echo "cvc5 at $(cat target/cvc5/install/.sqleq-cvc5-commit)"
+
+      # The library's unit tests (sqleq-cvc5's among them), the binaries' and sqleq-cvc5's
+      # integration tests. build.rs refuses a library the script recorded another commit for, so a
+      # stale cache fails here and is not tested as if it were the pinned one.
+      - run: cargo test --no-default-features --features cvc5 --lib --bins --test 'cvc5_*'
+      - run: cargo clippy --no-default-features --features cvc5 --all-targets -- -D warnings
+      # As in the frontend job: intra-doc links are checked only when the docs are built.
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --no-default-features --features cvc5
+          cargo doc --no-deps --no-default-features --features cvc5 --document-private-items
+
+      # As in the solver job: without the binary the harness test that drives the real sqleq-cvc5
+      # skips, and `$SQLEQ_CVC5_BIN` makes a missing one a failure.
+      - run: cargo build --no-default-features --features cvc5 --bin sqleq-cvc5 --bin sqleq-frontend --bin sqleq-check
+      - name: sqleq-check through the real sqleq-cvc5
+        env:
+          SQLEQ_CVC5_BIN: target/debug/sqleq-cvc5
+        run: cargo test --no-default-features --features cvc5 --test check_real_cvc5 -- --nocapture
+
+      # The pinned pairs on cvc5, at the budget the pins were blessed with (tests/pairs/README.md).
+      # Unlike the other axes', this run's exit code is not the answer: some pairs carry no cvc5
+      # pin because cvc5 does not answer them within that budget, a timeout is never pinned, and so
+      # the run exits 1 even when every pin holds; on a runner, slower than the machine that
+      # blessed them, a few pinned pairs run out of time as well. What the README tells a person to
+      # read instead, this step reads from the report: everything the run found must be a cvc5
+      # timeout. A pin that moved, a proof of a non-equivalent pair, an answer with no pin, a
+      # header error, an alarm, or the frontend or the driver giving no answer all fail it.
+      #
+      # No retry pass: it would give each timed-out pair another minute, one at a time, and the
+      # pairs with no pin use theirs up every time. And two checks that the run saw enough to pass
+      # for having found nothing wrong: it judged every pair file, where sqleq-check only warns
+      # about a path it cannot read, and cvc5 ran out of time on no more of them than the ceiling.
+      - name: pinned pairs (cvc5)
+        env:
+          MAX_TIMEOUTS: "40"
+        run: |
+          set -uo pipefail
+          test -x target/debug/sqleq-cvc5
+          report="$RUNNER_TEMP/cvc5-pins.json"
+          rc=0
+          target/debug/sqleq-check --expect pinned --axes cvc5 --timeout 60 --no-retry \
+            --frontend target/debug/sqleq-frontend --cvc5-bin target/debug/sqleq-cvc5 \
+            --json "$report" tests/pairs examples/*.sql || rc=$?
+          # 0: every case holds. 1: something did not, which the report names. Anything else is
+          # sqleq-check failing to run.
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::sqleq-check exited $rc"
+            exit 1
+          fi
+          late='.axis == "cvc5" and .state == "unanswered" and .observed == "timeout"'
+          jq -e '.meta.findings | type == "array"' "$report" > /dev/null
+          other=$(jq "[.meta.findings[] | select(($late) | not)] | length" "$report")
+          timeouts=$(jq "[.meta.findings[] | select($late)] | length" "$report")
+          alarms=$(jq '.meta.alarms // [] | length' "$report")
+          echo "cvc5: $(jq -r '"\(.meta.pinned.held) of \(.meta.pinned.total)"' "$report") cases hold," \
+            "$timeouts cvc5 timeout(s), $other other finding(s), $alarms alarm(s)"
+          if [ "$other" -ne 0 ] || [ "$alarms" -ne 0 ]; then
+            echo "::error::the pinned pairs do not hold on cvc5: see the table above for what moved"
+            exit 1
+          fi
+          # What the command above names: tests/pairs all the way down, and examples/*.sql.
+          files=$(( $(find tests/pairs -name '*.sql' | wc -l) + $(find examples -maxdepth 1 -name '*.sql' | wc -l) ))
+          judged=$(jq '.meta.pinned.total' "$report")
+          if [ "$judged" -ne "$files" ]; then
+            echo "::error::the run judged $judged cases and there are $files pair files"
+            exit 1
+          fi
+          if [ "$timeouts" -gt "$MAX_TIMEOUTS" ]; then
+            echo "::error::cvc5 ran out of time on $timeouts cases (at most $MAX_TIMEOUTS expected): too few were checked to pass"
+            exit 1
+          fi
 
   package:
     name: package
