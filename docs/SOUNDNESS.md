@@ -467,6 +467,14 @@ what it is or refused:
   an *unqualified* cast over a parameter is dropped as the parameter's type. A qualified cast, over
   a parameter, a literal or anything else, is a function named after the full spelling of its
   target. A typmod on an array's element counts: `$1::varchar(1)[]` truncates each element.
+- **A cast kept as a function is named as Postgres reads its target.** Two casts under one name
+  are one function to a prover and one plan to the frontend, so the name keeps what tells two
+  targets apart and nothing else. An unquoted `bit` is `bit(1)`: `c::bit` is the function
+  `c::bit(1)` is, and not the one `c::"bit"` is, which names the type with no length and changes
+  nothing. A quoted name keeps its case, so `"Mood"` and `mood` are two types, and loses its
+  quotes only where the unquoted word names the same type (`"mood"`, `"uuid"`). The same holds of
+  an array's element, under either catalog. sqleq-lean reads a bare `bit` the same way: as a
+  cast's target it truncates, so `unnest($2::bit[])` is not what `VALUES ($1, $2)` stores.
 - **A second cast to the type a cast just gave is no cast.** In Postgres, `CAST(CAST(e AS T) AS T)`
   is `CAST(e AS T)`: the outer cast is handed a value of its own type, and a typmod's coercion and a
   domain's checks are idempotent. So it is removed before anything reads the tree
