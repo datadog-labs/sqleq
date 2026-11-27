@@ -725,3 +725,39 @@ fn a_nots_operand_is_boolean_wherever_it_is_lowered() {
         assert!(types.iter().all(|t| t == "BOOLEAN"), "{mode:?}: {types:?}");
     }
 }
+
+/// A cast kept as a function is named as Postgres reads its target (#311). The name was the
+/// target's spelling without its quotes and in lower case, so a cast to the unquoted `bit`, which is
+/// `bit(1)` and truncates, was the function a cast to `"bit"` is, which names the type with no
+/// length and changes nothing; and a cast to `"Mood"` was the cast to `mood`, another type. Each
+/// pair below returns different rows in Postgres and lowered to one plan, the array one under the
+/// declared catalog as well.
+#[test]
+fn a_kept_cast_is_one_function_only_with_a_cast_postgres_reads_as_it() {
+    const B: &str = r#"create type mood as enum ('a', 'b');
+create type "Mood" as enum ('b', 'a');
+create table "t" ("id" INTEGER PRIMARY KEY, "b" BIT(4), "c" BIT(4), "bs" BIT(4)[], "cs" BIT(4)[], "m" TEXT, "n" TEXT);"#;
+    let one_plan = |q0: &str, q1: &str, src: CatalogSource| {
+        lower_with(&format!("{B}\n{q0};\n{q1};"), src).ok().map(|v| v["queries"][0] == v["queries"][1])
+    };
+    // Two casts: refused, since two functions read a value whose `=` nobody knows, or two plans.
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "b" = "c"::bit"#, r#"SELECT "id" FROM "t" WHERE "b" = "c"::"bit""#),
+        (r#"SELECT "id" FROM "t" WHERE "bs" = "cs"::bit[]"#, r#"SELECT "id" FROM "t" WHERE "bs" = "cs"::"bit"[]"#),
+        (r#"SELECT "id" FROM "t" WHERE "b" = '1011'::bit"#, r#"SELECT "id" FROM "t" WHERE "b" = '1011'::"bit""#),
+        (r#"SELECT "id" FROM "t" WHERE "m"::mood < "n"::mood"#, r#"SELECT "id" FROM "t" WHERE "m"::"Mood" < "n"::"Mood""#),
+    ] {
+        for src in [CatalogSource::InferredSeeded, CatalogSource::Inferred, CatalogSource::Declared] {
+            assert_ne!(one_plan(q0, q1, src), Some(true), "{src:?}\n{q0}\n{q1}");
+        }
+    }
+    // One cast, spelled twice: still one function, so the pair is one plan.
+    for (q0, q1) in [
+        (r#"SELECT "id" FROM "t" WHERE "b" = "c"::bit"#, r#"SELECT "id" FROM "t" WHERE "b" = "c"::bit(1)"#),
+        (r#"SELECT "id" FROM "t" WHERE "bs" = "cs"::bit[]"#, r#"SELECT "id" FROM "t" WHERE "bs" = "cs"::bit(1)[]"#),
+        (r#"SELECT "id" FROM "t" WHERE "b" = '1011'::bit"#, r#"SELECT "id" FROM "t" WHERE "b" = '1011'::bit(1)"#),
+        (r#"SELECT "id" FROM "t" WHERE "m"::"mood" < "n"::"mood""#, r#"SELECT "id" FROM "t" WHERE "m"::mood < "n"::mood"#),
+    ] {
+        assert_eq!(one_plan(q0, q1, CatalogSource::InferredSeeded), Some(true), "{q0}\n{q1}");
+    }
+}

@@ -89,7 +89,9 @@ everything else:
     reach it through the same assignment coercion from the base type: the same length check that
     raises, and the same rounding.
   - A modifier on a *cast* is refused, because an explicit cast to `varchar(10)` truncates where
-    assignment raises.
+    assignment raises. An unquoted `char` or `bit` with no length carries one, `char(1)` and
+    `bit(1)`, so `unnest($2::bit[])` is refused as well. The quoted `"bit"` is the type with no
+    length.
   - Array-typed columns are refused, because `unnest` flattens every dimension. `T ARRAY` counts
     as an array type, as `T[]` does, and an `unnest` argument spelled `$j::T ARRAY` is refused, as
     the frontend refuses that spelling.

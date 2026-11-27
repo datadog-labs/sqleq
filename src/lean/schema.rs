@@ -104,7 +104,13 @@ pub fn type_key(dt: &DataType) -> TypeKey {
     .to_string();
     // `char`/`character` without a length is `char(1)`, and a bare `float` is `float8` only by
     // default precision: treat both as modified rather than guess.
-    let modded = modded || matches!(name.as_str(), "char" | "character" | "bpchar" | "float");
+    //
+    // An unquoted `bit` without a length is `bit(1)` as well, and a cast to it truncates:
+    // `unnest($2::bit[])` stores one bit of each element where `VALUES ($1, $2)` raises on a longer
+    // one. The quoted `"bit"` is the type with no length, and `base` still has its quotes.
+    let modded = modded
+        || base.eq_ignore_ascii_case("bit")
+        || matches!(name.as_str(), "char" | "character" | "bpchar" | "float");
     TypeKey { name, modded, array }
 }
 
@@ -910,6 +916,9 @@ mod tests {
         assert!(key("varchar(10)").modded);
         assert!(key("numeric(10,2)").modded);
         assert!(key("char").modded, "bare char is char(1)");
+        assert!(key("bit").modded && key("BIT[]").modded, "bare bit is bit(1)");
+        assert!(key("bit(4)").modded);
+        assert!(!key("\"bit\"").modded && !key("varbit").modded, "the quoted bit has no length");
         assert!(key("int[]").array);
         assert!(!key("text").modded && !key("text").array);
     }

@@ -57,9 +57,16 @@
 //! `qcastK` is a fresh uninterpreted function symbol `f : S → T`, standing in for the real
 //! conversion `g`. The prover quantifies over every interpretation of `f`, and `f = g` is one of
 //! them — so a proof that holds for all `f` holds for `g`. That argument does not depend on which
-//! occurrences share a symbol, which means **both sharing and splitting are sound** and the dedup
-//! key only trades completeness: sharing lets the two sides cancel a conversion against each other,
-//! splitting stops them. The preprocessor keys on `(target type, operand text)`, so this does too.
+//! occurrences of `g` share a symbol, which means **sharing and splitting two occurrences of one
+//! conversion are both sound** and the dedup key only trades completeness: sharing lets the two
+//! sides cancel a conversion against each other, splitting stops them. The preprocessor keys on
+//! `(target type, operand text)`, so this does too.
+//!
+//! What is not sound is one symbol for two conversions: `f` cannot be both, and the prover takes
+//! their results on one operand for equal. So the key holds everything in the target that decides
+//! what the cast computes, read as Postgres reads it (`canon_target`): the typmod, the quotes that
+//! make `"bit"` the type with no length where an unquoted `bit` is `bit(1)`, and the case of a
+//! quoted name.
 //!
 //! One consequence worth naming, because it is a quirk rather than a design: the key omits the
 //! *argument* type, so two operands that render identically but were inferred differently collide,
@@ -118,8 +125,9 @@ use sqlparser::ast::{
 use crate::catalog::{obj_name, Catalog, FnDecl};
 use crate::error::{unsupported, FrontendError, Result};
 use crate::infer::{
-    builtin_rtype, canon_type_name, is_agg_name, map_type_name, nid, sweep, Atom, Inferred, Ty, Uf,
+    builtin_rtype, is_agg_name, map_type_name, nid, sweep, Atom, Inferred, Ty, Uf,
 };
+use crate::types::{array_element, cast_target_spelling, user_type_name};
 
 /// A shared uninterpreted conversion: rule 5b's `qcastK`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,35 +251,6 @@ fn type_name(elem: &str) -> String {
     .to_string()
 }
 
-/// Whether a folded, unqualified name can only be a type the input's DDL creates: one unquoted
-/// identifier that Postgres predefines no type under and that this crate reads as no class.
-fn user_type_name(t: &str) -> bool {
-    let ident = t.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
-    ident
-        && !crate::catalog::PG_CATALOG_TYPES.contains(&t)
-        && crate::types::scalar_class(t).is_none()
-        && crate::types::temporal_class(&t.to_uppercase()).is_none()
-        && crate::types::unfaithful_type(t).is_none()
-}
-
-/// A folded type spelling without what makes it an array, and whether anything did: its trailing
-/// `[..]` groups, or the SQL-standard `T ARRAY` and `T ARRAY[n]`, which Postgres reads as `T[]`.
-fn array_element(folded: &str) -> (&str, bool) {
-    let mut elem = folded.trim_end();
-    let mut array = false;
-    while elem.ends_with(']') {
-        let Some(open) = elem.rfind('[') else { break };
-        elem = elem[..open].trim_end();
-        array = true;
-    }
-    if let Some(of) = elem.strip_suffix(" array") {
-        elem = of.trim_end();
-        array = true;
-    }
-    (elem, array)
-}
-
 /// Whether a cast target computes something beyond naming a type: a length, a precision or an
 /// interval's fields, on the type or on an array's element, whatever the type is. So `bit(3)` and
 /// `timetz(0)` do, as `varchar(3)` does, and so does a type this crate does not know with anything
@@ -279,7 +258,8 @@ fn array_element(folded: &str) -> (&str, bool) {
 /// truncates each element, is asked about its element.
 ///
 /// An unquoted `bit` with no length is `bit(1)` to Postgres's grammar, and truncates like one. The
-/// quoted `"bit"` is the type with no length, and computes nothing.
+/// quoted `"bit"` is the type with no length, and computes nothing
+/// ([`crate::types::cast_target_spelling`] writes the first as `bit(1)`).
 fn has_typmod(txt: &str) -> bool {
     let folded = crate::types::fold_type_name(txt);
     let (elem, _) = array_element(&folded);
@@ -903,10 +883,15 @@ fn is_literal(e: &Expr) -> bool {
 ///   unmappable target shares [`Ty::Opaque`], so collapsing would make `x::jsonb` and `x::uuid[]` one
 ///   function. Z3 identifies an uninterpreted function by name and sorts, and both of those carry as
 ///   VARBINARY, so the name is the only thing keeping them apart.
+///
+/// A spelling that is kept is kept as Postgres reads it ([`cast_target_spelling`]), quotes
+/// included. `x::"bit"` is the type with no length and `x::bit` is `bit(1)`, which truncates;
+/// `x::"Mood"` and `x::mood` are two types. Written without their quotes and in lower case, as this
+/// key once was, each pair was one function, and `b = c::bit` one plan with `b = c::"bit"`.
 fn canon_target(txt: &str, target: Option<Ty>, qualified: bool) -> String {
     match target {
         Some(t) if !qualified => t.sql().to_string(),
-        _ => canon_type_name(txt),
+        _ => cast_target_spelling(txt),
     }
 }
 
@@ -1013,7 +998,11 @@ fn decide(
             if let Some(u) = crate::types::unfaithful_type(&txt) {
                 return Err(crate::types::unfaithful_refusal(u));
             }
-            let (target, qualified) = map_type_name(&txt);
+            let (target, _) = map_type_name(&txt);
+            // Whether the target computes something beyond naming a type. Not `map_type_name`'s
+            // flag, which is not set for an array (`varchar(1)[]` truncates each element) nor for
+            // an unquoted `bit`, which is `bit(1)`.
+            let qualified = has_typmod(&txt);
             // A target with no `Ty` is still a deterministic function of its operand; what is missing
             // is an interpretation, not a value. `Ty::Opaque` carries it -- VARBINARY, which the
             // prover gives an equality-only sort -- and rule 5b below wraps the cast in a symbol
@@ -1041,7 +1030,6 @@ fn decide(
             // on its element (`$1::varchar(1)[]`), computes something even where every use agrees
             // on the type, and takes rule 5b like any other qualified cast.
             let key = type_key(&txt);
-            let typmod = has_typmod(&txt);
             if let Some(n) = placeholder_index(op) {
                 if !uses.get(&n).is_some_and(|u| u.all_state(&key)) && rw.mistyped.is_none() {
                     rw.mistyped = Some(unsupported(format!(
@@ -1051,7 +1039,7 @@ fn decide(
                     )));
                 }
             }
-            if let Some(n) = placeholder_index(op).filter(|_| !typmod) {
+            if let Some(n) = placeholder_index(op).filter(|_| !qualified) {
                 let own = inf.params.get(&n).copied().unwrap_or(Ty::Opaque);
                 // Inference types an array parameter by its element, so an array cast states the
                 // element's type. A parameter inference has no evidence for at all is left to the
@@ -1705,6 +1693,61 @@ mod tests {
             run("SELECT t.n::text FROM t; SELECT t.n::varchar FROM t").expect("rewrites");
         assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
         assert_eq!(q[0], q[1]);
+    }
+
+    #[test]
+    fn a_kept_cast_is_named_as_postgres_reads_its_target() {
+        // #311. The symbol's key is the target's spelling, and the spelling was read without its
+        // quotes and in lower case, so `a::bit`, which truncates to one bit, was the function
+        // `a::"bit"` is, which changes nothing; and a cast to `"Mood"` the cast to `mood`, two types.
+        let symbols = |a: &str, b: &str| {
+            let (q, rw) = run(&format!("SELECT {a} FROM t; SELECT {b} FROM t")).expect("rewrites");
+            (q[0] == q[1], rw.qcasts.len())
+        };
+        // Two types, or two computations: two functions.
+        for (a, b) in [
+            ("t.a::bit", "t.a::\"bit\""),
+            ("t.a::bit[]", "t.a::\"bit\"[]"),
+            ("t.a::bit", "t.a::pg_catalog.bit"),
+            ("t.a::bit", "t.a::varbit"),
+            ("t.a::bit", "t.a::bit(2)"),
+            ("t.a::\"Mood\"", "t.a::mood"),
+            ("t.a::\"Mood\"[]", "t.a::mood[]"),
+            ("t.a::\"char\"", "t.a::\"bit\""),
+        ] {
+            assert_eq!(symbols(a, b), (false, 2), "{a} and {b}");
+        }
+        // One type, spelled twice: one function, so a pair that respells the cast still cancels.
+        for (a, b) in [
+            ("t.a::bit", "t.a::bit(1)"),
+            ("t.a::BIT", "t.a::bit (1)"),
+            ("t.a::bit[]", "t.a::bit(1)[]"),
+            ("t.a::\"mood\"", "t.a::mood"),
+            ("t.a::\"mood\"", "t.a::MOOD"),
+            ("t.a::\"jsonb\"", "t.a::JSONB"),
+            ("t.a::\"uuid\"[]", "t.a::uuid[]"),
+            ("t.a::\"varchar\"(8)", "t.a::varchar(8)"),
+        ] {
+            assert_eq!(symbols(a, b), (true, 1), "{a} and {b}");
+        }
+    }
+
+    #[test]
+    fn an_unquoted_bit_over_a_literal_is_a_cast_with_a_length() {
+        // Rule 2/3 retargets a literal's cast only where the target has no typmod, and the
+        // unquoted `bit` has one: `'1011'::bit` is `1`, where `'1011'::"bit"` is `1011`.
+        let (q, rw) = run("SELECT t.a, '1011'::bit FROM t; \
+             SELECT t.a, '1011'::\"bit\" FROM t; \
+             SELECT t.a, '1011'::bit(1) FROM t")
+        .expect("rewrites");
+        assert_ne!(q[0], q[1]);
+        assert_eq!(q[0], q[2]);
+        assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
+        // And an array of a type with a length parses each element to it.
+        let (q, rw) = run("SELECT t.a, '{abc}'::varchar(1)[] FROM t; SELECT t.a, '{abc}'::varchar[] FROM t")
+            .expect("rewrites");
+        assert_ne!(q[0], q[1]);
+        assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
     }
 
     /// Parse, infer, rewrite, substitute and synthesize — the whole tail of the preprocessor.

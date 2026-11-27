@@ -709,6 +709,85 @@ pub(crate) fn fold_type_name(declared: &str) -> String {
     canon
 }
 
+/// A folded type spelling without what makes it an array, and whether anything did: its trailing
+/// `[..]` groups, or the SQL-standard `T ARRAY` and `T ARRAY[n]`, which Postgres reads as `T[]`.
+pub(crate) fn array_element(folded: &str) -> (&str, bool) {
+    let mut elem = folded.trim_end();
+    let mut array = false;
+    while elem.ends_with(']') {
+        let Some(open) = elem.rfind('[') else { break };
+        elem = elem[..open].trim_end();
+        array = true;
+    }
+    if let Some(of) = elem.strip_suffix(" array") {
+        elem = of.trim_end();
+        array = true;
+    }
+    (elem, array)
+}
+
+/// Whether a folded, unqualified name can only be a type the input's DDL creates: one unquoted
+/// identifier that Postgres predefines no type under and that this crate reads as no class.
+pub(crate) fn user_type_name(t: &str) -> bool {
+    unquoted_identifier(t)
+        && !crate::catalog::PG_CATALOG_TYPES.contains(&t)
+        && scalar_class(t).is_none()
+        && temporal_class(&t.to_uppercase()).is_none()
+        && unfaithful_type(t).is_none()
+}
+
+/// Whether `t` is a name Postgres reads the same with and without double quotes around it: lower
+/// case, starting with a letter or `_`, and made of letters, digits, `_` and `$`.
+fn unquoted_identifier(t: &str) -> bool {
+    t.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+}
+
+/// The spelling of a cast's target that names the function the cast is: two targets get one
+/// spelling only where Postgres reads them as one type computing one thing, since two casts under
+/// one name are one function to a prover, and one plan to the frontend.
+///
+/// * **Case is folded outside double quotes** and white space squeezed ([`fold_type_name`]), so
+///   `VARCHAR(8)` is `varchar(8)`, and `"Mood"` and `mood` stay two types.
+/// * **A quoted name loses its quotes only where the unquoted word names the same type**: a name
+///   in lower case that is a type of the pair's own ([`user_type_name`]), or one Postgres predefines
+///   under that very name (`"uuid"`, `"varchar"`, `"timestamp"`). `"bit"` and `"char"` keep theirs:
+///   the grammar reads the unquoted `bit` as `bit(1)` and the unquoted `char` as `character(1)`,
+///   while `"bit"` is the type with no length and `"char"` a one-byte type of its own. So does any
+///   name the grammar reads as a class of its own unquoted (`"int"`, `"float"`), which quoted is
+///   whatever type the pair's DDL creates under it.
+/// * **An unquoted `bit` with no length is written `bit(1)`**, as itself or as an array's element,
+///   which is what it is: `x::bit` truncates to one bit, and `x::bit(1)` is the same cast.
+///
+/// A spelling with a doubled quote in it (`"a""b"`) is left as folded.
+pub(crate) fn cast_target_spelling(spelled: &str) -> String {
+    let folded = fold_type_name(spelled);
+    let mut canon = String::with_capacity(folded.len());
+    if folded.contains("\"\"") {
+        canon.push_str(&folded);
+    } else {
+        // The parts between quotes are at the odd positions.
+        for (i, part) in folded.split('"').enumerate() {
+            let alike = unquoted_identifier(part)
+                && !matches!(part, "bit" | "char")
+                && (user_type_name(part) || crate::catalog::PG_CATALOG_TYPES.contains(&part));
+            match i % 2 {
+                1 if !alike => {
+                    canon.push('"');
+                    canon.push_str(part);
+                    canon.push('"');
+                }
+                _ => canon.push_str(part),
+            }
+        }
+    }
+    let (elem, _) = array_element(&canon);
+    if elem == "bit" {
+        return format!("bit(1){}", &canon[elem.len()..]);
+    }
+    canon
+}
+
 /// `ty` carrying `tag`, as it is: the declared type it stands for where a coercion into it is named
 /// ([`opaque_cast_name`]). Not folded, so two tags are one only when they are written alike.
 pub fn with_tag(ty: String, tag: &str) -> String {
@@ -1132,9 +1211,21 @@ pub fn lower_cast(v: Value, dt: &DataType) -> Value {
 ///   and `numeric(10,2)` rounds, yet both map to the type an unqualified target maps to;
 /// * an opaque one. VARBINARY carries every array type and the binary ones, so `ys::int[]` over a
 ///   `text[]` would read as `ys`, while it parses each element.
+///
+/// The spelling is the target's as Postgres reads it ([`cast_target_spelling`]). [`cast_name`] is
+/// not one-to-one over a quote, so `cs::"bit"[]`, which leaves each element as it is, would be the
+/// `q_cast_bit_array` that `cs::bit[]` is, which truncates each to one bit. A spelling that keeps a
+/// quote is written out in full instead, as a column's declared type is ([`opaque_cast_name`]).
 fn named_cast(dt: &DataType, target: &str) -> Option<String> {
     let spelled = format!("{dt}");
-    (spelled.contains('(') || is_opaque(target)).then(|| cast_name(&spelled))
+    (spelled.contains('(') || is_opaque(target)).then(|| {
+        let spelled = cast_target_spelling(&spelled);
+        if spelled.contains('"') {
+            escaped_cast_name(&Value::String(spelled))
+        } else {
+            cast_name(&spelled)
+        }
+    })
 }
 
 /// The name of the cast function to the type spelled `spelled`: `q_cast_` and the spelling, lower
@@ -1769,6 +1860,58 @@ mod tests {
     /// `l op r` as `make_cmp` builds it once the operands already share a type.
     fn plain(op: &str, l: Value, r: Value) -> Value {
         json!({ "operator": op, "operand": [l, r], "type": "BOOLEAN" })
+    }
+
+    #[test]
+    fn a_cast_target_is_spelled_as_postgres_reads_it() {
+        for (spelled, read) in [
+            // An unquoted `bit` with no length is `bit(1)`; the quoted one has none.
+            ("BIT", "bit(1)"),
+            ("bit", "bit(1)"),
+            ("BIT[]", "bit(1)[]"),
+            ("BIT ARRAY", "bit(1) array"),
+            ("BIT(3)", "bit(3)"),
+            ("BIT VARYING", "bit varying"),
+            ("\"bit\"", "\"bit\""),
+            ("\"bit\"[]", "\"bit\"[]"),
+            ("pg_catalog.bit", "pg_catalog.bit"),
+            // `"char"` is a type of its own, and so is whatever a pair creates under a word the
+            // grammar reads as a class.
+            ("\"char\"", "\"char\""),
+            ("\"int\"", "\"int\""),
+            ("\"character\"", "\"character\""),
+            // A quoted name is the unquoted one where it is spelled as Postgres folds it.
+            ("\"Mood\"", "\"Mood\""),
+            ("\"mood\"", "mood"),
+            ("MOOD", "mood"),
+            ("public.\"mood\"", "public.mood"),
+            ("\"My Schema\".\"mood\"[]", "\"My Schema\".mood[]"),
+            ("\"uuid\"", "uuid"),
+            ("\"timestamp\"", "timestamp"),
+            ("\"varchar\"(8)", "varchar(8)"),
+            ("DOUBLE  PRECISION", "double precision"),
+            ("\"a\"\"b\"", "\"a\"\"b\""),
+        ] {
+            assert_eq!(cast_target_spelling(spelled), read, "{spelled}");
+        }
+    }
+
+    #[test]
+    fn a_named_cast_keeps_the_quotes_postgres_reads() {
+        use sqlparser::parser::Parser;
+        let name = |ty: &str| {
+            let dt = Parser::new(&crate::DIALECT).try_with_sql(ty).unwrap().parse_data_type().unwrap();
+            named_cast(&dt, &map_type(&dt)).unwrap_or_else(|| panic!("{ty} is a plain CAST"))
+        };
+        assert_eq!(name("int[]"), "q_cast_int_array");
+        assert_eq!(name("varchar(2)"), "q_cast_varchar_2");
+        // `cs::bit[]` truncates each element to one bit and `cs::"bit"[]` leaves each as it is.
+        assert_eq!(name("bit[]"), "q_cast_bit_1_array");
+        assert_eq!(name("bit(1)[]"), "q_cast_bit_1_array");
+        assert_ne!(name("\"bit\"[]"), name("bit[]"));
+        assert_ne!(name("\"Mood\"[]"), name("mood[]"));
+        assert_eq!(name("\"mood\"[]"), name("mood[]"));
+        assert_eq!(name("\"uuid\"[]"), "q_cast_uuid_array");
     }
 
     #[test]
