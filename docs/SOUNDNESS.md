@@ -475,6 +475,12 @@ what it is or refused:
   quotes only where the unquoted word names the same type (`"mood"`, `"uuid"`). The same holds of
   an array's element, under either catalog. sqleq-lean reads a bare `bit` the same way: as a
   cast's target it truncates, so `unnest($2::bit[])` is not what `VALUES ($1, $2)` stores.
+- **A literal's cast to a type the frontend has no class for is such a function too.** Under an
+  inferred catalog every such type is one opaque type, so a `CAST` of the literal to it would be
+  the same term whatever the type was, and `'…'::json`, which keeps its text, the same value as
+  `'…'::jsonb`, which parses it. The cast is a function named after its target, one for each
+  literal, as it is over a column. A cast of `NULL` stays a `CAST`: it is a NULL whatever the
+  target.
 - **A second cast to the type a cast just gave is no cast.** In Postgres, `CAST(CAST(e AS T) AS T)`
   is `CAST(e AS T)`: the outer cast is handed a value of its own type, and a typmod's coercion and a
   domain's checks are idempotent. So it is removed before anything reads the tree
