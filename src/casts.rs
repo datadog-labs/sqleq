@@ -14,7 +14,7 @@
 //! | | operand | becomes | why it is faithful |
 //! |---|---|---|---|
 //! | 1 | `$N` | `$N` | the parameter *is* an uninterpreted constant of the target type, so the cast is the identity on it. Only where the target is the type Postgres gave `$N`: see below |
-//! | 2/3 | a literal or `NULL` | `CAST(lit AS T′)` | a real cast survives; `T′` is only the prover's spelling of `T` |
+//! | 2/3 | a literal, where `T` has a class, or `NULL` | `CAST(lit AS T′)` | a real cast survives; `T′` is only the prover's spelling of `T`. A literal cast to any other type takes rule 5b: the prover's spelling of every such type is one, and `'…'::json` is not `'…'::jsonb` |
 //! | 4 | anything already of type `T`, target unqualified | the operand | a no-op cast |
 //! | 5a | `INTEGER` → `REAL` | `CAST(x AS NUMERIC)` | a widening the prover models natively |
 //! | 5b | any other real conversion | `qcastK(x)` | an uninterpreted function, shared across both sides |
@@ -868,6 +868,11 @@ fn is_literal(e: &Expr) -> bool {
     matches!(e, Expr::Value(v) if !matches!(v.value, SqlValue::Placeholder(_)))
 }
 
+/// A bare `NULL`.
+fn is_null(e: &Expr) -> bool {
+    matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::Null))
+}
+
 /// The dedup key's view of a cast target: two casts share a `qcast` symbol exactly when this agrees.
 ///
 /// Sharing a symbol is what lets an untouched conversion cancel between the two sides of a pair, and
@@ -1061,7 +1066,14 @@ fn decide(
             }
             // The same holds over a literal: `'abc'::varchar(2)` is `'ab'`, and retargeting it to the
             // bare type would make it a cast between equal types, which is the identity.
-            if is_literal(op) && !qualified {
+            //
+            // And a literal is retargeted only to a type inference has a class for. A target with
+            // none is `Ty::Opaque`, written back as VARBINARY whatever it was, so `'…'::json` and
+            // `'…'::jsonb` were one `CAST('…' AS VARBINARY)` and the pair one plan, though one keeps
+            // the text and the other parses it (#313). Such a cast takes rule 5b, as it does over a
+            // column: a function named after its target. A `NULL` is the exception, since a cast of
+            // it is a NULL whatever the target.
+            if is_literal(op) && !qualified && (target.is_some() || is_null(op)) {
                 dec.insert(nid(e), Decision::Retarget(tq));
                 return Ok(());
             }
@@ -1486,6 +1498,44 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_cast_to_a_type_with_no_class_keeps_its_target() {
+        // #313. Retargeted, a cast to a type inference has no class for was `CAST(lit AS VARBINARY)`
+        // whatever the type, so one literal cast to two such types was one term: `'…'::json`, which
+        // keeps its text, and `'…'::jsonb`, which parses it. It takes rule 5b, as over a column.
+        let functions = |a: &str, b: &str| {
+            let (q, rw) =
+                run(&format!("SELECT t.a, {a} FROM t; SELECT t.a, {b} FROM t")).expect("rewrites");
+            (q[0] == q[1], rw.qcasts.len())
+        };
+        for (a, b) in [
+            ("'{\"a\":1, \"a\":2}'::json", "'{\"a\":1, \"a\":2}'::jsonb"),
+            ("'08:00:2b:01:02:03'::macaddr", "'08:00:2b:01:02:03'::macaddr8"),
+            ("'ABC'::\"char\"", "'ABC'::name"),
+            ("'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::name"),
+            ("'{1,2}'::int[]", "'{1,2}'::text[]"),
+        ] {
+            assert_eq!(functions(a, b), (false, 2), "{a} and {b}");
+        }
+        // One cast on both sides is still one function, and so are two spellings of one target.
+        for (a, b) in [
+            ("'{}'::jsonb", "'{}'::jsonb"),
+            ("'{}'::jsonb", "'{}'::\"jsonb\""),
+            ("'{1,2}'::int[]", "'{1,2}'::INT[]"),
+        ] {
+            assert_eq!(functions(a, b), (true, 1), "{a} and {b}");
+        }
+        // The literal is part of the function's key: another literal is another term.
+        assert_eq!(functions("'{}'::jsonb", "'[]'::jsonb"), (false, 2));
+        // A NULL is a NULL whatever it is cast to, and stays a typed NULL the provers read as one.
+        let (q, rw) = run("SELECT t.a, NULL::json FROM t; SELECT t.a, NULL::jsonb FROM t").expect("rewrites");
+        assert_eq!(q[0], q[1]);
+        assert!(q[0].to_uppercase().contains("NULL::VARBINARY") && rw.qcasts.is_empty(), "{}", q[0]);
+        // And a type with a class is retargeted as before.
+        let (_, rw) = run("SELECT t.a, '1'::int FROM t; SELECT t.a, '1'::text FROM t").expect("rewrites");
+        assert!(rw.qcasts.is_empty(), "{:?}", rw.qcasts);
+    }
+
+    #[test]
     fn an_identity_cast_is_dropped_but_a_narrowing_one_is_not() {
         // Rule 4 against rule 5b. Both sides of the distinction in one pair: `name` infers VARCHAR,
         // so `::varchar` is a no-op and `::varchar(8)` is a truncation.
@@ -1742,12 +1792,14 @@ mod tests {
         .expect("rewrites");
         assert_ne!(q[0], q[1]);
         assert_eq!(q[0], q[2]);
-        assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
+        // One function for the two spellings of `bit(1)`, and one for `"bit"`, which has no class
+        // and keeps its own name (#313).
+        assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
         // And an array of a type with a length parses each element to it.
         let (q, rw) = run("SELECT t.a, '{abc}'::varchar(1)[] FROM t; SELECT t.a, '{abc}'::varchar[] FROM t")
             .expect("rewrites");
         assert_ne!(q[0], q[1]);
-        assert_eq!(rw.qcasts.len(), 1, "{:?}", rw.qcasts);
+        assert_eq!(rw.qcasts.len(), 2, "{:?}", rw.qcasts);
     }
 
     /// Parse, infer, rewrite, substitute and synthesize — the whole tail of the preprocessor.
