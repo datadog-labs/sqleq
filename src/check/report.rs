@@ -579,7 +579,7 @@ pub fn print_solver_line(c: Color, case: &Case, name_w: usize) {
     println!("  {:<22} {:<name_w$}{note}", s, case.name);
 }
 
-pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
+pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats, seed: u64) {
     let scored: Vec<&Case> = cases.iter().filter(|x| x.f_verdict.is_some()).collect();
     if scored.is_empty() {
         return;
@@ -606,9 +606,11 @@ pub fn print_fuzz(c: Color, cases: &[Case], stats: &fuzz::Stats) {
     println!(
         "{}",
         c.dim(&format!(
-            "  note  `no-counterexample` is not a proof: it is the verdict of {} trials\n        over a small value \
-             domain (see docs/fuzz.md).",
-            fuzz::FUZZ_ARGS[1]
+            "  note  `no-counterexample` is not a proof: it is the verdict of {} trials{}\n        over a small \
+             value domain (see docs/fuzz.md).",
+            fuzz::FUZZ_TRIALS,
+            // Said only for another seed than the default, so a default run prints what it did.
+            if seed == fuzz::DEFAULT_SEED { String::new() } else { format!(" at seed {seed}") }
         ))
     );
 }

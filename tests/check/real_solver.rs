@@ -110,6 +110,7 @@ fn a_portfolio_asks_it_per_case() {
         cvc5: None,
         cvc5_cap_ms: None,
         fuzz: None,
+        fuzz_seed: 0,
         lean: None,
         timeout: 30.0,
         smt_timeout_ms: None,

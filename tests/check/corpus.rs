@@ -109,6 +109,36 @@ fn rows_are_named_by_their_index_and_reach_every_axis_as_rows() {
     assert_eq!(fz.lines().filter(|l| l.starts_with("row row.csv 0 ")).count(), 3, "{fz}");
 }
 
+/// The fuzz's seed is the caller's. `--fuzz-seed` reaches sqleq-fuzz, the run's record names the
+/// budget it ran at, and each answer says which seed it is from. A run that names no seed passes
+/// the budget it always did, token for token, and writes the record it always did.
+#[test]
+fn the_fuzz_seed_reaches_sqleq_fuzz_and_the_record() {
+    for (extra, budget, seed) in [
+        (&[][..], "--trials 120 --rows 5 --seed 0 --engine postgres", Value::Null),
+        (&["--fuzz-seed", "3"][..], "--trials 120 --rows 5 --seed 3 --engine postgres", serde_json::json!(3)),
+    ] {
+        let f = Fakes::new();
+        let mut r = Run::new(&f);
+        let fuzz_argv = f.path().join("fuzz.argv");
+        r.set("FAKE_FUZZ_ARGV", &fuzz_argv.to_string_lossy());
+        let mut args = vec!["--axes", "fuzz"];
+        args.extend(extra);
+        let (ran, cases) = r.cases(&args);
+        assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+        let fz = std::fs::read_to_string(&fuzz_argv).unwrap();
+        assert_eq!(fz.lines().count(), 3, "{fz}");
+        assert!(fz.lines().all(|l| l == format!("row row.csv 0 {budget}")), "{fz}");
+        for c in &cases {
+            assert_eq!(c["f_raw"]["label"], "NO-COUNTEREXAMPLE", "{c}");
+            assert_eq!(c["f_raw"]["seed"], seed, "{c}");
+        }
+        let out: Value = serde_json::from_str(&std::fs::read_to_string(f.path().join("out.json")).unwrap()).unwrap();
+        let args: Vec<&str> = out["meta"]["fuzz"]["args"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(args.join(" "), budget);
+    }
+}
+
 #[test]
 fn only_keeps_the_named_rows_without_renumbering() {
     let f = Fakes::new();

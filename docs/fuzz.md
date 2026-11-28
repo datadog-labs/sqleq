@@ -322,7 +322,9 @@ fetches one for the common platforms, and an installed one uses the one on `PATH
 `SQLEQ_PG_BIN`; `--engine duckdb` needs none, but a build with the `duckdb` feature.
 
 `sqleq-check` passes the trial budget explicitly (`--trials 120 --rows 5 --seed 0`), so a change to
-the defaults below cannot move its answers. On its own:
+the defaults below cannot move its answers. Its `--fuzz-seed N` passes another seed, for a second
+look at pairs that seed 0 does not refute: a counterexample is sound whatever seed found it, and
+a `no-counterexample` is the verdict of the seeds that were tried. On its own:
 
 ```
 sqleq-fuzz csv  <corpus.csv> <names.txt> [out.json]   # batch (rows are a,b,ddl); names are pairNNNN

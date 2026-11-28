@@ -7,6 +7,13 @@ the command line, the IR or the library's API.
 
 ## [Unreleased]
 
+### Added
+
+- **`sqleq-check --fuzz-seed N`** runs `sqleq-fuzz` at another seed than 0. Another seed draws
+  other instances, so it can refute a pair seed 0 finds no counterexample for. The trial count is
+  unchanged, a run that names no seed is the run it was, and `--expect pinned` takes no seed but
+  0, the one the pins were blessed at.
+
 ### Changed
 
 - **The `duckdb` feature links DuckDB 2.0.1,** where it linked 1.5.6 (the `duckdb` crate, now

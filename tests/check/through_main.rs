@@ -290,6 +290,7 @@ fn setup_errors_exit_2() {
     let plan = f.path().join("plan.json");
     std::fs::write(&plan, "{}").unwrap();
     let nope = f.path().join("nope").to_string_lossy().into_owned();
+    let fz = f.fuzz.to_string_lossy().into_owned();
     let rows: Vec<(Vec<&str>, &Path)> = vec![
         (vec!["--expect", "pinned", "--axes", "fuzz", "--fuzz-bin", &nope], &f.case),
         (vec!["--expect", "pinned", "--axes", "frontend,qd"], &f.case),
@@ -300,6 +301,10 @@ fn setup_errors_exit_2() {
         // The pins are bags answers; a set-semantics answer could only ever be blessed wrongly.
         (vec!["--expect", "pinned", "--bless", "--axes", "frontend,cvc5", "--cvc5-semantics", "sets"], &f.case),
         (vec!["--expect", "pinned", "--axes", "frontend,cvc5", "--cvc5-semantics", "sets"], &f.case),
+        // The pins are answers at seed 0; another seed's could only ever be blessed wrongly.
+        (vec!["--expect", "pinned", "--bless", "--axes", "fuzz", "--fuzz-bin", &fz, "--fuzz-seed", "1"], &f.case),
+        (vec!["--expect", "pinned", "--axes", "fuzz", "--fuzz-bin", &fz, "--fuzz-seed", "1"], &f.case),
+        (vec!["--expect", "report-only", "--axes", "fuzz", "--fuzz-bin", &fz, "--fuzz-seed", "minus one"], &f.case),
         (vec!["--sqleq-solver", "--sqlsolver-jvm"], &f.case),
         // The JVM fork takes sqleq-solver's place, and never decides `--expect equivalent`.
         (vec!["--sqlsolver-jvm"], &f.case),
@@ -311,6 +316,20 @@ fn setup_errors_exit_2() {
         let ran = r.raw(f.path(), &a);
         assert_eq!(ran.code, 2, "{argv:?}: {}{}", ran.out, ran.err);
     }
+    // The seed is refused for what it is, and only beside the pins: the same run reports at seed 1.
+    let seeded = |expect: &str| {
+        let a: Vec<String> = ["--expect", expect, "--axes", "fuzz", "--fuzz-bin", &fz, "--fuzz-seed", "1"]
+            .iter()
+            .map(|x| s(x))
+            .chain([f.case.to_string_lossy().into_owned()])
+            .collect();
+        r.raw(f.path(), &a)
+    };
+    let pinned = seeded("pinned");
+    assert!(pinned.err.contains("the seed its pins were blessed at"), "{}", pinned.err);
+    let report = seeded("report-only");
+    assert_eq!(report.code, 0, "{}{}", report.out, report.err);
+    assert!(report.out.contains("trials at seed 1"), "{}", report.out);
 }
 
 #[test]
@@ -331,8 +350,10 @@ fn fuzz_labels_map_to_their_kind() {
     for (i, (body, (word, note))) in rows.iter().enumerate() {
         let fake = exe(&f.path().join(format!("fz{i}")), &format!("{body}\n"));
         let path = case.to_string_lossy();
-        let a = spawning(|| sqleq::check::axes::fuzz::fuzz_one(&fake.to_string_lossy(), Pair::File(&path), 10.0));
+        let a = spawning(|| sqleq::check::axes::fuzz::fuzz_one(&fake.to_string_lossy(), Pair::File(&path), 10.0, 0));
         assert_eq!((a.word.as_str(), a.note.as_str()), (*word, *note), "{body}");
+        // The default seed is not written out, so a default run's record is the one it always was.
+        assert!(a.raw.iter().all(|r| r.get("seed").is_none()), "{body}: {:?}", a.raw);
     }
 }
 
