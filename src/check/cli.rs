@@ -219,6 +219,12 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub fuzz_bin: Option<String>,
 
+    /// The seed sqleq-fuzz draws its instances from. Another seed tries other instances, so it can
+    /// refute a pair that seed 0 finds no counterexample for. Not with --expect pinned: the pins
+    /// are answers at seed 0.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub fuzz_seed: u64,
+
     /// Write full results as JSON.
     #[arg(long, value_name = "FILE")]
     pub json: Option<String>,

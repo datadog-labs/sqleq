@@ -154,6 +154,8 @@ pub struct Ctx<'a> {
     /// `--cvc5-timeout`, likewise.
     pub cvc5_cap_ms: Option<u64>,
     pub fuzz: Option<&'a str>,
+    /// `--fuzz-seed`.
+    pub fuzz_seed: u64,
     pub lean: Option<&'a str>,
     pub timeout: f64,
     pub smt_timeout_ms: Option<u64>,
@@ -292,7 +294,7 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
     let (fz, ln) = std::thread::scope(|s| {
         // The two axes that read the pair file themselves start at once, beside the frontend.
         let fz = ctx.fuzz.filter(|_| is_sql).map(|bin| {
-            let (path, row) = (&path, &row);
+            let (path, row, seed) = (&path, &row, ctx.fuzz_seed);
             s.spawn(move || {
                 let remaining = left(deadline);
                 let pair = match row {
@@ -300,7 +302,7 @@ pub fn run_case(item: &Item, ctx: &Ctx) -> Case {
                     None => fuzz::Pair::File(path),
                 };
                 let r = if remaining > 0.0 {
-                    fuzz::fuzz_one(bin, pair, remaining)
+                    fuzz::fuzz_one(bin, pair, remaining, seed)
                 } else {
                     fuzz::Answer { word: "timeout".into(), note: String::new(), ms: 0, raw: None }
                 };

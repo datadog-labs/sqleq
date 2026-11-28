@@ -70,6 +70,16 @@ pub fn setup(args: &Args) -> Result<Env, String> {
                     blessed under; run --cvc5-semantics sets with --expect report-only"
             .into());
     }
+    // Likewise the fuzz's seed: a pin is its answer at the default one. Another seed can refute a
+    // pair pinned `no-counterexample`, and blessing that would fail every run at the default.
+    if pinned && axes.contains(&"fuzz") && args.fuzz_seed != fuzz::DEFAULT_SEED {
+        return Err(format!(
+            "error: --expect pinned checks the fuzz axis at seed {}, the seed its pins were blessed at; \
+             run --fuzz-seed {} with --expect report-only",
+            fuzz::DEFAULT_SEED,
+            args.fuzz_seed
+        ));
+    }
     if pinned && args.corpus.is_some() {
         return Err("error: --expect pinned reads each case's header, and a corpus row has none; pin pair files".into());
     }
@@ -481,6 +491,7 @@ pub fn main(args: Args) -> i32 {
         cvc5: env.cvc5.as_ref(),
         cvc5_cap_ms,
         fuzz: env.fuzz.as_deref(),
+        fuzz_seed: args.fuzz_seed,
         lean: env.lean.as_deref(),
         timeout: args.timeout,
         smt_timeout_ms: args.smt_timeout,
@@ -695,7 +706,7 @@ pub fn main(args: Args) -> i32 {
                 stream.emit(x);
             }
         };
-        fuzz_stats = Some(fuzz::run_fuzz(&mut cases, fz, args.jobs, args.timeout, &done));
+        fuzz_stats = Some(fuzz::run_fuzz(&mut cases, fz, args.jobs, args.timeout, args.fuzz_seed, &done));
     }
 
     // The Lean axis, likewise apart from both: it reads the pair files itself.
@@ -792,7 +803,7 @@ pub fn main(args: Args) -> i32 {
             report::print_cvc5(c, &cases, st, &d.describe());
         }
         if let Some(st) = &fuzz_stats {
-            report::print_fuzz(c, &cases, st);
+            report::print_fuzz(c, &cases, st, args.fuzz_seed);
         }
         if let Some(st) = &lean_stats {
             report::print_lean(c, &cases, st);
@@ -824,7 +835,7 @@ pub fn main(args: Args) -> i32 {
         fuzz: env.fuzz.as_ref().map(|b| FuzzMeta {
             stats: fuzz_stats.clone().unwrap_or_default(),
             bin: b.clone(),
-            args: fuzz::FUZZ_ARGS.iter().map(|s| s.to_string()).collect(),
+            args: fuzz::fuzz_args(args.fuzz_seed),
         }),
         cvc5: env.cvc5.as_ref().map(|d| Cvc5Meta {
             stats: cvc5_stats.clone().unwrap_or_default(),

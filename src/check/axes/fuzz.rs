@@ -9,7 +9,9 @@
 //! PostgreSQL and compares the results. It reads the pair file itself and binds `$N` on its own, so it
 //! needs no frontend and ignores the catalog header. The trial budget is always passed explicitly
 //! -- the tool's defaults are free to change, and a pinned `no-counterexample` is only a claim about
-//! one budget.
+//! one budget. The seed is the caller's to choose (`--fuzz-seed`): another seed draws other
+//! instances, so it can refute a pair the default one finds nothing on. A pin is a claim at the
+//! default seed, and a pinned run takes no other.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,12 +25,25 @@ use crate::check::case::Case;
 use crate::check::inputs::CorpusRow;
 use crate::check::util::{abspath, tail};
 
+/// The trials each pair gets.
+pub const FUZZ_TRIALS: u32 = 120;
+/// The rows each table of an instance gets.
+const FUZZ_ROWS: u32 = 5;
+/// The seed every pin was blessed at, and the one a run takes unless `--fuzz-seed` names another.
+pub const DEFAULT_SEED: u64 = 0;
+
+/// The budget sqleq-fuzz is given, as its arguments: the trials and the rows, which are fixed, and
+/// the seed.
+///
 /// The engine is named too: only the Postgres engine's verdicts are claims about Postgres. The
 /// DuckDB engine answers as DuckDB evaluates the pair, so a counterexample from it is no evidence for
 /// a portfolio or an alarm, and `SQLEQ_FUZZ_ENGINE` must not be able to swap it in.
-pub const FUZZ_ARGS: [&str; 8] = [
-    "--trials", "120", "--rows", "5", "--seed", "0", "--engine", "postgres",
-];
+pub fn fuzz_args(seed: u64) -> Vec<String> {
+    ["--trials", &FUZZ_TRIALS.to_string(), "--rows", &FUZZ_ROWS.to_string(), "--seed", &seed.to_string(), "--engine", "postgres"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
 
 /// The label's kind is the part before the first `:` (`ERROR:…`, `PARAM-MISALIGNED:…`).
 fn word_of(kind: &str) -> &'static str {
@@ -81,7 +96,10 @@ impl Answer {
 /// sqleq-fuzz on one pair. A corpus row goes through its `row` mode, handed the row as a one-row
 /// CSV: that is the code its `csv` mode runs on every row, raw DDL and all, so a row is fuzzed here
 /// exactly as it is in a whole-corpus run.
-pub fn fuzz_one(fuzz_bin: &str, pair: Pair, timeout_s: f64) -> Answer {
+///
+/// A seed other than the default is written into the answer's record, so a result file says which
+/// seed each of its answers is from.
+pub fn fuzz_one(fuzz_bin: &str, pair: Pair, timeout_s: f64, seed: u64) -> Answer {
     let tmp;
     let (argv_tail, dir): (Vec<String>, std::path::PathBuf) = match pair {
         Pair::File(path) => {
@@ -102,7 +120,7 @@ pub fn fuzz_one(fuzz_bin: &str, pair: Pair, timeout_s: f64) -> Answer {
     };
     let mut argv = vec![fuzz_bin.to_string()];
     argv.extend(argv_tail);
-    argv.extend(FUZZ_ARGS.iter().map(|s| s.to_string()));
+    argv.extend(fuzz_args(seed));
     let r = crate::check::proc::run_cmd(&argv, &dir, timeout_s, &[]);
     let ms = (r.wall * 1000.0) as u64;
     if r.timed_out {
@@ -127,6 +145,9 @@ pub fn fuzz_one(fuzz_bin: &str, pair: Pair, timeout_s: f64) -> Answer {
         }
     }
     let mut raw = json!({ "label": label });
+    if seed != DEFAULT_SEED {
+        raw["seed"] = json!(seed);
+    }
     let partial = lines[1..].iter().find_map(|l| l.strip_prefix("partial: "));
     if let Some((ok, err)) = partial.and_then(|p| p.split_once(" trials compared both sides; last error: ")) {
         raw["ok_trials"] = ok.parse::<u64>().map_or(json!(ok), |n| json!(n));
@@ -145,7 +166,14 @@ pub struct Stats {
 
 /// Run sqleq-fuzz over every case with a pair -- `.sql` files and corpus rows -- and attach its
 /// verdicts in place, calling `done` on each case as its answer lands.
-pub fn run_fuzz(cases: &mut [Case], fuzz_bin: &str, jobs: usize, timeout_s: f64, done: &(dyn Fn(&Case) + Sync)) -> Stats {
+pub fn run_fuzz(
+    cases: &mut [Case],
+    fuzz_bin: &str,
+    jobs: usize,
+    timeout_s: f64,
+    seed: u64,
+    done: &(dyn Fn(&Case) + Sync),
+) -> Stats {
     let t0 = Instant::now();
     let next = AtomicUsize::new(0);
     let shared: Vec<Mutex<&mut Case>> = cases.iter_mut().filter(|c| c.has_pair()).map(Mutex::new).collect();
@@ -156,7 +184,7 @@ pub fn run_fuzz(cases: &mut [Case], fuzz_bin: &str, jobs: usize, timeout_s: f64,
                 let Some(slot) = shared.get(k) else { break };
                 let mut c = slot.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pair) = Pair::of(&c) {
-                    let a = fuzz_one(fuzz_bin, pair, timeout_s);
+                    let a = fuzz_one(fuzz_bin, pair, timeout_s, seed);
                     a.attach(&mut c);
                     done(&c);
                 }

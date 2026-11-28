@@ -101,6 +101,7 @@ sqleq-check --keep ./work rewrites/
 | `--frontend PATH` | The `sqleq-frontend` binary ([lookup order](#requirements)). |
 | `--prover PATH` | The `qed-prover` binary ([lookup order](#requirements)). |
 | `--fuzz-bin PATH` | The `sqleq-fuzz` binary ([lookup order](#requirements)). |
+| `--fuzz-seed N` | The seed `sqleq-fuzz` draws its instances from (default 0). Another seed tries other instances, so it can refute a pair seed 0 finds no counterexample for. Refused with `--expect pinned`: the pins are answers at seed 0. |
 | `--bin-dir DIR` | Take sqleq-frontend, sqleq-fuzz, sqleq-solver, sqleq-cvc5 and sqleq-lean out of DIR, unless a flag names one. |
 | `--json FILE` / `--csv FILE` | Write structured results (full prover `Stats` per case in JSON). |
 | `--keep DIR` | Keep intermediates instead of using temp dirs: each case's in `DIR/<name>`, with every `/` in the name as `__`. That directory is emptied when the case starts, so a re-run never reads the answers a previous run left there. |
@@ -512,7 +513,9 @@ Two things a pin depends on, though neither is particular to this policy:
 
 * **The fuzz axis.** `fuzz` runs `sqleq-fuzz file` on each pair with its trial budget passed
   explicitly (`--trials 120 --rows 5 --seed 0`), so a change to the tool's defaults cannot move a
-  pin. It reads the pair itself, so `--axes fuzz` alone needs no frontend. It answers a pair of the
+  pin. `--fuzz-seed` changes the seed and nothing else, and a pinned run takes no seed but 0:
+  what another seed finds is a fact about the pair, and not what its pin records. It reads the
+  pair itself, so `--axes fuzz` alone needs no frontend. It answers a pair of the
   gather rule's shape under that rule, as `counterexample-gather` or `no-counterexample-gather`,
   and those are the answers a `binding: gather` pin judges against its truth.
 * **The cvc5 axis.** Its pins are answers under bags, the default; `--expect pinned` refuses
